@@ -651,6 +651,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   segment-only blob/MSE traffic set. Candidate scope remains tab/frame based;
   associating several simultaneous players in one tab is a later refinement.
 
+## 2026-09-04 — Committed range job survives restart and resumes
+
+- A committed 8 MiB range job was paused after its first verified byte had
+  been written. The isolated row was `provisional=false`, `state=paused`,
+  `downloaded=1`, with `completedRanges=[{"start":0,"end":0}]`; the temporary
+  file remained owned by the job.
+- The resident process was terminated and relaunched from the same isolated
+  home `/tmp/dm-resume-proof.AZkkDT`. Startup preserved the committed row,
+  paused state, resource identity, and verified range.
+- The real main-window Tauri command `resume_job` was invoked through the
+  WebKit inspector. The existing temporary file was reused and the transfer
+  completed without losing the persisted job.
+- Final state was `provisional=false`, `state=completed`, with
+  `downloaded=8388608` and `total=8388608`. The destination
+  `/tmp/dm-resume-proof.AZkkDT/Downloads/resume.bin` was 8,388,608 bytes and
+  `cmp` passed against a fresh `/file/range.bin` fixture fetch.
+- This closes a real restart/resume acceptance path under SPEC §8.7. The
+  earlier recovery probe still covers crash cleanup and committed-state
+  preservation; this run additionally exercised the post-restart Resume
+  command through the live application.
+
 ## 2026-09-04 — Real browser media-button capture proven
 
 - Started the fixture server from its required `fixtures/` working directory

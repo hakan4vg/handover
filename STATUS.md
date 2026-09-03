@@ -509,3 +509,14 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   covered: HLS VOD, HLS master, HLS slow, DASH SegmentList, DASH template
   (live HLS/DASH correctly rejected at the parser unit level).
 - Verified: probe PASS x2; `diff --check`. `fixtures/server.py` untouched.
+
+## 2026-09-03 — Crash recovery: provisional sweep, committed survival
+
+- New `fixtures/recovery_probe.py`: seeds a committed paused range job (real
+  first MiB + matching completed range) in the DB, boots the app, starts a
+  slow-HLS capture, SIGTERMs at 1 MiB mid-download, reboots and asserts.
+- Result: no provisional rows survive, no provisional temp/segment leftovers
+  survive, the seeded job is intact and still paused with its verified range,
+  and the relaunched app stays alive. SPEC §7.3 + §8.7 restart behavior,
+  proven headless. PASS.
+- Verified: probe PASS; `diff --check`. `fixtures/server.py` untouched.

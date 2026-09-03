@@ -301,3 +301,17 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verified: full Rust suite 20/20; `cargo build`; `npm run build`
   (255.12 kB / 76.68 kB gzip); `git diff --check`; native-host probe PASS.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — First frontend test coverage (extension URL gating)
+
+- `npm test` (`vitest run`) previously exited 1 with "No test files found".
+  Added `extension/src/shared.test.ts`: 5 tests locking `isHttp` (accepts
+  http/https incl. fixture shapes; rejects blob/ftp/file/data/empty/garbage/
+  relative) and `siteOf` (strips www, lowercases, keeps subdomains/ports as
+  hostname only, `''` for hostname-less input) plus the `DEFAULT_POLICY`
+  shape. These are the exact predicates `background.ts` uses to decide what
+  gets remembered, forwarded to the native host, or blob-resolved.
+- Verified: `npx vitest run` 5/5; `npx tsc -b` clean (test file typechecks
+  under `tsconfig.node.json`, explicit `vitest` import resolves despite the
+  restricted `types` list); `npm run build:all` clean and `extension/dist/`
+  contains no test artifact (explicit rollup inputs only).

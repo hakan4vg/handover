@@ -1,0 +1,49 @@
+import { describe, expect, it } from 'vitest';
+import { DEFAULT_POLICY, isHttp, siteOf } from './shared';
+
+// Locks the URL-gating semantics the whole capture flow depends on:
+// background.ts only remembers/forwards http(s) sources, and per-site
+// exclusion matching is done on the normalized hostname.
+describe('isHttp', () => {
+  it('accepts http and https sources including fixture shapes', () => {
+    expect(isHttp('http://127.0.0.1:8901/range.bin')).toBe(true);
+    expect(isHttp('https://cdn.example.test/vod/index.m3u8?token=abc')).toBe(true);
+    expect(isHttp('http://localhost:4173/')).toBe(true);
+  });
+
+  it('rejects blob, ftp, file, data, and unparseable input', () => {
+    expect(isHttp('blob:https://x.test/abc')).toBe(false);
+    expect(isHttp('ftp://cdn.example.test/file.zip')).toBe(false);
+    expect(isHttp('file:///etc/passwd')).toBe(false);
+    expect(isHttp('data:text/plain,hi')).toBe(false);
+    expect(isHttp('')).toBe(false);
+    expect(isHttp('not a url')).toBe(false);
+    expect(isHttp('/relative/path.mp4')).toBe(false);
+  });
+});
+
+describe('siteOf', () => {
+  it('strips www and lowercases for exclusion matching', () => {
+    expect(siteOf('https://www.Example.COM/video')).toBe('example.com');
+    expect(siteOf('https://sub.cdn.example.test:8443/v/a.mp4?x=1')).toBe(
+      'sub.cdn.example.test',
+    );
+    expect(siteOf('http://127.0.0.1:8901/range.bin')).toBe('127.0.0.1');
+  });
+
+  it('returns empty for anything without a hostname', () => {
+    expect(siteOf('')).toBe('');
+    expect(siteOf('not a url')).toBe('');
+    expect(siteOf('blob:https://x.test/abc')).toBe('');
+  });
+});
+
+describe('DEFAULT_POLICY', () => {
+  it('starts with interception and media buttons on, nothing excluded', () => {
+    expect(DEFAULT_POLICY).toEqual({
+      interceptDownloads: true,
+      showMediaButtons: true,
+      excludedSites: [],
+    });
+  });
+});

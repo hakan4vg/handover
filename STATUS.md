@@ -619,6 +619,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `git diff --check` all passed during the implementation. No XTEST input was
   used. `fixtures/server.py` remains untouched.
 
+## 2026-09-04 — Blob/MSE capture selects the manifest, not a fragment
+
+- The capture-spec audit covered SPEC §6.2, §6.3, and §7.1–§7.2. The old
+  blob-player fallback chose the newest request in the tab/frame ring. A real
+  MSE run demonstrated the defect: it created a job for `v-2.m4s` (10,194
+  bytes), which is only one fragment and is not the media the player showed.
+- The fix keeps the generic browser-network observation path, records response
+  content types when available, classifies manifest/segment traffic, prefers
+  an observed HLS/DASH manifest, and refuses to guess a fragment when no
+  complete source is known. There are no site-specific resolver rules.
+- Unit coverage now checks HLS/DASH classification, manifest preference, and
+  the manifestless-fragment rejection.
+- Fresh bounded E2E proof used fixture server `:18902`, a clean app home
+  `/tmp/dm-mse-proof.XCCqAG`, a clean Chromium profile, and the real WebKit
+  Add Download window. The page fetched `/dash/manifest.mpd`, fed the video
+  `v-init.mp4` and three `v-*.m4s` requests through a real `MediaSource`, and
+  displayed the media Download control.
+- Before confirmation the isolated database contained exactly one job:
+  source `/dash/manifest.mpd`, `downloaded=87235`, state `finalizing`.
+- After the real Add Download confirmation the same row became
+  `provisional=false`, `state=completed`, with `downloaded=87235` and the
+  destination `/tmp/dm-mse-proof.XCCqAG/Downloads/MSE manifest proof.mp4`.
+  No fragment job was created in the clean database.
+- `ffprobe` validated the final 86,836-byte output as an MP4 containing H.264
+  video and AAC audio with duration 6.037188 seconds. The output is the local
+  FFmpeg mux/remux result, so it is not expected to be byte-identical to the
+  concatenated source fragments; the job's downloaded-byte total covers all
+  manifest tracks.
+- The implementation intentionally does not guess a complete download from a
+  segment-only blob/MSE traffic set. Candidate scope remains tab/frame based;
+  associating several simultaneous players in one tab is a later refinement.
+
 ## 2026-09-04 — Real browser media-button capture proven
 
 - Started the fixture server from its required `fixtures/` working directory

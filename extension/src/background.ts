@@ -1,13 +1,7 @@
 import { DEFAULT_POLICY, NATIVE_HOST, isHttp, siteOf, type BrowserPolicy } from './shared';
+import { chooseMediaCandidate, roleFor, type MediaCandidate } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
-
-interface MediaCandidate {
-  url: string;
-  tabId: number;
-  frameId: number;
-  at: number;
-}
 
 // Bounded ring of recent media-ish traffic per tab. M0 proof vehicle for the
 // generic current-media mechanism (SPEC §6): content scripts report the
@@ -88,23 +82,16 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   }
 }
 
-function rememberMedia(url: string, tabId: number, frameId: number): void {
+function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url)): void {
   if (!isHttp(url)) return;
   pruneMedia();
-  if (recentMedia.some((item) => item.url === url && item.tabId === tabId)) return;
-  recentMedia.push({ url, tabId, frameId, at: Date.now() });
-}
-
-function candidateFor(tabId: number, frameId: number): string | undefined {
-  pruneMedia();
-  for (let index = recentMedia.length - 1; index >= 0; index--) {
-    const item = recentMedia[index];
-    if (item.tabId === tabId && (item.frameId === frameId || item.frameId === 0)) return item.url;
+  const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId);
+  if (existing) {
+    if (role === 'manifest' || existing.role === 'unknown') existing.role = role;
+    existing.at = Date.now();
+    return;
   }
-  for (let index = recentMedia.length - 1; index >= 0; index--) {
-    if (recentMedia[index].tabId === tabId) return recentMedia[index].url;
-  }
-  return undefined;
+  recentMedia.push({ url, tabId, frameId, at: Date.now(), role });
 }
 
 // Observe (never block) response traffic that feeds media elements.
@@ -116,6 +103,18 @@ chrome.webRequest.onResponseStarted.addListener(
     rememberMedia(details.url, details.tabId, details.frameId);
   },
   { urls: ['<all_urls>'] },
+);
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (details.tabId < 0) return undefined;
+    const contentType = details.responseHeaders?.find((header) => header.name.toLowerCase() === 'content-type')?.value ?? '';
+    const role = roleFor(details.url, contentType);
+    if (role === 'manifest') rememberMedia(details.url, details.tabId, details.frameId, role);
+    return undefined;
+  },
+  { urls: ['<all_urls>'] },
+  ['responseHeaders'],
 );
 
 // INTERIM fallback (SPEC §5.1.1): observe-only. Forwards intent so the
@@ -158,7 +157,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       let source = typeof payload.source === 'string' ? payload.source : '';
       if (!isHttp(source) && sender.tab?.id !== undefined) {
         // blob:/MSE player — resolve to the real traffic behind the element.
-        source = candidateFor(sender.tab.id, sender.frameId ?? 0) ?? '';
+        source = chooseMediaCandidate(recentMedia, sender.tab.id, sender.frameId ?? 0) ?? '';
       }
       if (!isHttp(source)) {
         reply({ ok: false, error: 'no acquirable source for this media' });

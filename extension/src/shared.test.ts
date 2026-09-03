@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_POLICY, isHttp, siteOf } from './shared';
+import { chooseMediaCandidate, roleFor, type MediaCandidate } from './media-candidates';
 
 // Locks the URL-gating semantics the whole capture flow depends on:
 // background.ts only remembers/forwards http(s) sources, and per-site
@@ -45,5 +46,25 @@ describe('DEFAULT_POLICY', () => {
       showMediaButtons: true,
       excludedSites: [],
     });
+  });
+});
+
+describe('media candidate selection', () => {
+  it('classifies HLS/DASH manifests and fragment traffic', () => {
+    expect(roleFor('https://cdn.test/vod/playlist.m3u8')).toBe('manifest');
+    expect(roleFor('https://cdn.test/vod/manifest', 'application/dash+xml')).toBe('manifest');
+    expect(roleFor('https://cdn.test/vod/part-04.m4s', 'video/mp4')).toBe('segment');
+    expect(roleFor('https://cdn.test/vod/segment.ts', 'video/mp2t')).toBe('segment');
+    expect(roleFor('https://cdn.test/vod/file.bin', 'application/octet-stream')).toBe('unknown');
+  });
+
+  it('prefers the manifest and never guesses a fragment for a blob player', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest' },
+      { url: 'https://cdn.test/vod/v-0.m4s', tabId: 4, frameId: 0, at: 2, role: 'segment' },
+      { url: 'https://cdn.test/vod/v-1.m4s', tabId: 4, frameId: 0, at: 3, role: 'segment' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 2)).toBe('https://cdn.test/vod/manifest.mpd');
+    expect(chooseMediaCandidate(candidates.slice(1), 4, 2)).toBeUndefined();
   });
 });

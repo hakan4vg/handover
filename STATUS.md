@@ -368,3 +368,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   recreating the provisional. Clearing via null is a follow-up if wanted.
 - Verified: Rust 22/22; vitest 11/11; `tsc -b`; `build:all`; `diff --check`.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — Settings hardening + notification-action verdict
+
+- Root cause from the limiter-probe incident: settings load was all-or-nothing
+  (`serde_json::from_str` straight into `AppSettings`), so one mistyped value
+  anywhere reset folders, toggles, and limits to defaults silently.
+- Fix: `settings_from_stored()` overlays stored keys onto defaults one at a
+  time and keeps a key only if the whole struct still parses; corrupt keys
+  fall back individually. Wired into startup in place of the all-or-nothing
+  parse. TDD with 2 new tests (float-limit survival, garbage/round-trip
+  sanity).
+- New `fixtures/settings_probe.py` proves the wiring against the live binary:
+  seeded a corrupt row (float limit + custom folder + custom connections),
+  booted under Xvfb, read back `folder=/tmp/custom-downloads limit=None
+  maxConn=4` with the app alive throughout. PASS.
+- SPEC §14 notification actions (Open / Show in folder / View details):
+  checked the pinned `tauri-plugin-notification 2.4.0` source in the local
+  registry — the desktop builder is title/body/icon/sound only; `Action` /
+  `ActionType` models are mobile-only. Buttons are not implementable on this
+  plugin version. NOT building a custom WinRT/notify-rust action layer
+  unilaterally; the honest interim is the current title/body notifications
+  (completion names file+size, failure names file+reason), which already work
+  resident. Options when this is wanted: upgrade the plugin past 2.4.0 if a
+  later 2.x adds desktop actions, or add per-OS action code. Recorded, not
+  started.
+- Verified: Rust 24/24; `cargo build`; settings probe PASS; `diff --check`.
+  `fixtures/server.py` untouched.

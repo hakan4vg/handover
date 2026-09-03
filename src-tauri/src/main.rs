@@ -305,6 +305,26 @@ fn settings_policy(settings: &AppSettings) -> BrowserPolicy {
     (settings.intercept_downloads, settings.show_media_buttons, settings.excluded_sites.clone())
 }
 
+// Per-field settings recovery: overlay stored keys onto defaults one at a
+// time, keeping a key only if the whole struct still parses. A single corrupt
+// value (e.g. a float where the schema wants u64) previously discarded the
+// user's folders, toggles, and limits wholesale; now only that key falls back
+// to its default. Runs once per boot, so the per-key re-parse cost is trivial.
+fn settings_from_stored(stored: &str) -> AppSettings {
+    let defaults = default_settings();
+    let Ok(Value::Object(overlay)) = serde_json::from_str::<Value>(stored) else { return defaults; };
+    let mut current = serde_json::to_value(&defaults).unwrap_or(Value::Null);
+    for (key, value) in overlay {
+        let previous = if let Value::Object(ref mut base) = current { base.insert(key.clone(), value) } else { break; };
+        if serde_json::from_value::<AppSettings>(current.clone()).is_err() {
+            if let Value::Object(ref mut base) = current {
+                if let Some(old) = previous { base.insert(key, old); } else { base.remove(&key); }
+            }
+        }
+    }
+    serde_json::from_value(current).unwrap_or_else(|_| defaults)
+}
+
 fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolicy) {
     if let Ok(mut snapshot) = state.snapshot.lock() {
         snapshot.settings.intercept_downloads = policy.0;
@@ -1465,7 +1485,7 @@ fn main() {
             register_native_host(&root);
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
-            let mut settings = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0)).ok().and_then(|payload| serde_json::from_str(&payload).ok()).unwrap_or_else(default_settings);
+            let mut settings = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0)).ok().map(|payload| settings_from_stored(&payload)).unwrap_or_else(default_settings);
             if let Some(policy) = load_browser_policy(&root) { settings.intercept_downloads = policy.0; settings.show_media_buttons = policy.1; settings.excluded_sites = policy.2; } else { write_browser_policy(&root, &settings_policy(&settings)); }
             let show_manager_at_startup = settings.show_manager_at_sign_in;
             sync_startup(settings.start_at_sign_in);
@@ -1602,5 +1622,37 @@ mod capture_tests {
         assert!(source_compatible("https://cdn.example.test/vod/a.mp4?token=1", "https://cdn.example.test/vod/a.mp4?token=2"));
         assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "https://cdn.example.test/vod/b.mp4"));
         assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "http://cdn.example.test/vod/a.mp4"));
+    }
+
+    #[test]
+    fn corrupt_settings_field_does_not_reset_everything() {
+        use super::settings_from_stored;
+        // A float limit is rejected by the u64 schema; the user's folders and
+        // toggles must survive anyway.
+        let stored = serde_json::json!({
+            "startAtSignIn": false,
+            "defaultFolder": "/tmp/custom-downloads",
+            "bandwidthLimit": 1.5,
+            "bandwidthUnit": "MB/s",
+            "maxConnections": 4,
+        })
+        .to_string();
+        let settings = settings_from_stored(&stored);
+        assert_eq!(settings.bandwidth_limit, None);
+        assert_eq!(settings.start_at_sign_in, false);
+        assert_eq!(settings.default_folder, "/tmp/custom-downloads");
+        assert_eq!(settings.max_connections, 4);
+    }
+
+    #[test]
+    fn settings_fallbacks_stay_sane() {
+        use super::settings_from_stored;
+        let defaults = super::default_settings();
+        assert_eq!(settings_from_stored("not json at all").default_folder, defaults.default_folder);
+        // Valid payloads round-trip untouched.
+        let round = serde_json::to_string(&defaults).unwrap();
+        let parsed = settings_from_stored(&round);
+        assert_eq!(parsed.max_connections, defaults.max_connections);
+        assert_eq!(parsed.bandwidth_limit, defaults.bandwidth_limit);
     }
 }

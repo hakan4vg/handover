@@ -1,0 +1,34 @@
+{
+  "name": "download-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --mode mock",
+    "dev:native": "vite --mode native",
+    "build": "tsc -b && vite build",
+    "build:all": "npm run build && npm run build:extension",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "build:extension": "vite build --config extension/vite.config.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fluentui/react-icons": "^2.0.310",
+    "@tauri-apps/api": "^2.8.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@types/chrome": "^0.0.327",
+    "@types/node": "^24.3.0",
+    "@vitejs/plugin-react": "^5.0.2",
+    "jsdom": "^26.1.0",
+    "typescript": "~5.9.2",
+    "vite": "^7.1.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Download Manager",
+  "version": "0.1.0",
+  "identifier": "com.downloadmanager.app",
+  "build": {
+    "beforeDevCommand": "npm run dev:native",
+    "devUrl": "http://localhost:4173",
+    "beforeBuildCommand": "npm run build:all",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Download Manager",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 780,
+        "minHeight": 560,
+        "visible": true,
+        "decorations": false,
+        "resizable": true
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon.svg"],
+    "resources": ["../extension/dist"]
+  }
+}

@@ -451,3 +451,19 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Range default re-verified after the probe rework (0.98 MB/s + identity).
 - Verified: probe PASS (manifest) + PASS (range regression); `diff --check`.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — Single-stream fallback paced; all throttle sites proven
+
+- The last unverified throttle call site was the single-stream fallback loop.
+  Generalized the probe (`DM_CAPTURE_URL`, `DM_EXPECT_BYTES`,
+  `DM_MIN_SAMPLES`): `no-range.bin` (2 MiB, server ignores Range) under a
+  1 MB/s global → 1.18 MB/s over a 1.5s window, byte-identical. The rate sits
+  high in the band because the window is short (burst + polling granularity
+  dominate); unpaced loopback would finish in ~0.05s, so the pacing signal is
+  unambiguous.
+- Complete call-site matrix on the reworked binary: `range_bytes` 0.98,
+  `fragment_bytes` 1.05, single-stream 1.18 — all byte-identical.
+- Range default re-run after the probe generalization: 0.84 MB/s (PASS, in
+  band; lower than the earlier 0.98 — box-load variance, same binary).
+- Verified: probe PASS (no-range) + PASS (range regression); `diff --check`.
+  `fixtures/server.py` untouched.

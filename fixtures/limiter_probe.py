@@ -21,13 +21,27 @@ BIN = "/srv/repos/downloadmanager/src-tauri/target/debug/download-manager"
 HOME = os.environ.get("DM_HOME", "/tmp/dm-limit-test")
 DB = os.path.join(HOME, ".local/share/com.downloadmanager.app/download-manager.db")
 CAPTURE_URL = os.environ.get(
-    "DM_MANIFEST_URL", "http://127.0.0.1:8901/file/range.bin"
+    "DM_CAPTURE_URL",
+    os.environ.get(
+        "DM_MANIFEST_URL", "http://127.0.0.1:8901/file/range.bin"
+    ),
 )
 # Manifest mode (HLS/DASH): byte-identity against the manifest URL is
 # meaningless (the product is assembled media), so the end assertion is
 # segments completed == total with the full byte count downloaded instead.
-MANIFEST_MODE = bool(os.environ.get("DM_MANIFEST_URL"))
-CAPTURE_NAME = "slow" if MANIFEST_MODE else "range.bin"
+MANIFEST_MODE = os.environ.get("DM_MANIFEST_MODE", "") == "1" or bool(
+    os.environ.get("DM_MANIFEST_URL")
+)
+CAPTURE_NAME = (
+    "slow"
+    if MANIFEST_MODE
+    else ("norange" if "no-range" in CAPTURE_URL else "range.bin")
+)
+# DM_EXPECT_BYTES: finished temp-file size (default 8 MiB range.bin).
+EXPECT_BYTES = int(os.environ.get("DM_EXPECT_BYTES", str(8 * 1024 * 1024)))
+# DM_MIN_SAMPLES: downloading progress samples required (default 6; small
+# files at low limits finish in fewer polls).
+MIN_SAMPLES = int(os.environ.get("DM_MIN_SAMPLES", "6"))
 # DM_LIMIT_MB: "none" for unlimited global, else a number (default "1").
 # DM_JOB_CAP_BPS: per-job cap in bytes/sec for the capture (default unset).
 # DM_EXPECT_MB: expected effective rate in MB/s (default follows the limit).
@@ -174,7 +188,7 @@ def main():
             n0 = 0
             n1 = max(n for (_, n, _) in samples)
         else:
-            assert len(downloading) >= 6, f"too few downloading samples: {len(samples)}"
+            assert len(downloading) >= MIN_SAMPLES, f"too few downloading samples: {len(samples)}"
             (t0, n0), (t1, n1) = downloading[0], downloading[-1]
         rate = (n1 - n0) / max(t1 - t0, 0.01)
         expected = EXPECT_MB * 1e6
@@ -201,7 +215,7 @@ def main():
         elif job.get("state") in ("finalizing", "completed"):
             temp_path = job["tempPath"]
             for _ in range(60):
-                if os.path.exists(temp_path) and os.path.getsize(temp_path) == 8 * 1024 * 1024:
+                if os.path.exists(temp_path) and os.path.getsize(temp_path) == EXPECT_BYTES:
                     break
                 time.sleep(0.5)
             actual = open(temp_path, "rb").read()

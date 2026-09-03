@@ -282,7 +282,7 @@ fn browser_policy_from_value(value: &Value) -> Option<BrowserPolicy> {
     let payload = value.get("payload").unwrap_or(value);
     let intercept = payload.get("interceptDownloads").and_then(Value::as_bool)?;
     let media = payload.get("showMediaButtons").and_then(Value::as_bool)?;
-    let excluded = payload.get("excludedSites").and_then(Value::as_array)?.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).filter(|site| !site.is_empty()).collect::<Vec<_>>();
+    let excluded = payload.get("excludedSites").and_then(Value::as_array)?.iter().filter_map(Value::as_str).map(|site| site.trim().to_ascii_lowercase()).filter(|site| !site.is_empty()).collect::<Vec<_>>();
     Some((intercept, media, excluded))
 }
 
@@ -344,6 +344,28 @@ fn save_snapshot(state: &CoreState) {
 fn emit_snapshot(app: &AppHandle, state: &CoreState) {
     if let Ok(snapshot) = state.snapshot.lock() { let _ = app.emit("state-changed", snapshot.clone()); }
     save_snapshot(state);
+    refresh_tray(app, state);
+}
+
+// SPEC §12: the tray shows the live active-download count and aggregate
+// speed. The tooltip is the flicker-free surface for it; menu labels stay
+// static so the menu never rebuilds under the user's cursor.
+fn tray_status_text(active: usize, aggregate_speed: u64) -> String {
+    if active == 0 {
+        return "Download Manager — idle".into();
+    }
+    let noun = if active == 1 { "download" } else { "downloads" };
+    format!("Download Manager — {active} active {noun} · {}/s", format_bytes(Some(aggregate_speed)))
+}
+
+fn refresh_tray(app: &AppHandle, state: &CoreState) {
+    let status = state.snapshot.lock().ok().map(|snapshot| {
+        let active = snapshot.jobs.iter().filter(|job| ["downloading", "connecting", "finalizing"].contains(&job.state.as_str())).count();
+        tray_status_text(active, snapshot.aggregate_speed)
+    });
+    if let Some(text) = status {
+        if let Some(tray) = app.tray_by_id("main-tray") { let _ = tray.set_tooltip(Some(text)); }
+    }
 }
 
 fn job_event(message: &str, tone: Option<&str>) -> JobEvent { JobEvent { at: now_label(), message: message.into(), tone: tone.map(str::to_string) } }
@@ -1432,4 +1454,81 @@ fn main() {
         .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job])
         .run(tauri::generate_context!())
         .expect("error while running Download Manager");
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, provisional_input_from_message, source_compatible, tray_status_text};
+    use serde_json::json;
+
+    #[test]
+    fn tray_tooltip_reports_idle_and_live_state() {
+        assert_eq!(tray_status_text(0, 0), "Download Manager — idle");
+        assert_eq!(tray_status_text(0, 99999), "Download Manager — idle");
+        assert_eq!(tray_status_text(1, 0), "Download Manager — 1 active download · 0 B/s");
+        assert_eq!(tray_status_text(2, 1536), "Download Manager — 2 active downloads · 1 KB/s");
+        assert_eq!(tray_status_text(3, 5 * 1024 * 1024), "Download Manager — 3 active downloads · 5.0 MB/s");
+    }
+
+    #[test]
+    fn capture_acquisition_accepts_source_and_name() {
+        let message = json!({ "type": "capture-acquisition", "payload": { "source": "https://cdn.example.test/file.zip", "name": "file.zip" } });
+        let input = provisional_input_from_message(&message).expect("valid capture");
+        assert_eq!(input.source, "https://cdn.example.test/file.zip");
+        assert_eq!(input.name.as_deref(), Some("file.zip"));
+        assert_eq!(input.media, Some(false));
+    }
+
+    #[test]
+    fn media_capture_marks_media_without_explicit_flag() {
+        let message = json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/index.m3u8" } });
+        let input = provisional_input_from_message(&message).expect("valid media capture");
+        assert_eq!(input.media, Some(true));
+    }
+
+    #[test]
+    fn capture_accepts_url_alias_and_trims_whitespace() {
+        let message = json!({ "type": "capture-acquisition", "payload": { "url": "  http://127.0.0.1:8901/range.bin  " } });
+        let input = provisional_input_from_message(&message).expect("url alias");
+        assert_eq!(input.source, "http://127.0.0.1:8901/range.bin");
+    }
+
+    #[test]
+    fn capture_rejects_non_http_wrong_type_and_missing_source() {
+        assert!(provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "ftp://cdn.example.test/file.zip" } })).is_none());
+        assert!(provisional_input_from_message(&json!({ "type": "open-manager" })).is_none());
+        assert!(provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": {} })).is_none());
+        assert!(provisional_input_from_message(&json!({ "type": "media-capture", "payload": { "source": "blob:https://x.test/abc" } })).is_none());
+    }
+
+    #[test]
+    fn capture_args_parse_forwards_native_host_payload() {
+        let raw = serde_json::to_string(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin", "name": "range.bin" } })).unwrap();
+        let args = vec!["download-manager".to_string(), "--capture".to_string(), raw];
+        let input = capture_input_from_args(&args).expect("args capture");
+        assert_eq!(input.source, "http://127.0.0.1:8901/range.bin");
+        assert_eq!(input.name.as_deref(), Some("range.bin"));
+    }
+
+    #[test]
+    fn browser_policy_roundtrip_normalizes_sites() {
+        let policy = (true, false, vec!["Example.COM".to_string(), "  ".to_string(), "cdn.example.test".to_string()]);
+        let value = browser_policy_value(&policy);
+        let parsed = browser_policy_from_value(&value).expect("policy roundtrip");
+        assert_eq!(parsed.0, true);
+        assert_eq!(parsed.1, false);
+        assert_eq!(parsed.2, vec!["example.com".to_string(), "cdn.example.test".to_string()]);
+    }
+
+    #[test]
+    fn browser_policy_rejects_incomplete_payload() {
+        assert!(browser_policy_from_value(&json!({ "interceptDownloads": true })).is_none());
+    }
+
+    #[test]
+    fn reattach_compatibility_ignores_query_but_not_path() {
+        assert!(source_compatible("https://cdn.example.test/vod/a.mp4?token=1", "https://cdn.example.test/vod/a.mp4?token=2"));
+        assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "https://cdn.example.test/vod/b.mp4"));
+        assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "http://cdn.example.test/vod/a.mp4"));
+    }
 }

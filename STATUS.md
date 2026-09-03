@@ -263,3 +263,41 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   probes were used instead. New `lifecycle.rs` passes rustfmt; the whole
   repository remains non-rustfmt-clean because existing compact source files
   would require an unrelated mass reformat.
+
+## 2026-09-03 — Capture handshake tests, policy trim fix, live native-host proof, tray status
+
+- Added `capture_tests` in `src-tauri/src/main.rs` (9 tests): capture/media
+  parsing, `url` alias + trim, rejection of non-HTTP/wrong-type/missing-source,
+  `--capture` arg forwarding, policy roundtrip, incomplete-policy rejection,
+  reattach compatibility (query ignored, path/scheme strict), tray tooltip text.
+- The policy roundtrip test failed first (real bug): `excludedSites`
+  normalization lowercased but kept whitespace-only entries (`"  "` survived
+  the `is_empty` filter). Fixed to trim before lowercasing; suite went green.
+- Proved the extension-to-app handshake against the real compiled binary with
+  an isolated HOME over Chrome native-messaging framing
+  (`/tmp/dm-native-probe.py`, no GUI, no XTEST): `get-policy` returns defaults,
+  unknown types rejected, invalid acquisitions rejected, a valid
+  `capture-acquisition` passes validation and reports forward. PASS.
+- Commit path audited against SPEC §7.2: `commit_provisional` keeps the same
+  job id and temp file and never respawns work; a finished provisional
+  finalizes in place, a running one keeps running into the chosen destination.
+- Tray now satisfies SPEC §12's live count/speed bullet: `emit_snapshot`
+  refreshes the `main-tray` tooltip on every state change
+  (`tray_status_text`: idle vs `N active download(s) · speed/s`, reusing the
+  real `aggregate_speed`). Menu labels stay static so the menu never rebuilds
+  under the cursor. Verified API against vendored tauri 2.11.5 source
+  (`set_tooltip`, `tray_by_id`).
+- XTEST blocker recorded precisely: on private Xvfb `:101` the server rejects
+  synthetic key and button events (`BadValue` for XTEST opcodes); on shared
+  `:99` clicks dispatch but `:hover` never updates. No further XTEST loops —
+  verification goes through unit tests, live-binary stdio probes, fixture
+  HTTP probes, and SQLite inspection.
+- Open product decision (not changed unilaterally): the extension's
+  `downloads.onCreated` fallback is observe-only — it forwards the capture but
+  leaves the browser download running, so a one-use/tokenized URL is consumed
+  twice (browser copy succeeds, DM fetch gets 410). Real takeover
+  (cancel+erase) risks destroying the one-use transaction when the DM fetch
+  then fails. Needs a product call before implementation.
+- Verified: full Rust suite 20/20; `cargo build`; `npm run build`
+  (255.12 kB / 76.68 kB gzip); `git diff --check`; native-host probe PASS.
+  `fixtures/server.py` untouched.

@@ -672,6 +672,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   preservation; this run additionally exercised the post-restart Resume
   command through the live application.
 
+## 2026-09-04 — Cold-start native capture launches the resident app
+
+- A fresh Chromium profile used a native-host wrapper while no
+  `download-manager` process was running. The ordinary link click was stopped
+  before Chromium's normal download path (`dispatch=false`,
+  `defaultPrevented=true`).
+- The native host launched the resident application, which created the
+  independent Add Download window and began a real capture without opening the
+  main manager window.
+- Before confirmation the clean DB contained exactly one provisional row for
+  `/file/no-range.bin`, at `2,097,152/2,097,152` bytes and `finalizing`.
+- The real Add Download Download action was activated through the WebKit
+  inspector. The same row became `provisional=false`, `state=completed`, and
+  the destination `/tmp/dm-coldstart.uQZNoC/Downloads/cold.bin` was
+  2,097,152 bytes. `cmp` passed against a fresh fixture response, and no
+  duplicate browser Downloads copy existed.
+- This closes the application-not-running flow in SPEC §7.6 using the real
+  native-host launch path.
+
 ## 2026-09-04 — Real browser media-button capture proven
 
 - Started the fixture server from its required `fixtures/` working directory

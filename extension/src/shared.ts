@@ -1,0 +1,30 @@
+export const NATIVE_HOST = 'com.downloadmanager.host';
+
+export interface BrowserPolicy {
+  interceptDownloads: boolean;
+  showMediaButtons: boolean;
+  excludedSites: string[];
+}
+
+export const DEFAULT_POLICY: BrowserPolicy = {
+  interceptDownloads: true,
+  showMediaButtons: true,
+  excludedSites: [],
+};
+
+export function siteOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '').toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+export function isHttp(url: string): boolean {
+  try {
+    const scheme = new URL(url).protocol;
+    return scheme === 'http:' || scheme === 'https:';
+  } catch {
+    return false;
+  }
+}

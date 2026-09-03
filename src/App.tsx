@@ -167,7 +167,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
           </nav>
           <div className="sidebar-spacer" />
           <SidebarItem icon="settings" label="Settings" active={isSettings} onClick={() => { setFilter('settings' as FilterKey); setContextJobId(null); }} />
-          <div className="sidebar-footer"><span className="status-dot" /> <span>Connected</span><span className="footer-divider" /><Icon name="shield" size={15} /><span>Browser integration {snapshot.settings.interceptDownloads ? 'on' : 'off'}</span></div>
+          <div className="sidebar-footer"><span className="status-dot" /> <span>Connected</span><span className="footer-divider" /><span>Browser integration {snapshot.settings.interceptDownloads ? 'on' : 'off'}</span></div>
         </aside>
         {isSettings ? <SettingsView adapter={adapter} settings={snapshot.settings} page={settingsPage} onPageChange={setSettingsPage} /> : (
           <main className="manager-main">
@@ -259,7 +259,7 @@ function DownloadRow({ job, selected, onSelect, onPause, onResume, onRetry, onMe
   const stateLabel = stateText(job.state);
   const action = job.state === 'downloading' || job.state === 'connecting' || job.state === 'finalizing' ? onPause : job.state === 'paused' || job.state === 'pending' ? onResume : job.state === 'failed' ? onRetry : undefined;
   return <article className={`download-row ${selected ? 'selected' : ''}`} onClick={onSelect}>
-    <FileIcon kind={job.kind} />
+    <div className="file-cell"><FileIcon kind={job.kind} /><span className="file-type">{typeLabel(job.name)}</span></div>
     <div className="row-main">
       <div className="row-title-line"><strong title={job.name}>{job.name}</strong><span className={`state ${stateTone(job.state)}`}>{stateLabel}</span></div>
       <div className="row-source"><Icon name="globe" size={12} />{job.domain}</div>
@@ -286,6 +286,13 @@ function stateTone(state: DownloadState) {
 function FileIcon({ kind }: { kind: DownloadJob['kind'] }) {
   const icon = kind === 'video' ? 'media' : kind === 'disk' ? 'disk' : kind === 'archive' ? 'archive' : kind === 'audio' ? 'audio' : 'file';
   return <div className={`file-icon file-${kind}`}><Icon name={icon} size={25} /></div>;
+}
+
+function typeLabel(name: string) {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tar.xz') || lower.endsWith('.tar.bz2')) return 'TAR';
+  const ext = name.split('.').pop()?.toUpperCase().slice(0, 5) ?? '';
+  return ext || 'FILE';
 }
 
 function EmptyState({ filter, onAdd }: { filter: FilterKey; onAdd: () => void }) {

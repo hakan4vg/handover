@@ -43,3 +43,78 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 
 - Added `.gitignore`, this file. `git init`, baseline commit.
 - Toolchains on infra-vps: node v22, npm 10, rustc/cargo 1.98. No git repo before this.
+
+## 2026-09-03 — Visual dev loop repair (.env files)
+
+- Defect: `npm run dev` (`vite --mode mock`) never selected the mock adapter —
+  no `.env.mock` existed, so `VITE_DATA_MODE` was undefined and the dev loop
+  opened the "core unavailable" screen. The SPEC §3.2 iteration loop was dead
+  on arrival.
+- Fix: `.env.mock` (mock), `.env.native` (native), `.env.production` (native).
+  Production can never silently fall back to mock either.
+- Verified: `npx tsc -b` clean, vite serves 200 on :4173.
+
+## 2026-09-03 — Extension scaffold (was entirely missing)
+
+- `build:extension`, `build:all`, tauri `resources: ../extension/dist`, and
+  `tsconfig.node.json` all referenced `extension/`, which did not exist.
+- Added minimal MV3 scaffold, no framework, matching the native-host protocol
+  already in main.rs (`get-policy`, `update-policy`, `capture-acquisition`,
+  `media-capture`, `open-manager`):
+  - `manifest.json` (storage, downloads, webRequest, `<all_urls>`).
+  - `background.ts`: policy cache in chrome.storage, observe-only
+    `downloads.onCreated` fallback (forwards intent, NEVER cancels the browser
+    download — destroying one-use transactions is worse than a duplicate;
+    interim until the M0 pre-browser proof), bounded media-traffic ring buffer
+    for blob:/MSE resolution, message router.
+  - `content.ts`: hover/playing player picker, single anchored Download button
+    following layout via rAF, stale-button cleanup, exclusion respect.
+    Fixed my own tangled rAF loop before first run (loop/track split).
+  - `popup.html/ts`: two toggles, site state, exclude/enable, open manager.
+  - `vite.config.ts`: multi-entry build into `extension/dist/` + manifest copy
+    plugin. Fixed wrong outDir (first build landed in `dist/extension/`).
+- `DownloadItem.tabId` does not exist in @types/chrome — removed.
+- Verified: `tsc -b` clean, `build:extension` outputs 6 files incl. manifest.
+
+## 2026-09-03 — UI fidelity pass (browser screenshots vs references)
+
+- Screenshots via headless Chromium (Hermes browser driver is down: 500s from
+  its localhost:9377 backend — using chrome binary directly).
+- Fixed: sidebar footer clipped ("Browser inte…") — dropped shield icon,
+  tightened to 9px. Now shows full "Browser integration on".
+- Fixed: settings nav "Browser Integration" wrapped to two lines — nowrap.
+- Added: file-type labels under row icons (ISO/MKV/ZIP/TAR/MP4), as in reference.
+- False alarm: thought settings nav/content were mirrored; DOM order + fresh
+  screenshot confirm nav-left/content-right. Correct per reference.
+- All surfaces render: main, settings, add window, extension popup, tray,
+  notifications. No blank/clipped/overlapping defects seen.
+
+## 2026-09-03 — Cross-platform residency (Linux must work)
+
+- `app_data_root()` is now the single resolver for the per-user data dir on
+  all OSes (mirrors Tauri's own convention for the bundle id). DB, browser
+  policy, and native-host registration all use it — previously the policy
+  path fell back to `"."` off-Windows and setup used a different resolver.
+- `default_settings()`: XDG paths on Linux (~/Downloads,
+  $XDG_CACHE_HOME/download-manager/tmp). Windows paths unchanged.
+- `sync_startup()`: Linux writes `~/.config/autostart/download-manager.desktop`.
+- `register_native_host()`: Linux writes wrapper `.sh` + manifests for
+  Chrome/Chromium/Edge/Vivaldi/Brave. Windows manifest now points at a `.cmd`
+  wrapper adding `--native-host` — the bare exe never spoke the framed stdio
+  protocol, so the old registration could never complete a handshake.
+- `DM_EXTENSION_ID` env adds dev extension IDs to allowed_origins (unpacked
+  builds get random IDs).
+- Pending: `cargo test` re-run with these changes (previous run failed only on
+  the then-missing extension/dist; re-running in background).
+
+## 2026-09-03 — Fixture server + green Rust run
+
+- `cargo test`: 7/7 pass, cross-platform edits compile clean on Linux.
+  (Two earlier failures were environmental: missing extension/dist, then
+  missing frontend dist — both fixed by building, not by code changes.)
+- `fixtures/server.py` (stdlib only, :8901): range/no-range/slow files,
+  redirects, token auth, mint-once one-use URLs (200 then 410), ETag variants,
+  finite + live HLS, static/template/dynamic DASH, progressive MP4, 503/404.
+  Curl-verified every shape. Deterministic seeded bytes for resume/identity.
+- `npm run build:all` passes (frontend + extension).
+- Full `cargo build` (Linux link against system webkit/gtk) running.

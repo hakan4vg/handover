@@ -121,6 +121,50 @@ fn default_collision_behavior() -> String { "rename".into() }
 fn clamp_connections(value: u32) -> u32 { value.clamp(1, 32) }
 
 const EXTENSION_ID: &str = "mfdaoipoffnpeijnjminkdhecpnoemel";
+const APP_IDENTIFIER: &str = "com.downloadmanager.app";
+const NATIVE_HOST_NAME: &str = "com.downloadmanager.host";
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+// Single resolver for the per-user application data directory on every OS.
+// Mirrors the platform convention Tauri itself uses for the same bundle
+// identifier, so the database, browser policy, and native-host registration
+// always land in the same place whether or not a Tauri handle is available.
+fn app_data_root() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"));
+    #[cfg(target_os = "macos")]
+    let base = home_dir().join("Library").join("Application Support");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home_dir().join(".local").join("share"));
+    base.join(APP_IDENTIFIER)
+}
+
+// Published extension ID plus any development IDs from DM_EXTENSION_ID
+// (comma/space separated). Unpacked dev builds get a random ID; without an
+// override the browser refuses to talk to the native host.
+fn extension_ids() -> Vec<String> {
+    let mut ids = vec![EXTENSION_ID.to_string()];
+    if let Ok(extra) = std::env::var("DM_EXTENSION_ID") {
+        for id in extra.split([',', ' ', ';']) {
+            let id = id.trim();
+            if !id.is_empty() && !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
 
 fn sync_startup(enabled: bool) {
     #[cfg(windows)]
@@ -130,16 +174,36 @@ fn sync_startup(enabled: bool) {
             if let Ok(executable) = std::env::current_exe() { let value = format!("\"{}\" --startup", executable.display()); let _ = Command::new("reg.exe").args(["ADD", key, "/v", "Download Manager", "/t", "REG_SZ", "/d", &value, "/f"]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
         } else { let _ = Command::new("reg.exe").args(["DELETE", key, "/v", "Download Manager", "/f"]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let entry = home_dir().join(".config").join("autostart").join("download-manager.desktop");
+        if enabled {
+            if let Ok(executable) = std::env::current_exe() {
+                let _ = std::fs::create_dir_all(entry.parent().unwrap_or_else(|| Path::new(".")));
+                let _ = std::fs::write(&entry, format!("[Desktop Entry]\nType=Application\nName=Download Manager\nExec=\"{}\" --startup\nHidden=false\nX-GNOME-Autostart-enabled=true\n", executable.display()));
+            }
+        } else {
+            let _ = std::fs::remove_file(&entry);
+        }
+    }
+    #[cfg(target_os = "macos")]
     let _ = enabled;
 }
 
-fn register_native_host(root: &PathBuf) {
+fn register_native_host(root: &Path) {
+    let Ok(executable) = std::env::current_exe() else { return; };
+    let _ = std::fs::create_dir_all(root);
+    let origins: Vec<String> = extension_ids().into_iter().map(|id| format!("chrome-extension://{id}/")).collect();
+    // Browsers launch the manifest path without arguments, so the manifest
+    // points at a small wrapper that adds --native-host. Registering the bare
+    // executable would start the full application, which does not speak the
+    // framed stdio protocol the extension expects.
     #[cfg(windows)]
     {
-        let Ok(executable) = std::env::current_exe() else { return; };
+        let wrapper = root.join("com.downloadmanager.host.cmd");
+        let _ = std::fs::write(&wrapper, format!("@echo off\r\n\"{}\" --native-host\r\n", executable.display()));
         let manifest_path = root.join("com.downloadmanager.host.json");
-        let manifest = json!({ "name": "com.downloadmanager.host", "description": "Download Manager browser bridge", "path": executable, "type": "stdio", "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")] });
+        let manifest = json!({ "name": NATIVE_HOST_NAME, "description": "Download Manager browser bridge", "path": wrapper, "type": "stdio", "allowed_origins": origins });
         let Ok(contents) = serde_json::to_string_pretty(&manifest) else { return; };
         if std::fs::write(&manifest_path, contents).is_err() { return; }
         let manifest = manifest_path.to_string_lossy().into_owned();
@@ -151,20 +215,52 @@ fn register_native_host(root: &PathBuf) {
         ];
         for key in keys { let _ = Command::new("reg.exe").arg("ADD").arg(key).arg("/ve").arg("/t").arg("REG_SZ").arg("/d").arg(&manifest).arg("/f").stdout(Stdio::null()).stderr(Stdio::null()).status(); }
     }
-    #[cfg(not(windows))]
-    let _ = root;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let wrapper = root.join("com.downloadmanager.host.sh");
+        if std::fs::write(&wrapper, format!("#!/bin/sh\nexec \"{}\" --native-host\n", executable.display())).is_err() { return; }
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755));
+        let manifest = json!({ "name": NATIVE_HOST_NAME, "description": "Download Manager browser bridge", "path": wrapper, "type": "stdio", "allowed_origins": origins });
+        let Ok(contents) = serde_json::to_string_pretty(&manifest) else { return; };
+        let _ = std::fs::write(root.join("com.downloadmanager.host.json"), &contents);
+        let config = home_dir().join(".config");
+        for browser in ["google-chrome", "chromium", "microsoft-edge", "vivaldi"] {
+            let dir = config.join(browser).join("NativeMessagingHosts");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let _ = std::fs::write(dir.join("com.downloadmanager.host.json"), &contents);
+            }
+        }
+        let brave = config.join("BraveSoftware").join("Brave-Browser").join("NativeMessagingHosts");
+        if std::fs::create_dir_all(&brave).is_ok() {
+            let _ = std::fs::write(brave.join("com.downloadmanager.host.json"), &contents);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let _ = (root, origins);
 }
 
 fn default_settings() -> AppSettings {
-    let profile = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
-    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| profile.clone());
-    AppSettings { start_at_sign_in: true, show_manager_at_sign_in: true, close_behavior: "tray".into(), default_folder: format!("{profile}\\Downloads"), temp_folder: format!("{local_app_data}\\Download Manager\\Temp"), collision_behavior: default_collision_behavior(), intercept_downloads: true, show_media_buttons: true, excluded_sites: vec![], bandwidth_limit: None, bandwidth_unit: "MB/s".into(), max_connections: 8, per_download_overrides: true, retry_automatically: true, max_retries: 5, completion_notifications: true, failure_notifications: true, theme: "system".into(), accent: "#0878ed".into(), density: "comfortable".into() }
+    let home = home_dir();
+    #[cfg(windows)]
+    let (default_folder, temp_folder) = (
+        home.join("Downloads"),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home.join("AppData").join("Local")).join("Download Manager").join("Temp"),
+    );
+    #[cfg(not(windows))]
+    let (default_folder, temp_folder) = (
+        home.join("Downloads"),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|path| path.is_absolute()).unwrap_or_else(|| home.join(".cache")).join("download-manager").join("tmp"),
+    );
+    AppSettings { start_at_sign_in: true, show_manager_at_sign_in: true, close_behavior: "tray".into(), default_folder: default_folder.to_string_lossy().into_owned(), temp_folder: temp_folder.to_string_lossy().into_owned(), collision_behavior: default_collision_behavior(), intercept_downloads: true, show_media_buttons: true, excluded_sites: vec![], bandwidth_limit: None, bandwidth_unit: "MB/s".into(), max_connections: 8, per_download_overrides: true, retry_automatically: true, max_retries: 5, completion_notifications: true, failure_notifications: true, theme: "system".into(), accent: "#0878ed".into(), density: "comfortable".into() }
 }
 
 type BrowserPolicy = (bool, bool, Vec<String>);
 
 fn browser_policy_root() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).map(|path| path.join("com.downloadmanager.app")).unwrap_or_else(|| PathBuf::from("."))
+    app_data_root()
 }
 
 fn browser_policy_value(policy: &BrowserPolicy) -> Value {
@@ -1060,7 +1156,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| { if let Some(policy) = policy_from_args(&argv) { let state = app.state::<CoreState>(); apply_browser_policy(app, state.inner(), policy); } else if let Some(input) = capture_input_from_args(&argv) { if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); } let state = app.state::<CoreState>(); let _ = start_provisional(app.clone(), state.inner(), input, true); } else if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }))
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            let root = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let root = app_data_root();
             std::fs::create_dir_all(&root).ok();
             register_native_host(&root);
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_POLICY, isHttp, siteOf } from './shared';
-import { chooseMediaCandidate, roleFor, type MediaCandidate } from './media-candidates';
+import {
+  chooseMediaCandidate,
+  choosePlayerEvidence,
+  roleFor,
+  type MediaCandidate,
+  type MediaPlayerEvidence,
+} from './media-candidates';
 
 // Locks the URL-gating semantics the whole capture flow depends on:
 // background.ts only remembers/forwards http(s) sources, and per-site
@@ -58,13 +64,46 @@ describe('media candidate selection', () => {
     expect(roleFor('https://cdn.test/vod/file.bin', 'application/octet-stream')).toBe('unknown');
   });
 
-  it('prefers the manifest and never guesses a fragment for a blob player', () => {
+  it('keeps two players in one frame on their own manifest candidates', () => {
     const candidates: MediaCandidate[] = [
-      { url: 'https://cdn.test/vod/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest' },
-      { url: 'https://cdn.test/vod/v-0.m4s', tabId: 4, frameId: 0, at: 2, role: 'segment' },
-      { url: 'https://cdn.test/vod/v-1.m4s', tabId: 4, frameId: 0, at: 3, role: 'segment' },
+      { url: 'https://cdn.test/a/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/a/a-1.m4s', tabId: 4, frameId: 0, at: 2, role: 'segment', playerKey: 'player-a' },
+      { url: 'https://cdn.test/b/manifest.mpd', tabId: 4, frameId: 0, at: 3, role: 'manifest', playerKey: 'player-b' },
+      { url: 'https://cdn.test/b/b-1.m4s', tabId: 4, frameId: 0, at: 4, role: 'segment', playerKey: 'player-b' },
     ];
-    expect(chooseMediaCandidate(candidates, 4, 2)).toBe('https://cdn.test/vod/manifest.mpd');
-    expect(chooseMediaCandidate(candidates.slice(1), 4, 2)).toBeUndefined();
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/a/manifest.mpd');
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-b')).toBe('https://cdn.test/b/manifest.mpd');
+  });
+
+  it('refuses to cross-select another player when the clicked player has no evidence', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/a/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-b')).toBeUndefined();
+  });
+
+  it('does not mistake an MSE initialization file for a complete download', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/a-init.mp4', tabId: 4, frameId: 0, at: 1, role: 'unknown' },
+      { url: 'https://cdn.test/vod/a-0.m4s', tabId: 4, frameId: 0, at: 2, role: 'segment' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBeUndefined();
+  });
+
+  it('does not reuse a candidate from a previous document in the same tab', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/old/manifest.mpd', tabId: 4, frameId: 0, documentId: 'doc-old', at: 1, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/new/manifest.mpd', tabId: 4, frameId: 0, documentId: 'doc-new', at: 2, role: 'manifest', playerKey: 'player-b' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-b', 'doc-new')).toBe('https://cdn.test/new/manifest.mpd');
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-b', 'doc-old')).toBeUndefined();
+  });
+
+  it('keeps player evidence isolated by document identity', () => {
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'old', tabId: 4, frameId: 0, documentId: 'doc-old', at: 999, active: true, hovered: true, playing: true, visible: true },
+      { playerKey: 'new', tabId: 4, frameId: 0, documentId: 'doc-new', at: 998, active: false, hovered: false, playing: true, visible: true },
+    ];
+    expect(choosePlayerEvidence(players, 4, 0, 1000, 'doc-new')?.playerKey).toBe('new');
   });
 });

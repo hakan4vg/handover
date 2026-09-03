@@ -1,5 +1,5 @@
-import { DEFAULT_POLICY, NATIVE_HOST, isHttp, siteOf, type BrowserPolicy } from './shared';
-import { chooseMediaCandidate, roleFor, type MediaCandidate } from './media-candidates';
+import { DEFAULT_POLICY, NATIVE_HOST, isHttp, type BrowserPolicy } from './shared';
+import { chooseMediaCandidate, choosePlayerEvidence, roleFor, type MediaCandidate, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 
@@ -8,8 +8,11 @@ const POLICY_KEY = 'dm-policy';
 // element the user interacts with, this buffer supplies the real network
 // source behind blob:/MSE players. URLs only, no bodies, no cookies.
 const recentMedia: MediaCandidate[] = [];
+const recentPlayers: MediaPlayerEvidence[] = [];
 const MEDIA_BUFFER_MAX = 60;
 const MEDIA_BUFFER_MS = 90_000;
+const PLAYER_BUFFER_MAX = 40;
+const PLAYER_BUFFER_MS = 15_000;
 
 let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 
@@ -44,6 +47,37 @@ function sendNative(message: unknown): Promise<unknown> {
 function pruneMedia(now = Date.now()): void {
   while (recentMedia.length && now - recentMedia[0].at > MEDIA_BUFFER_MS) recentMedia.shift();
   while (recentMedia.length > MEDIA_BUFFER_MAX) recentMedia.shift();
+}
+
+function prunePlayers(now = Date.now()): void {
+  while (recentPlayers.length && now - recentPlayers[0].at > PLAYER_BUFFER_MS) recentPlayers.shift();
+  while (recentPlayers.length > PLAYER_BUFFER_MAX) recentPlayers.shift();
+}
+
+function rememberPlayer(payload: Record<string, unknown>, tabId: number, frameId: number, documentId?: string): void {
+  const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey.trim() : '';
+  if (!playerKey) return;
+  const now = Date.now();
+  prunePlayers(now);
+  const evidence: MediaPlayerEvidence = {
+    playerKey,
+    tabId,
+    frameId,
+    at: now,
+    documentId,
+    active: payload.active === true,
+    hovered: payload.hovered === true,
+    playing: payload.playing === true,
+    visible: payload.visible === true,
+  };
+  const existing = recentPlayers.find((item) => item.playerKey === playerKey && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
+  if (existing) Object.assign(existing, evidence);
+  else recentPlayers.push(evidence);
+}
+
+function activePlayerKey(tabId: number, frameId: number, documentId?: string): string | undefined {
+  prunePlayers();
+  return choosePlayerEvidence(recentPlayers, tabId, frameId, Date.now(), documentId)?.playerKey;
 }
 
 function cleanFilename(value: unknown): string | undefined {
@@ -82,16 +116,17 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   }
 }
 
-function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url)): void {
+function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey = activePlayerKey(tabId, frameId, documentId)): void {
   if (!isHttp(url)) return;
   pruneMedia();
-  const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId);
+  const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
   if (existing) {
     if (role === 'manifest' || existing.role === 'unknown') existing.role = role;
+    if (playerKey && !existing.playerKey) existing.playerKey = playerKey;
     existing.at = Date.now();
     return;
   }
-  recentMedia.push({ url, tabId, frameId, at: Date.now(), role });
+  recentMedia.push({ url, tabId, frameId, at: Date.now(), role, documentId, playerKey });
 }
 
 // Observe (never block) response traffic that feeds media elements.
@@ -100,7 +135,7 @@ chrome.webRequest.onResponseStarted.addListener(
     if (details.tabId < 0) return;
     const type = details.type;
     if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return;
-    rememberMedia(details.url, details.tabId, details.frameId);
+    rememberMedia(details.url, details.tabId, details.frameId, undefined, details.documentId);
   },
   { urls: ['<all_urls>'] },
 );
@@ -110,7 +145,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (details.tabId < 0) return undefined;
     const contentType = details.responseHeaders?.find((header) => header.name.toLowerCase() === 'content-type')?.value ?? '';
     const role = roleFor(details.url, contentType);
-    if (role === 'manifest') rememberMedia(details.url, details.tabId, details.frameId, role);
+    if (role === 'manifest') rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId);
     return undefined;
   },
   { urls: ['<all_urls>'] },
@@ -152,12 +187,18 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     } else if (type === 'ordinary-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
       reply(await captureOrdinary(payload));
+    } else if (type === 'media-player-state') {
+      const tabId = sender.tab?.id;
+      if (tabId !== undefined) rememberPlayer((message as { payload?: Record<string, unknown> }).payload ?? {}, tabId, sender.frameId ?? 0, sender.documentId);
+      reply({ ok: true });
     } else if (type === 'media-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
+      const documentId = sender.documentId;
+      const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey : (sender.tab?.id === undefined ? undefined : activePlayerKey(sender.tab.id, sender.frameId ?? 0, documentId));
       let source = typeof payload.source === 'string' ? payload.source : '';
       if (!isHttp(source) && sender.tab?.id !== undefined) {
         // blob:/MSE player — resolve to the real traffic behind the element.
-        source = chooseMediaCandidate(recentMedia, sender.tab.id, sender.frameId ?? 0) ?? '';
+        source = chooseMediaCandidate(recentMedia, sender.tab.id, sender.frameId ?? 0, playerKey, documentId) ?? '';
       }
       if (!isHttp(source)) {
         reply({ ok: false, error: 'no acquirable source for this media' });

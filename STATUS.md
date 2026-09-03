@@ -741,3 +741,47 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - This closes the real progressive-media browser flow in addition to the
   explicit ordinary-download flow. The fixture server source remains
   untouched.
+
+## 2026-09-04 — Simultaneous-player and document isolation proven
+
+- The implementation audit covered SPEC §§6.2–6.4, §7.1–§7.2, §7.6, and
+  §19.3. The remaining weakness was that a tab/frame-wide candidate ring could
+  associate one MSE player's manifest with another player's blob control, or
+  reuse traffic after navigation.
+- Implemented the bounded evidence path in
+  `extension/src/background.ts`, `extension/src/content.ts`, and
+  `extension/src/media-candidates.ts`: each media element receives a stable
+  `playerKey`; active, hovered, playing, visible, and fresh evidence is ranked;
+  candidates and player evidence are scoped by `tabId`, `frameId`, and
+  `documentId`; a player with no owned evidence refuses another player's
+  identified traffic; manifests win over segments; and initialization/segment
+  traffic alone is rejected.
+- Added focused regression coverage in `extension/src/shared.test.ts` for two
+  players in one frame, cross-player refusal, document isolation, active-player
+  ranking, and MSE initialization-file rejection.
+- Fresh Chromium profile + real native host + real WebKit Add Download flow
+  proved two simultaneous MSE players in one tab/document. The test loaded the
+  player-A and player-B traffic while switching active/playing evidence, then
+  clicked each media control. The isolated DB contained exactly two rows:
+  `source=.../dash/manifest.mpd?player=a` and
+  `source=.../dash/manifest.mpd?player=b`; there was no `.m4s`, init, or
+  cross-player source. Both rows completed at `87235/87235` downloaded bytes,
+  and both final outputs were 86,836-byte MP4 files with H.264 video and AAC
+  audio. The Add Download actions were invoked through WebKit inspection, not
+  XTEST. Artifacts are under `/tmp/dm-mp-e2e-20260904/`, including
+  `two-players-fresh.png`, `navigation-data.png`, and the final DB readback.
+- Same-tab navigation to a fresh 200 HTML document with a playable in-memory
+  blob player displayed the real Download Manager button. Clicking it created
+  no third row and no output file: the prior document's manifest candidates
+  were not reused. The post-navigation DB remained exactly the two completed
+  player rows above.
+- Harness findings: Chromium's native-host manifest must be present under the
+  disposable profile's `NativeMessagingHosts/` directory, and an app launched
+  without `DM_EXTENSION_ID` overwrote the manifest without the unpacked
+  extension origin. The final run used the correct profile-local manifest and
+  `DM_EXTENSION_ID`; this is test-rig setup, not a product-path failure.
+- Verification: `npx vitest run extension/src/shared.test.ts`,
+  `npm run build:extension`, `npx tsc -b`, `npm test`, `npm run build:all`,
+  `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo build
+  --manifest-path src-tauri/Cargo.toml`, and `git diff --check` all passed.
+  `fixtures/server.py` remains untouched.

@@ -26,6 +26,10 @@ let policy: BrowserPolicy | null = null;
 let current: HTMLVideoElement | HTMLAudioElement | null = null;
 let button: HTMLButtonElement | null = null;
 let frame: number | null = null;
+let nextPlayerKey = 1;
+const playerKeys = new WeakMap<HTMLMediaElement, string>();
+const observedPlayers = new WeakSet<HTMLMediaElement>();
+const lastPlayerReports = new WeakMap<HTMLMediaElement, number>();
 
 function cleanFilename(value: string | null | undefined): string | undefined {
   const leaf = value?.trim().split('/').pop()?.split('\\').pop()?.trim();
@@ -108,6 +112,44 @@ function visible(el: HTMLMediaElement): boolean {
   );
 }
 
+function keyFor(el: HTMLMediaElement): string {
+  const existing = playerKeys.get(el);
+  if (existing) return existing;
+  const key = `player-${nextPlayerKey++}`;
+  playerKeys.set(el, key);
+  return key;
+}
+
+function reportPlayer(el: HTMLMediaElement, force = false): void {
+  if (!active()) return;
+  const now = Date.now();
+  if (!force && now - (lastPlayerReports.get(el) ?? 0) < 500) return;
+  lastPlayerReports.set(el, now);
+  const source = el.currentSrc || el.src || '';
+  void chrome.runtime.sendMessage({
+    type: 'media-player-state',
+    payload: {
+      playerKey: keyFor(el),
+      source: isHttp(source) ? source : '',
+      active: el === current,
+      hovered: el.matches(':hover'),
+      playing: !el.paused && !el.ended,
+      visible: visible(el),
+    },
+  }).catch(() => undefined);
+}
+
+function observePlayer(el: HTMLMediaElement): void {
+  keyFor(el);
+  if (observedPlayers.has(el)) return;
+  observedPlayers.add(el);
+  const update = () => {
+    track();
+    reportPlayer(el, true);
+  };
+  for (const event of ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'mouseenter', 'mouseleave']) el.addEventListener(event, update, { passive: true });
+}
+
 function pick(): HTMLVideoElement | HTMLAudioElement | null {
   // Hovering the button itself must keep the current player: the button is a
   // separate fixed element, so :hover on the media is lost while the pointer
@@ -187,8 +229,11 @@ function track(): void {
   // MutationObserver; any non-idempotent write here (e.g. rewriting
   // document.title every tick) re-triggers the observer into a
   // self-perpetuating loop that starves the page's main thread. Proven live.
+  const media = document.querySelectorAll('video, audio');
+  media.forEach((el) => observePlayer(el as HTMLMediaElement));
   const next = active() ? pick() : null;
   if (next !== current) {
+    const previous = current;
     current = next;
     if (frame !== null) {
       cancelAnimationFrame(frame);
@@ -196,7 +241,9 @@ function track(): void {
     }
     button?.remove();
     button = null;
+    if (previous) reportPlayer(previous, true);
   }
+  if (current) reportPlayer(current, true);
   if (current && frame === null) {
     if (!positionButton()) current = null;
     else frame = requestAnimationFrame(loop);
@@ -214,6 +261,7 @@ async function capture(): Promise<void> {
         source: isHttp(source) ? source : '',
         pageUrl: window.location.href,
         media: true,
+        playerKey: keyFor(el),
         name: document.title ? `${document.title.slice(0, 80)}.mp4` : undefined,
       },
     })) as { ok?: boolean; error?: string };

@@ -520,3 +520,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   and the relaunched app stays alive. SPEC §7.3 + §8.7 restart behavior,
   proven headless. PASS.
 - Verified: probe PASS; `diff --check`. `fixtures/server.py` untouched.
+
+## 2026-09-03 — UI verification via headless Chromium + CDP (no XTEST)
+
+- New `/tmp/dm-cdp.py`: dependency-free (stdlib only) CDP driver — navigate,
+  evaluate JS, screenshot. The repo's `cdp_shot.py` needs `websocket-client`
+  (absent) and is hardcoded to port 9222 + video.html pages.
+- Verified today's frontend in mock mode against a real browser engine, all
+  visually inspected: `?settings=network` renders the global-limit controls
+  intact (`/tmp/dm-ui-network.png`); `?window=add` + Advanced toggle shows
+  Connections 8 + Bandwidth cap Global/Limited-to 50 MB/s
+  (`/tmp/dm-ui-add.png`); the inspector Network tab shows the new
+  Bandwidth-cap row as "Global setting" on an uncapped job
+  (`/tmp/dm-ui-inspector.png`).
+- Full create flow driven through CDP (URL set via native input setter,
+  Advanced expanded, Limited-to radio clicked, Start Download): the window
+  transitioned to captured state — provisional panel 42.0 MB / 1.25 GB,
+  Downloading, 1 active, Resumable Yes, action button flipped to Download
+  (`/tmp/dm-ui-created.png`). The cap radio/form state machine works in the
+  real component, not just in unit tests.
+- Caveat: the driver's JS-result readout returns null even for `1+1`
+  (screenshots are authoritative; clicks demonstrably land). The mock
+  progress numbers are simulated — wiring and transitions are the real
+  product code; engine-side set-path is proven by the limiter probes.
+- UI rig (vite mock :4317, headless Chromium :9223) stopped after the run;
+  the pre-existing `:4173` native-mode vite was left untouched.
+- Verified: 4/4 surfaces visually correct. `fixtures/server.py` untouched.

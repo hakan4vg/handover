@@ -17,6 +17,7 @@ Usage:  python3 server.py [--port 8901]
 
 import argparse
 import os
+import random
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,18 +37,17 @@ def media_file(name: str) -> bytes | None:
         return None
 
 
-def stream(seed: int, offset: int, length: int) -> bytes:
-    # Deterministic byte stream: xorshift-ish, reproducible at any offset.
-    out = bytearray()
-    state = (seed ^ 0x9E3779B9) & 0xFFFFFFFF
-    # Advance to offset cheaply (lengths here are small; simple loop is fine).
-    for i in range(offset + length):
-        state ^= (state << 13) & 0xFFFFFFFF
-        state ^= state >> 17
-        state ^= (state << 5) & 0xFFFFFFFF
-        if i >= offset:
-            out.append((state ^ (i & 0xFF)) & 0xFF)
-    return bytes(out)
+def file_data(name: str, seed: int, size: int) -> bytes:
+    # Pre-generated once per (name, seed); slicing is O(1) C-speed. The old
+    # per-byte generator was O(offset) Python and serialized all concurrent
+    # range requests under the GIL, masquerading as an engine stall.
+    key = (name, seed)
+    if key not in FILE_DATA:
+        FILE_DATA[key] = random.Random(seed).randbytes(size)
+    return FILE_DATA[key]
+
+
+FILE_DATA: dict = {}
 
 
 FILES = {
@@ -112,14 +112,14 @@ class Handler(BaseHTTPRequestHandler):
             start, end = parsed
             headers["Content-Range"] = f"bytes {start}-{end}/{total}"
             headers["Accept-Ranges"] = "bytes"
-            self._send_bytes(stream(seed, start, end - start + 1), 206, headers)
+            self._send_bytes(file_data(name, seed, total)[start:end + 1], 206, headers)
             return
         if ranged:
             headers["Accept-Ranges"] = "bytes"
         # no-range files deliberately omit Accept-Ranges and ignore Range.
         if not ranged and range_header:
             pass
-        self._send_bytes(stream(seed, 0, total) if self.command == "GET" or True else b"", 200, headers)
+        self._send_bytes(file_data(name, seed, total), 200, headers)
 
     def do_HEAD(self):
         self.do_GET()
@@ -134,7 +134,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_file("range.bin", seed, size, True)
         if path == "/file/no-range.bin":
             size, seed, _ = FILES["no-range.bin"]
-            data = stream(seed, 0, size)
+            data = file_data("no-range.bin", seed, size)
             return self._send_bytes(data if self.command == "GET" else b"", 200)
         if path == "/file/slow.bin":
             size, seed, _ = FILES["slow.bin"]
@@ -148,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
             import time
             for off in range(0, size, 32 * 1024):
                 try:
-                    self.wfile.write(stream(seed, off, min(32 * 1024, size - off)))
+                    self.wfile.write(file_data("slow.bin", seed, size)[off:off + 32 * 1024])
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     return
@@ -174,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
             with ONE_USE_LOCK:
                 ONE_USE_COUNTER[0] += 1
                 token = f"t{ONE_USE_COUNTER[0]}"
-                ONE_USE[token] = stream(0x77, 0, 64 * 1024)
+                ONE_USE[token] = file_data("one-use", 0x77, 64 * 1024)
             host = self.headers.get("Host", "127.0.0.1")
             return self._send_bytes(f"http://{host}/one-use/{token}".encode(), 200)
         m = re.match(r"^/one-use/(t\d+)$", path)
@@ -207,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/hls/(seg(\d+)\.ts)$", path)
         if m:
             idx = int(m.group(2))
-            return self._send_bytes(stream(0x80 + idx, 0, 188 * 16), 200, {"Content-Type": "video/mp2t"})
+            return self._send_bytes(file_data(f"seg{idx}", 0x80 + idx, 188 * 16), 200, {"Content-Type": "video/mp2t"})
         # --- DASH ---
         if path == "/dash/manifest.mpd":
             v = "".join(f'<SegmentURL media="v-{i}.m4s"/>' for i in range(DASH_V_SEGS))

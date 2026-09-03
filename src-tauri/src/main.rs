@@ -104,7 +104,13 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem> }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket> }
+
+// One shared token bucket for ALL transfer workers across ALL jobs, so the
+// aggregate never exceeds the global limit no matter how many workers or jobs
+// run (SPEC §8.6). Per-worker sleeping would multiply the limit by the worker
+// count; a shared bucket cannot.
+struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -343,6 +349,7 @@ fn complete_job(job: &mut DownloadJob) {
     if job.total.is_none() { job.total = Some(job.downloaded); }
     job.speed = 0;
     job.connections = 0;
+    job.eta = None;
     job.state = "completed".into();
     job.progress = 100.0;
     job.completed = Some(now_label());
@@ -527,13 +534,41 @@ fn job_state(app: &AppHandle, id: &str) -> Option<String> {
     state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.state.clone()))
 }
 
-async fn throttle(app: &AppHandle, bytes: usize) {
-    let state = app.state::<CoreState>();
-    let limit = state.snapshot.lock().ok().and_then(|snapshot| snapshot.settings.bandwidth_limit.map(|value| (value, snapshot.settings.bandwidth_unit.clone(), snapshot.jobs.iter().filter(|job| ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).count().max(1) as u64)));
-    let Some((value, unit, active)) = limit else { return; };
-    let multiplier = match unit.as_str() { "GB/s" => 1024f64 * 1024f64 * 1024f64, "MB/s" => 1024f64 * 1024f64, _ => 1024f64 };
-    let bytes_per_second = value as f64 * multiplier / active as f64;
-    if bytes_per_second > 0.0 { sleep(Duration::from_secs_f64(bytes as f64 / bytes_per_second)).await; }
+async fn throttle(app: &AppHandle, id: &str, bytes: usize) -> bool {
+    // Shared-bucket pacing with ~100ms responsiveness: take available tokens,
+    // sleep only until enough accrue, and re-check job state every slice so
+    // Pause/Cancel take effect promptly even mid-chunk. Returns false when
+    // the job left "downloading" (caller must stop).
+    let rate = app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
+        snapshot.settings.bandwidth_limit.map(|value| {
+            let multiplier = match snapshot.settings.bandwidth_unit.as_str() { "GB/s" => 1024f64 * 1024f64 * 1024f64, "MB/s" => 1024f64 * 1024f64, _ => 1024f64 };
+            value as f64 * multiplier
+        })
+    });
+    let Some(rate) = rate.filter(|rate| *rate > 0.0) else {
+        return job_state(app, id).as_deref() == Some("downloading");
+    };
+    let capacity = rate.max(64.0 * 1024.0);
+    let mut remaining = bytes as f64;
+    while remaining > 0.0 {
+        if job_state(app, id).as_deref() != Some("downloading") { return false; }
+        let wait = {
+            let state = app.state::<CoreState>();
+            let Ok(mut bucket) = state.bandwidth.lock() else { return false; };
+            let now = std::time::Instant::now();
+            bucket.tokens = (bucket.tokens + now.duration_since(bucket.updated).as_secs_f64().max(0.0) * rate).min(capacity);
+            bucket.updated = now;
+            let take = bucket.tokens.min(remaining);
+            bucket.tokens -= take;
+            remaining -= take;
+            if remaining <= 0.0 {
+                return job_state(app, id).as_deref() == Some("downloading");
+            }
+            remaining / rate
+        };
+        sleep(Duration::from_secs_f64(wait.min(0.1))).await;
+    }
+    job_state(app, id).as_deref() == Some("downloading")
 }
 
 async fn fragment_bytes(client: &reqwest::Client, source: &str, retries: u32) -> Result<Vec<u8>, String> {
@@ -556,16 +591,38 @@ fn content_range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
     Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
 }
 
-async fn range_bytes(client: &reqwest::Client, source: &str, start: u64, end: u64, retries: u32, expected: &ResourceIdentity) -> Result<Vec<u8>, String> {
+async fn range_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source: &str, start: u64, end: u64, retries: u32, expected: &ResourceIdentity) -> Result<Vec<u8>, String> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("range request failed");
+    let total_len = end.saturating_sub(start).saturating_add(1);
     for _ in 0..attempts {
         match client.get(source).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send().await {
             Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
                 let valid_range = content_range(&response).map(|(actual_start, actual_end, actual_total)| actual_start == start && actual_end == end && actual_total == expected.length).unwrap_or(false);
                 if !valid_range { last_error = "The server returned an invalid byte range".into(); continue; }
                 if !valid_range_identity(&response, expected) { last_error = "The resource changed while it was being acquired".into(); continue; }
-                match response.bytes().await { Ok(bytes) if bytes.len() as u64 == end - start + 1 => return Ok(bytes.to_vec()), Ok(_) => last_error = "The server returned an incomplete byte range".into(), Err(error) => last_error = error.to_string() }
+                let mut buf = Vec::new();
+                let mut stream = response.bytes_stream();
+                let mut overflow = false;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            buf.extend_from_slice(&bytes);
+                            if buf.len() as u64 > total_len { overflow = true; break; }
+                            // Pace each received chunk. The byte counter is
+                            // deliberately updated only after the complete
+                            // range is durably written by the caller. That
+                            // keeps displayed progress and persisted ranges
+                            // truthful if pause or a retry interrupts here.
+                            if !throttle(app, id, bytes.len()).await { return Err("paused".to_string()); }
+                        }
+                        Err(error) => { last_error = error.to_string(); buf.clear(); break; }
+                    }
+                }
+                if overflow { last_error = "The server returned an overlong byte range".into(); continue; }
+                if buf.len() as u64 == total_len { return Ok(buf); }
+                if buf.is_empty() { continue; }
+                last_error = "The server returned an incomplete byte range".into();
             }
             Ok(response) => last_error = format!("range request returned {}", response.status()),
             Err(error) => last_error = error.to_string(),
@@ -608,6 +665,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = Some(total); job.downloaded = initial_downloaded; job.progress = initial_downloaded as f64 / total as f64 * 100.0; job.resumable = true; job.mode = "whole-object".into(); job.resource_identity = Some(identity.clone()); job.completed_ranges = completed_ranges.clone(); job.connections = if ranges.is_empty() { 0 } else { worker_count as u32 }; job.events.insert(0, job_event(&format!("Range support verified; {worker_count} workers started"), Some("success"))); });
     emit_snapshot(&app, &state);
     let downloaded = std::sync::Arc::new(AtomicU64::new(initial_downloaded));
+    let started = std::time::Instant::now();
     let completed_workers = std::sync::Arc::new(AtomicU64::new(0));
     let total_ranges = ranges.len() as u64;
     let mut transfers = futures_util::stream::iter(ranges.into_iter().map(|(start, end)| {
@@ -621,25 +679,31 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
         let completed_workers = completed_workers.clone();
         async move {
             if job_state(&app, &id).as_deref() != Some("downloading") { return Err("paused".to_string()); }
-            let bytes = range_bytes(&client, &source, start, end, retry_count, &identity).await?;
+            let bytes = range_bytes(&client, &app, &id, &source, start, end, retry_count, &identity).await?;
             if job_state(&app, &id).as_deref() != Some("downloading") { return Err("paused".to_string()); }
             let mut file = OpenOptions::new().write(true).open(&temp_path).await.map_err(|error| error.to_string())?;
             file.seek(SeekFrom::Start(start)).await.map_err(|error| error.to_string())?;
             file.write_all(&bytes).await.map_err(|error| error.to_string())?;
-            throttle(&app, bytes.len()).await;
             let total_downloaded = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            let speed = ((total_downloaded.saturating_sub(initial_downloaded)) as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
             let finished = completed_workers.fetch_add(1, Ordering::Relaxed) + 1;
             let state = app.state::<CoreState>();
-            emit_job(&state, &id, |job| { job.downloaded = total_downloaded; job.progress = total_downloaded as f64 / total as f64 * 100.0; job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end }); job.connections = worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32; });
+            emit_job(&state, &id, |job| { job.downloaded = total_downloaded; job.speed = speed; job.eta = if speed > 0 { Some(format!("{}s left", total.saturating_sub(total_downloaded) / speed)) } else { None }; job.progress = total_downloaded as f64 / total as f64 * 100.0; job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end }); job.connections = worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32; });
             emit_snapshot(&app, &state);
+            // No throttle here: intake was already paced piece-by-piece inside
+            // range_bytes; charging the whole chunk again would halve the rate.
             Ok::<(), String>(())
         }
     })).buffer_unordered(worker_count);
     let mut transfer_error = None;
     while let Some(result) = transfers.next().await { if let Err(error) = result { transfer_error = Some(error); } }
     if let Some(error) = transfer_error {
-        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.events.insert(0, job_event("Paused with verified byte ranges preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
+        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused with verified byte ranges preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
         return Err(error);
+    }
+    if job_state(&app, &id).as_deref() != Some("downloading") {
+        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); }
+        return Ok(());
     }
     let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() { if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = tokio::fs::create_dir_all(parent).await; } if replace_existing { let _ = tokio::fs::remove_file(&committed.1).await; } move_completed_file(&temp_path, &committed.1).await?; }
@@ -755,13 +819,13 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
             tokio::fs::write(&segment_temp_path, &bytes).await.map_err(|error| error.to_string())?;
             tokio::fs::rename(&segment_temp_path, &segment_path).await.map_err(|error| error.to_string())?;
-            throttle(&app, bytes.len()).await;
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let size = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
             let state = app.state::<CoreState>();
             let finished_missing = done.saturating_sub(existing_count);
             emit_job(&state, &id, |job| { job.downloaded = size; job.progress = done as f64 / total_segments as f64 * 100.0; job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) }); job.connections = concurrency.min((missing_count as u64).saturating_sub(finished_missing) as usize) as u32; });
             emit_snapshot(&app, &state);
+            if !throttle(&app, &id, bytes.len()).await { return Err("paused".to_string()); }
             Ok::<(), String>(())
         }
     }).buffer_unordered(concurrency).collect::<Vec<_>>().await;
@@ -861,10 +925,10 @@ async fn acquire_once(app: AppHandle, id: String, source: String) -> bool {
             Ok(bytes) => {
                 if let Err(error) = file.write_all(&bytes).await { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Could not write temporary data", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
                 downloaded += bytes.len() as u64;
-                throttle(&app, bytes.len()).await;
                 let speed = (downloaded as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
                 emit_job(&state, &id, |job| { job.downloaded = downloaded; job.speed = speed; job.progress = total.map(|value| downloaded as f64 / value as f64 * 100.0).unwrap_or(0.0); job.eta = total.and_then(|value| if speed > 0 { Some(format!("{}s left", (value.saturating_sub(downloaded) / speed).max(1))) } else { None }); });
                 emit_snapshot(&app, &state);
+                if !throttle(&app, &id, bytes.len()).await { drop(stream); drop(file); emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); return false; }
             }
             Err(error) => { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Network stream interrupted", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         }
@@ -1027,7 +1091,11 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         let requested_destination = if input.destination.trim().is_empty() { job.destination.clone() } else { input.destination.trim().to_string() };
         job.name = name;
         job.destination = collision_destination(&requested_destination, &collision);
-        if job.destination != requested_destination { job.events.insert(0, job_event("Destination renamed to avoid an existing file", Some("warning"))); }
+        if job.destination != requested_destination {
+            // Keep the row title coherent with the actual file on disk.
+            if let Some(file_name) = PathBuf::from(&job.destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
+            job.events.insert(0, job_event("Destination renamed to avoid an existing file", Some("warning")));
+        }
         if let Some(max_connections) = input.max_connections { job.max_connections = clamp_connections(max_connections); }
         job.provisional = Some(false);
         job.resumable = true;
@@ -1211,7 +1279,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }) });
             save_snapshot(&app.state::<CoreState>());
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             if let Some(window) = app.get_webview_window("main") {

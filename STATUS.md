@@ -203,3 +203,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   B multi-track/mux + C (fallback).
 - Dialog follow fix: engine renames (mpd→mp4) now propagate into the open
   Add window unless the user already edited the field (dirty flags).
+
+## 2026-09-03 — Range pause/resume + limiter correctness slice
+
+- Root cause found in the first shared-limiter implementation: range workers
+  incremented `downloaded` as response chunks arrived, but persisted a completed
+  range only after the whole range had been written. A pause could therefore
+  display bytes that were still only in memory and could be counted again on
+  retry. The running DB reproduced it (`downloaded` greater than the covered
+  `completedRanges`).
+- Fixed `range_bytes()` to pace each body chunk but leave accounting to the
+  worker after its complete range is written. Added a state gate before media
+  finalization, truthful range-job speed/ETA, and explicit paused ETA cleanup.
+- The limiter is one token bucket shared across all workers and jobs, so a
+  global limit is not multiplied by connection count or simultaneous downloads.
+- Fixed settings number inputs to select their current value on click. Verified
+  in a rebuilt native Linux binary: clicking the limited field and typing `100`
+  persisted exactly `100` rather than appending to the default.
+- Real native UI proof on Xvfb with `/tmp/dm-ui2`: at 50–100 KB/s a committed
+  range job paused with `downloaded=2,097,153` and exactly
+  `completedRanges: 0..2,097,152`; after killing and relaunching the app, the
+  paused state and range survived. Resuming through the UI completed the file.
+  Output SHA256 matched the live fixture: `70204857af3fc5eaeec3102843f9a0b58a2b8c4d8336a127db9c2aedef5c29bb`.
+- Regression matrix rerun on the rebuilt binary `/tmp/dm-ui3`:
+  - HLS VOD → `vod.ts`, 18,048 bytes, completed.
+  - DASH audio+video → `manifest.mp4`, 87,235 bytes; ffprobe reports H.264,
+    AAC, duration 6.037188 seconds.
+  - no-range fallback → `no-range.bin`, 2,097,152 bytes, SHA256
+    `014bd78c2370e7d3528e2439df2afb5d0d15b612e57c4140105a728b7caf26f7`,
+    identical to the fixture response.
+- The fixture generator now caches seeded bytes instead of recomputing from
+  offset zero for every range request. Historical SHA values in earlier log
+  entries refer to the previous generator; current fixtures are deterministic
+  and the current values above are the authoritative proof.

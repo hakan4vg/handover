@@ -176,3 +176,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   everywhere — commit went through Tab×4+Space after clicks mysteriously
   missed one specific button 4 times (cause undetermined; possibly focus).
   Clicks otherwise reliable (Add URL, Start Download).
+
+## 2026-09-03 — Segmented media e2e (Modes B + C proven)
+
+- HLS TS VOD: manifest → 6 concurrent fragments → ordered assembly → `vod.ts`
+  (container-aware rename from `vod.m3u8`), committed, SHA256-IDENTICAL to
+  concatenated source segments. No FFmpeg involved (correct per SPEC §9.2).
+- DASH A+V: first attempt failed honestly (my fixture 404'd the init
+  segments — regex only allowed `.m4s`). Engine preserved parts and reported
+  clearly. Fixed fixture to serve REAL fragmented MP4 (ffmpeg testsrc+sine,
+  split into init+frags via a box parser, committed under `fixtures/media/`;
+  template.mpd routes reuse the video bytes).
+- Stale-segment poisoning found by the retry: old positional part-files from
+  a differently-shaped manifest were trusted by existence alone, poisoning
+  the mux. Fixed with `segment_identity` (FNV over track kinds + segment
+  URLs, SPEC §8.8): mismatch or unknown identity wipes the segment dir and
+  refetches. `SegmentState.identity` is `#[serde(default)]` so old DBs load.
+- `complete_job()` helper collapsed 4 duplicated completion blocks; bakes
+  in total:=downloaded when the source never advertised a size (fixes
+  "Unknown size"/"0 B" on completed manifest jobs; also fixes the Rust-side
+  `formatBytes(None)` display via frontend null guard).
+- DASH retry on clean bytes: muxed `manifest.mp4`, ffprobe shows valid
+  h264+AAC, 6s. File size displays (85 KB).
+- Mode C (no-range server): single-stream fallback, byte-identical 2MB.
+- Transfer matrix now fully proven live: A (ranges) + B single-track +
+  B multi-track/mux + C (fallback).
+- Dialog follow fix: engine renames (mpd→mp4) now propagate into the open
+  Add window unless the user already edited the field (dirty flags).

@@ -319,8 +319,8 @@ export function createAdapter(): DownloadAdapter {
   return new NativeAdapter();
 }
 
-export function formatBytes(bytes?: number) {
-  if (bytes === undefined || Number.isNaN(bytes)) return 'Unknown size';
+export function formatBytes(bytes?: number | null) {
+  if (bytes === undefined || bytes === null || Number.isNaN(bytes)) return 'Unknown size';
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(bytes >= 10 * 1024 ** 3 ? 0 : 2)} GB`;
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(bytes >= 100 * 1024 ** 2 ? 0 : 1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;

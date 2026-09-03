@@ -55,7 +55,7 @@ export interface DownloadJob {
   started?: string;
   completed?: string;
   provisional?: boolean;
-  segments?: { completed: number; total: number };
+  segments?: { completed: number; total: number; identity?: string };
   completedRanges?: ByteRange[];
   resourceIdentity?: ResourceIdentity;
   events: JobEvent[];

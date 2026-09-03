@@ -60,7 +60,7 @@ struct DownloadJob {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SegmentState { completed: u32, total: u32 }
+struct SegmentState { completed: u32, total: u32, #[serde(default)] identity: Option<String> }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -336,6 +336,18 @@ fn emit_snapshot(app: &AppHandle, state: &CoreState) {
 }
 
 fn job_event(message: &str, tone: Option<&str>) -> JobEvent { JobEvent { at: now_label(), message: message.into(), tone: tone.map(str::to_string) } }
+
+fn complete_job(job: &mut DownloadJob) {
+    // A finished acquisition knows its size even when the source never
+    // advertised one (segmented or unknown-length transfers).
+    if job.total.is_none() { job.total = Some(job.downloaded); }
+    job.speed = 0;
+    job.connections = 0;
+    job.state = "completed".into();
+    job.progress = 100.0;
+    job.completed = Some(now_label());
+    job.events.insert(0, job_event("Download completed", Some("success")));
+}
 
 fn domain(source: &str) -> String { reqwest::Url::parse(source).ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_else(|| "source unavailable".into()) }
 
@@ -631,7 +643,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     }
     let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() { if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = tokio::fs::create_dir_all(parent).await; } if replace_existing { let _ = tokio::fs::remove_file(&committed.1).await; } move_completed_file(&temp_path, &committed.1).await?; }
-    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { job.state = "completed".into(); job.progress = 100.0; job.completed = Some(now_label()); job.events.insert(0, job_event("Download completed", Some("success"))); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
+    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
     Ok(())
@@ -641,7 +653,28 @@ fn manifest_segment_path(directory: &Path, track: usize, index: usize, track_cou
     if track_count == 1 { directory.join(format!("{index:08}.part")) } else { directory.join(format!("{track:02}")).join(format!("{index:08}.part")) }
 }
 
-async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, mime: Option<String>) -> Result<(), String> {
+// Identity of a segmented resource: track kinds plus every segment URL.
+// Positional part-files are only reusable when this matches; otherwise the
+// directory is wiped and refetched rather than stitching a new manifest onto
+// old bytes (SPEC §8.8: restart when identity cannot be established safely).
+fn segment_identity(tracks: &[media::MediaTrack]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for track in tracks {
+        for byte in track.kind.bytes().chain([0xff]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for segment in &track.segments {
+            for byte in segment.url.bytes().chain([0xfe]) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    format!("{hash:016x}")
+}
+
+async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, _mime: Option<String>) -> Result<(), String> {
     let client = http_client();
     let mut manifest_source = source;
     let mut manifest_body = body;
@@ -655,6 +688,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         manifest_source = variant;
     }
     let is_hls = manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
+    let single_hls_playlist = hls_track_sources.is_none() && is_hls;
     let tracks = if let Some(sources) = hls_track_sources {
         let mut tracks = Vec::with_capacity(sources.len());
         for (kind, track_source) in sources {
@@ -669,14 +703,22 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         }
         tracks
     } else if is_hls { vec![media::MediaTrack { kind: "video".into(), segments: media::parse_hls(&manifest_source, &manifest_body)? }] } else { media::parse_dash_tracks(&manifest_source, &manifest_body)? };
+    // Name the acquisition after its container, not the manifest: suggesting
+    // "vod.m3u8" for MPEG-TS bytes guarantees a doomed FFmpeg remux later.
+    // HLS without an EXT-X-MAP carries MPEG-TS; everything else assembles to MP4.
+    let (container_ext, container_mime) = if single_hls_playlist && !manifest_body.contains("#EXT-X-MAP") { ("ts", "video/mp2t") } else { ("mp4", "video/mp4") };
     let track_count = tracks.len();
     let track_lengths = tracks.iter().map(|track| track.segments.len()).collect::<Vec<_>>();
     let track_kinds = tracks.iter().map(|track| if track.kind.is_empty() { "media" } else { track.kind.as_str() }).collect::<Vec<_>>().join(" + ");
     let total_segments = track_lengths.iter().sum::<usize>();
     if total_segments == 0 { return Err("The manifest did not contain any downloadable segments".into()); }
     let state = app.state::<CoreState>();
-    let (temp_path, max_connections, retry_count, replace_existing) = state.snapshot.lock().map_err(|_| "State unavailable".to_string()).and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.temp_path.clone(), job.max_connections, if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }, snapshot.settings.collision_behavior == "replace")).ok_or_else(|| "Acquisition no longer exists".to_string()))?;
+    let (temp_path, max_connections, retry_count, replace_existing, stored_identity) = state.snapshot.lock().map_err(|_| "State unavailable".to_string()).and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.temp_path.clone(), job.max_connections, if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }, snapshot.settings.collision_behavior == "replace", job.segments.as_ref().and_then(|segments| segments.identity.clone()))).ok_or_else(|| "Acquisition no longer exists".to_string()))?;
     let segment_dir = PathBuf::from(format!("{temp_path}.segments"));
+    let identity = segment_identity(&tracks);
+    if stored_identity.as_deref() != Some(identity.as_str()) {
+        let _ = tokio::fs::remove_dir_all(&segment_dir).await;
+    }
     tokio::fs::create_dir_all(&segment_dir).await.map_err(|error| error.to_string())?;
     let total_segments = total_segments as u32;
     let concurrency = max_connections.clamp(1, total_segments) as usize;
@@ -693,7 +735,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     }
     let missing_count = total_segments as usize - existing_segments.len();
     let existing_count = existing_segments.len() as u64;
-    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.mode = "segments".into(); job.media = true; job.mime = mime.clone(); job.media_tracks = Some(track_count as u32); job.resumable = true; job.downloaded = existing_bytes; job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0; job.connections = concurrency.min(missing_count) as u32; job.segments = Some(SegmentState { completed: existing_segments.len() as u32, total: total_segments }); job.events.insert(0, job_event(&format!("Manifest parsed: {total_segments} fragments across {track_kinds}"), Some("success"))); });
+    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.mode = "segments".into(); job.media = true; job.mime = Some(container_mime.to_string()); job.media_tracks = Some(track_count as u32); job.resumable = true; job.downloaded = existing_bytes; job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0; job.connections = concurrency.min(missing_count) as u32; job.segments = Some(SegmentState { completed: existing_segments.len() as u32, total: total_segments, identity: Some(identity.clone()) }); if job.name == source_name(&job.source) { let stem = Path::new(&job.name).file_stem().and_then(|value| value.to_str()).unwrap_or("media"); job.name = format!("{stem}.{container_ext}"); let mut destination = PathBuf::from(&job.destination); destination.set_file_name(&job.name); job.destination = destination.to_string_lossy().into_owned(); } job.events.insert(0, job_event(&format!("Manifest parsed: {total_segments} fragments across {track_kinds}"), Some("success"))); });
     emit_snapshot(&app, &state);
     let completed = std::sync::Arc::new(AtomicU64::new(existing_segments.len() as u64));
     let downloaded = std::sync::Arc::new(AtomicU64::new(existing_bytes));
@@ -718,7 +760,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             let size = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
             let state = app.state::<CoreState>();
             let finished_missing = done.saturating_sub(existing_count);
-            emit_job(&state, &id, |job| { job.downloaded = size; job.progress = done as f64 / total_segments as f64 * 100.0; job.segments = Some(SegmentState { completed: done as u32, total: total_segments }); job.connections = concurrency.min((missing_count as u64).saturating_sub(finished_missing) as usize) as u32; });
+            emit_job(&state, &id, |job| { job.downloaded = size; job.progress = done as f64 / total_segments as f64 * 100.0; job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) }); job.connections = concurrency.min((missing_count as u64).saturating_sub(finished_missing) as usize) as u32; });
             emit_snapshot(&app, &state);
             Ok::<(), String>(())
         }
@@ -759,7 +801,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         move_completed_file(&final_path, &committed.1).await?;
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
     }
-    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { job.state = "completed".into(); job.progress = 100.0; job.completed = Some(now_label()); job.events.insert(0, job_event("Download completed", Some("success"))); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event(if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" }, Some("warning"))); } });
+    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event(if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" }, Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
     Ok(())
@@ -840,7 +882,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String) -> bool {
             return false;
         }
     }
-    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { job.state = "completed".into(); job.progress = 100.0; job.completed = Some(now_label()); job.events.insert(0, job_event("Download completed", Some("success"))); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
+    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
     false
@@ -1015,7 +1057,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         if let Some(parent) = PathBuf::from(&ready.2).parent() { let _ = std::fs::create_dir_all(parent); }
         if ready.3 { let _ = std::fs::remove_file(&ready.2); }
         match move_completed_file(&final_path, &ready.2).await {
-            Ok(()) => { if ready.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", ready.1)); } emit_job(&state, &id, |job| { job.state = "completed".into(); job.progress = 100.0; job.eta = None; job.completed = Some(now_label()); job.events.insert(0, job_event("Download completed", Some("success"))); }); add_notification(&app, &state, &id, "completed"); },
+            Ok(()) => { if ready.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", ready.1)); } emit_job(&state, &id, |job| { complete_job(job); job.eta = None; }); add_notification(&app, &state, &id, "completed"); },
             Err(error) => emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); }),
         }
     }

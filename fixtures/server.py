@@ -16,6 +16,7 @@ Usage:  python3 server.py [--port 8901]
 """
 
 import argparse
+import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +24,16 @@ from urllib.parse import urlparse, parse_qs
 
 SEG_TS_COUNT = 6
 DASH_V_SEGS = 3
-DASH_A_SEGS = 2
+DASH_A_SEGS = 1
+MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+
+
+def media_file(name: str) -> bytes | None:
+    try:
+        with open(os.path.join(MEDIA_DIR, name), "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
 
 
 def stream(seed: int, offset: int, length: int) -> bytes:
@@ -227,11 +237,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/dash/live.mpd":
             body = '<MPD type="dynamic" minimumUpdatePeriod="PT2S"><Period><AdaptationSet><Representation><SegmentTemplate media="s.m4s"/></Representation></AdaptationSet></Period></MPD>'
             return self._send_bytes(body.encode(), 200, {"Content-Type": "application/dash+xml"})
-        m = re.match(r"^/dash/([vat]-[\w-]+\.m4s|t-init\.mp4|t-\d+\.m4s)$", path)
+        # Real fragmented-MP4 bytes (see media/): init + per-track fragments.
+        # Transport tests use deterministic garbage; finalization tests need
+        # media FFmpeg can actually demux, so these routes serve real files.
+        m = re.match(r"^/dash/([va])-init\.mp4$", path)
         if m:
-            name = m.group(1)
-            seed = sum(name.encode()) & 0xFF
-            return self._send_bytes(stream(seed, 0, 32 * 1024), 200, {"Content-Type": "video/mp4"})
+            data = media_file(f"{m.group(1)}-init.mp4")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
+        m = re.match(r"^/dash/([va])-(\d+)\.m4s$", path)
+        if m:
+            data = media_file(f"{m.group(1)}-{m.group(2)}.m4s")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
+        if path == "/dash/t-init.mp4":
+            data = media_file("v-init.mp4")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
+        m = re.match(r"^/dash/t-(\d+)\.m4s$", path)
+        if m:
+            data = media_file(f"v-{int(m.group(1)) - 1}.m4s")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
         if path == "/media/sample.mp4":
             size, seed, _ = FILES["sample.mp4"]
             return self._serve_file("sample.mp4", seed, size, True, {"Content-Type": "video/mp4"})

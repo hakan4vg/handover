@@ -241,7 +241,7 @@ class MockAdapter implements DownloadAdapter {
       eta: 'Connecting…',
       connections: 0,
        maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? this.snapshot.settings.maxConnections)),
-      bandwidthLimit: sanitizeCapBps(input.bandwidthLimit),
+      bandwidthLimit: sanitizeCapBps(input.bandwidthLimit) ?? null,
       mode: media ? 'segments' : 'single-stream',
       media,
       mediaDetails: media ? 'Detecting current media…' : undefined,
@@ -261,7 +261,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) {
-    this.update(id, (job) => ({ ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), bandwidthLimit: sanitizeCapBps(input.bandwidthLimit) ?? job.bandwidthLimit, provisional: false, resumable: true, state: job.state === 'connecting' ? 'downloading' : job.state, speed: job.speed || 9.4 * 1024 ** 2, connections: job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] }));
+    this.update(id, (job) => ({ ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), bandwidthLimit: input.bandwidthLimit === undefined ? job.bandwidthLimit : sanitizeCapBps(input.bandwidthLimit) ?? null, provisional: false, resumable: true, state: job.state === 'connecting' ? 'downloading' : job.state, speed: job.speed || 9.4 * 1024 ** 2, connections: job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] }));
   }
 
   async updateSettings(patch: Partial<AppSettings>) {

@@ -134,7 +134,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
 
   const handleManualSubmit = async (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => {
     try {
-      const id = await adapter.createProvisional({ source, name, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined });
+      const id = await adapter.createProvisional({ source, name, maxConnections, bandwidthLimit });
       setShowManualAdd(false);
       setAddWindowId(id);
       setSelectedId(id);
@@ -144,7 +144,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
   };
 
   const handleCommit = (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => {
-    run(adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined }), 'Download added to Manager');
+    run(adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }), 'Download added to Manager');
     setAddWindowId(null);
   };
 
@@ -470,8 +470,8 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const [createdId, setCreatedId] = useState<string | undefined>(jobId);
   const currentJob = snapshot.jobs.find((item) => item.id === createdId);
   const close = () => window.close();
-  const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined }));
-  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={(id, name, destination, maxConnections, bandwidthLimit) => { void adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined }).then(close); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
+  const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit }));
+  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={(id, name, destination, maxConnections, bandwidthLimit) => { void adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }).then(close); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
 }
 
 function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {

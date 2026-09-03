@@ -128,7 +128,16 @@ struct ProvisionalInput { source: String, name: Option<String>, media: Option<bo
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CommitInput { name: String, destination: String, max_connections: Option<u32>, bandwidth_limit: Option<u64> }
+struct CommitInput { name: String, destination: String, max_connections: Option<u32>, #[serde(default, deserialize_with = "opt_opt_u64")] bandwidth_limit: Option<Option<u64>> }
+
+// Three-state optional: missing key -> None (keep), explicit null ->
+// Some(None) (clear), number -> Some(Some(n)) (set). Plain
+// Option<Option<u64>> would collapse null into None and make "clear"
+// indistinguishable from "keep".
+fn opt_opt_u64<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where D: serde::Deserializer<'de> {
+    Option::<u64>::deserialize(deserializer).map(Some)
+}
 
 fn now_label() -> String { "Just now".to_string() }
 
@@ -1308,7 +1317,9 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
             job.events.insert(0, job_event("Destination renamed to avoid an existing file", Some("warning")));
         }
         if let Some(max_connections) = input.max_connections { job.max_connections = clamp_connections(max_connections); }
-        if input.bandwidth_limit.is_some() { job.bandwidth_limit = input.bandwidth_limit.filter(|value| *value > 0); }
+        // None (absent) = keep the existing cap; Some(None) (explicit null)
+        // = clear back to the global setting; Some(n) = set.
+        if let Some(cap) = input.bandwidth_limit { job.bandwidth_limit = cap.filter(|value| *value > 0); }
         job.provisional = Some(false);
         job.resumable = true;
         job.events.insert(0, job_event("Accepted as managed download", Some("success")));
@@ -1642,6 +1653,17 @@ mod capture_tests {
         assert_eq!(settings.start_at_sign_in, false);
         assert_eq!(settings.default_folder, "/tmp/custom-downloads");
         assert_eq!(settings.max_connections, 4);
+    }
+
+    #[test]
+    fn commit_cap_semantics_keep_clear_and_set() {
+        use super::CommitInput;
+        let keep: CommitInput = serde_json::from_str(r#"{"name":"a","destination":"b"}"#).unwrap();
+        assert_eq!(keep.bandwidth_limit, None);
+        let clear: CommitInput = serde_json::from_str(r#"{"name":"a","destination":"b","bandwidthLimit":null}"#).unwrap();
+        assert_eq!(clear.bandwidth_limit, Some(None));
+        let set: CommitInput = serde_json::from_str(r#"{"name":"a","destination":"b","bandwidthLimit":524288}"#).unwrap();
+        assert_eq!(set.bandwidth_limit, Some(Some(524288)));
     }
 
     #[test]

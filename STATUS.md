@@ -411,6 +411,23 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verified: probe PASS (2-job) + PASS (1-job regression); `diff --check`.
   `fixtures/server.py` untouched.
 
+## 2026-09-03 — Per-job cap clearing (keep/clear/set contract)
+
+- Follow-up to the per-job slice: omitting the cap at commit kept the old
+  value with no way to clear it. `CommitInput.bandwidth_limit` is now
+  `Option<Option<u64>>` — absent keeps, explicit null clears to the global
+  setting, number sets. Frontend passes null straight through (Global radio
+  clears); mock adapter implements the same three states.
+- The new contract test caught a real serde gotcha first run: plain
+  `Option<Option<u64>>` collapses explicit null into None, making clear ==
+  keep. Fixed with a three-state `opt_opt_u64` deserializer (missing → None,
+  null → Some(None), n → Some(Some(n))).
+- Clear-path is unit-covered, not e2e-covered (commit needs the Tauri
+  runtime); the set-path matrix from the previous slice stands.
+- Verified: Rust 28/28; vitest 11/11; `tsc -b`; `build:all`; `diff --check`;
+  headless default probe on the rebuilt binary 0.98 MB/s + byte identity.
+  `fixtures/server.py` untouched.
+
 ## 2026-09-03 — Range-resume math unit coverage
 
 - `merge_range` / `covered_bytes` / `missing_ranges` previously had zero unit

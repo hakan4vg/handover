@@ -467,3 +467,19 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   band; lower than the earlier 0.98 — box-load variance, same binary).
 - Verified: probe PASS (no-range) + PASS (range regression); `diff --check`.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — Acquire paths proven: redirect, one-use, bounded 503 retry
+
+- New `fixtures/acquire_probe.py` (`DM_MODE` = redirect | one-use |
+  retry-503) drives the real binary headless (Xvfb :99, isolated HOME,
+  `--capture` stdio) and asserts on the jobs SQLite table only — no XTEST.
+- redirect: `/redirect` (302 -> range.bin) completes byte-identical 8 MiB.
+  PASS.
+- one-use: minted single-fetch URL completes as sole consumer (64 KiB,
+  byte-identical across mints). Documents the double-consume hazard: a
+  parallel browser fetch would 410 the app's copy — still an open product
+  call, not changed. PASS.
+- retry-503: `/status/503` fails honestly after 5 bounded automatic retries;
+  job events show the retry attempts, error names the 503. PASS.
+- Verified: probe PASS x3 modes; `diff --check`. `fixtures/server.py`
+  untouched.

@@ -17,6 +17,8 @@ import urllib.request
 
 PORT, URL, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
 SCRIPTS = sys.argv[4:]
+# DM_CDP_TARGET: substring the target URL must contain (default: first page).
+WANT = os.environ.get("DM_CDP_TARGET", "")
 
 
 def ws_connect(port, path):
@@ -123,33 +125,46 @@ def main():
     targets = json.load(
         urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/list", timeout=15)
     )
-    page = next(t for t in targets if t["type"] == "page")
+    pages = [t for t in targets if t["type"] == "page"]
+    if WANT:
+        pool = [t for t in targets if WANT in t["url"]]
+        if not pool:
+            raise SystemExit(f"no target matching {WANT!r}")
+        page = pool[0]
+    else:
+        page = next(t for t in pages)
     ws_url = page["webSocketDebuggerUrl"]
     path = ws_url.split(f"127.0.0.1:{PORT}", 1)[1]
     cdp = CDP(ws_connect(PORT, path))
-    cdp.call("Page.enable")
-    cdp.call("Page.navigate", {"url": URL})
-    import time
+    if URL != "-":
+        cdp.call("Page.enable")
+        cdp.call("Page.navigate", {"url": URL})
+        import time
 
-    for _ in range(60):
-        time.sleep(0.5)
-        try:
-            state = cdp.evaluate("document.readyState")
-        except RuntimeError:
-            continue
-        if state == "complete":
-            break
-    time.sleep(2)  # let React render + mock timeouts fire
+        for _ in range(60):
+            time.sleep(0.5)
+            try:
+                state = cdp.evaluate("document.readyState")
+            except RuntimeError:
+                continue
+            if state == "complete":
+                break
+        time.sleep(2)  # let React render + mock timeouts fire
+    else:
+        import time
+
+        time.sleep(1)
     for script in SCRIPTS:
         try:
             print("JS:", json.dumps(cdp.evaluate(script))[:1500], flush=True)
         except RuntimeError as exc:
             print(f"JS-ERROR: {exc}", flush=True)
         time.sleep(1)
-    shot = cdp.call("Page.captureScreenshot", {"format": "png"})
-    with open(OUT, "wb") as handle:
-        handle.write(base64.b64decode(shot["data"]))
-    print(f"saved {OUT}", flush=True)
+    if URL != "-":
+        shot = cdp.call("Page.captureScreenshot", {"format": "png"})
+        with open(OUT, "wb") as handle:
+            handle.write(base64.b64decode(shot["data"]))
+        print(f"saved {OUT}", flush=True)
 
 
 if __name__ == "__main__":

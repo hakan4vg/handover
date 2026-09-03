@@ -70,6 +70,9 @@ def env():
     return dict(
         os.environ,
         HOME=HOME,
+        # Scope the temp dir too: the app resolves it via the cache dir,
+        # which follows XDG_CACHE_HOME, not HOME.
+        XDG_CACHE_HOME=os.path.join(HOME, ".cache"),
         DISPLAY=":99",
         WEBKIT_DISABLE_COMPOSITING_MODE="1",
     )

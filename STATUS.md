@@ -555,3 +555,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   workflow; this one is the general-purpose equivalent.
 - Full sweep on HEAD: Rust 28/28, vitest 11/11, `tsc -b` clean.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — Native-host capture proven byte-identical; cache leak fixed
+
+- Direct native-host probe (framed `capture-acquisition` into the real
+  `com.downloadmanager.host.sh`, isolated HOME): host replied `{"ok":true}`,
+  resident app created the provisional and drove it to `finalizing` with
+  dl=2097152/2097152. Temp file `cmp` against the served fixture:
+  BYTE-IDENTITY PASS (2,097,152 bytes).
+- Root cause found on the way: the first attempt (host env without DISPLAY)
+  replied ok but produced no job — the spawned `--capture` second instance
+  needs a display to forward via single-instance. With `DISPLAY=:99` the
+  row appears. On desktop Linux the browser session always provides one, so
+  this is harness environment, not an app bug.
+- Real finding from the same runs: every headless probe leaked provisional
+  temps into the REAL `~/.cache` (~38 orphan files, ~115 MB) because the
+  probes overrode HOME without XDG_CACHE_HOME (the app resolves temp via
+  the cache dir). Cleaned all orphans (no live app, no real-HOME DB
+  references them). All four app-launching probes now set
+  `XDG_CACHE_HOME=$HOME/.cache`; re-ran settings recovery green and
+  confirmed the real cache tmp stays empty while the isolated HOME absorbs
+  cache writes.
+- This commit also carries the `cdp_drive.py` target-selection (`DM_CDP_TARGET`)
+  and skip-navigate (`-` URL) improvements built for the extension e2e work.
+- Verified: BYTE-IDENTITY PASS; settings-probe PASS after fix; `diff --check`.
+  `fixtures/server.py` untouched.

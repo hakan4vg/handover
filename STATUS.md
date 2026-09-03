@@ -580,3 +580,41 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   and skip-navigate (`-` URL) improvements built for the extension e2e work.
 - Verified: BYTE-IDENTITY PASS; settings-probe PASS after fix; `diff --check`.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Pre-browser ordinary-download takeover proven
+
+- Root cause of the first browser probe: the MV3 manifest lacked the required
+  `nativeMessaging` permission. Chromium reported `Specified native messaging
+  host not found` from the extension service worker; direct framed stdio still
+  worked. Chrome's official native-messaging documentation confirms both the
+  permission requirement and the rule that content scripts must pass messages
+  through the service worker.
+- Implemented the smallest canonical path:
+  - `extension/src/content.ts` captures only unmodified left-clicks on explicit
+    HTTP(S) `<a download>` actions in the document capture phase, prevents the
+    browser default, and forwards source/name/page URL to the worker.
+  - `extension/src/background.ts` forwards that intent to the native host.
+    If native messaging fails, it uses `chrome.downloads.download()` as a
+    non-destructive fallback; the existing `downloads.onCreated` listener
+    ignores extension-owned fallback downloads.
+  - `extension/manifest.json` declares `nativeMessaging`.
+- Real fresh Chromium + real native-host + fixture proof (`/tmp/dm-confirm2.Tpp5VR`):
+  explicit click returned `dispatch=false, defaultPrevented=true`; isolated DB
+  contained exactly one job; it acquired 2,097,152/2,097,152 bytes; the Add
+  Download window was inspected over WebKit's remote inspector and its real
+  Download button was activated without XTEST; the row became
+  `provisional=false, state=completed`; final output was
+  `/tmp/dm-confirm2.Tpp5VR/Downloads/confirm.bin` (2,097,152 bytes); the temp
+  `.part` was removed; `cmp` against a fresh `/file/no-range.bin` fetch passed.
+  Chromium's Downloads directory stayed empty, proving no duplicate browser
+  copy.
+- Policy-off audit (`/tmp/dm-policy-off.o4kPVD`): after a real worker policy
+  update to `interceptDownloads=false`, the same explicit click returned
+  `defaultPrevented=false`; Chromium saved its own 2,097,152-byte copy; no
+  Download Manager DB was created.
+- Native-failure audit (`/tmp/dm-native-fail.LSNOOI`): with no native-host
+  manifest, the click was prevented, the worker's browser API fallback saved
+  `native-fail.bin` at 2,097,152 bytes, and `cmp` passed; no app DB was created.
+- Verification: `npm run build:extension`, `npx vitest run`, `npx tsc -b`, and
+  `git diff --check` all passed during the implementation. No XTEST input was
+  used. `fixtures/server.py` remains untouched.

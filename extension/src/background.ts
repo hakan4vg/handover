@@ -52,6 +52,42 @@ function pruneMedia(now = Date.now()): void {
   while (recentMedia.length > MEDIA_BUFFER_MAX) recentMedia.shift();
 }
 
+function cleanFilename(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const leaf = value.trim().split('/').pop()?.split('\\').pop()?.trim();
+  return leaf || undefined;
+}
+
+async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
+  const source = typeof payload.source === 'string' ? payload.source.trim() : '';
+  if (!policy.interceptDownloads || !isHttp(source)) {
+    return { ok: false, error: 'ordinary interception disabled or invalid source' };
+  }
+  const response = (await sendNative({
+    type: 'capture-acquisition',
+    payload: {
+      source,
+      name: cleanFilename(payload.name),
+      pageUrl: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
+    },
+  })) as { ok?: boolean };
+  if (response?.ok) return { ok: true };
+  // The pre-browser path consumed the anchor event. If native messaging is
+  // unavailable, preserve the user's download through the extension API;
+  // the onCreated listener ignores downloads started by this extension.
+  try {
+    const id = await chrome.downloads.download({
+      url: source,
+      filename: cleanFilename(payload.name),
+      saveAs: false,
+    });
+    return { ok: typeof id === 'number' };
+  } catch {
+    // No safe fallback remains. Do not navigate the page or invent success.
+    return { ok: false, error: 'native host and browser fallback unavailable' };
+  }
+}
+
 function rememberMedia(url: string, tabId: number, frameId: number): void {
   if (!isHttp(url)) return;
   pruneMedia();
@@ -114,6 +150,9 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       reply({ ok: true, policy });
       // Best-effort push so the resident app (when running) stays coherent.
       void sendNative({ type: 'update-policy', payload: policy });
+    } else if (type === 'ordinary-capture') {
+      const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
+      reply(await captureOrdinary(payload));
     } else if (type === 'media-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
       let source = typeof payload.source === 'string' ? payload.source : '';

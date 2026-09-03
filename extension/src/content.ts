@@ -27,6 +27,44 @@ let current: HTMLVideoElement | HTMLAudioElement | null = null;
 let button: HTMLButtonElement | null = null;
 let frame: number | null = null;
 
+function cleanFilename(value: string | null | undefined): string | undefined {
+  const leaf = value?.trim().split('/').pop()?.split('\\').pop()?.trim();
+  return leaf || undefined;
+}
+
+function basenameFromUrl(url: string): string | undefined {
+  try {
+    return cleanFilename(new URL(url).pathname);
+  } catch {
+    return undefined;
+  }
+}
+
+// Explicit <a download> clicks are the generic pre-browser action Chromium
+// exposes safely. Capture in the document's capture phase, before page
+// handlers/default navigation can consume a one-use URL. Other browser-owned
+// downloads retain the observe-only downloads.onCreated fallback.
+function interceptDownloadClick(event: MouseEvent): void {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (!policy?.interceptDownloads) return;
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const anchor = target.closest('a');
+  if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download')) return;
+  const source = anchor.href;
+  if (!isHttp(source)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  void chrome.runtime.sendMessage({
+    type: 'ordinary-capture',
+    payload: {
+      source,
+      name: cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source),
+      pageUrl: window.location.href,
+    },
+  }).catch(() => undefined);
+}
+
 let policyTimer: number | null = null;
 
 async function refreshPolicy(): Promise<void> {
@@ -198,6 +236,7 @@ void refreshPolicy().then(() => {
   window.setInterval(track, 500);
   window.setInterval(refreshPolicy, 10_000);
   new MutationObserver(track).observe(document.documentElement, { childList: true, subtree: true });
+  document.addEventListener('click', interceptDownloadClick, true);
   document.addEventListener('mouseenter', track, true);
   document.addEventListener('scroll', track, { capture: true, passive: true });
   chrome.storage.onChanged.addListener(() => void refreshPolicy());

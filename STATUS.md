@@ -705,6 +705,21 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   row. The same lifecycle abort path is shared by the Add Download Cancel
   action, titlebar close, and bulk cancellation paths.
 
+## 2026-09-04 — Explicit reattach resumes the chosen partial job
+
+- Seeded one committed paused range job (`reattach-1`) with a verified first
+  MiB and a persisted resource identity. Relaunching the app preserved the
+  selected job and range.
+- Invoked `reattach_job` for that exact ID through the live manager WebKit
+  inspector. A renewed browser capture used the same path with a changed query
+  (`old=expired` → `renewed=1`); the source compatibility check accepted the
+  renewed URL without binding any other job.
+- The existing job ID and temporary file were reused. It completed at
+  `8388608/8388608` bytes, updated its source to the renewed URL, and produced
+  `/tmp/dm-reattach-proof.ABC8ry/Downloads/reattach.bin`.
+- `cmp` passed against a fresh renewed-URL fixture response. This verifies the
+  targeted reattach path in SPEC §8.9 rather than a global URL heuristic.
+
 ## 2026-09-04 — Real browser media-button capture proven
 
 - Started the fixture server from its required `fixtures/` working directory

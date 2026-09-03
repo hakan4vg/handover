@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 SEG_TS_COUNT = 6
+HLS_SLOW_COUNT = 4
+HLS_SLOW_BYTES = 1024 * 1024
 DASH_V_SEGS = 3
 DASH_A_SEGS = 1
 MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
@@ -201,6 +203,12 @@ class Handler(BaseHTTPRequestHandler):
                 lines += ["#EXTINF:2.0,", f"seg{i}.ts"]
             lines.append("#EXT-X-ENDLIST")
             return self._send_bytes(("\n".join(lines) + "\n").encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/hls/slow.m3u8":
+            lines = ["#EXTM3U", f"#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:0"]
+            for i in range(HLS_SLOW_COUNT):
+                lines += ["#EXTINF:1.0,", f"slow{i}.bin"]
+            lines.append("#EXT-X-ENDLIST")
+            return self._send_bytes(("\n".join(lines) + "\n").encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
         if path == "/hls/live.m3u8":
             body = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n"
             return self._send_bytes(body.encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
@@ -208,6 +216,12 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             idx = int(m.group(2))
             return self._send_bytes(file_data(f"seg{idx}", 0x80 + idx, 188 * 16), 200, {"Content-Type": "video/mp2t"})
+        m = re.match(r"^/hls/(slow(\d+)\.bin)$", path)
+        if m:
+            idx = int(m.group(2))
+            if idx >= HLS_SLOW_COUNT:
+                return self._send_bytes(b"missing fixture", 404)
+            return self._send_bytes(file_data(f"slow{idx}", 0x180 + idx, HLS_SLOW_BYTES), 200, {"Content-Type": "application/octet-stream"})
         # --- DASH ---
         if path == "/dash/manifest.mpd":
             v = "".join(f'<SegmentURL media="v-{i}.m4s"/>' for i in range(DASH_V_SEGS))

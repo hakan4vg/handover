@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod lifecycle;
 mod media;
 
-use futures_util::StreamExt;
+use futures_util::{future::Abortable, StreamExt};
+use lifecycle::{state_allows_transfer, TransferRegistry};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -104,9 +106,12 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem> }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, transfer_controls: TransferRegistry, lifecycle: Mutex<()> }
 
-// One shared token bucket for ALL transfer workers across ALL jobs, so the
+// Transfer ownership is separate from persisted job state. A paused task may
+// still be inside an HTTP future; retaining its handle prevents Resume from
+// launching a second task until the first one has actually unwound.
+
 // aggregate never exceeds the global limit no matter how many workers or jobs
 // run (SPEC §8.6). Per-worker sleeping would multiply the limit by the worker
 // count; a shared bucket cannot.
@@ -534,6 +539,29 @@ fn job_state(app: &AppHandle, id: &str) -> Option<String> {
     state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.state.clone()))
 }
 
+fn transfer_can_continue(app: &AppHandle, id: &str) -> bool {
+    state_allows_transfer(job_state(app, id).as_deref())
+}
+
+fn transfer_is_active(state: &CoreState, id: &str) -> bool {
+    state.transfer_controls.is_active(id)
+}
+
+fn abort_transfer(state: &CoreState, id: &str) {
+    state.transfer_controls.abort(id);
+}
+
+fn spawn_transfer(app: &AppHandle, state: &CoreState, id: String, source: String) -> bool {
+    let Some(registration) = state.transfer_controls.claim(&id) else { return false; };
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = Abortable::new(acquire(handle.clone(), id.clone(), source), registration).await;
+        let state = handle.state::<CoreState>();
+        state.transfer_controls.release(&id);
+    });
+    true
+}
+
 async fn throttle(app: &AppHandle, id: &str, bytes: usize) -> bool {
     // Shared-bucket pacing with ~100ms responsiveness: take available tokens,
     // sleep only until enough accrue, and re-check job state every slice so
@@ -571,12 +599,25 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize) -> bool {
     job_state(app, id).as_deref() == Some("downloading")
 }
 
-async fn fragment_bytes(client: &reqwest::Client, source: &str, retries: u32) -> Result<Vec<u8>, String> {
+async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source: &str, retries: u32) -> Result<Vec<u8>, String> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     for _ in 0..attempts {
         match client.get(source).send().await {
-            Ok(response) if response.status().is_success() => match response.bytes().await { Ok(bytes) => return Ok(bytes.to_vec()), Err(error) => last_error = error.to_string() },
+            Ok(response) if response.status().is_success() => {
+                let mut bytes = Vec::new();
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(chunk) => {
+                            if !throttle(app, id, chunk.len()).await { return Err("paused".to_string()); }
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        Err(error) => { last_error = error.to_string(); bytes.clear(); break; }
+                    }
+                }
+                if !bytes.is_empty() { return Ok(bytes); }
+            }
             Ok(response) => last_error = format!("source returned {}", response.status()),
             Err(error) => last_error = error.to_string(),
         }
@@ -632,10 +673,12 @@ async fn range_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source
 }
 
 async fn acquire_ranges(app: AppHandle, id: String, source: String, response: reqwest::Response, total: u64) -> Result<(), String> {
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
     let state = app.state::<CoreState>();
     let (temp_path, max_connections, retry_count, replace_existing) = state.snapshot.lock().map_err(|_| "State unavailable".to_string()).and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.temp_path.clone(), job.max_connections, if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }, snapshot.settings.collision_behavior == "replace")).ok_or_else(|| "Acquisition no longer exists".to_string()))?;
     let identity = identity_from_response(&response, total);
     let first = response.bytes().await.map_err(|error| error.to_string())?;
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
     if first.len() != 1 { return Err("The range probe returned an unexpected payload".into()); }
     let Some(parent) = PathBuf::from(&temp_path).parent().map(PathBuf::from) else { return Err("Temporary path is invalid".into()); };
     tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
@@ -650,6 +693,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     }
     if !can_resume {
         completed_ranges = vec![ByteRange { start: 0, end: 0 }];
+        if !transfer_can_continue(&app, &id) { return Ok(()); }
         let mut initial = File::create(&temp_path).await.map_err(|error| error.to_string())?;
         initial.write_all(&first).await.map_err(|error| error.to_string())?;
         initial.set_len(total).await.map_err(|error| error.to_string())?;
@@ -662,6 +706,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     let ranges = missing_ranges(total, &completed_ranges, max_connections);
     let worker_count = max_connections.clamp(1, 32).min(ranges.len().max(1) as u32) as usize;
     let initial_downloaded = covered_bytes(&completed_ranges).min(total);
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
     emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = Some(total); job.downloaded = initial_downloaded; job.progress = initial_downloaded as f64 / total as f64 * 100.0; job.resumable = true; job.mode = "whole-object".into(); job.resource_identity = Some(identity.clone()); job.completed_ranges = completed_ranges.clone(); job.connections = if ranges.is_empty() { 0 } else { worker_count as u32 }; job.events.insert(0, job_event(&format!("Range support verified; {worker_count} workers started"), Some("success"))); });
     emit_snapshot(&app, &state);
     let downloaded = std::sync::Arc::new(AtomicU64::new(initial_downloaded));
@@ -707,6 +752,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     }
     let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() { if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = tokio::fs::create_dir_all(parent).await; } if replace_existing { let _ = tokio::fs::remove_file(&committed.1).await; } move_completed_file(&temp_path, &committed.1).await?; }
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
@@ -739,6 +785,7 @@ fn segment_identity(tracks: &[media::MediaTrack]) -> String {
 }
 
 async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, _mime: Option<String>) -> Result<(), String> {
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
     let client = http_client();
     let mut manifest_source = source;
     let mut manifest_body = body;
@@ -748,7 +795,9 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         if !is_hls { break; }
         if let Some(sources) = media::hls_variant_tracks(&manifest_source, &manifest_body) { hls_track_sources = Some(sources); break; }
         let Some(variant) = (if is_hls { media::hls_variant(&manifest_source, &manifest_body) } else { None }) else { break };
-        manifest_body = client.get(&variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.text().await.map_err(|error| error.to_string())?;
+        let response = client.get(&variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+        manifest_body = response.text().await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id) { return Ok(()); }
         manifest_source = variant;
     }
     let is_hls = manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
@@ -757,10 +806,14 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let mut tracks = Vec::with_capacity(sources.len());
         for (kind, track_source) in sources {
             let mut source = track_source;
-            let mut body = client.get(&source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.text().await.map_err(|error| error.to_string())?;
+            let response = client.get(&source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+            let mut body = response.text().await.map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id) { return Ok(()); }
             for _ in 0..4 {
                 let Some(variant) = media::hls_variant(&source, &body) else { break; };
-                body = client.get(&variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.text().await.map_err(|error| error.to_string())?;
+                let response = client.get(&variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+                body = response.text().await.map_err(|error| error.to_string())?;
+                if !transfer_can_continue(&app, &id) { return Ok(()); }
                 source = variant;
             }
             tracks.push(media::MediaTrack { kind, segments: media::parse_hls(&source, &body)? });
@@ -776,6 +829,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     let track_kinds = tracks.iter().map(|track| if track.kind.is_empty() { "media" } else { track.kind.as_str() }).collect::<Vec<_>>().join(" + ");
     let total_segments = track_lengths.iter().sum::<usize>();
     if total_segments == 0 { return Err("The manifest did not contain any downloadable segments".into()); }
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
     let state = app.state::<CoreState>();
     let (temp_path, max_connections, retry_count, replace_existing, stored_identity) = state.snapshot.lock().map_err(|_| "State unavailable".to_string()).and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.temp_path.clone(), job.max_connections, if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }, snapshot.settings.collision_behavior == "replace", job.segments.as_ref().and_then(|segments| segments.identity.clone()))).ok_or_else(|| "Acquisition no longer exists".to_string()))?;
     let segment_dir = PathBuf::from(format!("{temp_path}.segments"));
@@ -799,8 +853,10 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     }
     let missing_count = total_segments as usize - existing_segments.len();
     let existing_count = existing_segments.len() as u64;
-    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.mode = "segments".into(); job.media = true; job.mime = Some(container_mime.to_string()); job.media_tracks = Some(track_count as u32); job.resumable = true; job.downloaded = existing_bytes; job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0; job.connections = concurrency.min(missing_count) as u32; job.segments = Some(SegmentState { completed: existing_segments.len() as u32, total: total_segments, identity: Some(identity.clone()) }); if job.name == source_name(&job.source) { let stem = Path::new(&job.name).file_stem().and_then(|value| value.to_str()).unwrap_or("media"); job.name = format!("{stem}.{container_ext}"); let mut destination = PathBuf::from(&job.destination); destination.set_file_name(&job.name); job.destination = destination.to_string_lossy().into_owned(); } job.events.insert(0, job_event(&format!("Manifest parsed: {total_segments} fragments across {track_kinds}"), Some("success"))); });
+    if !transfer_can_continue(&app, &id) { return Ok(()); }
+    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.mode = "segments".into(); job.media = true; job.mime = Some(container_mime.to_string()); job.media_tracks = Some(track_count as u32); job.resumable = true; job.downloaded = existing_bytes; job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0; job.speed = 0; job.eta = None; job.connections = concurrency.min(missing_count) as u32; job.segments = Some(SegmentState { completed: existing_segments.len() as u32, total: total_segments, identity: Some(identity.clone()) }); if job.name == source_name(&job.source) { let stem = Path::new(&job.name).file_stem().and_then(|value| value.to_str()).unwrap_or("media"); job.name = format!("{stem}.{container_ext}"); let mut destination = PathBuf::from(&job.destination); destination.set_file_name(&job.name); job.destination = destination.to_string_lossy().into_owned(); } job.events.insert(0, job_event(&format!("Manifest parsed: {total_segments} fragments across {track_kinds}"), Some("success"))); });
     emit_snapshot(&app, &state);
+    let started = std::time::Instant::now();
     let completed = std::sync::Arc::new(AtomicU64::new(existing_segments.len() as u64));
     let downloaded = std::sync::Arc::new(AtomicU64::new(existing_bytes));
     let existing_segments = std::sync::Arc::new(existing_segments);
@@ -815,26 +871,43 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let downloaded = downloaded.clone();
         async move {
             if !matches!(job_state(&app, &id).as_deref(), Some("connecting") | Some("downloading") | Some("finalizing")) { return Err("paused".to_string()); }
-            let bytes = fragment_bytes(&client, &fragment.url, retry_count).await?;
+            let bytes = fragment_bytes(&client, &app, &id, &fragment.url, retry_count).await?;
+            if !transfer_can_continue(&app, &id) { return Err("paused".to_string()); }
             if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
+            if !transfer_can_continue(&app, &id) { return Err("paused".to_string()); }
             tokio::fs::write(&segment_temp_path, &bytes).await.map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id) { return Err("paused".to_string()); }
             tokio::fs::rename(&segment_temp_path, &segment_path).await.map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id) { return Err("paused".to_string()); }
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let size = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            let elapsed = started.elapsed().as_secs_f64().max(0.1);
+            let speed = ((size.saturating_sub(existing_bytes)) as f64 / elapsed) as u64;
+            let remaining = (total_segments as u64).saturating_sub(done);
+            let eta = if speed > 0 && remaining > 0 {
+                let average_fragment = size / done.max(1);
+                Some(format!("{}s left", (average_fragment.saturating_mul(remaining) / speed).max(1)))
+            } else {
+                None
+            };
             let state = app.state::<CoreState>();
             let finished_missing = done.saturating_sub(existing_count);
-            emit_job(&state, &id, |job| { job.downloaded = size; job.progress = done as f64 / total_segments as f64 * 100.0; job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) }); job.connections = concurrency.min((missing_count as u64).saturating_sub(finished_missing) as usize) as u32; });
+            if !transfer_can_continue(&app, &id) { return Err("paused".to_string()); }
+            emit_job(&state, &id, |job| { job.downloaded = size; job.progress = done as f64 / total_segments as f64 * 100.0; job.speed = speed; job.eta = eta.clone(); job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) }); job.connections = concurrency.min((missing_count as u64).saturating_sub(finished_missing) as usize) as u32; });
             emit_snapshot(&app, &state);
-            if !throttle(&app, &id, bytes.len()).await { return Err("paused".to_string()); }
             Ok::<(), String>(())
         }
     }).buffer_unordered(concurrency).collect::<Vec<_>>().await;
     if results.iter().any(Result::is_err) {
-        if matches!(job_state(&app, &id).as_deref(), Some("paused")) { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.events.insert(0, job_event("Paused with completed fragments preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
+        if matches!(job_state(&app, &id).as_deref(), Some("paused")) { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused with completed fragments preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
         let error = results.into_iter().find_map(Result::err).unwrap_or_else(|| "A media fragment failed".into());
         emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.speed = 0; job.events.insert(0, job_event("Media fragment acquisition failed", Some("error"))); });
         emit_snapshot(&app, &state);
         return Err(error);
+    }
+    if job_state(&app, &id).as_deref() != Some("downloading") {
+        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); }
+        return Ok(());
     }
     emit_job(&state, &id, |job| { job.state = "finalizing".into(); job.connections = 0; job.events.insert(0, job_event("Assembling ordered media fragments", Some("warning"))); });
     emit_snapshot(&app, &state);
@@ -878,42 +951,68 @@ async fn acquire_once(app: AppHandle, id: String, source: String) -> bool {
         Ok(response) if response.status().is_success() => response,
         _ => match client.get(&source).send().await {
             Ok(response) if response.status().is_success() => response,
-            Ok(response) => { let retryable = retryable_status(response.status()); emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
-            Err(error) => { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Ok(response) => { let retryable = retryable_status(response.status()); if !transfer_can_continue(&app, &id) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
+            Err(error) => { if !transfer_can_continue(&app, &id) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         }
     };
+    if !transfer_can_continue(&app, &id) { return false; }
     let valid_probe = response.status() != reqwest::StatusCode::PARTIAL_CONTENT || content_range(&response).map(|(start, end, total)| start == 0 && end == 0 && total > 0).unwrap_or(false);
     if !valid_probe {
         response = match client.get(&source).send().await {
             Ok(response) if response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT => response,
-            Ok(_response) => { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("The source returned an invalid partial response".into()); job.eta = None; job.events.insert(0, job_event("Source returned an invalid partial response", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
-            Err(error) => { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Ok(_response) => { if !transfer_can_continue(&app, &id) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("The source returned an invalid partial response".into()); job.eta = None; job.events.insert(0, job_event("Source returned an invalid partial response", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
+            Err(error) => { if !transfer_can_continue(&app, &id) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         };
     }
+    if !transfer_can_continue(&app, &id) { return false; }
     let response_mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string);
     if media::is_manifest_source(&source, response_mime.as_deref()) {
-        let result = match response.text().await { Ok(body) => acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone()).await, Err(error) => Err(error.to_string()) };
-        if let Err(error) = result { if job_state(&app, &id).as_deref() != Some("failed") { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.events.insert(0, job_event("Manifest acquisition failed", Some("error"))); }); emit_snapshot(&app, &state); } add_notification(&app, &state, &id, "failed"); }
+        if !transfer_can_continue(&app, &id) { return false; }
+        let result = match response.text().await { Ok(body) => { if !transfer_can_continue(&app, &id) { return false; } acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone()).await }, Err(error) => Err(error.to_string()) };
+        if let Err(error) = result {
+            if job_state(&app, &id).as_deref() == Some("paused") {
+                emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); });
+                emit_snapshot(&app, &state);
+            } else if job_state(&app, &id).as_deref() != Some("failed") {
+                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.events.insert(0, job_event("Manifest acquisition failed", Some("error"))); });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+            }
+        }
         return false;
     }
-    if let Some((start, end, ranged_total)) = content_range(&response) { if response.status() == reqwest::StatusCode::PARTIAL_CONTENT && start == 0 && end == 0 && ranged_total > 1 { if let Err(error) = acquire_ranges(app.clone(), id.clone(), source.clone(), response, ranged_total).await { if job_state(&app, &id).as_deref() != Some("failed") { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.events.insert(0, job_event("Range acquisition failed", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); } } return false; } }
+    if let Some((start, end, ranged_total)) = content_range(&response) { if response.status() == reqwest::StatusCode::PARTIAL_CONTENT && start == 0 && end == 0 && ranged_total > 1 { if !transfer_can_continue(&app, &id) { return false; } if let Err(error) = acquire_ranges(app.clone(), id.clone(), source.clone(), response, ranged_total).await {
+                if job_state(&app, &id).as_deref() == Some("paused") {
+                    emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); });
+                    emit_snapshot(&app, &state);
+                } else if job_state(&app, &id).as_deref() != Some("failed") {
+                    emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.events.insert(0, job_event("Range acquisition failed", Some("error"))); });
+                    emit_snapshot(&app, &state);
+                    add_notification(&app, &state, &id, "failed");
+                }
+            }
+            return false; } }
     let total = response.content_length();
     let temp_path = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.temp_path.clone()));
     let Some(temp_path) = temp_path else { return false; };
     if let Some(parent) = PathBuf::from(&temp_path).parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            if !transfer_can_continue(&app, &id) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Could not create the temporary folder: {error}")); job.events.insert(0, job_event("Could not create the temporary folder", Some("error"))); });
             emit_snapshot(&app, &state);
             add_notification(&app, &state, &id, "failed");
             return false;
         }
     }
+    if !transfer_can_continue(&app, &id) { return false; }
     let Ok(mut file) = File::create(&temp_path).await else {
+        if !transfer_can_continue(&app, &id) { return false; }
         emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("Could not open the temporary file".into()); job.events.insert(0, job_event("Could not open the temporary file", Some("error"))); });
         emit_snapshot(&app, &state);
         add_notification(&app, &state, &id, "failed");
         return false;
     };
+    if !transfer_can_continue(&app, &id) { return false; }
     emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = total; job.resumable = total.is_some(); job.connections = 1; job.mode = "single-stream".into(); job.mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string); job.events.insert(0, job_event("First native acquisition is receiving data", Some("success"))); });
     emit_snapshot(&app, &state);
     let started = std::time::Instant::now();
@@ -923,29 +1022,33 @@ async fn acquire_once(app: AppHandle, id: String, source: String) -> bool {
         if job_state(&app, &id).as_deref() != Some("downloading") { drop(stream); drop(file); emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); return false; }
         match chunk {
             Ok(bytes) => {
-                if let Err(error) = file.write_all(&bytes).await { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Could not write temporary data", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
+                if let Err(error) = file.write_all(&bytes).await { if !transfer_can_continue(&app, &id) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Could not write temporary data", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
+                if !transfer_can_continue(&app, &id) { return false; }
                 downloaded += bytes.len() as u64;
                 let speed = (downloaded as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
                 emit_job(&state, &id, |job| { job.downloaded = downloaded; job.speed = speed; job.progress = total.map(|value| downloaded as f64 / value as f64 * 100.0).unwrap_or(0.0); job.eta = total.and_then(|value| if speed > 0 { Some(format!("{}s left", (value.saturating_sub(downloaded) / speed).max(1))) } else { None }); });
                 emit_snapshot(&app, &state);
                 if !throttle(&app, &id, bytes.len()).await { drop(stream); drop(file); emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); return false; }
             }
-            Err(error) => { emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Network stream interrupted", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Err(error) => { if !transfer_can_continue(&app, &id) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Network stream interrupted", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         }
     }
     drop(file);
+    if !transfer_can_continue(&app, &id) { return false; }
     let replace_existing = state.snapshot.lock().ok().map(|snapshot| snapshot.settings.collision_behavior == "replace").unwrap_or(false);
     let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() {
         if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = std::fs::create_dir_all(parent); }
         if replace_existing { let _ = std::fs::remove_file(&committed.1); }
         if let Err(error) = move_completed_file(&temp_path, &committed.1).await {
+            if !transfer_can_continue(&app, &id) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
             add_notification(&app, &state, &id, "failed");
             return false;
         }
     }
+    if !transfer_can_continue(&app, &id) { return false; }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
@@ -953,17 +1056,20 @@ async fn acquire_once(app: AppHandle, id: String, source: String) -> bool {
 }
 
 async fn acquire(app: AppHandle, id: String, source: String) {
+    if !transfer_can_continue(&app, &id) { return; }
     let (automatic, retries) = {
         let state = app.state::<CoreState>();
         state.snapshot.lock().ok().map(|snapshot| (snapshot.settings.retry_automatically, snapshot.settings.max_retries)).unwrap_or((false, 0))
     };
     for attempt in 0..=retries {
+        if attempt == 0 && !transfer_can_continue(&app, &id) { return; }
         if attempt > 0 {
             let state = app.state::<CoreState>();
             if job_state(&app, &id).as_deref() != Some("failed") { return; }
             emit_job(&state, &id, |job| { job.state = "connecting".into(); job.error = None; job.connections = 0; job.events.insert(0, job_event(&format!("Automatic retry {attempt} of {retries}"), Some("warning"))); });
             emit_snapshot(&app, &state);
             sleep(Duration::from_millis((attempt as u64 * 500).min(5000))).await;
+            if !transfer_can_continue(&app, &id) { return; }
         }
         let retryable = acquire_once(app.clone(), id.clone(), source.clone()).await;
         if !automatic || !retryable || job_state(&app, &id).as_deref() != Some("failed") || attempt == retries { return; }
@@ -986,21 +1092,38 @@ fn open_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) { emit_job(&state, &id, |job| { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { job.state = "paused".into(); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Paused by user", Some("warning"))); } }); emit_snapshot(&app, &state); }
-
-#[tauri::command]
-fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
-    let Some((source, ready)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| (job.source.clone(), job.provisional == Some(true) && job.progress >= 100.0))) else { return; };
-    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = if ready { "finalizing" } else { "downloading" }.into(); job.connections = 0; job.eta = Some(if ready { "Ready to save" } else { "Resuming" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
+fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    abort_transfer(state.inner(), &id);
+    emit_job(&state, &id, |job| {
+        if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) {
+            job.state = "paused".into();
+            job.speed = 0;
+            job.connections = 0;
+            job.eta = Some("Paused".into());
+            job.events.insert(0, job_event("Paused by user", Some("warning")));
+        }
+    });
     emit_snapshot(&app, &state);
-    if !ready { tauri::async_runtime::spawn(acquire(app.clone(), id, source)); }
 }
 
 #[tauri::command]
-fn retry_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let source = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.source.clone())); emit_job(&state, &id, |job| { job.state = "connecting".into(); job.error = None; job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Retrying source", None)); }); emit_snapshot(&app, &state); if let Some(source) = source { tauri::async_runtime::spawn(acquire(app.clone(), id, source)); } }
+fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    if transfer_is_active(state.inner(), &id) { return; }
+    let Some((source, ready)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| (job.source.clone(), job.provisional == Some(true) && job.progress >= 100.0))) else { return; };
+    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = if ready { "finalizing" } else { "downloading" }.into(); job.connections = 0; job.eta = Some(if ready { "Ready to save" } else { "Resuming" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
+    emit_snapshot(&app, &state);
+    if !ready && !spawn_transfer(&app, state.inner(), id, source) { return; }
+}
+
+#[tauri::command]
+fn retry_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); if transfer_is_active(state.inner(), &id) { return; } let source = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.source.clone())); emit_job(&state, &id, |job| { job.state = "connecting".into(); job.error = None; job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Retrying source", None)); }); emit_snapshot(&app, &state); if let Some(source) = source { let _ = spawn_transfer(&app, state.inner(), id, source); } }
 
 #[tauri::command]
 fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    abort_transfer(state, id);
     let mut temp_path = None;
     if let Ok(mut snapshot) = state.snapshot.lock() {
         if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id && job.provisional == Some(true)) { temp_path = Some(job.temp_path.clone()); }
@@ -1015,21 +1138,22 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
 fn cancel_job(app: AppHandle, state: State<'_, CoreState>, id: String) { cancel_job_internal(&app, &state, &id); }
 
 #[tauri::command]
-fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let mut temporary = None; if let Ok(mut snapshot) = state.snapshot.lock() { temporary = snapshot.jobs.iter().find(|job| job.id == id && job.state != "completed").map(|job| job.temp_path.clone()); snapshot.jobs.retain(|job| job.id != id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } emit_snapshot(&app, &state); }
+fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); abort_transfer(state.inner(), &id); let mut temporary = None; if let Ok(mut snapshot) = state.snapshot.lock() { temporary = snapshot.jobs.iter().find(|job| job.id == id && job.state != "completed").map(|job| job.temp_path.clone()); snapshot.jobs.retain(|job| job.id != id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } emit_snapshot(&app, &state); }
 
 #[tauri::command]
-fn pause_all(app: AppHandle, state: State<'_, CoreState>) { if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { job.state = "paused".into(); job.speed = 0; job.connections = 0; } } } emit_snapshot(&app, &state); }
+fn pause_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(&app, &state); }
 
 #[tauri::command]
-fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = "downloading".into(); job.connections = 1; sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(&app, &state); for (id, source) in sources { tauri::async_runtime::spawn(acquire(app.clone(), id, source)); } }
+fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { job.state = "downloading".into(); job.connections = 1; sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(&app, &state); for (id, source) in sources { let _ = spawn_transfer(&app, state.inner(), id, source); } }
 
 fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput, show_window: bool) -> Result<String, String> {
+    let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable")?;
     let parsed = reqwest::Url::parse(&input.source).map_err(|_| "Use an HTTP or HTTPS URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") { return Err("Use an HTTP or HTTPS URL".into()); }
     if show_window {
         let target = state.reattach_target.lock().ok().and_then(|mut value| value.take());
         if let Some(target_id) = target {
-            let accepted = state.snapshot.lock().ok().map(|mut snapshot| {
+            let accepted = !transfer_is_active(state, &target_id) && state.snapshot.lock().ok().map(|mut snapshot| {
                 let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == target_id && job.provisional != Some(true) && source_compatible(&job.source, &input.source)) else { return false; };
                 job.source = input.source.clone();
                 job.domain = domain(&input.source);
@@ -1043,7 +1167,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
             }).unwrap_or(false);
             if accepted {
                 emit_snapshot(&app, state);
-                tauri::async_runtime::spawn(acquire(app.clone(), target_id.clone(), input.source));
+                let _ = spawn_transfer(&app, state, target_id.clone(), input.source);
                 return Ok(target_id);
             }
             if let Ok(mut value) = state.reattach_target.lock() { if value.is_none() { *value = Some(target_id); } }
@@ -1053,8 +1177,8 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| source_name(&input.source)); let destination = Path::new(&snapshot.settings.default_folder).join(&name).to_string_lossy().into_owned(); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
     let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
-    emit_snapshot(&app, &state);
-    tauri::async_runtime::spawn(acquire(app.clone(), id.clone(), input.source));
+    emit_snapshot(&app, state);
+    let _ = spawn_transfer(&app, state, id.clone(), input.source);
     if show_window {
         let label = format!("add-{}", id);
         let url = format!("index.html?window=add&id={id}");
@@ -1247,8 +1371,8 @@ fn install_tray(app: &tauri::AppHandle, intercept_downloads: bool, show_media_bu
         let id = event.id().as_ref();
         match id {
             "open-manager" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }
-            "pause-all" => { let state = app.state::<CoreState>(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { job.state = "paused".into(); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Paused from the system tray", Some("warning"))); } } } emit_snapshot(app, &state); }
-            "resume-all" => { let state = app.state::<CoreState>(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = "downloading".into(); job.connections = 1; job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(app, &state); for (id, source) in sources { tauri::async_runtime::spawn(acquire(app.clone(), id, source)); } }
+            "pause-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused from the system tray", Some("warning"))); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(app, &state); }
+            "resume-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { job.state = "downloading".into(); job.connections = 1; job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(app, &state); for (id, source) in sources { let _ = spawn_transfer(app, state.inner(), id, source); } }
             "browser-integration" => { let state = app.state::<CoreState>(); if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.intercept_downloads = !snapshot.settings.intercept_downloads; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); } emit_snapshot(app, &state); }
             "media-buttons" => { let state = app.state::<CoreState>(); if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.show_media_buttons = !snapshot.settings.show_media_buttons; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); } emit_snapshot(app, &state); }
             "bandwidth" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); let _ = window.eval("window.location.href = window.location.pathname + '?settings=network'"); } }
@@ -1279,7 +1403,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), lifecycle: Mutex::new(()) });
             save_snapshot(&app.state::<CoreState>());
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             if let Some(window) = app.get_webview_window("main") {
@@ -1302,7 +1426,7 @@ fn main() {
             } else if std::env::args().any(|value| value == "--startup") && !show_manager_at_startup {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
             }
-            for (id, source) in recovered { tauri::async_runtime::spawn(acquire(app.handle().clone(), id, source)); }
+            for (id, source) in recovered { let _ = spawn_transfer(app.handle(), app.state::<CoreState>().inner(), id, source); }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job])

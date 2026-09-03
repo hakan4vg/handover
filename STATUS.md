@@ -236,3 +236,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   offset zero for every range request. Historical SHA values in earlier log
   entries refer to the previous generator; current fixtures are deterministic
   and the current values above are the authoritative proof.
+
+## 2026-09-03 — Transfer lifecycle ownership and cancellation races
+
+- Audit finding: detached acquisition tasks were not represented separately
+  from persisted job state. Resume could launch a duplicate task, and a stale
+  task could overwrite pause/cancel while inside probing, network waits,
+  filesystem work, or finalization.
+- Added `src-tauri/src/lifecycle.rs`: one per-job transfer owner, atomic claim
+  rejection for duplicate starts, explicit abort, release-on-unwind, and the
+  persisted-state gate (`connecting`/`downloading`/`finalizing` only).
+- Wired `spawn_transfer()` and all start paths (provisional, retry, resume,
+  bulk resume, tray resume, and startup recovery) through that owner. Pause,
+  cancel, remove, and bulk pause abort before changing state. Existing slow-HLS
+  streaming and aggregate limiter work is preserved.
+- Added deterministic lifecycle coverage: exclusive claim/reclaim, eight-way
+  concurrent claim race (one winner), aborting a pending transfer, and active
+  state gating.
+- Verified: focused lifecycle tests 4/4, repeated five times; full Rust suite
+  11/11; `cargo build`; `npm run build`; `git diff --check`; `server.py`
+  compilation; slow manifest HTTP 200/163 bytes; slow fragment HTTP
+  1,048,576 bytes.
+- The GUI pause/resume proof was not retried through XTEST. The isolated
+  display repeatedly returned X11 `XTEST BadValue` for generated keyboard and
+  click events. The supported deterministic lifecycle tests and real fixture
+  probes were used instead. New `lifecycle.rs` passes rustfmt; the whole
+  repository remains non-rustfmt-clean because existing compact source files
+  would require an unrelated mass reformat.

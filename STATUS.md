@@ -395,3 +395,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   started.
 - Verified: Rust 24/24; `cargo build`; settings probe PASS; `diff --check`.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — Aggregate proven shared across simultaneous jobs
+
+- Extended `fixtures/limiter_probe.py` with `DM_JOBS`: extra captures launch
+  as separate processes and reach the resident app through single-instance
+  forwarding, exactly like rapid browser captures. The poll loop measures the
+  COMBINED downloaded-bytes rate plus a per-job no-starvation check.
+- Result with 2 concurrent 8 MiB captures under one 1 MB/s global:
+  `combined 2 -> 14,680,065 bytes over 14.5s = 1.01 MB/s`, both jobs
+  progressed, first job byte-identical. The global limit paces the sum, not
+  each job independently (SPEC §8.6: "must not become 50 MB/s independently
+  for every job"). Single-job default re-verified at 0.98 MB/s after the
+  probe rework.
+- Verified: probe PASS (2-job) + PASS (1-job regression); `diff --check`.
+  `fixtures/server.py` untouched.

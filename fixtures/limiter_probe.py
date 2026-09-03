@@ -27,6 +27,10 @@ CAPTURE_URL = "http://127.0.0.1:8901/file/range.bin"
 LIMIT_MB = os.environ.get("DM_LIMIT_MB", "1")
 JOB_CAP_BPS = os.environ.get("DM_JOB_CAP_BPS")
 EXPECT_MB = float(os.environ.get("DM_EXPECT_MB", "1" if LIMIT_MB != "none" else "0.5"))
+# DM_JOBS: concurrent captures in the one app instance (default 1). With 2+,
+# the assertion is on the COMBINED rate (the global limit paces the sum of
+# active jobs) plus a no-starvation check per job.
+NUM_JOBS = max(1, int(os.environ.get("DM_JOBS", "1")))
 
 
 def env():
@@ -106,36 +110,63 @@ def main():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    samples = []
+    forwarders = []
+    # Extra captures go through single-instance forwarding into the same
+    # resident app, exactly like two rapid browser captures would.
+    for extra in range(1, NUM_JOBS):
+        for _ in range(30):
+            if len(get_jobs()) >= extra:
+                break
+            time.sleep(0.5)
+        forwarders.append(
+            subprocess.Popen(
+                [BIN, "--capture", capture],
+                env=env(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        )
+    for proc in forwarders:
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    samples: list = []
     job = None
     try:
-        deadline = time.time() + 90
+        deadline = time.time() + 150
         while time.time() < deadline:
             time.sleep(0.5)
             jobs = get_jobs()
-            if not jobs:
+            if len(jobs) < NUM_JOBS:
                 continue
             job = jobs[0]
+            total_downloaded = sum(item.get("downloaded", 0) for item in jobs)
             samples.append(
-                (time.time(), job.get("downloaded", 0), job.get("state"))
+                (time.time(), total_downloaded, [item.get("state") for item in jobs])
             )
-            if job.get("state") in ("finalizing", "completed"):
+            if all(item.get("state") in ("finalizing", "completed") for item in jobs):
                 break
-        states = sorted({state for _, _, state in samples})
+        states = sorted({state for _, _, group in samples for state in group})
         print(f"observed states: {states}", flush=True)
         downloading = [
-            (t, n) for (t, n, s) in samples if s == "downloading" and n > 0
+            (t, n) for (t, n, group) in samples if "downloading" in group and n > 0
         ]
         assert len(downloading) >= 6, f"too few downloading samples: {len(samples)}"
         (t0, n0), (t1, n1) = downloading[0], downloading[-1]
         rate = (n1 - n0) / max(t1 - t0, 0.01)
         expected = EXPECT_MB * 1e6
         print(
-            f"downloaded {n0} -> {n1} bytes over {t1 - t0:.1f}s = {rate / 1e6:.2f} MB/s (expect ~{EXPECT_MB})",
+            f"combined {n0} -> {n1} bytes over {t1 - t0:.1f}s = {rate / 1e6:.2f} MB/s (expect ~{EXPECT_MB})",
             flush=True,
         )
         assert 0.5 * expected <= rate <= 1.6 * expected, f"rate {rate} outside paced band"
         print(f"RATE-ASSERT: PASS ({rate / 1e6:.2f} MB/s within band of ~{EXPECT_MB} MB/s)", flush=True)
+        if NUM_JOBS > 1:
+            finals = {item["id"]: item for item in get_jobs()}
+            for job_id, item in finals.items():
+                assert item.get("downloaded", 0) > 0, f"{job_id} starved"
+            print(f"NO-STARVATION: PASS ({len(finals)} jobs all progressed)", flush=True)
 
         if job.get("state") in ("finalizing", "completed"):
             temp_path = job["tempPath"]

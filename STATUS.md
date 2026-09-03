@@ -497,3 +497,15 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   (1.05 MB/s, 4/4).
 - Verified: probe PASS (DASH) + PASS (HLS regression); `diff --check`.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — DASH template + HLS master paths proven
+
+- `/dash/template.mpd` (SegmentTemplate + timeline): 4/4 segments, 32,058
+  bytes, downloading → finalizing. PASS.
+- `/hls/master.m3u8` (master → variant resolution): 6/6 segments, 18,048
+  bytes — matches the historical HLS VOD size exactly. PASS.
+- Both ran completion-only (`DM_SKIP_RATE=1`); files are too small for rate
+  windows. With these, every fixture manifest shape on the current binary is
+  covered: HLS VOD, HLS master, HLS slow, DASH SegmentList, DASH template
+  (live HLS/DASH correctly rejected at the parser unit level).
+- Verified: probe PASS x2; `diff --check`. `fixtures/server.py` untouched.

@@ -411,6 +411,15 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verified: probe PASS (2-job) + PASS (1-job regression); `diff --check`.
   `fixtures/server.py` untouched.
 
+## 2026-09-03 — Range-resume math unit coverage
+
+- `merge_range` / `covered_bytes` / `missing_ranges` previously had zero unit
+  coverage despite carrying pause/resume persistence. Added 3 tests: overlap
+  + adjacency coalescing, disjoint ordering, bridge collapse; inclusive-end
+  byte counts; 1 MiB chunking of a 5 MiB gap set, full-coverage emptiness,
+  middle-gap complement, zero-length no-op.
+- Verified: Rust 27/27. `fixtures/server.py` untouched.
+
 ## 2026-09-03 — Per-job cap clearing (keep/clear/set contract)
 
 - Follow-up to the per-job slice: omitting the cap at commit kept the old
@@ -427,12 +436,3 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verified: Rust 28/28; vitest 11/11; `tsc -b`; `build:all`; `diff --check`;
   headless default probe on the rebuilt binary 0.98 MB/s + byte identity.
   `fixtures/server.py` untouched.
-
-## 2026-09-03 — Range-resume math unit coverage
-
-- `merge_range` / `covered_bytes` / `missing_ranges` previously had zero unit
-  coverage despite carrying pause/resume persistence. Added 3 tests: overlap
-  + adjacency coalescing, disjoint ordering, bridge collapse; inclusive-end
-  byte counts; 1 MiB chunking of a 5 MiB gap set, full-coverage emptiness,
-  middle-gap complement, zero-length no-op.
-- Verified: Rust 27/27. `fixtures/server.py` untouched.

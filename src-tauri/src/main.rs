@@ -1655,4 +1655,55 @@ mod capture_tests {
         assert_eq!(parsed.max_connections, defaults.max_connections);
         assert_eq!(parsed.bandwidth_limit, defaults.bandwidth_limit);
     }
+
+    fn ranges(pairs: &[(u64, u64)]) -> Vec<super::ByteRange> {
+        pairs.iter().map(|(start, end)| super::ByteRange { start: *start, end: *end }).collect()
+    }
+
+    fn pairs(ranges: &[super::ByteRange]) -> Vec<(u64, u64)> {
+        ranges.iter().map(|range| (range.start, range.end)).collect()
+    }
+
+    #[test]
+    fn merge_range_coalesces_overlap_and_adjacency() {
+        use super::merge_range;
+        // Overlapping.
+        assert_eq!(pairs(&merge_range(&ranges(&[(0, 100)]), super::ByteRange { start: 50, end: 200 })), [(0, 200)]);
+        // Adjacent (end+1) merges — byte ranges are inclusive.
+        assert_eq!(pairs(&merge_range(&ranges(&[(0, 99)]), super::ByteRange { start: 100, end: 199 })), [(0, 199)]);
+        // Disjoint stays split and sorted even when added out of order.
+        assert_eq!(pairs(&merge_range(&ranges(&[(500, 599)]), super::ByteRange { start: 0, end: 99 })), [(0, 99), (500, 599)]);
+        // A bridge spanning two ranges collapses all three.
+        assert_eq!(
+            pairs(&merge_range(&ranges(&[(0, 99), (200, 299)]), super::ByteRange { start: 50, end: 250 })),
+            [(0, 299)]
+        );
+    }
+
+    #[test]
+    fn covered_bytes_counts_inclusive_ends() {
+        use super::covered_bytes;
+        assert_eq!(covered_bytes(&[]), 0);
+        assert_eq!(covered_bytes(&ranges(&[(0, 0)])), 1);
+        assert_eq!(covered_bytes(&ranges(&[(0, 99), (200, 299)])), 200);
+    }
+
+    #[test]
+    fn missing_ranges_returns_complement_in_bounded_chunks() {
+        use super::missing_ranges;
+        // 5 MiB untouched with 8 workers: chunk = max(5MiB/32, 1MiB) = 1MiB.
+        let missing = missing_ranges(5 * 1024 * 1024, &[], 8);
+        assert_eq!(missing.len(), 5);
+        assert_eq!(missing[0], (0, 1024 * 1024 - 1));
+        assert_eq!(missing[4], (4 * 1024 * 1024, 5 * 1024 * 1024 - 1));
+        // Fully covered means no work left.
+        assert!(missing_ranges(1024, &ranges(&[(0, 1023)]), 8).is_empty());
+        // A middle gap is the only work; completed edges are excluded.
+        assert_eq!(
+            missing_ranges(3 * 1024 * 1024, &ranges(&[(0, 1024 * 1024 - 1), (2 * 1024 * 1024, 3 * 1024 * 1024 - 1)]), 8),
+            [(1024 * 1024, 2 * 1024 * 1024 - 1)]
+        );
+        // Zero-length resources need no ranges.
+        assert!(missing_ranges(0, &[], 8).is_empty());
+    }
 }

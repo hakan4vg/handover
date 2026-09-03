@@ -118,3 +118,61 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   Curl-verified every shape. Deterministic seeded bytes for resume/identity.
 - `npm run build:all` passes (frontend + extension).
 - Full `cargo build` (Linux link against system webkit/gtk) running.
+
+## 2026-09-03 — Extension proven in a real browser (Xvfb + CDP rig)
+
+- Rig: `fixtures/cdp_shot.py` (CDP screenshot + evaluate via websocket-client),
+  `fixtures/real.mp4` (ffmpeg testsrc, committed), `/page/video.html`.
+- Fixed along the way (each reproduced, then verified):
+  - MV3 content scripts cannot `import` ESM chunks (SyntaxError, extension
+    disabled). Helpers inlined into content.ts; background/popup still share.
+  - Policy fetch raced SW wakeup and failed silently once. Content now retries
+    every 1s until the first answer, then backs off.
+  - Button vanished under the cursor: hovering it un-hovers the video.
+    `pick()` keeps the current player while its button is hovered.
+  - rAF can be throttled to zero (observed r0). `track()` positions directly
+    too; rAF is smooth-follow only, never load-bearing.
+- Wedge hunt: page renderer fully wedged (frozen frames, CDP evaluate timeout,
+  no input) with the full script, alive with a title-only script. Bisected
+  V1→V4: neither the whole-document MutationObserver nor per-tick
+  `document.title` writes wedge alone — TOGETHER they self-drive
+  (write → childList mutation → observer → write …) and starve the main
+  thread. Removed all debug DOM writes, kept the observer, and documented the
+  idempotence discipline in a comment on `track()`.
+- Test-env lesson: scrot/X captures under Xvfb do NOT show compositor
+  overlays (button + marker invisible though hit-test-perfect). Chrome's own
+  `Page.captureScreenshot` is authoritative — and it shows the blue Download
+  button painted over the playing video. Proof: `artifacts/cdp-final.png`.
+- Full app links on Linux: `src-tauri/target/debug/download-manager` (297M).
+
+## 2026-09-03 — Real app running on Linux (native backend, fresh DB)
+
+- Ran the actual binary under Xvfb with sandboxed HOME (`/tmp/dm-home`):
+  manager renders, "Connected", empty DB, tray icon up. Screenshots in
+  `artifacts/app-*.png` (X captures are fine for the app UI itself).
+- Residency proof: app wrote `~/.config/autostart/download-manager.desktop`
+  plus NativeMessagingHosts manifests for Chrome/Chromium/Edge/Vivaldi/Brave.
+  The cross-platform registration code works for real.
+- Fixed from these screenshots: empty-state "No all downloads" → "No
+  downloads"; footer spacing tightened again (DejaVu is wider than Segoe).
+- Tauri lesson: frontend dist is EMBEDDED at compile time (`cargo build`),
+  not read from disk at runtime. Rebuild binary after every frontend change
+  before re-testing the app (only `tauri dev` uses the live dev server).
+
+## 2026-09-03 — First full end-to-end download (M1 proof on Linux)
+
+- Manual Add URL → 8MB range file → provisional (7 live connections, real
+  bytes/progress/resumable) → Download → Completed, dialog closed.
+- Output `/tmp/dm-home2/Downloads/range.bin` is SHA256-IDENTICAL to the
+  fixture source (`b061c26e…`). Mode A multi-connection engine verified live.
+- Fixed en route:
+  - Windows `\\` path joins in `start_provisional` created literal-backslash
+    filenames on Linux (proven by a committed `Downloads\range.bin`). Now
+    `Path::join` everywhere in core logic.
+  - Add-dialog "Connections" metric said "Connecting…" for finished
+    provisionals → state-aware copy.
+- Test note: xdotool mouse CLICKS dispatch fine in webkit, but :hover never
+  updates (same XTest quirk as Chrome). Keyboard (Tab/Space/typing) works
+  everywhere — commit went through Tab×4+Space after clicks mysteriously
+  missed one specific button 4 times (cause undetermined; possibly focus).
+  Clicks otherwise reliable (Add URL, Start Download).

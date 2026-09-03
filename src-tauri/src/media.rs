@@ -65,6 +65,8 @@ pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
     Ok(segments)
 }
 
+/// Flattened single-track view; the engine uses parse_dash_tracks, tests use this.
+#[allow(dead_code)]
 pub fn parse_dash(source: &str, body: &str) -> Result<Vec<Segment>, String> {
     Ok(parse_dash_tracks(source, body)?.into_iter().flat_map(|track| track.segments).collect())
 }

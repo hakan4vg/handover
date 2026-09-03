@@ -546,3 +546,12 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - UI rig (vite mock :4317, headless Chromium :9223) stopped after the run;
   the pre-existing `:4173` native-mode vite was left untouched.
 - Verified: 4/4 surfaces visually correct. `fixtures/server.py` untouched.
+
+## 2026-09-03 — CDP driver preserved + HEAD sweep green
+
+- `fixtures/cdp_drive.py`: the stdlib-only CDP driver used for the UI
+  verification above, preserved in-repo (navigate + evaluate + screenshot,
+  no third-party deps). The older `cdp_shot.py` stays for its video-page
+  workflow; this one is the general-purpose equivalent.
+- Full sweep on HEAD: Rust 28/28, vitest 11/11, `tsc -b` clean.
+  `fixtures/server.py` untouched.

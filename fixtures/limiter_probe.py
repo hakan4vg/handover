@@ -32,16 +32,28 @@ CAPTURE_URL = os.environ.get(
 MANIFEST_MODE = os.environ.get("DM_MANIFEST_MODE", "") == "1" or bool(
     os.environ.get("DM_MANIFEST_URL")
 )
-CAPTURE_NAME = (
-    "slow"
-    if MANIFEST_MODE
-    else ("norange" if "no-range" in CAPTURE_URL else "range.bin")
+CAPTURE_NAME = os.environ.get(
+    "DM_CAPTURE_NAME",
+    (
+        "slow"
+        if MANIFEST_MODE
+        else ("norange" if "no-range" in CAPTURE_URL else "range.bin")
+    ),
 )
 # DM_EXPECT_BYTES: finished temp-file size (default 8 MiB range.bin).
 EXPECT_BYTES = int(os.environ.get("DM_EXPECT_BYTES", str(8 * 1024 * 1024)))
 # DM_MIN_SAMPLES: downloading progress samples required (default 6; small
 # files at low limits finish in fewer polls).
 MIN_SAMPLES = int(os.environ.get("DM_MIN_SAMPLES", "6"))
+# DM_EXPECT_SEGMENTS / DM_EXPECT_DOWNLOADED: manifest-mode end state
+# (defaults pin the slow-HLS fixture: 4 fragments, 4 MiB).
+EXPECT_SEGMENTS = int(os.environ.get("DM_EXPECT_SEGMENTS", "4"))
+EXPECT_DOWNLOADED = int(
+    os.environ.get("DM_EXPECT_DOWNLOADED", str(4 * 1024 * 1024))
+)
+# DM_SKIP_RATE=1: skip the rate assertion (completion-only runs for small
+# fixtures where no meaningful rate window exists).
+SKIP_RATE = os.environ.get("DM_SKIP_RATE", "") == "1"
 # DM_LIMIT_MB: "none" for unlimited global, else a number (default "1").
 # DM_JOB_CAP_BPS: per-job cap in bytes/sec for the capture (default unset).
 # DM_EXPECT_MB: expected effective rate in MB/s (default follows the limit).
@@ -184,9 +196,10 @@ def main():
                 for (t, _, group) in samples
                 if "finalizing" in group or "completed" in group
             )
-            assert t1 - t0 >= 1.5, f"downloading phase too short: {t1 - t0:.1f}s"
             n0 = 0
             n1 = max(n for (_, n, _) in samples)
+            if not SKIP_RATE:
+                assert t1 - t0 >= 1.5, f"downloading phase too short: {t1 - t0:.1f}s"
         else:
             assert len(downloading) >= MIN_SAMPLES, f"too few downloading samples: {len(samples)}"
             (t0, n0), (t1, n1) = downloading[0], downloading[-1]
@@ -196,8 +209,9 @@ def main():
             f"combined {n0} -> {n1} bytes over {t1 - t0:.1f}s = {rate / 1e6:.2f} MB/s (expect ~{EXPECT_MB})",
             flush=True,
         )
-        assert 0.5 * expected <= rate <= 1.6 * expected, f"rate {rate} outside paced band"
-        print(f"RATE-ASSERT: PASS ({rate / 1e6:.2f} MB/s within band of ~{EXPECT_MB} MB/s)", flush=True)
+        if not SKIP_RATE:
+            assert 0.5 * expected <= rate <= 1.6 * expected, f"rate {rate} outside paced band"
+            print(f"RATE-ASSERT: PASS ({rate / 1e6:.2f} MB/s within band of ~{EXPECT_MB} MB/s)", flush=True)
         if NUM_JOBS > 1:
             finals = {item["id"]: item for item in get_jobs()}
             for job_id, item in finals.items():
@@ -209,9 +223,14 @@ def main():
             segments = job.get("segments") or {}
             done, total = segments.get("completed"), segments.get("total")
             print(f"segments: {done}/{total} downloaded={job.get('downloaded')}", flush=True)
-            assert (done, total) == (4, 4), f"slow manifest incomplete: {segments}"
-            assert job.get("downloaded") == 4 * 1024 * 1024, job.get("downloaded")
-            print("SEGMENT-COMPLETION: PASS (4/4 fragments, 4 MiB)", flush=True)
+            assert (done, total) == (EXPECT_SEGMENTS, EXPECT_SEGMENTS), (
+                f"manifest incomplete: {segments}"
+            )
+            assert job.get("downloaded") == EXPECT_DOWNLOADED, job.get("downloaded")
+            print(
+                f"SEGMENT-COMPLETION: PASS ({done}/{total} fragments)",
+                flush=True,
+            )
         elif job.get("state") in ("finalizing", "completed"):
             temp_path = job["tempPath"]
             for _ in range(60):

@@ -483,3 +483,17 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   job events show the retry attempts, error names the 503. PASS.
 - Verified: probe PASS x3 modes; `diff --check`. `fixtures/server.py`
   untouched.
+
+## 2026-09-03 — DASH SegmentList path on the current binary
+
+- The manifest probe only covered HLS. Generalized its end-state knobs
+  (`DM_CAPTURE_NAME`, `DM_EXPECT_SEGMENTS`, `DM_EXPECT_DOWNLOADED`,
+  `DM_SKIP_RATE` for small fixtures with no meaningful rate window) and ran
+  `/dash/manifest.mpd`: 6/6 segments, 87,235 bytes, downloading →
+  finalizing — byte count matches the historical DASH e2e exactly. PASS.
+- First run with guessed expectations failed on the byte count (actual
+  87,235) while segments already read 6/6; pinned the observed deterministic
+  values and re-ran green. HLS slow re-verified after the shared-code edits
+  (1.05 MB/s, 4/4).
+- Verified: probe PASS (DASH) + PASS (HLS regression); `diff --check`.
+  `fixtures/server.py` untouched.

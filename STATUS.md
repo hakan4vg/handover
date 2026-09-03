@@ -618,3 +618,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verification: `npm run build:extension`, `npx vitest run`, `npx tsc -b`, and
   `git diff --check` all passed during the implementation. No XTEST input was
   used. `fixtures/server.py` remains untouched.
+
+## 2026-09-04 — Real browser media-button capture proven
+
+- Started the fixture server from its required `fixtures/` working directory
+  on `:18902`; this matters because `/media/real.mp4` is intentionally loaded
+  relative to that directory. The endpoint returned a playable 34,524-byte MP4
+  (`readyState=4`, `paused=false`).
+- Fresh Chromium loaded `/page/video.html` with the built extension. The real
+  content script injected `#dm-media-download-button`; DOM inspection confirmed
+  the playing video and button. Clicking that button sent `media-capture` over
+  native messaging and created a second job in the resident app DB.
+- The media Add Download window was inspected and its real Download button was
+  activated through the WebKit remote inspector, not XTEST. The row became
+  `provisional=false, state=completed`, with 34,524/34,524 bytes. Final output
+  `/tmp/dm-confirm2.Tpp5VR/Downloads/real.mp4` is 34,524 bytes and `cmp` passes
+  against a fresh `:18902/media/real.mp4` fetch.
+- The existing completed ordinary pre-browser job remained intact. Total DB
+  rows after the media confirmation: exactly 2, both completed and byte-
+  verified. The media temp `.part` was removed.
+- This closes the real progressive-media browser flow in addition to the
+  explicit ordinary-download flow. The fixture server source remains
+  untouched.

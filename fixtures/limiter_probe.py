@@ -20,7 +20,14 @@ import urllib.request
 BIN = "/srv/repos/downloadmanager/src-tauri/target/debug/download-manager"
 HOME = os.environ.get("DM_HOME", "/tmp/dm-limit-test")
 DB = os.path.join(HOME, ".local/share/com.downloadmanager.app/download-manager.db")
-CAPTURE_URL = "http://127.0.0.1:8901/file/range.bin"
+CAPTURE_URL = os.environ.get(
+    "DM_MANIFEST_URL", "http://127.0.0.1:8901/file/range.bin"
+)
+# Manifest mode (HLS/DASH): byte-identity against the manifest URL is
+# meaningless (the product is assembled media), so the end assertion is
+# segments completed == total with the full byte count downloaded instead.
+MANIFEST_MODE = bool(os.environ.get("DM_MANIFEST_URL"))
+CAPTURE_NAME = "slow" if MANIFEST_MODE else "range.bin"
 # DM_LIMIT_MB: "none" for unlimited global, else a number (default "1").
 # DM_JOB_CAP_BPS: per-job cap in bytes/sec for the capture (default unset).
 # DM_EXPECT_MB: expected effective rate in MB/s (default follows the limit).
@@ -100,7 +107,7 @@ def main():
     print(f"seeded global={LIMIT_MB} MB/s job_cap={JOB_CAP_BPS} expect={EXPECT_MB} MB/s", flush=True)
 
     # Pass 2: real capture of the 8 MiB fixture.
-    payload: dict = {"source": CAPTURE_URL, "name": "range.bin"}
+    payload: dict = {"source": CAPTURE_URL, "name": CAPTURE_NAME}
     if JOB_CAP_BPS:
         payload["bandwidthLimit"] = int(JOB_CAP_BPS)
     capture = json.dumps({"type": "capture-acquisition", "payload": payload})
@@ -152,8 +159,23 @@ def main():
         downloading = [
             (t, n) for (t, n, group) in samples if "downloading" in group and n > 0
         ]
-        assert len(downloading) >= 6, f"too few downloading samples: {len(samples)}"
-        (t0, n0), (t1, n1) = downloading[0], downloading[-1]
+        if MANIFEST_MODE:
+            # Parallel same-size fragments complete together, so progress jumps
+            # 0 -> total at the end and progress samples may not exist. Measure
+            # wall-clock across the downloading phase instead.
+            assert any("downloading" in group for (_, _, group) in samples), "never entered downloading"
+            t0 = next(t for (t, _, group) in samples if "downloading" in group)
+            t1 = next(
+                t
+                for (t, _, group) in samples
+                if "finalizing" in group or "completed" in group
+            )
+            assert t1 - t0 >= 1.5, f"downloading phase too short: {t1 - t0:.1f}s"
+            n0 = 0
+            n1 = max(n for (_, n, _) in samples)
+        else:
+            assert len(downloading) >= 6, f"too few downloading samples: {len(samples)}"
+            (t0, n0), (t1, n1) = downloading[0], downloading[-1]
         rate = (n1 - n0) / max(t1 - t0, 0.01)
         expected = EXPECT_MB * 1e6
         print(
@@ -168,7 +190,15 @@ def main():
                 assert item.get("downloaded", 0) > 0, f"{job_id} starved"
             print(f"NO-STARVATION: PASS ({len(finals)} jobs all progressed)", flush=True)
 
-        if job.get("state") in ("finalizing", "completed"):
+        if MANIFEST_MODE:
+            assert job is not None, "no job observed"
+            segments = job.get("segments") or {}
+            done, total = segments.get("completed"), segments.get("total")
+            print(f"segments: {done}/{total} downloaded={job.get('downloaded')}", flush=True)
+            assert (done, total) == (4, 4), f"slow manifest incomplete: {segments}"
+            assert job.get("downloaded") == 4 * 1024 * 1024, job.get("downloaded")
+            print("SEGMENT-COMPLETION: PASS (4/4 fragments, 4 MiB)", flush=True)
+        elif job.get("state") in ("finalizing", "completed"):
             temp_path = job["tempPath"]
             for _ in range(60):
                 if os.path.exists(temp_path) and os.path.getsize(temp_path) == 8 * 1024 * 1024:

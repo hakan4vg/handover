@@ -436,3 +436,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verified: Rust 28/28; vitest 11/11; `tsc -b`; `build:all`; `diff --check`;
   headless default probe on the rebuilt binary 0.98 MB/s + byte identity.
   `fixtures/server.py` untouched.
+
+## 2026-09-03 — Segment/fragment path paced on the reworked binary
+
+- All limiter proofs so far exercised `range_bytes`. Extended the probe with
+  `DM_MANIFEST_URL` mode for the slow-HLS manifest (4 x 1 MiB fragments via
+  `fragment_bytes`, a different throttle call site): 4,194,304 bytes over
+  4.0s = 1.05 MB/s under a 1 MB/s global, 4/4 segments, `finalizing`. PASS.
+- Measurement lesson: parallel same-size fragments complete together, so
+  segmented progress jumps 0 -> total at the end instead of ramping. The
+  probe measures wall-clock across the downloading phase in manifest mode
+  rather than progress samples. The coarseness is honest (real completed
+  fragments only) but worth knowing for progress UX with large fragments.
+- Range default re-verified after the probe rework (0.98 MB/s + identity).
+- Verified: probe PASS (manifest) + PASS (range regression); `diff --check`.
+  `fixtures/server.py` untouched.

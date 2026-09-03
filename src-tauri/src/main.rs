@@ -38,6 +38,11 @@ struct DownloadJob {
     eta: Option<String>,
     connections: u32,
     max_connections: u32,
+    /// Per-job bandwidth cap in bytes/sec (SPEC §8.6: constrains the job
+    /// inside the global limit). None = no per-job cap. Serde default keeps
+    /// databases written before this field existed loadable.
+    #[serde(default)]
+    bandwidth_limit: Option<u64>,
     mode: String,
     media: bool,
     media_details: Option<String>,
@@ -106,7 +111,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem> }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, transfer_controls: TransferRegistry, lifecycle: Mutex<()> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()> }
 
 // Transfer ownership is separate from persisted job state. A paused task may
 // still be inside an HTTP future; retaining its handle prevents Resume from
@@ -119,11 +124,11 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CommitInput { name: String, destination: String, max_connections: Option<u32> }
+struct CommitInput { name: String, destination: String, max_connections: Option<u32>, bandwidth_limit: Option<u64> }
 
 fn now_label() -> String { "Just now".to_string() }
 
@@ -580,8 +585,31 @@ fn spawn_transfer(app: &AppHandle, state: &CoreState, id: String, source: String
         let _ = Abortable::new(acquire(handle.clone(), id.clone(), source), registration).await;
         let state = handle.state::<CoreState>();
         state.transfer_controls.release(&id);
+        if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(&id); };
     });
     true
+}
+
+// SPEC §8.6: a per-job cap constrains the job inside the global limit — the
+// binding rate is the minimum of the two. Non-positive values are ignored so
+// a zero can never wedge a transfer.
+fn effective_rate(global_bps: Option<f64>, job_bps: Option<f64>) -> Option<f64> {
+    match (global_bps.filter(|rate| *rate > 0.0), job_bps.filter(|rate| *rate > 0.0)) {
+        (Some(global), Some(job)) => Some(global.min(job)),
+        (Some(global), None) => Some(global),
+        (None, Some(job)) => Some(job),
+        (None, None) => None,
+    }
+}
+
+fn bucket_wait(bucket: &mut BandwidthBucket, rate: f64, capacity: f64, remaining: &mut f64) -> Option<f64> {
+    let now = std::time::Instant::now();
+    bucket.tokens = (bucket.tokens + now.duration_since(bucket.updated).as_secs_f64().max(0.0) * rate).min(capacity);
+    bucket.updated = now;
+    let take = bucket.tokens.min(*remaining);
+    bucket.tokens -= take;
+    *remaining -= take;
+    if *remaining <= 0.0 { None } else { Some(*remaining / rate) }
 }
 
 async fn throttle(app: &AppHandle, id: &str, bytes: usize) -> bool {
@@ -589,34 +617,50 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize) -> bool {
     // sleep only until enough accrue, and re-check job state every slice so
     // Pause/Cancel take effect promptly even mid-chunk. Returns false when
     // the job left "downloading" (caller must stop).
-    let rate = app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
-        snapshot.settings.bandwidth_limit.map(|value| {
+    //
+    // The global bucket paces the aggregate across all jobs. A job with its
+    // own cap draws from the global bucket at the binding (minimum) rate when
+    // a global limit exists, so both constraints hold; with no global limit
+    // it draws from a per-job bucket shared by that job's workers, so the cap
+    // is not multiplied by the connection count.
+    let (global, job) = app.state::<CoreState>().snapshot.lock().ok().map(|snapshot| {
+        let global = snapshot.settings.bandwidth_limit.map(|value| {
             let multiplier = match snapshot.settings.bandwidth_unit.as_str() { "GB/s" => 1024f64 * 1024f64 * 1024f64, "MB/s" => 1024f64 * 1024f64, _ => 1024f64 };
             value as f64 * multiplier
-        })
-    });
-    let Some(rate) = rate.filter(|rate| *rate > 0.0) else {
+        });
+        let job = snapshot.jobs.iter().find(|item| item.id == id).and_then(|item| item.bandwidth_limit.map(|value| value as f64));
+        (global, job)
+    }).unwrap_or((None, None));
+    let Some(rate) = effective_rate(global, job) else {
+        // No binding rate: drop any stale per-job bucket (cap was cleared).
+        if let Ok(mut buckets) = app.state::<CoreState>().job_bandwidth.lock() { buckets.remove(id); }
         return job_state(app, id).as_deref() == Some("downloading");
     };
+    let use_global = global.is_some_and(|limit| limit > 0.0);
+    if !use_global {
+        if let Ok(mut buckets) = app.state::<CoreState>().job_bandwidth.lock() {
+            buckets.entry(id.to_string()).or_insert(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() });
+        }
+    }
     let capacity = rate.max(64.0 * 1024.0);
     let mut remaining = bytes as f64;
     while remaining > 0.0 {
         if job_state(app, id).as_deref() != Some("downloading") { return false; }
         let wait = {
             let state = app.state::<CoreState>();
-            let Ok(mut bucket) = state.bandwidth.lock() else { return false; };
-            let now = std::time::Instant::now();
-            bucket.tokens = (bucket.tokens + now.duration_since(bucket.updated).as_secs_f64().max(0.0) * rate).min(capacity);
-            bucket.updated = now;
-            let take = bucket.tokens.min(remaining);
-            bucket.tokens -= take;
-            remaining -= take;
-            if remaining <= 0.0 {
-                return job_state(app, id).as_deref() == Some("downloading");
+            if use_global {
+                let Ok(mut bucket) = state.bandwidth.lock() else { return false; };
+                bucket_wait(&mut bucket, rate, capacity, &mut remaining)
+            } else {
+                let Ok(mut buckets) = state.job_bandwidth.lock() else { return false; };
+                let Some(bucket) = buckets.get_mut(id) else { return false; };
+                bucket_wait(bucket, rate, capacity, &mut remaining)
             }
-            remaining / rate
         };
-        sleep(Duration::from_secs_f64(wait.min(0.1))).await;
+        match wait {
+            None => { return job_state(app, id).as_deref() == Some("downloading"); }
+            Some(wait) => sleep(Duration::from_secs_f64(wait.min(0.1))).await,
+        }
     }
     job_state(app, id).as_deref() == Some("downloading")
 }
@@ -1153,6 +1197,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
         if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { job.state = "failed".into(); job.error = Some("Cancelled by user".into()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Cancelled by user", Some("warning"))); }
     }
     if let Some(path) = temp_path { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); }
+    if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(id); }
     emit_snapshot(app, state);
 }
 
@@ -1160,7 +1205,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
 fn cancel_job(app: AppHandle, state: State<'_, CoreState>, id: String) { cancel_job_internal(&app, &state, &id); }
 
 #[tauri::command]
-fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); abort_transfer(state.inner(), &id); let mut temporary = None; if let Ok(mut snapshot) = state.snapshot.lock() { temporary = snapshot.jobs.iter().find(|job| job.id == id && job.state != "completed").map(|job| job.temp_path.clone()); snapshot.jobs.retain(|job| job.id != id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } emit_snapshot(&app, &state); }
+fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); abort_transfer(state.inner(), &id); let mut temporary = None; if let Ok(mut snapshot) = state.snapshot.lock() { temporary = snapshot.jobs.iter().find(|job| job.id == id && job.state != "completed").map(|job| job.temp_path.clone()); snapshot.jobs.retain(|job| job.id != id); } if let Ok(mut buckets) = state.inner().job_bandwidth.lock() { buckets.remove(&id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } emit_snapshot(&app, &state); }
 
 #[tauri::command]
 fn pause_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(&app, &state); }
@@ -1197,7 +1242,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     }
     let id = format!("provisional-{}", Uuid::new_v4());
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| source_name(&input.source)); let destination = Path::new(&snapshot.settings.default_folder).join(&name).to_string_lossy().into_owned(); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, events: vec![job_event("Provisional acquisition created", None)] };
+    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
@@ -1243,6 +1288,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
             job.events.insert(0, job_event("Destination renamed to avoid an existing file", Some("warning")));
         }
         if let Some(max_connections) = input.max_connections { job.max_connections = clamp_connections(max_connections); }
+        if input.bandwidth_limit.is_some() { job.bandwidth_limit = input.bandwidth_limit.filter(|value| *value > 0); }
         job.provisional = Some(false);
         job.resumable = true;
         job.events.insert(0, job_event("Accepted as managed download", Some("success")));
@@ -1306,7 +1352,9 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
     if !matches!(parsed.scheme(), "http" | "https") { return None; }
     let name = payload.get("name").and_then(Value::as_str).map(str::to_string);
     let media = message_type == "media-capture" || payload.get("media").and_then(Value::as_bool).unwrap_or(false);
-    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None })
+    // Bytes/sec; absent, zero, or non-numeric means no per-job cap.
+    let bandwidth_limit = payload.get("bandwidthLimit").and_then(Value::as_u64).filter(|value| *value > 0);
+    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit })
 }
 
 fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {
@@ -1425,7 +1473,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), lifecycle: Mutex::new(()) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()) });
             save_snapshot(&app.state::<CoreState>());
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             if let Some(window) = app.get_webview_window("main") {
@@ -1468,6 +1516,30 @@ mod capture_tests {
         assert_eq!(tray_status_text(1, 0), "Download Manager — 1 active download · 0 B/s");
         assert_eq!(tray_status_text(2, 1536), "Download Manager — 2 active downloads · 1 KB/s");
         assert_eq!(tray_status_text(3, 5 * 1024 * 1024), "Download Manager — 3 active downloads · 5.0 MB/s");
+    }
+
+    #[test]
+    fn per_job_cap_parses_from_capture_message() {
+        // Bytes/sec on the wire; absent or garbage means no per-job cap.
+        let message = serde_json::json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin", "bandwidthLimit": 524288 } });
+        let input = provisional_input_from_message(&message).expect("cap accepted");
+        assert_eq!(input.bandwidth_limit, Some(524288));
+        let plain = serde_json::json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin" } });
+        assert_eq!(provisional_input_from_message(&plain).expect("plain").bandwidth_limit, None);
+        let bad = serde_json::json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin", "bandwidthLimit": "fast" } });
+        assert_eq!(provisional_input_from_message(&bad).expect("bad cap").bandwidth_limit, None);
+    }
+
+    #[test]
+    fn effective_rate_constrains_job_inside_global() {
+        use super::effective_rate;
+        assert_eq!(effective_rate(None, None), None);
+        assert_eq!(effective_rate(Some(1_000_000.0), None), Some(1_000_000.0));
+        assert_eq!(effective_rate(None, Some(500_000.0)), Some(500_000.0));
+        assert_eq!(effective_rate(Some(1_000_000.0), Some(500_000.0)), Some(500_000.0));
+        assert_eq!(effective_rate(Some(500_000.0), Some(1_000_000.0)), Some(500_000.0));
+        assert_eq!(effective_rate(Some(0.0), Some(500_000.0)), Some(500_000.0));
+        assert_eq!(effective_rate(Some(1_000_000.0), Some(0.0)), Some(1_000_000.0));
     }
 
     #[test]

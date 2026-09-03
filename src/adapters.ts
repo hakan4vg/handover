@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { sanitizeCapBps } from './bandwidth';
 import type {
   AppSettings,
   AppSnapshot,
@@ -222,7 +223,7 @@ class MockAdapter implements DownloadAdapter {
     this.emit();
   }
 
-  async createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number }) {
+  async createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) {
     const name = input.name?.trim() || sourceName(input.source);
     const media = Boolean(input.media) || ['video', 'audio'].includes(guessKind(name));
     const id = `provisional-${this.nextId++}`;
@@ -240,6 +241,7 @@ class MockAdapter implements DownloadAdapter {
       eta: 'Connecting…',
       connections: 0,
        maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? this.snapshot.settings.maxConnections)),
+      bandwidthLimit: sanitizeCapBps(input.bandwidthLimit),
       mode: media ? 'segments' : 'single-stream',
       media,
       mediaDetails: media ? 'Detecting current media…' : undefined,
@@ -258,8 +260,8 @@ class MockAdapter implements DownloadAdapter {
     return id;
   }
 
-  async commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number }) {
-    this.update(id, (job) => ({ ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), provisional: false, resumable: true, state: job.state === 'connecting' ? 'downloading' : job.state, speed: job.speed || 9.4 * 1024 ** 2, connections: job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] }));
+  async commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) {
+    this.update(id, (job) => ({ ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), bandwidthLimit: sanitizeCapBps(input.bandwidthLimit) ?? job.bandwidthLimit, provisional: false, resumable: true, state: job.state === 'connecting' ? 'downloading' : job.state, speed: job.speed || 9.4 * 1024 ** 2, connections: job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] }));
   }
 
   async updateSettings(patch: Partial<AppSettings>) {
@@ -308,8 +310,8 @@ class NativeAdapter implements DownloadAdapter {
   removeJob(id: string) { return this.command<void>('remove_job', { id }); }
   pauseAll() { return this.command<void>('pause_all'); }
   resumeAll() { return this.command<void>('resume_all'); }
-  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number }) { return this.command<string>('create_provisional', { input }); }
-  commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number }) { return this.command<void>('commit_provisional', { id, input }); }
+  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<string>('create_provisional', { input }); }
+  commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<void>('commit_provisional', { id, input }); }
   updateSettings(patch: Partial<AppSettings>) { return this.command<void>('update_settings', { patch }); }
   reattachJob(id: string) { return this.command<void>('reattach_job', { id }); }
 }

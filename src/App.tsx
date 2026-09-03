@@ -3,6 +3,7 @@ import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode } from 're
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createAdapter, formatBytes, formatSpeed } from './adapters';
+import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
 import { Icon, type IconName } from './icons';
 import type {
   AppSettings,
@@ -131,9 +132,9 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
     setAddWindowId(null);
   };
 
-  const handleManualSubmit = async (source: string, name: string, maxConnections: number) => {
+  const handleManualSubmit = async (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => {
     try {
-      const id = await adapter.createProvisional({ source, name, maxConnections });
+      const id = await adapter.createProvisional({ source, name, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined });
       setShowManualAdd(false);
       setAddWindowId(id);
       setSelectedId(id);
@@ -142,8 +143,8 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
     }
   };
 
-  const handleCommit = (id: string, name: string, destination: string, maxConnections: number) => {
-    run(adapter.commitProvisional(id, { name, destination, maxConnections }), 'Download added to Manager');
+  const handleCommit = (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => {
+    run(adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined }), 'Download added to Manager');
     setAddWindowId(null);
   };
 
@@ -319,7 +320,7 @@ function Overview({ job, onOpen }: { job: DownloadJob; onOpen: () => void }) {
 }
 
 function NetworkDetails({ job }: { job: DownloadJob }) {
-  return <><SectionTitle icon="network" title="Connection" /><DetailGrid items={[{ label: 'Transfer mode', value: job.mode === 'whole-object' ? 'Whole file · ranges' : job.mode === 'segments' ? 'Ordered segments' : 'Single stream' }, { label: 'Active connections', value: `${job.connections}` }, { label: 'Maximum allowed', value: `${job.maxConnections}` }, { label: 'Source', value: job.source }, { label: 'MIME type', value: job.mime ?? 'Detecting' }, { label: 'Resumability', value: job.resumable ? 'Verified' : 'Unknown' }]} /><div className="info-callout"><Icon name="shield" size={16} /><span>Credentials and request context are kept only for this acquisition.</span></div></>;
+  return <><SectionTitle icon="network" title="Connection" /><DetailGrid items={[{ label: 'Transfer mode', value: job.mode === 'whole-object' ? 'Whole file · ranges' : job.mode === 'segments' ? 'Ordered segments' : 'Single stream' }, { label: 'Active connections', value: `${job.connections}` }, { label: 'Maximum allowed', value: `${job.maxConnections}` }, { label: 'Bandwidth cap', value: job.bandwidthLimit ? formatSpeed(job.bandwidthLimit) : 'Global setting' }, { label: 'Source', value: job.source }, { label: 'MIME type', value: job.mime ?? 'Detecting' }, { label: 'Resumability', value: job.resumable ? 'Verified' : 'Unknown' }]} /><div className="info-callout"><Icon name="shield" size={16} /><span>Credentials and request context are kept only for this acquisition.</span></div></>;
 }
 
 function MediaDetails({ job }: { job: DownloadJob }) {
@@ -421,7 +422,7 @@ function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => v
   return <button className="radio" onClick={onClick}><span className={checked ? 'checked' : ''} />{label}</button>;
 }
 
-function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number) => void; onCancel: (id: string) => void; onClose: () => void }) {
+function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void; onCancel: (id: string) => void; onClose: () => void }) {
   const [source, setSource] = useState(job?.source ?? '');
   const [name, setName] = useState(job?.name ?? '');
   const [nameTouched, setNameTouched] = useState(false);
@@ -431,10 +432,16 @@ function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClos
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState('');
   const [maxConnections, setMaxConnections] = useState(job?.maxConnections ?? settings.maxConnections);
+  const capInitial = bpsToParts(job?.bandwidthLimit ?? 50 * 1024 ** 2);
+  const [capLimited, setCapLimited] = useState(job?.bandwidthLimit != null);
+  const [capValue, setCapValue] = useState(capInitial.value);
+  const [capUnit, setCapUnit] = useState<BandwidthUnit>(capInitial.unit);
   useEffect(() => { if (job) { setSource(job.source); if (!nameTouched) setName(job.name); if (!destTouched) setDestination(job.destination); } }, [job?.id, job?.source, job?.name, job?.destination]);
   useEffect(() => { if (job?.maxConnections) setMaxConnections(job.maxConnections); }, [job?.id, job?.maxConnections]);
+  useEffect(() => { if (job?.bandwidthLimit != null) { const parts = bpsToParts(job.bandwidthLimit); setCapLimited(true); setCapValue(parts.value); setCapUnit(parts.unit); } }, [job?.id]);
   const submit = async () => {
-    if (job && onCommit) { onCommit(job.id, name, destination, maxConnections); return; }
+    const bandwidthLimit = capLimited ? bandwidthToBps(capValue, capUnit) : null;
+    if (job && onCommit) { onCommit(job.id, name, destination, maxConnections, bandwidthLimit); return; }
     if (!source.trim() || !onCreate) return;
     try {
       const parsed = new URL(source.trim());
@@ -445,10 +452,10 @@ function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClos
     }
     setFormError('');
     setBusy(true);
-    try { await onCreate(source.trim(), name.trim(), maxConnections); } finally { setBusy(false); }
+    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } finally { setBusy(false); }
   };
   const cancel = () => { if (job && job.provisional !== false) onCancel(job.id); else onClose(); };
-  return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} aria-label="Add Download"><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input autoFocus={!job} value={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error"><Icon name="error" size={14} />{formError}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input value={destination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} /></div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : 'Checking…'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim())} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busy ? 'Starting…' : job ? 'Download' : 'Start Download'}</button><button className="button" onClick={cancel}>Cancel</button></div></div></section>;
+  return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} aria-label="Add Download"><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input autoFocus={!job} value={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error"><Icon name="error" size={14} />{formError}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input value={destination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} /></div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : 'Checking…'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim())} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busy ? 'Starting…' : job ? 'Download' : 'Start Download'}</button><button className="button" onClick={cancel}>Cancel</button></div></div></section>;
 }
 
 function Metric({ icon, label, value, tone }: { icon: IconName; label: string; value: string; tone?: string }) {
@@ -463,8 +470,8 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const [createdId, setCreatedId] = useState<string | undefined>(jobId);
   const currentJob = snapshot.jobs.find((item) => item.id === createdId);
   const close = () => window.close();
-  const create = async (url: string, name: string, maxConnections: number) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections }));
-  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={(id, name, destination, maxConnections) => { void adapter.commitProvisional(id, { name, destination, maxConnections }).then(close); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
+  const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined }));
+  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={(id, name, destination, maxConnections, bandwidthLimit) => { void adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit: bandwidthLimit ?? undefined }).then(close); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
 }
 
 function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {

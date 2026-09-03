@@ -331,3 +331,40 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Next SPEC gap queued: §8.6 sentence 2 — per-job limits constraining a job
   inside the global limit are still unimplemented (no per-job limit field
   anywhere in `DownloadJob`, inputs, or UI).
+
+## 2026-09-03 — Per-job bandwidth caps (SPEC §8.6 sentence 2)
+
+- TDD: wrote the RED tests first (`effective_rate` minimum rule, capture
+  parsing of `bandwidthLimit` bps). They failed on the missing field/function
+  as required, then went green with the implementation.
+- Engine (`src-tauri/src/main.rs`): `DownloadJob.bandwidth_limit: Option<u64>`
+  (bytes/sec, `#[serde(default)]` so pre-cap databases load as uncapped);
+  `ProvisionalInput`/`CommitInput` carry it; `effective_rate()` resolves the
+  binding rate as the minimum, ignoring non-positive values so zero can never
+  wedge pacing. `throttle()` paces against the global bucket at the binding
+  rate when a global limit exists (both constraints hold), otherwise against
+  a per-job bucket shared by that job's workers (no worker-count
+  multiplication). Buckets are cleaned on transfer unwind, cancel, remove,
+  and cap-clear. Capture messages accept `bandwidthLimit` (positive ints only).
+- Frontend: new pure `src/bandwidth.ts` (`bandwidthToBps`/`bpsToParts`/
+  `sanitizeCapBps`) with 6 vitest tests; `types.ts` + both adapters pass the
+  cap through; Add window Advanced section has Global/Limited + value + unit
+  (mirrors the global Network settings, gated by `perDownloadOverrides`,
+  prefills from the captured job); inspector Network tab shows the cap or
+  "Global setting".
+- Headless rate matrix against the real binary (all 8 MiB byte-identical):
+  global 1 MB/s only → 0.98 MB/s (no regression from the throttle rework);
+  job 0.5 + global 10 → 0.47 MB/s; job 0.5 with no global → 0.47 MB/s.
+- Incidents: the parametrized probe first wrote the limit as JSON float
+  `1.0`; Rust `Option<u64>` rejects floats, so settings silently fell back to
+  defaults (unlimited) and the run downloaded unpaced. Real finding: any
+  non-integer in settings resets the WHOLE settings to defaults. Probe fixed
+  to write integers (as the real settings path always does); the silent-reset
+  behavior is recorded here as a hardening candidate, not changed in this
+  slice. The frontend sends integers (`Math.floor`), so the product path is
+  unaffected.
+- Known limitation (same convention as `maxConnections`): omitting the cap at
+  commit keeps the existing value; there is no explicit "clear cap" except
+  recreating the provisional. Clearing via null is a follow-up if wanted.
+- Verified: Rust 22/22; vitest 11/11; `tsc -b`; `build:all`; `diff --check`.
+  `fixtures/server.py` untouched.

@@ -18,10 +18,15 @@ import time
 import urllib.request
 
 BIN = "/srv/repos/downloadmanager/src-tauri/target/debug/download-manager"
-HOME = "/tmp/dm-limit-test"
+HOME = os.environ.get("DM_HOME", "/tmp/dm-limit-test")
 DB = os.path.join(HOME, ".local/share/com.downloadmanager.app/download-manager.db")
 CAPTURE_URL = "http://127.0.0.1:8901/file/range.bin"
-LIMIT_BPS = 1 * 1024 * 1024
+# DM_LIMIT_MB: "none" for unlimited global, else a number (default "1").
+# DM_JOB_CAP_BPS: per-job cap in bytes/sec for the capture (default unset).
+# DM_EXPECT_MB: expected effective rate in MB/s (default follows the limit).
+LIMIT_MB = os.environ.get("DM_LIMIT_MB", "1")
+JOB_CAP_BPS = os.environ.get("DM_JOB_CAP_BPS")
+EXPECT_MB = float(os.environ.get("DM_EXPECT_MB", "1" if LIMIT_MB != "none" else "0.5"))
 
 
 def env():
@@ -58,8 +63,13 @@ def set_bandwidth_limit():
             "SELECT payload FROM settings WHERE id = 1"
         ).fetchone()
         settings = json.loads(payload)
-        settings["bandwidthLimit"] = 1
-        settings["bandwidthUnit"] = "MB/s"
+        if LIMIT_MB == "none":
+            settings["bandwidthLimit"] = None
+        else:
+            # Integers only: the Rust settings schema is Option<u64> and a
+            # JSON float fails the whole settings parse (silent default reset).
+            settings["bandwidthLimit"] = int(float(LIMIT_MB))
+            settings["bandwidthUnit"] = "MB/s"
         con.execute(
             "UPDATE settings SET payload = ? WHERE id = 1",
             (json.dumps(settings),),
@@ -83,15 +93,13 @@ def main():
         boot.terminate()
         boot.wait(timeout=15)
     set_bandwidth_limit()
-    print("seeded bandwidthLimit=1 MB/s", flush=True)
+    print(f"seeded global={LIMIT_MB} MB/s job_cap={JOB_CAP_BPS} expect={EXPECT_MB} MB/s", flush=True)
 
     # Pass 2: real capture of the 8 MiB fixture.
-    capture = json.dumps(
-        {
-            "type": "capture-acquisition",
-            "payload": {"source": CAPTURE_URL, "name": "range.bin"},
-        }
-    )
+    payload: dict = {"source": CAPTURE_URL, "name": "range.bin"}
+    if JOB_CAP_BPS:
+        payload["bandwidthLimit"] = int(JOB_CAP_BPS)
+    capture = json.dumps({"type": "capture-acquisition", "payload": payload})
     app = subprocess.Popen(
         [BIN, "--capture", capture],
         env=env(),
@@ -121,12 +129,13 @@ def main():
         assert len(downloading) >= 6, f"too few downloading samples: {len(samples)}"
         (t0, n0), (t1, n1) = downloading[0], downloading[-1]
         rate = (n1 - n0) / max(t1 - t0, 0.01)
+        expected = EXPECT_MB * 1e6
         print(
-            f"downloaded {n0} -> {n1} bytes over {t1 - t0:.1f}s = {rate / 1e6:.2f} MB/s",
+            f"downloaded {n0} -> {n1} bytes over {t1 - t0:.1f}s = {rate / 1e6:.2f} MB/s (expect ~{EXPECT_MB})",
             flush=True,
         )
-        assert 0.4e6 <= rate <= 1.7e6, f"rate {rate} outside paced band"
-        print("RATE-ASSERT: PASS (≈1 MB/s limit honored on loopback)", flush=True)
+        assert 0.5 * expected <= rate <= 1.6 * expected, f"rate {rate} outside paced band"
+        print(f"RATE-ASSERT: PASS ({rate / 1e6:.2f} MB/s within band of ~{EXPECT_MB} MB/s)", flush=True)
 
         if job.get("state") in ("finalizing", "completed"):
             temp_path = job["tempPath"]

@@ -42,6 +42,8 @@ export interface DownloadJob {
   eta?: string;
   connections: number;
   maxConnections: number;
+  /** Per-job bandwidth cap in bytes/sec. Absent/null = follow the global setting. */
+  bandwidthLimit?: number | null;
   mode: TransferMode;
   media: boolean;
   mediaDetails?: string;
@@ -111,8 +113,8 @@ export interface DownloadAdapter {
   removeJob(id: string): Promise<void>;
   pauseAll(): Promise<void>;
   resumeAll(): Promise<void>;
-  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number }): Promise<string>;
-  commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number }): Promise<void>;
+  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }): Promise<string>;
+  commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }): Promise<void>;
   updateSettings(patch: Partial<AppSettings>): Promise<void>;
   reattachJob(id: string): Promise<void>;
 }

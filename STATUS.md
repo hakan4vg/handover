@@ -691,6 +691,20 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - This closes the application-not-running flow in SPEC §7.6 using the real
   native-host launch path.
 
+## 2026-09-04 — Provisional cancellation aborts and cleans active media
+
+- A fresh resident app received a slow finite HLS capture with a real
+  provisional Add Download window. The job created its `.segments` workspace
+  and remained uncommitted while fragment work was in flight.
+- The live `cancel_job` command was invoked through the main manager's WebKit
+  inspector. After the abort settled, the isolated database contained zero
+  jobs and the cache contained only its root directory: no provisional `.part`
+  file and no `.segments` directory remained.
+- This verifies the destructive side of SPEC §7.3: cancellation removes the
+  uncommitted acquisition instead of leaving an orphaned transfer or durable
+  row. The same lifecycle abort path is shared by the Add Download Cancel
+  action, titlebar close, and bulk cancellation paths.
+
 ## 2026-09-04 — Real browser media-button capture proven
 
 - Started the fixture server from its required `fixtures/` working directory

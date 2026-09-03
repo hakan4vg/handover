@@ -235,6 +235,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/media/sample.mp4":
             size, seed, _ = FILES["sample.mp4"]
             return self._serve_file("sample.mp4", seed, size, True, {"Content-Type": "video/mp4"})
+        if path == "/page/video.html":
+            body = (
+                "<!doctype html><html><body style='margin:40px;background:#222'>"
+                "<video width='640' height='360' controls autoplay muted loop "
+                "src='/media/real.mp4'></video></body></html>"
+            )
+            return self._send_bytes(body.encode(), 200, {"Content-Type": "text/html"})
+        if path == "/media/real.mp4":
+            # Real playable fixture (ffmpeg testsrc). No Range support needed;
+            # the browser streams it progressively for playback tests.
+            try:
+                with open("real.mp4", "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                return self._send_bytes(b"fixture not generated", 500)
+            return self._send_bytes(data, 200, {"Content-Type": "video/mp4", "Accept-Ranges": "bytes"})
         return self._send_bytes(b"not found", 404)
 
 

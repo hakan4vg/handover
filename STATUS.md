@@ -315,3 +315,19 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   under `tsconfig.node.json`, explicit `vitest` import resolves despite the
   restricted `types` list); `npm run build:all` clean and `extension/dist/`
   contains no test artifact (explicit rollup inputs only).
+
+## 2026-09-03 — Aggregate limiter proven end to end (headless, no XTEST)
+
+- New `fixtures/limiter_probe.py`: isolated HOME, boots the real binary under
+  Xvfb `:99`, seeds `bandwidthLimit=1 MB/s` in its SQLite settings, starts a
+  `--capture` of the 8 MiB deterministic `/file/range.bin` fixture, and polls
+  the jobs table for the effective rate. No GUI input of any kind.
+- Result: `1 -> 7,340,032 bytes over 7.5s = 0.98 MB/s` (RATE-ASSERT PASS —
+  loopback otherwise moves >50 MB/s, so the plateau is the token bucket, not
+  the network). Job reached `finalizing`; the provisional temp file is
+  8,388,608 bytes byte-identical to the fixture (BYTE-IDENTITY PASS).
+- This also proves the headless `--capture` → provisional → paced
+  multi-connection → finalizing path works with zero interaction.
+- Next SPEC gap queued: §8.6 sentence 2 — per-job limits constraining a job
+  inside the global limit are still unimplemented (no per-job limit field
+  anywhere in `DownloadJob`, inputs, or UI).

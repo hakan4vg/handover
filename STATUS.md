@@ -1979,3 +1979,20 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   The requested destination remained the only output, the temp source was
   removed, `destinationReservation` was cleared, and exactly one job row
   remained. Tauri IPC returned `{}` for the void command.
+
+## 2026-09-04 — Recognize Windows replacement errors
+
+- The move-helper audit found that fallback selection matched raw Linux
+  `EEXIST`/`EXDEV` values `17`/`18` only. Windows reports an existing target as
+  `ERROR_ALREADY_EXISTS` (`183`), so reserved rename moves and explicit replace
+  moves could fail instead of entering the tested fallback path.
+- Added `move_needs_fallback`, which accepts the portable Rust
+  `ErrorKind::AlreadyExists` plus raw `17`, `18`, and `183`, and routed both
+  reserved and replace fallback branches through it. The protected sibling
+  `wait_for_transfer_idle` remains unstaged.
+- Added the Rust regression
+  `move_fallback_accepts_existing_and_cross_device_errors`: all three platform
+  codes pass and an unrelated error is rejected. The real cross-filesystem
+  move probe was rerun against the rebuilt binary and passed with one durable
+  268435456-byte output and SHA-256
+  `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`.

@@ -746,11 +746,15 @@ fn ffmpeg_remux_failure(status: &std::process::ExitStatus) -> String {
     }
 }
 
+fn move_needs_fallback(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AlreadyExists || matches!(error.raw_os_error(), Some(17) | Some(18) | Some(183))
+}
+
 async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reserved: bool) -> Result<(), String> {
     if let Some(parent) = PathBuf::from(destination).parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
     match tokio::fs::rename(source, destination).await {
         Ok(()) => Ok(()),
-        Err(error) if matches!(error.raw_os_error(), Some(17) | Some(18)) && reserved => {
+        Err(error) if move_needs_fallback(&error) && reserved => {
             match tokio::fs::copy(source, destination).await {
                 Ok(_) => match tokio::fs::remove_file(source).await {
                     Ok(()) => Ok(()),
@@ -759,7 +763,7 @@ async fn move_completed_file(source: &str, destination: &str, replace_existing: 
                 Err(copy_error) => { let _ = tokio::fs::remove_file(destination).await; Err(format!("{error}; fallback copy failed: {copy_error}")) }
             }
         }
-        Err(error) if matches!(error.raw_os_error(), Some(17) | Some(18)) && replace_existing => {
+        Err(error) if move_needs_fallback(&error) && replace_existing => {
             let staging = format!("{destination}.download-manager-staging-{}", uuid::Uuid::new_v4());
             if let Err(copy_error) = tokio::fs::copy(source, &staging).await {
                 let _ = tokio::fs::remove_file(&staging).await;
@@ -2380,6 +2384,15 @@ mod capture_tests {
         std::fs::remove_file(first).unwrap();
         std::fs::remove_file(second).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn move_fallback_accepts_existing_and_cross_device_errors() {
+        use super::move_needs_fallback;
+        assert!(move_needs_fallback(&std::io::Error::from_raw_os_error(17)));
+        assert!(move_needs_fallback(&std::io::Error::from_raw_os_error(18)));
+        assert!(move_needs_fallback(&std::io::Error::from_raw_os_error(183)));
+        assert!(!move_needs_fallback(&std::io::Error::from_raw_os_error(13)));
     }
 
     #[test]

@@ -2194,3 +2194,20 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - The real probe passed with 6/6 segments, video plus alternate audio, each
   manifest and segment fetched exactly once, and an 86836-byte output with
   SHA-256 `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`.
+
+## 2026-09-04 — Close startup and media recovery probe gaps
+
+- `startup_finalizing_probe.py` passed against the rebuilt binary. It restored
+  the persisted finalizing HLS media job byte-for-byte, with one manifest
+  request and SHA-256 `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`.
+- The first combined specialized batch reached segmented persistence,
+  cancellation, and restart reuse, then hit a transient third-app `-11`
+  before Inspector readiness. No product log was produced. The isolated rerun
+  passed every segmented phase: 5/6 fragment persistence, bounded cancel,
+  restart reuse, bounded three-attempt retry, and manual retry recovery, with
+  the same 86836-byte reference hash.
+- The subsequent fail-fast batch passed targeted reattach (query renewal and
+  validator identity change), incompatible reattach isolation, startup
+  segmented identity invalidation, simultaneous independent captures, and
+  progressive MP4 byte preservation. The progressive result was 34524 bytes
+  with SHA-256 `c5dba3fa0bbbf13a6c8981b1941f9713dc85bd5fb9522bee98945a0592932c9`.

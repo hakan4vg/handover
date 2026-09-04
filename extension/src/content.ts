@@ -1,3 +1,5 @@
+import { restoreBrowserDownload } from './download-fallback';
+
 // Local copies (not imported): MV3 content scripts must be classic scripts,
 // so they cannot share an ES module chunk with the service worker.
 import type { BrowserPolicy } from './shared';
@@ -54,7 +56,7 @@ function interceptDownloadClick(event: MouseEvent): void {
   const target = event.target;
   if (!(target instanceof Element)) return;
   const anchor = target.closest('a');
-  if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download')) return;
+  if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download') || anchor.hasAttribute('data-dm-browser-fallback')) return;
   const source = anchor.href;
   if (!isHttp(source)) return;
   event.preventDefault();
@@ -66,7 +68,9 @@ function interceptDownloadClick(event: MouseEvent): void {
       name: cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source),
       pageUrl: window.location.href,
     },
-  }).catch(() => undefined);
+  }).catch(() => {
+    restoreBrowserDownload(source, cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source));
+  });
 }
 
 let policyTimer: number | null = null;

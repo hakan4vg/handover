@@ -1082,6 +1082,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   slice; it was not staged.
 - `fixtures/server.py` untouched.
 
+## 2026-09-04 — Browser interception worker failure restores default download
+
+- Reachability audit found `content.ts` prevented an explicit `<a download>`
+  click before calling `chrome.runtime.sendMessage`, then swallowed a rejected
+  message promise. If the MV3 worker could not be reached, that user download
+  disappeared instead of returning to browser handling.
+- Added `restoreBrowserDownload` with a `data-dm-browser-fallback` recursion
+  marker. The capture listener ignores only that marked synthetic anchor; the
+  rejected-worker path replays it with the original URL and cleaned filename.
+  The worker-response `{ok:false}` path remains unchanged because background.ts
+  already owns its browser-download fallback.
+- Clean jsdom regression: 1/1. Full frontend/extension suite: 25/25 across 5
+  files. `npx tsc -b` clean. `npm run build:all` produced application and
+  classic extension bundles, including `dist/content.js` 4.76 kB.
+- No Rust files were staged for this slice. The sibling's 16-line
+  `wait_for_transfer_idle` change remains unstaged in `src-tauri/src/main.rs`.
+- `fixtures/server.py` untouched.
+
 ## 2026-09-04 — Filename path escape closed
 
 - Fresh audit found `start_provisional` joining the caller-provided filename

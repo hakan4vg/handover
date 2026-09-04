@@ -1432,3 +1432,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - No code change; probe evidence only. The sibling's
   `wait_for_transfer_idle` helper remains the only unstaged and unmodified
   worktree change; this evidence slice stages no sibling hunk.
+
+## 2026-09-04 — Interception and media buttons remain independent
+
+- Audited SPEC §§5.3, 6.4, and 19.2 after the policy-off ordinary-download
+  probe. The missing real-browser case was the combination of
+  `interceptDownloads=false` with `showMediaButtons=true`.
+- Through the real extension popup sender, set that combination in the live
+  disposable Chromium profile. On the still-playing fixture MP4 page, the
+  content script rendered exactly one `Download` control. An ordinary anchor
+  click returned `dispatchReturned=true` and `defaultPrevented=false`; Chromium
+  saved `policy-independent-browser.bin` at `34524/34524` bytes with
+  `state=complete` and `error=null`.
+- Clicking the media control separately reached the native bridge and added a
+  new isolated app row for `real.mp4`, `media=true`, `34524/34524`,
+  `state=finalizing`, `provisional=true`. No browser download was attributed
+  to the media-control click; the ordinary browser copy was the separate
+  expected artifact.
+- Live-page policy propagation was then exercised without navigation or app
+  restart: setting `showMediaButtons=false` produced zero controls while the
+  video remained `readyState=4, paused=false`; setting it back to true restored
+  one control with text `Download` and aria-label `Download this media`.
+  `interceptDownloads` stayed false in both states.
+- No code change; this closes the independent-control acceptance gap. The
+  sibling's `wait_for_transfer_idle` helper remains the only unstaged and
+  unmodified worktree change; this slice stages no sibling hunk.

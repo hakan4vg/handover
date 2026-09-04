@@ -1505,3 +1505,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   XTEST remains blocked by the previously recorded `BadValue` failure.
 - Only the owned resume-plan code/test hunks belong in this commit. The sibling
   `wait_for_transfer_idle` hunk remains unstaged.
+
+## 2026-09-04 — Per-site media exclusion is honored in a real browser
+
+- Audited SPEC §6.4 after the global media-button toggle proof. The remaining
+  unverified policy case was a hostname exclusion while media buttons stayed
+  enabled.
+- In disposable Chromium 151 with the unpacked extension, the popup writer set
+  `{interceptDownloads:true, showMediaButtons:true, excludedSites:["127.0.0.1"]}`.
+  The real fixture page had a playing, ready video (`readyState=4`,
+  `paused=false`) and rendered zero `#dm-media-download-button` controls.
+- A second disposable popup tab cleared `excludedSites` through the supported
+  `update-policy` message while the media page stayed open. The page's real
+  `HTMLMediaElement.play()` resolved successfully; the same video then had
+  `readyState=4`, `paused=false`, and exactly one control with aria-label
+  `Download this media`.
+- This verifies hostname exclusion and policy recovery without changing the
+  resident browser or application. The temporary storage-only write was not
+  treated as a product path because the worker's in-memory policy correctly
+  remained authoritative until the popup update message.
+- No source change; the disposable profile and Chromium process were cleaned
+  after the probe. The sibling `wait_for_transfer_idle` helper remains the only
+  unstaged worktree change.

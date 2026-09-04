@@ -2470,3 +2470,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `PUBLIC-HLS-CHROMIUM-PROBE: PASS`.
 - Frontend/extension verification after the fix passed Vitest `32/32`,
   `tsc -b`, `npm run build:all`, and the focused candidate regression `12/12`.
+
+## 2026-09-04 — Prove public blob/MSE DASH capture
+
+- Added `fixtures/public_dash_chromium_probe.py` against the official DASH-IF
+  reference client. The fixture uses the visible `stream-url` field and `Load`
+  button to load the static 30-second MPD
+  `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps_shortened.mpd`.
+  The real player reported `blob=true`, `readyState=4`, `paused=false`, and
+  `duration=30`; the extension button was visible on the playing MSE player.
+- The first run reached native completion and found both tracks, but the probe
+  incorrectly required a 29–31 second output. The MPD's 4-second segment grid
+  produces a valid `32.085333` second remux. The probe now checks that observed
+  range instead of rejecting correct output.
+- The clean real run created one native job from the exact MPD, committed it,
+  and completed a playable MP4. Browser-context fetch plus Web Crypto recorded
+  the exact first-representation source tracks: video `9` segments,
+  `9755337` bytes, SHA-256
+  `44ddc05092974595726f81181796611d257ac55927244b36d8b60129bf8a839f`; audio
+  `9` segments, `267561` bytes, SHA-256
+  `26195401fbff20512d36a9b08c9fd8e9c45b62fe0ad8e9a212a7b6ea24be9273`.
+  Native FFmpeg output was `10017817` bytes with SHA-256
+  `a1cb574d31bbb18c8b0e54918177ad3ad2d4dc8e00d509c5dee6fd59f911b833`; FFprobe
+  found one audio and one video stream. Final output:
+  `PUBLIC-DASH-CHROMIUM: PASS (tracks=video+audio, output_bytes=10017817,
+  duration=32.085333, jobs=1, browser_downloads=[])`.
+- Trusted Ctrl-click and right-click on a normal HTTP link remained
+  browser-owned (`isTrusted=true`, `defaultPrevented=false`), with no extra job
+  or browser download. The run ended with
+  `PUBLIC-DASH-CHROMIUM-PROBE: PASS`.
+- This closes a real static DASH/MSE plus separate audio/video mux path. The
+  adaptive sample starts at 480p and switches to 768p while the parser selects
+  the first representation, so this evidence does not claim the separate
+  quality-switch acceptance case; that remains a distinct gap.

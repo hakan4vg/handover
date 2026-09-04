@@ -954,3 +954,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   slice still uncommitted in the same file; split-staged only my hunks
   (`@@ -11/111/349/1482/1577/1592/1622`), theirs stay in the working tree.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Native toast actions: investigated, closed as platform-limited (SPEC §14)
+
+- SPEC §14 wants Open / Show in folder / View details actions on native
+  toasts. Our native toasts carry title/body only. Checked whether that is
+  an implementation gap or a platform ceiling, from two sides:
+  - Vendored `tauri-plugin-notification-2.4.0` source (the version this tree
+    builds): `register_action_types` exists only in `mobile.rs`;
+    `desktop.rs` `show()` forwards title/body/icon to the OS notifier and
+    never consumes `action_type_id`. No action buttons or action-click
+    events exist on the desktop path.
+  - Official docs (v2.tauri.app/plugin/notification) describe Actions
+    generically with JS `registerActionTypes`/listener APIs, but the Rust
+    desktop backend drops them — so wiring action types from our side
+    would be dead code on Windows/Linux.
+- Verdict: no code change. Native toasts stay notify-only (they already
+  identify the file, and failures carry the concise reason). All three
+  SPEC actions exist and work in the in-app notification center
+  (`NotificationCard`: Open / Show in folder for completed, View details /
+  Open Manager for failed — verified in `App.tsx`). This closes the old
+  "notification action labels" blocker note: there is no label/command
+  mismatch to fix, only a plugin ceiling. Revisit only if the plugin's
+  desktop backend gains action support (would need a dependency upgrade,
+  not a local patch).
+- Final regression on the closing tree (my three slices + sibling's
+  uncommitted wait-guard, all present in the worktree binary): Rust 32/32,
+  vitest 21/21 (3 files), `tsc -b` clean, `cargo build` clean, headless
+  limiter probe PASS (8 MiB byte-identical, paced). No test rigs left
+  running. `fixtures/server.py` untouched.

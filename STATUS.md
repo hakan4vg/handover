@@ -1457,3 +1457,23 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - No code change; this closes the independent-control acceptance gap. The
   sibling's `wait_for_transfer_idle` helper remains the only unstaged and
   unmodified worktree change; this slice stages no sibling hunk.
+
+## 2026-09-04 — Live HLS and dynamic DASH are rejected by the real app
+
+- The fixture audit found live rejection recorded only at parser-unit level,
+  despite SPEC §§6.3, 9, 18, and 19.3 requiring a clear failure instead of an
+  indefinite recorder. After stopping the known disposable single-instance app,
+  ran fresh `--capture` probes against the live fixture server on `:8904`.
+- `/hls/live.m3u8` produced exactly one isolated provisional row with
+  `state=failed`, `downloaded=0`, no temp output, and the exact error
+  `Live media is not supported; a finite VOD playlist is required`.
+- `/dash/live.mpd` produced exactly one isolated provisional row with
+  `state=failed`, `downloaded=0`, no temp output, and the exact error
+  `Live media is not supported; a static MPD is required`.
+- Both app processes remained alive until the harness terminated them; neither
+  entered an indefinite recording or retry loop. The fixture endpoints returned
+  HTTP 200 before the app probes, so these are application rejection results,
+  not missing-route errors.
+- No code change; real binary failure-path evidence only. The sibling's
+  `wait_for_transfer_idle` helper remains the only unstaged and unmodified
+  worktree change; this slice stages no sibling hunk.

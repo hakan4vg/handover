@@ -1575,3 +1575,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   passed. `npm test` passed `31/31`, `npx tsc -b` passed, and
   `npm run build:all` passed. Cargo reported only the sibling's existing
   unused `wait_for_transfer_idle` warning.
+
+## 2026-09-04 — HLS fragmented MP4 with alternate audio
+
+- The DASH restart proof closed the multi-track fMP4 path, but no real binary
+  evidence covered HLS `EXT-X-MAP` or HLS alternate audio. Added
+  `fixtures/hls_fmp4_probe.py` as a disposable real-app probe.
+- The probe serves a finite HLS master plus separate video and audio playlists
+  through a local proxy. Every media byte is forwarded from the existing real
+  `fixtures/media/{v,a}-*` fMP4 files; no external site or synthetic media is
+  involved. It drives `create_provisional` and `commit_provisional` through
+  WebKit Inspector IPC in a dedicated Xvfb and isolated HOME.
+- Real output passed: the provisional reached `finalizing` at `6/6` fragments
+  across `video + audio`; commit produced `86836` bytes with SHA-256
+  `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`, exactly
+  matching an independent FFmpeg `-c copy` assembly.
+- Request accounting passed: `/hls/master.m3u8`, `/hls/video.m3u8`,
+  `/hls/audio.m3u8`, and all six `/dash/*` fMP4 fragments were each requested
+  exactly once. This proves HLS map parsing, alternate audio discovery,
+  manifest order, and native two-track muxing on the real binary.
+- Command evidence: `python3 -m py_compile fixtures/hls_fmp4_probe.py &&
+  python3 fixtures/hls_fmp4_probe.py` exited `0` with
+  `HLS-FMP4-PROBE: PASS`. No product source changed; the sibling's
+  `wait_for_transfer_idle` helper remains the only unstaged worktree change.

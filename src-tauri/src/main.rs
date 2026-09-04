@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::{io::{Read, SeekFrom, Write}, path::{Path, PathBuf}, process::{Command, Stdio}, sync::{atomic::{AtomicU64, Ordering}, Mutex}};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri::image::Image;
-use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
+use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri_plugin_notification::NotificationExt;
 use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
@@ -111,7 +111,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem> }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>> }
 
 // Transfer ownership is separate from persisted job state. A paused task may
 // still be inside an HTTP future; retaining its handle prevents Resume from
@@ -349,6 +349,7 @@ fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolic
         snapshot.settings.show_media_buttons = policy.1;
         snapshot.settings.excluded_sites = policy.2;
         write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings));
+        sync_tray_checks(app, policy.0, policy.1);
     }
     emit_snapshot(app, state);
 }
@@ -1482,6 +1483,8 @@ fn update_settings(app: AppHandle, state: State<'_, CoreState>, patch: Value) {
         if let Value::Object(patch) = patch.get("patch").cloned().unwrap_or(patch) {
             snapshot.settings = apply_settings_patch(&snapshot.settings, &Value::Object(patch));
             write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings));
+            let checks = (snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons);
+            sync_tray_checks(&app, checks.0, checks.1);
         }
     }
     let enabled = state.snapshot.lock().map(|snapshot| snapshot.settings.start_at_sign_in).unwrap_or(true);
@@ -1577,6 +1580,25 @@ fn tray_image() -> Image<'static> {
     Image::new_owned(pixels, 32, 32)
 }
 
+// Keeps the native tray checkmarks coherent with Settings (SPEC §12: one
+// policy, not two copies). Called from every writer of the two flags — the
+// tray toggle arms, update_settings, apply_browser_policy — because neither
+// direction propagates on its own: Tauri check items keep whatever checked
+// state they were built or last set with, and Settings-panel changes never
+// reach the tray menu. Handles are stored at install time; before that (or
+// in tests, where no tray exists) this is a silent no-op.
+fn sync_tray_checks(app: &tauri::AppHandle, intercept_downloads: bool, show_media_buttons: bool) {
+    let state = app.state::<CoreState>();
+    {
+        if let Ok(checks) = state.tray_checks.lock() {
+            if let Some((browser, media)) = checks.as_ref() {
+                let _ = browser.set_checked(intercept_downloads);
+                let _ = media.set_checked(show_media_buttons);
+            }
+        };
+    }
+}
+
 fn install_tray(app: &tauri::AppHandle, intercept_downloads: bool, show_media_buttons: bool) -> tauri::Result<()> {
     let open_manager = MenuItemBuilder::with_id("open-manager", "Open Download Manager").build(app)?;
     let pause_all = MenuItemBuilder::with_id("pause-all", "Pause All").build(app)?;
@@ -1592,13 +1614,17 @@ fn install_tray(app: &tauri::AppHandle, intercept_downloads: bool, show_media_bu
             "open-manager" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }
             "pause-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused from the system tray", Some("warning"))); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(app, &state); }
             "resume-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { job.state = "downloading".into(); job.connections = 1; job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(app, &state); for (id, source) in sources { let _ = spawn_transfer(app, state.inner(), id, source); } }
-            "browser-integration" => { let state = app.state::<CoreState>(); if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.intercept_downloads = !snapshot.settings.intercept_downloads; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); } emit_snapshot(app, &state); }
-            "media-buttons" => { let state = app.state::<CoreState>(); if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.show_media_buttons = !snapshot.settings.show_media_buttons; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); } emit_snapshot(app, &state); }
+            "browser-integration" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.intercept_downloads = !snapshot.settings.intercept_downloads; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons)) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
+            "media-buttons" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.show_media_buttons = !snapshot.settings.show_media_buttons; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons)) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
             "bandwidth" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); let _ = window.eval("window.location.href = window.location.pathname + '?settings=network'"); } }
             "exit-manager" => app.exit(0),
             _ => {}
         }
     }).build(app)?;
+    {
+        let state = app.state::<CoreState>();
+        if let Ok(mut checks) = state.tray_checks.lock() { *checks = Some((browser_integration.clone(), media_buttons.clone())); };
+    }
     Ok(())
 }
 
@@ -1622,7 +1648,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) });
             save_snapshot(&app.state::<CoreState>());
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             if let Some(window) = app.get_webview_window("main") {

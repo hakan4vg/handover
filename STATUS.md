@@ -925,3 +925,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   (PIDs 1706871/91/92, `--host 127.0.0.1`) predating this session — leftover
   from an earlier rig, not mine, ports confirmed down after.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Tray checkmarks follow Settings both directions (SPEC §12)
+
+- SPEC §12 demands one coherent policy between tray and Settings. The two
+  tray check items (Browser Integration, Media Buttons) were built with the
+  right initial state but never updated after: tray toggles flipped the
+  setting without touching the item's visual check, and Settings-panel
+  toggles never reached the tray at all. Verified against the vendored
+  tauri-2.11.5/muda-0.19.3 sources: the wrapper exposes `set_checked` /
+  `is_checked` and performs no automatic flip on click, so explicit sync is
+  required in both directions.
+- Fix: `CoreState.tray_checks` stores the two `CheckMenuItem<Wry>` handles at
+  install time; new `sync_tray_checks` sets both visuals, called from all
+  four writers (both tray arms, `update_settings`, `apply_browser_policy`).
+  Startup path already passes persisted policy into `install_tray`, so the
+  initial state was and stays correct. Lock discipline: sync touches only
+  `tray_checks`, never `snapshot` — no new lock ordering, no cycle.
+- Verification, stated honestly: no headless unit test exists for this —
+  native tray menus need a running app (no AppHandle in `cargo test`, CDP
+  cannot see native menus, XTEST out of bounds). Verified instead by
+  source-level API confirmation + `cargo test` 32/32 + `cargo build` clean
+  with no new warnings. Two compile fights on the way, both real lessons:
+  `CheckMenuItem` needs its `<tauri::Wry>` generic, and `if let … lock()`
+  in tail position extends the scrutinee temporary past the `State` binding
+  (E0597) — trailing `;` fixes it.
+- Commit hygiene as before: sibling session's 16-line `wait_for_transfer_idle`
+  slice still uncommitted in the same file; split-staged only my hunks
+  (`@@ -11/111/349/1482/1577/1592/1622`), theirs stay in the working tree.
+  `fixtures/server.py` untouched.

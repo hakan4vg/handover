@@ -2324,3 +2324,19 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   bridge, so the probe uses the native X11 map state as the visibility proof.
   The resident log contained only the known libayatana-appindicator
   deprecation warning and no product error.
+
+## 2026-09-04 — Prove three independent Add Download windows
+
+- Added `fixtures/multiple_add_windows_probe.py` for SPEC §19.1. It starts one
+  resident application and sends three real `--capture` launches for distinct
+  local sources through the single-instance forwarding path.
+- The rebuilt binary created three distinct SQLite jobs and three native
+  `Add Download` windows. The resident process stayed alive and `/proc`
+  reported exactly one product process.
+- Each source was requested exactly once: `one.bin`, `two.bin`, and
+  `three.bin`. The windows therefore remained independently addressable rather
+  than retargeting one capture or creating duplicate product owners.
+- Real probe output:
+  `MULTIPLE-ADD-WINDOWS: PASS (windows=3, jobs=3, processes=1, source_requests={'three.bin': 1, 'two.bin': 1, 'one.bin': 1})`.
+- The resident application log contained only the known
+  `libayatana-appindicator is deprecated` warning and no product error.

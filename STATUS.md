@@ -1689,3 +1689,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Only `fixtures/reattach_probe.py`, `fixtures/startup_recovery_probe.py`, and
   this status entry belong in this slice. The sibling
   `wait_for_transfer_idle` hunk remains untouched and must not be staged.
+
+## 2026-09-04 — Persisted finalizing media resumes from local fragments
+
+- Continued the §8.9 startup audit with a committed two-track DASH job already
+  in `finalizing`, containing all six persisted fragments and the matching
+  segment identity.
+- Added `fixtures/startup_finalizing_probe.py`. It launches the real rebuilt
+  binary in an isolated HOME with no UI command or browser capture. It serves
+  the finite DASH manifest through the existing local proxy and counts every
+  manifest/fragment request.
+- Startup recovery fetched `/dash/manifest.mpd` exactly once and fetched zero
+  of the six media fragments. The application rebuilt the video and audio
+  tracks from the persisted `.segments` files, moved the muxed output, removed
+  the temporary files, and left exactly one completed job.
+- The output was byte-identical to the independent FFmpeg reference:
+  `86836` bytes, SHA-256
+  `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`.
+  Command `python3 -m py_compile fixtures/startup_finalizing_probe.py &&
+  python3 fixtures/startup_finalizing_probe.py` exited `0` with
+  `STARTUP-FINALIZING-RECOVERY: PASS`.
+- This closes persisted `finalizing` recovery for a complete finite multi-track
+  job. The next weakness to audit is identity invalidation during startup: a
+  changed manifest/segment identity must discard stale local fragments before
+  assembling the new resource, rather than silently combining generations.
+- Only `fixtures/startup_finalizing_probe.py` and this status entry belong in
+  this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
+  must not be staged.

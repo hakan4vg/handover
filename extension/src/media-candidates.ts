@@ -58,6 +58,8 @@ export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number
   // bug. An unassigned manifest is safe only while no competing ownership is
   // known; otherwise fail clearly instead of downloading the wrong media.
   if (!owned.length && assignedToOther) return undefined;
-  const pool = owned.length ? owned : scoped.filter((item) => !item.playerKey);
+  const pool = owned.length
+    ? (assignedToOther ? owned : [...owned, ...scoped.filter((item) => !item.playerKey)])
+    : scoped.filter((item) => !item.playerKey);
   return chooseFromPool(pool);
 }

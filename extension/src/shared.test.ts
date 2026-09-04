@@ -75,6 +75,14 @@ describe('media candidate selection', () => {
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-b')).toBe('https://cdn.test/b/manifest.mpd');
   });
 
+  it('allows a manifest observed before player evidence when that player owns the segments', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/index.m3u8', tabId: 4, frameId: 0, at: 1, role: 'manifest' },
+      { url: 'https://cdn.test/vod/segment-1.ts', tabId: 4, frameId: 0, at: 2, role: 'segment', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/index.m3u8');
+  });
+
   it('refuses to cross-select another player when the clicked player has no evidence', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/a/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },

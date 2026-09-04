@@ -2436,3 +2436,37 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `BROWSER-OWNERSHIP: PASS ({"click":{"button":0,"ctrlKey":true,
   "defaultPrevented":false,"isTrusted":true},"context":{"button":2,
   "defaultPrevented":false,"isTrusted":true}})`.
+
+## 2026-09-04 — Prove public blob/MSE HLS capture
+
+- Added `fixtures/public_hls_chromium_probe.py` against the official hls.js demo
+  at `https://hlsjs.video-dev.org/demo/`, using its fixed finite 480p Big Buck
+  Bunny stream:
+  `https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8`.
+  The real player reported `blob=true`, `readyState=4`, `paused=false`, and
+  `duration=634.6`; the extension button was visible on the playing player.
+- First real attempt failed at the probe boundary, not the product: the fixture
+  fetched all 64 reference segments before clicking, which filled the bounded
+  traffic ring and evicted the manifest. The native job was not created. The
+  fixture was reordered to click and commit first, then fetch the browser
+  reference, so it no longer tests its own reference traffic.
+- This exposed the real candidate-ordering edge: the manifest can be observed
+  before player evidence, while later segments carry the player key. The old
+  selector then considered only owned segments and returned no source. Added a
+  regression and a narrow fix: when no competing player's traffic is known,
+  owned traffic may be considered with unassigned candidates, still preferring
+  a manifest; cross-player refusal remains unchanged.
+- The clean, non-instrumented real run completed one native `.ts` job from the
+  exact manifest. Browser-context fetch plus Web Crypto assembled 64 ordered
+  segments and produced `71878228` bytes with SHA-256
+  `6e830be99296a8452aa3294f25ca64193bee2b58bf4d559a7cc5ffbb1cda0a42`.
+  Native output matched both size and hash:
+  `PUBLIC-HLS-CHROMIUM: PASS (segments=64, output_bytes=71878228,
+  sha256=6e830be99296a8452aa3294f25ca64193bee2b58bf4d559a7cc5ffbb1cda0a42,
+  jobs=1, browser_downloads=[])`.
+- Trusted Ctrl-click and right-click on a normal HTTP link remained
+  browser-owned (`isTrusted=true`, `defaultPrevented=false`); no extra native
+  job or browser download appeared. The run ended with
+  `PUBLIC-HLS-CHROMIUM-PROBE: PASS`.
+- Frontend/extension verification after the fix passed Vitest `32/32`,
+  `tsc -b`, `npm run build:all`, and the focused candidate regression `12/12`.

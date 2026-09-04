@@ -1476,4 +1476,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   not missing-route errors.
 - No code change; real binary failure-path evidence only. The sibling's
   `wait_for_transfer_idle` helper remains the only unstaged and unmodified
-  worktree change; this slice stages no sibling hunk.
+  worktree change; this slice stages no hunk.
+
+## 2026-09-04 — Tray Resume All preserves ready provisional acquisitions
+
+- Audit found the tray `resume-all` closure still unconditionally changed every
+  paused/pending job to `downloading`, set one connection, and respawned it.
+  The main `resume_all` command already avoided that for a ready provisional,
+  so tray use could refetch a consumed one-use source after Pause All.
+- Added `resume_plan_for_job`, returning the next state, spawn decision, and
+  connection count. `resume_job`, the main `resume_all` command, and the tray
+  `resume-all` handler now use the same plan. Ready provisionals return to
+  `finalizing` / `Ready to save`, with zero connections and no respawn; ordinary
+  paused jobs retain the downloading/respawn path.
+- TDD evidence: the new tray-plan test was first run RED because the helper was
+  absent, then GREEN after the shared implementation. Focused test passed.
+- Real rebuilt-app IPC evidence used a fresh one-use fixture: the row reached
+  `finalizing`, `100%`, and `65536` bytes; `pause_all` changed it to `paused`
+  with zero connections; `resume_all` restored `finalizing` with zero
+  connections and preserved the bytes. The second request returned HTTP `410`,
+  and deterministic fixture-byte identity passed. Job ID:
+  `provisional-ea4b7a73-cbe2-499a-84bc-9ceeb7a3bea0`.
+- Rust suite: `45/45`; cargo build passed. Frontend/extension suite: `31/31`;
+  `npx tsc -b` and `npm run build:all` passed. The only Rust warning is the
+  sibling's untouched unused `wait_for_transfer_idle` helper.
+- The tray itself was not driven through XTEST; the shared handler decision is
+  covered by the focused Rust regression and the real command path by IPC.
+  XTEST remains blocked by the previously recorded `BadValue` failure.
+- Only the owned resume-plan code/test hunks belong in this commit. The sibling
+  `wait_for_transfer_idle` hunk remains unstaged.

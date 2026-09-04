@@ -1413,12 +1413,17 @@ fn resume_all_plan(provisional: Option<bool>, progress: f64) -> (&'static str, b
     (if ready { "finalizing" } else { "downloading" }, !ready)
 }
 
+fn resume_plan_for_job(provisional: Option<bool>, progress: f64) -> (&'static str, bool, u32) {
+    let (next_state, should_spawn) = resume_all_plan(provisional, progress);
+    (next_state, should_spawn, if should_spawn { 1 } else { 0 })
+}
+
 #[tauri::command]
 fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     let _lifecycle = state.lifecycle.lock().ok();
     if transfer_is_active(state.inner(), &id) { return; }
-    let Some((source, next_state, should_spawn)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| { let (next_state, should_spawn) = resume_all_plan(job.provisional, job.progress); (job.source.clone(), next_state, should_spawn) })) else { return; };
-    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = next_state.into(); job.connections = 0; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
+    let Some((source, next_state, should_spawn, connections)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); (job.source.clone(), next_state, should_spawn, connections) })) else { return; };
+    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
     emit_snapshot(&app, &state);
     if should_spawn && !spawn_transfer(&app, state.inner(), id, source) { return; }
 }
@@ -1451,7 +1456,7 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _li
 fn pause_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(&app, &state); }
 
 #[tauri::command]
-fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn) = resume_all_plan(job.provisional, job.progress); job.state = next_state.into(); job.connections = if should_spawn { 1 } else { 0 }; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(&app, &state); for (id, source) in sources { let _ = spawn_transfer(&app, state.inner(), id, source); } }
+fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(&app, &state); for (id, source) in sources { let _ = spawn_transfer(&app, state.inner(), id, source); } }
 
 fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput, show_window: bool) -> Result<String, String> {
     let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable")?;
@@ -1776,7 +1781,7 @@ fn install_tray(app: &tauri::AppHandle, intercept_downloads: bool, show_media_bu
         match id {
             "open-manager" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }
             "pause-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused from the system tray", Some("warning"))); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(app, &state); }
-            "resume-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { job.state = "downloading".into(); job.connections = 1; job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(app, &state); for (id, source) in sources { let _ = spawn_transfer(app, state.inner(), id, source); } }
+            "resume-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(app, &state); for (id, source) in sources { let _ = spawn_transfer(app, state.inner(), id, source); } }
             "browser-integration" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.intercept_downloads = !snapshot.settings.intercept_downloads; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons)) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
             "media-buttons" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.show_media_buttons = !snapshot.settings.show_media_buttons; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons)) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
             "bandwidth" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); let _ = window.eval("window.location.href = window.location.pathname + '?settings=network'"); } }
@@ -2155,6 +2160,14 @@ mod capture_tests {
         let rebooted = settings_from_stored(&stored);
         assert!(!rebooted.default_folder.trim().is_empty());
         assert!(!rebooted.temp_folder.trim().is_empty());
+    }
+
+    #[test]
+    fn tray_resume_all_uses_provisional_plan() {
+        use super::resume_plan_for_job;
+        assert_eq!(resume_plan_for_job(Some(true), 100.0), ("finalizing", false, 0));
+        assert_eq!(resume_plan_for_job(Some(true), 99.9), ("downloading", true, 1));
+        assert_eq!(resume_plan_for_job(Some(false), 100.0), ("downloading", true, 1));
     }
 
     #[test]

@@ -115,7 +115,7 @@ def main() -> int:
     client = None
     log_handle = None
     try:
-        xvfb, display = None, ":99"
+        xvfb, display = hls.start_xvfb()
         support.DISPLAY = display
         server = SlowSequentialServer()
         source = f"http://127.0.0.1:{server.port}/sequential-pause.m3u8"

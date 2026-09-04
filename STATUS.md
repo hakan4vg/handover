@@ -2503,3 +2503,16 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   adaptive sample starts at 480p and switches to 768p while the parser selects
   the first representation, so this evidence does not claim the separate
   quality-switch acceptance case; that remains a distinct gap.
+
+## 2026-09-04 — Reverify sequential fallback pause with owned Xvfb
+
+- The existing pause probe's first current run was not product evidence: it used
+  a fixed `DISPLAY=:99` without starting Xvfb, and the resident died during
+  Inspector startup with `app_poll=-11`. The probe now starts the same disposable
+  Xvfb helper used by the passing sequential-only probe and owns its cleanup.
+- The corrected real-binary run passed:
+  `SEQUENTIAL-PAUSE: PASS (state=paused, completed=1/4,
+  downloaded=262144, rejected_overlaps=4,
+  requests={'seg0.ts': 1, 'seg1.ts': 2, 'seg2.ts': 1, 'seg3.ts': 1})`.
+  The resident remained alive, one valid fragment was retained, and no error was
+  recorded. This closes the real pause-during-sequential-fallback case.

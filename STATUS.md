@@ -1303,3 +1303,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   4.82 kB); `git diff --check` passed.
 - The sibling's `wait_for_transfer_idle` helper remains unstaged and unmodified
   in `src-tauri/src/main.rs`; this slice stages no sibling hunk.
+
+## 2026-09-04 — Real mid-transfer cancel probe (SPEC §7.3)
+
+- Used the live isolated Tauri app + fixture `:8904` via the WebKit inspector
+  bridge. Created `slow.bin?capped=1` with a 10 KB/s per-job cap, observed
+  `downloading 4.66% (24436 bytes), provisional=true` mid-transfer, then
+  issued `cancel_job` for that exact id.
+- After cancel: the row is absent from the isolated SQLite `jobs` table, its
+  temp `.part` is gone, and no destination file was created. The unrelated
+  ready `slow-hls` provisional (`finalizing 100%`, awaiting Download/Cancel)
+  was correctly preserved — cancel is selective, not a sweep.
+- An earlier immediate create→cancel of `slow.bin?cancel=1` also left no row,
+  no temp, and no destination.
+- No code change; probe evidence only. Fixture `:8904` and the isolated app
+  were left running for further probes.

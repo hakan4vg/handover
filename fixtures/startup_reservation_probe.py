@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-binary proof that a persisted destination marker is reclaimed on startup."""
+"""Real-binary proof that an incomplete persisted destination marker is reclaimed on startup."""
 
 from __future__ import annotations
 
@@ -22,7 +22,13 @@ JOB_ID = "startup-reservation-recovery"
 MARKER_PREFIX = "download-manager-reservation-v1:"
 
 
-def update_seed(db: str, job_id: str, expected: bytes, marker: str) -> tuple[str, str]:
+def update_seed(
+    db: str,
+    job_id: str,
+    expected: bytes,
+    marker: str,
+    marker_bytes: bytes,
+) -> tuple[str, str]:
     with sqlite3.connect(db) as connection:
         payload = connection.execute("SELECT payload FROM jobs WHERE id = ?", (job_id,)).fetchone()[0]
         job = json.loads(payload)
@@ -38,7 +44,7 @@ def update_seed(db: str, job_id: str, expected: bytes, marker: str) -> tuple[str
             destinationReservation=marker,
         )
         Path(destination).parent.mkdir(parents=True, exist_ok=True)
-        Path(destination).write_bytes(marker.encode())
+        Path(destination).write_bytes(marker_bytes)
         connection.execute("UPDATE jobs SET payload = ? WHERE id = ?", (json.dumps(job), job_id))
         connection.commit()
     return temp_path, destination
@@ -82,7 +88,7 @@ def main() -> int:
             state="downloading",
         )
         marker = f"{MARKER_PREFIX}{os.urandom(16).hex()}"
-        temp_path, destination = update_seed(db, JOB_ID, expected, marker)
+        temp_path, destination = update_seed(db, JOB_ID, expected, marker, marker.encode()[: len(marker) // 2])
 
         app = subprocess.Popen(
             [support.BIN],
@@ -104,7 +110,7 @@ def main() -> int:
         assert output.read_bytes() != marker.encode()
         assert proxy.snapshot().get("/changed.bin") == 1, proxy.snapshot()
         assert len(requests) == 1 and requests[0]["range"] == "bytes=0-0", requests
-        print(f"STARTUP-RESERVATION-RECOVERY: PASS (job={JOB_ID}, destination={output.name}, sha256={expected_hash})", flush=True)
+        print(f"STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS (job={JOB_ID}, destination={output.name}, sha256={expected_hash})", flush=True)
         print(f"STARTUP-RESERVATION-REQUESTS: {requests}", flush=True)
         print(f"E2E-ROOT: {home}", flush=True)
         return 0

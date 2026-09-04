@@ -437,7 +437,7 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
             for payload in rows.flatten() {
                 if let Ok(mut job) = serde_json::from_str::<DownloadJob>(&payload) {
                     if let Some(marker) = job.destination_reservation.clone() {
-                        match reconcile_destination_reservation(Path::new(&job.destination), &marker) {
+                        match reconcile_destination_reservation(Path::new(&job.destination), &marker, job.total == Some(0)) {
                             DestinationReservationRecovery::Retry | DestinationReservationRecovery::Missing => job.destination_reservation = None,
                             DestinationReservationRecovery::Completed => {
                                 job.destination_reservation = None;
@@ -570,9 +570,13 @@ enum DestinationReservationRecovery { Retry, Completed, Missing, Unknown }
 
 fn destination_reservation_marker() -> String { format!("{DESTINATION_RESERVATION_PREFIX}{}", Uuid::new_v4()) }
 
-fn reconcile_destination_reservation(path: &Path, marker: &str) -> DestinationReservationRecovery {
+fn reconcile_destination_reservation(path: &Path, marker: &str, allow_empty_completed: bool) -> DestinationReservationRecovery {
     match std::fs::read(path) {
-        Ok(bytes) if bytes == marker.as_bytes() => match std::fs::remove_file(path) {
+        Ok(bytes) if bytes == marker.as_bytes() || bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => match std::fs::remove_file(path) {
+            Ok(()) => DestinationReservationRecovery::Retry,
+            Err(_) => DestinationReservationRecovery::Unknown,
+        },
+        Ok(bytes) if bytes.is_empty() && !allow_empty_completed => match std::fs::remove_file(path) {
             Ok(()) => DestinationReservationRecovery::Retry,
             Err(_) => DestinationReservationRecovery::Unknown,
         },
@@ -2389,11 +2393,20 @@ mod capture_tests {
         let target = root.join("managed.bin");
         let marker = destination_reservation_marker();
         std::fs::write(&target, marker.as_bytes()).unwrap();
-        assert_eq!(reconcile_destination_reservation(&target, &marker), DestinationReservationRecovery::Retry);
+        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Retry);
+        assert!(!target.exists());
+        std::fs::write(&target, marker.as_bytes()[..marker.len() / 2].to_vec()).unwrap();
+        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Retry);
         assert!(!target.exists());
         std::fs::write(&target, b"completed-output").unwrap();
-        assert_eq!(reconcile_destination_reservation(&target, &marker), DestinationReservationRecovery::Completed);
+        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Completed);
         assert_eq!(std::fs::read(&target).unwrap(), b"completed-output");
+        std::fs::write(&target, []).unwrap();
+        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Retry);
+        assert!(!target.exists());
+        std::fs::write(&target, []).unwrap();
+        assert_eq!(reconcile_destination_reservation(&target, &marker, true), DestinationReservationRecovery::Completed);
+        assert!(target.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1938,3 +1938,23 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   build; Vitest frontend/extension `7` files and `31/31` tests; `npx tsc -b`;
   and `npm run build:all` (frontend plus extension). The only native warning
   is the protected sibling `wait_for_transfer_idle` helper being unused.
+
+## 2026-09-04 — Reclaim interrupted reservation writes
+
+- A follow-up audit found that a crash while writing the reservation token could
+  leave an empty or prefix-only destination. The reconciler previously treated
+  an empty file as completed output. It now reclaims empty and prefix-only
+  reservation bytes, while preserving an empty file only when the persisted job
+  total is exactly zero. A marker mismatch with ordinary non-empty bytes still
+  means the move completed and those bytes are preserved.
+- Extended the Rust regression with exact, prefix-only, empty/non-zero, and
+  empty/zero-length cases. The protected sibling `wait_for_transfer_idle`
+  hunk remains unstaged.
+- Extended `fixtures/startup_reservation_probe.py` to seed a half-written
+  marker in SQLite and the destination. The rebuilt real binary exited `0`:
+  `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS
+  (job=startup-reservation-recovery, destination=managed.bin,
+  sha256=3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87)`.
+  It reused the original destination, cleared `destinationReservation`,
+  removed the interrupted marker, reused the complete temp file, and made only
+  the one-byte `Range: bytes=0-0` request.

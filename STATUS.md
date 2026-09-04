@@ -2060,3 +2060,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   helper being unused. The replacement-failure probe also received display
   propagation and retained app-log diagnostics after one harness-only
   inspector-startup failure; its isolated rerun exited `0`.
+
+## 2026-09-04 — Preserve durable output when source cleanup fails
+
+- The next finalization audit found that both cross-filesystem fallback branches
+  deleted the final destination if removing the temporary source failed after a
+  successful install. That could destroy the only durable output and turn a
+  cleanup error into data loss.
+- Added `remove_completed_source` and routed reserved and explicit-replace
+  fallback cleanup through it. A source-removal error is now reported without
+  deleting the already-installed destination. Test-only controls force the
+  fallback path and source-cleanup failure; production builds compile those
+  controls out.
+- Added the deterministic Rust regression
+  `durable_reserved_destination_survives_source_cleanup_failure`. It forces a
+  reserved fallback, injects failure at source cleanup, and verifies the
+  complete destination bytes remain while the source remains available for
+  diagnosis or retry.
+- Fresh native verification passed `50/50` tests and Cargo build. The only
+  warning remains the protected sibling `wait_for_transfer_idle` helper being
+  unused.
+- Fresh fail-fast real-binary probes all exited successfully:
+  `MOVE-CANCEL-RACE: PASS` with one 268435456-byte output and SHA-256
+  `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`;
+  `MANAGED-RENAME-COLLISION: PASS` with `managed (1).bin`;
+  `REPLACE-COLLISION: PASS`;
+  `REPLACE-FAILURE-CLEANUP: PASS` with the old destination preserved;
+  `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS` with one `bytes=0-0`
+  request; and `COLLISION-RESERVATION: PASS` with distinct output names and
+  hashes.

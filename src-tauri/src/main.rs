@@ -774,6 +774,43 @@ fn fail_reserved_install_after_marker_removal() -> bool {
 #[cfg(not(test))]
 fn fail_reserved_install_after_marker_removal() -> bool { false }
 
+#[cfg(test)]
+static FORCE_RESERVED_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn inject_reserved_fallback_for_test() {
+    FORCE_RESERVED_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn force_reserved_fallback_for_test() -> bool {
+    FORCE_RESERVED_FALLBACK.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn force_reserved_fallback_for_test() -> bool { false }
+
+#[cfg(test)]
+static FAIL_SOURCE_CLEANUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn inject_source_cleanup_failure_for_test() {
+    FAIL_SOURCE_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn fail_source_cleanup_for_test() -> bool {
+    FAIL_SOURCE_CLEANUP.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn fail_source_cleanup_for_test() -> bool { false }
+
+async fn remove_completed_source(source: &str) -> Result<(), String> {
+    if fail_source_cleanup_for_test() { return Err("injected source cleanup failure".into()); }
+    tokio::fs::remove_file(source).await.map_err(|error| error.to_string())
+}
+
 enum ReservationRestore {
     Restored,
     DestinationChanged,
@@ -841,7 +878,12 @@ async fn install_reserved_staging(staging: &str, destination: &str, marker: &str
 async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reservation_marker: Option<&str>) -> Result<(), String> {
     let reserved = reservation_marker.is_some();
     if let Some(parent) = PathBuf::from(destination).parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
-    match tokio::fs::rename(source, destination).await {
+    let initial_move = if reserved && force_reserved_fallback_for_test() {
+        Err(std::io::Error::from_raw_os_error(18))
+    } else {
+        tokio::fs::rename(source, destination).await
+    };
+    match initial_move {
         Ok(()) => Ok(()),
         Err(error) if move_needs_fallback(&error) && reserved => {
             let staging = format!("{destination}.download-manager-staging-{}", uuid::Uuid::new_v4());
@@ -863,9 +905,9 @@ async fn move_completed_file(source: &str, destination: &str, replace_existing: 
                     return Err(format!("{error}; fallback move failed: {rename_error}"));
                 }
             }
-            match tokio::fs::remove_file(source).await {
+            match remove_completed_source(source).await {
                 Ok(()) => Ok(()),
-                Err(remove_error) => { let _ = tokio::fs::remove_file(destination).await; Err(remove_error.to_string()) }
+                Err(remove_error) => Err(remove_error),
             }
         }
         Err(error) if move_needs_fallback(&error) && replace_existing => {
@@ -886,9 +928,9 @@ async fn move_completed_file(source: &str, destination: &str, replace_existing: 
             match tokio::fs::rename(&staging, destination).await {
                 Ok(()) => {
                     if had_existing { let _ = tokio::fs::remove_file(&backup).await; }
-                    match tokio::fs::remove_file(source).await {
+                    match remove_completed_source(source).await {
                         Ok(()) => Ok(()),
-                        Err(remove_error) => { let _ = tokio::fs::remove_file(destination).await; if had_existing { let _ = tokio::fs::rename(&backup, destination).await; } Err(remove_error.to_string()) }
+                        Err(remove_error) => Err(remove_error),
                     }
                 }
                 Err(rename_error) => {
@@ -2500,6 +2542,26 @@ mod capture_tests {
         assert!(!move_needs_fallback(&std::io::Error::from_raw_os_error(13)));
     }
 
+    #[test]
+    fn durable_reserved_destination_survives_source_cleanup_failure() {
+        use super::{inject_reserved_fallback_for_test, inject_source_cleanup_failure_for_test, move_completed_file};
+        let root = std::env::temp_dir().join(format!("download-manager-source-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.part");
+        let destination = root.join("managed.bin");
+        let marker = "download-manager-reservation-v1:test-source-cleanup";
+        std::fs::write(&source, b"complete-output").unwrap();
+        std::fs::write(&destination, marker.as_bytes()).unwrap();
+        inject_reserved_fallback_for_test();
+        inject_source_cleanup_failure_for_test();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(move_completed_file(source.to_str().unwrap(), destination.to_str().unwrap(), false, Some(marker)));
+        assert!(result.is_err(), "injected source cleanup failure must be reported");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete-output", "durable output must survive source cleanup failure");
+        assert!(source.exists(), "failed source cleanup must leave the source for diagnosis/retry");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn reserved_staging_install_restores_marker_when_final_rename_fails() {
         use super::{inject_reserved_install_failure_for_test, install_reserved_staging};

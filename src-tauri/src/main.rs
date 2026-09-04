@@ -657,7 +657,17 @@ async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String
         Ok(status) if status.success() => { tokio::fs::rename(&output_path, temp_path).await.map_err(|error| error.to_string())?; Ok(()) }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
-        Ok(_) => { let _ = tokio::fs::remove_file(&output_path).await; Err("Media finalization failed; downloaded parts were preserved".into()) }
+        Ok(status) => { let _ = tokio::fs::remove_file(&output_path).await; Err(ffmpeg_remux_failure(&status)) }
+    }
+}
+
+// A failed remux must name its cause: the previous generic string discarded
+// ffmpeg's exit status, leaving "Media finalization failed" with no way to
+// tell corrupt input apart from a broken toolchain.
+fn ffmpeg_remux_failure(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("Media remux failed (ffmpeg exit {code}); downloaded parts were preserved"),
+        None => "Media remux failed (ffmpeg terminated); downloaded parts were preserved".into(),
     }
 }
 
@@ -2116,6 +2126,16 @@ mod capture_tests {
         assert!(!commit_is_ready(Some(true), Some("failed"), 100.0, false));
         assert!(!commit_is_ready(None, None, 0.0, false));
         assert!(!commit_is_ready(Some(true), Some("finalizing"), 100.0, true));
+    }
+
+    #[test]
+    fn failed_remux_names_ffmpeg_exit_status() {
+        use super::ffmpeg_remux_failure;
+        use std::os::unix::process::ExitStatusExt;
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        let message = ffmpeg_remux_failure(&failed);
+        assert!(message.contains("ffmpeg exit 1"), "{message}");
+        assert!(message.contains("parts were preserved"), "{message}");
     }
     #[test]
     fn settings_patch_rejects_blank_folders() {

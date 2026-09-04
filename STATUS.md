@@ -1330,3 +1330,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - SHA256 of `/tmp/dm-commit-probe-home-tAe0rJ/Downloads/pauseresume.bin` is
   `d76394c6…ccdc33f`, identical to a fresh GET of `/file/slow.bin`.
 - No code change; probe evidence only.
+
+## 2026-09-04 — Failed media remux now names its cause (real HLS probe)
+
+- Committing the ready HLS `slow-hls` provisional as `slow-hls.bin` failed in
+  `finalize_media`: the fixture's `/hls/slow.m3u8` segments are random bytes,
+  and destination extension `.bin` routes through `ffmpeg -c copy`, which
+  rejected the input (`Invalid data found`). The product failed honestly with
+  parts preserved — but `job.error` carried only the generic string, discarding
+  ffmpeg's cause. Reproduced byte-for-byte with the installed ffmpeg 7.1.5.
+- `finalize_media` now returns `ffmpeg_remux_failure(&status)`, e.g. `Media
+  remux failed (ffmpeg exit 183); downloaded parts were preserved`, which flows
+  into `job.error` and the invoke result. The timeline event text is unchanged.
+  Pure regression `failed_remux_names_ffmpeg_exit_status`; Rust suite `44/44`.
+- Live proof on the rebuilt binary: a fresh HLS commit as `.bin` failed with
+  `error: Media remux failed (ffmpeg exit 183); downloaded parts were
+  preserved` and kept its 4194304-byte part; a fresh HLS commit as `.ts`
+  (remux correctly skipped) completed with `state=completed, error=None`,
+  output `tsok.ts` at 4194304 bytes, temp part removed.
+- Frontend/extension suite `31/31`, `tsc` clean, cargo build clean (only the
+  sibling's unused-helper warning), `git diff --check` clean.
+- The sibling's `wait_for_transfer_idle` helper remains unstaged and unmodified
+  in `src-tauri/src/main.rs`; this slice stages no sibling hunk.

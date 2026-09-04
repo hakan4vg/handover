@@ -1318,3 +1318,15 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   no temp, and no destination.
 - No code change; probe evidence only. Fixture `:8904` and the isolated app
   were left running for further probes.
+
+## 2026-09-04 — Real pause/resume/commit chain is byte-identical
+
+- Same live app + fixture `:8904`. Created `slow.bin?pauseresume=1` at 50 KB/s:
+  observed `downloading 23.4% (122880 bytes)`, then `pause_job` → `paused
+  48.8% (256000 bytes)` with the 256000-byte temp part preserved on disk.
+- `resume_job` continued the same acquisition to `finalizing 100% (524288
+  bytes)` — no restart from zero. `commit_provisional` then completed it as a
+  managed download; the temp part was removed.
+- SHA256 of `/tmp/dm-commit-probe-home-tAe0rJ/Downloads/pauseresume.bin` is
+  `d76394c6…ccdc33f`, identical to a fresh GET of `/file/slow.bin`.
+- No code change; probe evidence only.

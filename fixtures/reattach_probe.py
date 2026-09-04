@@ -149,7 +149,7 @@ def assert_range_requests(requests: list[dict], query: str, etag: str, remainder
     assert all(request["etag"] == etag for request in requests), requests
 
 
-def seed_job(db: str, home: str, source: str, job_id: str, name: str, data: bytes, etag: str):
+def seed_job(db: str, home: str, source: str, job_id: str, name: str, data: bytes, etag: str, state: str = "paused"):
     temp_path = os.path.join(home, ".cache", "download-manager", "tmp", f"{job_id}.part")
     os.makedirs(os.path.dirname(temp_path), exist_ok=True)
     with open(temp_path, "wb") as handle:
@@ -161,7 +161,7 @@ def seed_job(db: str, home: str, source: str, job_id: str, name: str, data: byte
         "source": source,
         "domain": "127.0.0.1",
         "kind": "document",
-        "state": "paused",
+        "state": state,
         "progress": PARTIAL / TOTAL * 100,
         "downloaded": PARTIAL,
         "total": TOTAL,

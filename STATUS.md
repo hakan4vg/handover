@@ -1661,3 +1661,31 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Only the probe, this status entry, and the host-identity test hunk belong in
   this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
   must not be staged.
+
+## 2026-09-04 — Committed range jobs recover automatically at startup
+
+- Continued the §8.9 audit into the boot path. `setup` preserves committed
+  `connecting`, `downloading`, and `finalizing` rows and respawns their normal
+  acquisition engine without UI or browser input.
+- Added `fixtures/startup_recovery_probe.py`. It starts the real rebuilt binary
+  with an isolated HOME and no command/IPC, after seeding one committed
+  `downloading` row with a full-length sparse `.part`, completed range
+  `0-65535`, and validator `"v1"`.
+- The automatic startup recovery passed with exactly two HTTP requests:
+  `GET Range: bytes=0-0` → `206`, `Content-Range: bytes 0-0/262144`, `1`
+  byte, ETag `"v1"`; then `GET Range: bytes=65536-262143` → `206`,
+  `196608` bytes, the same ETag. No duplicate full fetch occurred.
+- The single recovered row completed, its temporary file was removed, and the
+  output SHA-256 was
+  `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87`.
+  The probe exited `0` with `STARTUP-AUTO-RECOVERY: PASS`.
+- Parameterized the shared probe seeder so startup tests can select an active
+  persisted state while targeted reattach keeps its paused default. No native
+  production source changed in this slice.
+- This probe closes automatic startup recovery for ordinary committed range
+  jobs. The next related check is a persisted `finalizing` media job, where
+  recovery must reuse assembled fragment state rather than refetching or
+  overwriting a completed artifact.
+- Only `fixtures/reattach_probe.py`, `fixtures/startup_recovery_probe.py`, and
+  this status entry belong in this slice. The sibling
+  `wait_for_transfer_idle` hunk remains untouched and must not be staged.

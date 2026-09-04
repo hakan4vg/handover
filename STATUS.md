@@ -1527,3 +1527,51 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - No source change; the disposable profile and Chromium process were cleaned
   after the probe. The sibling `wait_for_transfer_idle` helper remains the only
   unstaged worktree change.
+
+## 2026-09-04 — Multi-track DASH segmented restart and recovery proof
+
+- Re-read SPEC §8.5 and §8.7. The relevant contract is that committed jobs
+  survive restart with completed segmented fragment state intact, retries are
+  bounded and cancellation-aware, and pause/resume must preserve valid work.
+- Added `fixtures/segmented_restart_probe.py`. It launches a fresh
+  `fixtures/server.py` finite `/dash/manifest.mpd`, fronts it with a local
+  counting/delaying proxy, and runs the real debug binary in an isolated HOME
+  and dedicated Xvfb. It seeds only three real fragments of a committed,
+  non-provisional two-track job and computes the same manifest identity as the
+  Rust engine.
+- Phase 1 passed: the running app recorded `5/6` fragments before the probe
+  SIGKILLed only that disposable app. The three seeded paths were not fetched;
+  only the three missing paths were requested once. The SQLite row and five
+  non-empty fragment files remained after termination.
+- Phase 2 passed: relaunching the binary reused all five persisted fragments.
+  The delayed sixth request was cancelled through direct WebKit Inspector IPC;
+  the committed row became `failed`, `connections=0`, and its `a-0` request
+  count stayed at `1` for one second after cancellation. The normal `retry_job`
+  command then fetched only `a-0` and completed the job.
+- The recovered output was `86836` bytes with SHA-256
+  `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`. It was
+  byte-identical to an independent FFmpeg `-c copy` assembly of the four video
+  and two audio fixture fragments.
+- Phase 3 passed the retry bound: with `maxRetries=2`, an injected HTTP 503 on
+  the missing audio fragment produced exactly `3` attempts, then a failed row
+  at `5/6` with no retry storm. Clearing the injected failure and invoking the
+  normal retry command reused five fragments, fetched only `a-0`, and produced
+  the same final SHA-256.
+- Clean command evidence: `python3 -m py_compile
+  fixtures/segmented_restart_probe.py && python3
+  fixtures/segmented_restart_probe.py` exited `0` and printed
+  `PHASE-1-PERSIST: PASS`, `CANCEL-BOUND: PASS`, `RESTART-REUSE: PASS`,
+  `RETRY-BOUND: PASS`, `RETRY-RECOVERY: PASS`, and
+  `SEGMENTED-RESTART-PROBE: PASS`. The retained probe root was
+  `/tmp/dm-segmented-restart-k22e1jke`.
+- The probe required three harness corrections before the clean pass: product
+  identity grouping was mirrored correctly, WebKitGTK target discovery used
+  its emitted page target instead of unsupported `Target.getTargets`, and
+  Tauri bridge readiness was awaited. None changed product code.
+- Only this probe and this STATUS entry belong in the next commit; the sibling
+  `wait_for_transfer_idle` hunk remains untouched.
+- Verification after the probe: native `media::tests` passed `8/8`, native
+  `lifecycle::tests` passed `5/5`, full Rust passed `45/45`, and `cargo build`
+  passed. `npm test` passed `31/31`, `npx tsc -b` passed, and
+  `npm run build:all` passed. Cargo reported only the sibling's existing
+  unused `wait_for_transfer_idle` warning.

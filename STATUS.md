@@ -2340,3 +2340,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `MULTIPLE-ADD-WINDOWS: PASS (windows=3, jobs=3, processes=1, source_requests={'three.bin': 1, 'two.bin': 1, 'one.bin': 1})`.
 - The resident application log contained only the known
   `libayatana-appindicator is deprecated` warning and no product error.
+
+## 2026-09-04 — Degrade segmented media to sequential acquisition
+
+- Added `fixtures/sequential_only_probe.py` for SPEC §19.4. Its local finite
+  HLS source returns HTTP `429 Too Many Requests` whenever a second segment
+  overlaps the first. The initial real-binary run failed at one of four
+  fragments with `source returned 429 Too Many Requests`, proving that the
+  previous concurrent-only path did not meet the sequential-source acceptance.
+- The acquisition path now preserves successful fragment files, retries only
+  missing fragments with one active connection, reports the transition as
+  `Retrying sequentially`, and keeps bounded 100 ms spacing on fragment
+  retries. Persistent errors still fail honestly with the original and
+  fallback causes.
+- The corrected real probe passed with four segments and 131072 bytes. The
+  server rejected five overlapping requests, then served all segments through
+  the serial fallback: `SEQUENTIAL-ONLY: PASS (state=finalizing, segments=4,
+  bytes=131072, rejected_overlaps=5, requests={'seg2.ts': 1, 'seg1.ts': 3,
+  'seg0.ts': 2, 'seg3.ts': 3})`.
+- Added `fixtures/sequential_pause_probe.py`. It invokes the real `pause_job`
+  command as soon as the sequential fallback begins. The probe passed with
+  `state=paused`, `completed=1/4`, and `downloaded=262144` after four overlap
+  rejections; valid work was retained and no error was recorded.
+- Cargo verification after the product change passed Rust `54/54` and the
+  native build. The only Rust warning remains the protected sibling
+  `wait_for_transfer_idle` helper. The successful pause probe log contained
+  only the shared-Xvfb accessibility-bus warning and the known
+  libayatana-appindicator deprecation warning.

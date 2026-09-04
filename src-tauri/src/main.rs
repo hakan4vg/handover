@@ -1136,7 +1136,11 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     let expected_length = byte_range.map(|(_, length)| length);
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            sleep(Duration::from_millis(100)).await;
+            if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+        }
         let mut request = client.get(source);
         if let Some((start, length)) = byte_range {
             let Some(end) = start.checked_add(length).and_then(|value| value.checked_sub(1)) else {
@@ -1174,6 +1178,58 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
         }
     }
     Err(last_error)
+}
+
+async fn acquire_media_segment(
+    client: &reqwest::Client,
+    app: &AppHandle,
+    id: &str,
+    fragment: &media::Segment,
+    segment_path: &Path,
+    segment_temp_path: &Path,
+    retry_count: u32,
+    generation: u64,
+    completed: &AtomicU64,
+    downloaded: &AtomicU64,
+    started: std::time::Instant,
+    existing_bytes: u64,
+    total_segments: u32,
+    existing_count: u64,
+    connection_cap: usize,
+) -> Result<(), String> {
+    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    let bytes = fragment_bytes(client, app, id, &fragment.url, fragment.range, retry_count, generation).await?;
+    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
+    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    tokio::fs::write(segment_temp_path, &bytes).await.map_err(|error| error.to_string())?;
+    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    tokio::fs::rename(segment_temp_path, segment_path).await.map_err(|error| error.to_string())?;
+    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+    let size = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+    let elapsed = started.elapsed().as_secs_f64().max(0.1);
+    let speed = ((size.saturating_sub(existing_bytes)) as f64 / elapsed) as u64;
+    let remaining = (total_segments as u64).saturating_sub(done);
+    let eta = if speed > 0 && remaining > 0 {
+        let average_fragment = size / done.max(1);
+        Some(format!("{}s left", (average_fragment.saturating_mul(remaining) / speed).max(1)))
+    } else {
+        None
+    };
+    let state = app.state::<CoreState>();
+    let finished_missing = done.saturating_sub(existing_count);
+    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    emit_job(&state, id, |job| {
+        job.downloaded = size;
+        job.progress = done as f64 / total_segments as f64 * 100.0;
+        job.speed = speed;
+        job.eta = eta.clone();
+        job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) });
+        job.connections = connection_cap.min((total_segments as u64).saturating_sub(finished_missing) as usize) as u32;
+    });
+    emit_snapshot(app, &state);
+    Ok(())
 }
 
 fn content_range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
@@ -1465,8 +1521,8 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     let completed = std::sync::Arc::new(AtomicU64::new(existing_segments.len() as u64));
     let downloaded = std::sync::Arc::new(AtomicU64::new(existing_bytes));
     let existing_segments = std::sync::Arc::new(existing_segments);
-    let work = tracks.into_iter().enumerate().flat_map(|(track, media_track)| media_track.segments.into_iter().enumerate().map(move |(index, fragment)| (track, index, fragment))).filter(|(track, index, _)| !existing_segments.contains(&(*track, *index)));
-    let results = futures_util::stream::iter(work).map(|(track, index, fragment)| {
+    let work: Vec<_> = tracks.into_iter().enumerate().flat_map(|(track, media_track)| media_track.segments.into_iter().enumerate().map(move |(index, fragment)| (track, index, fragment))).filter(|(track, index, _)| !existing_segments.contains(&(*track, *index))).collect();
+    let results = futures_util::stream::iter(work.clone()).map(|(track, index, fragment)| {
         let client = client.clone();
         let app = app.clone();
         let id = id.clone();
@@ -1475,41 +1531,33 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let completed = completed.clone();
         let downloaded = downloaded.clone();
         async move {
-            if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            let bytes = fragment_bytes(&client, &app, &id, &fragment.url, fragment.range, retry_count, generation).await?;
-            if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
-            if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            tokio::fs::write(&segment_temp_path, &bytes).await.map_err(|error| error.to_string())?;
-            if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            tokio::fs::rename(&segment_temp_path, &segment_path).await.map_err(|error| error.to_string())?;
-            if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let size = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
-            let elapsed = started.elapsed().as_secs_f64().max(0.1);
-            let speed = ((size.saturating_sub(existing_bytes)) as f64 / elapsed) as u64;
-            let remaining = (total_segments as u64).saturating_sub(done);
-            let eta = if speed > 0 && remaining > 0 {
-                let average_fragment = size / done.max(1);
-                Some(format!("{}s left", (average_fragment.saturating_mul(remaining) / speed).max(1)))
-            } else {
-                None
-            };
-            let state = app.state::<CoreState>();
-            let finished_missing = done.saturating_sub(existing_count);
-            if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            emit_job(&state, &id, |job| { job.downloaded = size; job.progress = done as f64 / total_segments as f64 * 100.0; job.speed = speed; job.eta = eta.clone(); job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) }); job.connections = concurrency.min((missing_count as u64).saturating_sub(finished_missing) as usize) as u32; });
-            emit_snapshot(&app, &state);
-            Ok::<(), String>(())
+            acquire_media_segment(&client, &app, &id, &fragment, &segment_path, &segment_temp_path, retry_count, generation, &completed, &downloaded, started, existing_bytes, total_segments, existing_count, concurrency).await
         }
     }).buffer_unordered(concurrency).collect::<Vec<_>>().await;
-    if results.iter().any(Result::is_err) {
+    let concurrent_error = results.iter().find_map(|result| result.as_ref().err().cloned());
+    if let Some(initial_error) = concurrent_error {
         if !transfer_is_current(&app, &id, generation) { return Ok(()); }
         if matches!(job_state(&app, &id).as_deref(), Some("paused")) { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused with completed fragments preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
-        let error = results.into_iter().find_map(Result::err).unwrap_or_else(|| "A media fragment failed".into());
-        emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.speed = 0; job.events.insert(0, job_event("Media fragment acquisition failed", Some("error"))); });
+        emit_job(&state, &id, |job| { job.connections = 1; job.speed = 0; job.eta = Some("Retrying sequentially".into()); job.events.insert(0, job_event("Concurrent fragment acquisition failed; retrying sequentially", Some("warning"))); });
         emit_snapshot(&app, &state);
-        return Err(error);
+        let mut sequential_error = None;
+        for (track, index, fragment) in &work {
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            let segment_path = manifest_segment_path(&segment_dir, *track, *index, track_count);
+            let present = tokio::fs::metadata(&segment_path).await.map(|metadata| metadata.is_file() && metadata.len() > 0).unwrap_or(false);
+            if present { continue; }
+            let segment_temp_path = segment_path.with_extension("part.tmp");
+            if let Err(error) = acquire_media_segment(&client, &app, &id, fragment, &segment_path, &segment_temp_path, retry_count.max(1), generation, &completed, &downloaded, started, existing_bytes, total_segments, existing_count, 1).await {
+                sequential_error = Some(error);
+                break;
+            }
+        }
+        if let Some(error) = sequential_error {
+            let error = format!("{initial_error}; sequential fallback failed: {error}");
+            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.speed = 0; job.events.insert(0, job_event("Media fragment acquisition failed", Some("error"))); });
+            emit_snapshot(&app, &state);
+            return Err(error);
+        }
     }
     if !transfer_is_current(&app, &id, generation) { return Ok(()); }
     if job_state(&app, &id).as_deref() != Some("downloading") {

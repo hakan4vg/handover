@@ -1401,3 +1401,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   and `git diff --check` passed. The sibling's `wait_for_transfer_idle` helper
   remains the only unstaged worktree change and is unmodified; this evidence
   slice stages no sibling hunk.
+
+## 2026-09-04 — Media button capture reaches the native engine
+
+- Started the valid fixture page from `fixtures/` so its real H.264 MP4 served
+  successfully (`34,524` bytes, 5 seconds, 640x360). The native-enabled browser
+  rendered exactly one `Download` media button while the video was playing
+  (`readyState=4`, `paused=false`).
+- Clicking that rendered button sent `media-capture` through the extension's
+  native bridge. The app created `real.mp4` as `media=true`,
+  `mode=single-stream`, `mime=video/mp4`, and reached `finalizing 100%`
+  (`34,524` bytes). Its temporary part SHA256 was
+  `c5dba3fa0bbbf13a6c8981b1941f9713dc85bd5fb9522bee98945ba0592932c9`,
+  identical to the served MP4. No code change; probe evidence only.
+- The sibling's `wait_for_transfer_idle` helper remains the only unstaged and
+  unmodified worktree change; this evidence slice stages no sibling hunk.

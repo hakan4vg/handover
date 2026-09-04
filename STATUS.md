@@ -1416,3 +1416,19 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   identical to the served MP4. No code change; probe evidence only.
 - The sibling's `wait_for_transfer_idle` helper remains the only unstaged and
   unmodified worktree change; this evidence slice stages no sibling hunk.
+
+## 2026-09-04 — Policy-off ordinary download stays in Chromium
+
+- Used the real extension popup sender to update the persisted policy to
+  `interceptDownloads=false`, `showMediaButtons=true`, with no exclusions. The
+  popup reply was `ok=true` and the worker/content-script state followed it.
+- A fresh ordinary one-use link on the fixture page was not cancelled:
+  `dispatchReturned=true`, `defaultPrevented=false`. Chromium's download
+  history reported one complete item at `65536/65536` bytes with
+  `state=complete` and `error=null`; the saved file was present in the
+  isolated HOME. The app SQLite job count stayed at exactly four, so the
+  native app did not consume the source. A second source request returned
+  `410`.
+- No code change; probe evidence only. The sibling's
+  `wait_for_transfer_idle` helper remains the only unstaged and unmodified
+  worktree change; this evidence slice stages no sibling hunk.

@@ -147,6 +147,22 @@ def retry_mode():
         app.wait(timeout=15)
 
 
+def no_range_mode():
+    app = run_capture("http://127.0.0.1:8901/file/no-range.bin", "no-range.bin")
+    try:
+        (job,) = wait_state(("finalizing", "completed"))
+        assert job.get("resumable") is False, f"single-stream fallback was marked resumable: {job.get('resumable')}"
+        actual = temp_bytes(job, 2 * 1024 * 1024)
+        expected = urllib.request.urlopen(
+            "http://127.0.0.1:8901/file/no-range.bin", timeout=30
+        ).read()
+        assert actual == expected, "no-range bytes differ from fixture"
+        print(f"NO-RANGE: PASS ({len(actual)} bytes, restart-safe flag is false)", flush=True)
+    finally:
+        app.terminate()
+        app.wait(timeout=15)
+
+
 def ranged_manifest_mode():
     source = "http://127.0.0.1:8902/hls/ranged-vod.m3u8"
     app = run_capture(source, "ranged-vod.m3u8")
@@ -170,7 +186,7 @@ def main():
     shutil.rmtree(HOME, ignore_errors=True)
     os.makedirs(HOME, exist_ok=True)
     print(f"mode={MODE}", flush=True)
-    {"redirect": redirect_mode, "one-use": one_use_mode, "retry-503": retry_mode, "ranged-manifest": ranged_manifest_mode}[
+    {"redirect": redirect_mode, "one-use": one_use_mode, "retry-503": retry_mode, "no-range": no_range_mode, "ranged-manifest": ranged_manifest_mode}[
         MODE
     ]()
     print("ACQUIRE-PROBE: PASS", flush=True)

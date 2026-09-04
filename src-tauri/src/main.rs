@@ -1253,7 +1253,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         return false;
     };
     if !transfer_can_continue(&app, &id, generation) { return false; }
-    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = total; job.resumable = total.is_some(); job.connections = 1; job.mode = "single-stream".into(); job.mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string); job.events.insert(0, job_event("First native acquisition is receiving data", Some("success"))); });
+    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = total; job.resumable = false; job.connections = 1; job.mode = "single-stream".into(); job.mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string); job.events.insert(0, job_event("First native acquisition is receiving data", Some("success"))); });
     emit_snapshot(&app, &state);
     let started = std::time::Instant::now();
     let mut downloaded = 0u64;
@@ -1478,7 +1478,8 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         // = clear back to the global setting; Some(n) = set.
         if let Some(cap) = input.bandwidth_limit { job.bandwidth_limit = cap.filter(|value| *value > 0); }
         job.provisional = Some(false);
-        job.resumable = true;
+        // Keep the acquisition mode's verified resumability. Single-stream
+        // fallback is intentionally non-resumable until range resume exists.
         job.events.insert(0, job_event("Accepted as managed download", Some("success")));
         (job.state == "finalizing" || job.progress >= 100.0, job.temp_path.clone(), job.destination.clone(), collision == "replace", job.mode == "segments", job.media_tracks.unwrap_or(1))
     };

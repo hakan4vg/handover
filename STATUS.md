@@ -1168,3 +1168,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Rust suite: 36/36; frontend/extension suite: 27/27 across 6 files;
   `npx tsc -b` clean; cargo build and `git diff --check` passed. The sibling's
   two `wait_for_transfer_idle` hunks remain unstaged in `src-tauri/src/main.rs`.
+
+## 2026-09-04 — No-range fallback reports non-resumable state
+
+- Fresh audit found Mode C marking every known-length single-stream transfer
+  `resumable=true`, even though restart currently recreates the stream from
+  byte zero. `commit_provisional` also overwrote the mode-specific flag with
+  `true`, so the Add Download UI could promise resume the source cannot provide.
+- Single-stream acquisition now records `resumable=false`, and commit preserves
+  that verified mode flag. Range and segmented paths still set it true after
+  their completed-work state is established.
+- Added a no-range fixture probe requiring both the flag and exact bytes. Real
+  rebuilt-binary evidence: `NO-RANGE: PASS (2097152 bytes, restart-safe flag is
+  false)`. Redirect, one-use, bounded-503, ranged-manifest, limiter, and byte
+  identity probes remained passing. Rust 36/36; frontend/extension 27/27;
+  TypeScript clean; cargo build and diff check passed.
+- Final post-staging rerun: Rust `36/36`; no-range and ranged-manifest probes
+  passed again; redirect, one-use, bounded-503, limiter, and byte-identity
+  probes passed again. Temporary ranged fixture server was isolated on :8902
+  and stopped afterward.
+- The sibling's two `wait_for_transfer_idle` hunks remain unstaged in
+  `src-tauri/src/main.rs`.

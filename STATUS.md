@@ -1958,3 +1958,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   It reused the original destination, cleared `destinationReservation`,
   removed the interrupted marker, reused the complete temp file, and made only
   the one-byte `Range: bytes=0-0` request.
+
+## 2026-09-04 — Final move wins a pause/cancel race
+
+- The next finalization audit found that a pause or cancel arriving after the
+  durable move began could leave a completed destination paired with a paused
+  job. A later resume could fetch the source again and create a suffixed
+  duplicate. The post-move ownership check is now applied only before the move;
+  once the move succeeds, completion wins, temporary cleanup runs, and the
+  destination reservation is cleared. Provisional commit uses the same rule
+  even if the job state changed from `finalizing` during the move.
+- Added `fixtures/cancel_during_move_probe.py`. It used a real `/tmp` to `/srv`
+  cross-filesystem move so the product entered its fallback copy path, paused
+  the job after the destination exceeded 1 MiB, and waited for the real Tauri
+  commit to finish. The probe exited `0` with:
+  `MOVE-CANCEL-RACE: PASS
+  (job=provisional-ab676467-85c0-41ff-a0ce-262b22521f5e, state=completed,
+  bytes=268435456,
+  sha256=a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b)`.
+  The requested destination remained the only output, the temp source was
+  removed, `destinationReservation` was cleared, and exactly one job row
+  remained. Tauri IPC returned `{}` for the void command.

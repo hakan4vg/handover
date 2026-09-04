@@ -1122,9 +1122,8 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             return Err(error);
         }
         clear_destination_reservation(&app, &state, &id);
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     }
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
@@ -1347,11 +1346,10 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             return Err(error);
         }
         clear_destination_reservation(&app, &state, &id);
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         cleanup_media_track_files(&temp_path);
     }
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event(if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" }, Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
@@ -1508,7 +1506,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         }
         clear_destination_reservation(&app, &state, &id);
     }
-    if !transfer_can_continue(&app, &id, generation) { return false; }
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) { return false; }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
     if committed.0 { add_notification(&app, &state, &id, "completed"); }
@@ -1815,11 +1813,10 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
     }
     match move_completed_file(&final_path, &destination, accepted.3, reserved).await {
         Ok(()) => {
-            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
             if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }
             cleanup_media_track_files(&accepted.1);
             let mut completed = false;
-            emit_job(&state, &id, |job| { if job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0 { job.destination_reservation = None; complete_job(job); job.eta = None; completed = true; } });
+            emit_job(&state, &id, |job| { if job.provisional == Some(false) && job.progress >= 100.0 { job.destination_reservation = None; complete_job(job); job.eta = None; completed = true; } });
             if !completed { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before completion".into()); }
             add_notification(&app, &state, &id, "completed");
         }

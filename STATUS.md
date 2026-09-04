@@ -2284,3 +2284,22 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   It completed `3/3` segments and produced the expected 15-byte concatenation,
   SHA-256 `a9342f061651954a0223ba72bfa54ff6629ecfe72d97c975e5effe289d740f53`.
   The server observed exactly `bytes=0-4`, `bytes=20-25`, and `bytes=30-33`.
+
+## 2026-09-04 — Prove resident single-instance capture forwarding
+
+- Added `fixtures/single_instance_probe.py` to launch the rebuilt application
+  twice in one isolated HOME: first as the resident process, then with a real
+  `--capture` payload.
+- The real two-process probe passed twice. The second process exited `0`, the
+  resident first PID stayed alive, `/proc` reported exactly one product
+  process, and the resident SQLite database contained one provisional job.
+- The local source server saw exactly one GET. The forwarded job reached
+  `finalizing` with all 32768 bytes downloaded, proving the second launch was
+  forwarded rather than starting an independent database/job owner.
+- Probe output was:
+  `SINGLE-INSTANCE: PASS (second_exit=0, resident_pid=2392036, jobs=1, state=finalizing, bytes=32768, source_requests=1)`.
+- The resident application log contained only the known
+  `libayatana-appindicator is deprecated` warning. The forwarded process log
+  was empty. No product error was observed.
+- The probe disables Python bytecode generation so shared fixture imports do
+  not leave disposable `fixtures/__pycache__` files in the worktree.

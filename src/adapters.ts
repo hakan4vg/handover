@@ -55,6 +55,20 @@ function persistSettings(settings: AppSettings) {
   }
 }
 
+/**
+ * Client-side parity guard for the native settings patch contract.
+ *
+ * Rust's apply_settings_patch remains authoritative for schema validation and
+ * persistence. This narrow helper only prevents the mock/native adapters from
+ * sending a blank folder value that Rust deliberately ignores.
+ */
+export function sanitizeSettingsPatch(patch: Partial<AppSettings>): Partial<AppSettings> {
+  const next = { ...patch };
+  if (typeof next.defaultFolder === 'string' && next.defaultFolder.trim().length === 0) delete next.defaultFolder;
+  if (typeof next.tempFolder === 'string' && next.tempFolder.trim().length === 0) delete next.tempFolder;
+  return next;
+}
+
 function event(message: string, tone: JobEvent['tone'] = 'normal'): JobEvent {
   return { at: timeLabel(), message, tone };
 }
@@ -265,7 +279,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async updateSettings(patch: Partial<AppSettings>) {
-    this.snapshot.settings = { ...this.snapshot.settings, ...patch };
+    this.snapshot.settings = { ...this.snapshot.settings, ...sanitizeSettingsPatch(patch) };
     persistSettings(this.snapshot.settings);
     this.emit();
   }
@@ -312,7 +326,7 @@ class NativeAdapter implements DownloadAdapter {
   resumeAll() { return this.command<void>('resume_all'); }
   createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<string>('create_provisional', { input }); }
   commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<void>('commit_provisional', { id, input }); }
-  updateSettings(patch: Partial<AppSettings>) { return this.command<void>('update_settings', { patch }); }
+  updateSettings(patch: Partial<AppSettings>) { return this.command<void>('update_settings', { patch: sanitizeSettingsPatch(patch) }); }
   reattachJob(id: string) { return this.command<void>('reattach_job', { id }); }
 }
 

@@ -1063,3 +1063,21 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Commit hygiene as before: split-staged only my hunks (`@@ -322`,
   `@@ -1896`); the sibling's 16-line `wait_for_transfer_idle` slice stays
   uncommitted in the working tree. `fixtures/server.py` untouched.
+
+## 2026-09-04 — Frontend settings patch parity guard
+
+- Tight red repro: focused Vitest for the new settings patch seam failed
+  with `TypeError: sanitizeSettingsPatch is not a function` in all three
+  tests because `src/adapters.ts` exported no such helper.
+- Implemented the smallest seam: exported `sanitizeSettingsPatch`, which
+  removes only blank string `defaultFolder`/`tempFolder` fields and preserves
+  every other key. The mock adapter now uses it before merging settings, and
+  the native adapter uses it before sending the patch. Rust
+  `apply_settings_patch` remains authoritative for schema validation,
+  persistence, and all malformed non-folder values.
+- Verification: focused Vitest 3/3, full Vitest 24/24, `tsc -b` clean,
+  `npm run build:all` green, Rust tests 34/34, and the redirect acquisition
+  plus aggregate limiter probes both passed. `src-tauri/src/main.rs` still
+  contains only the sibling's 16-line uncommitted `wait_for_transfer_idle`
+  slice; it was not staged.
+- `fixtures/server.py` untouched.

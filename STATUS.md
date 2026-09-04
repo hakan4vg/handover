@@ -1138,3 +1138,16 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   completed successfully. `git diff --check` clean.
 - The sibling's `wait_for_transfer_idle` changes remain unstaged in
   `src-tauri/src/main.rs`; no sibling hunks are included in this slice.
+
+## 2026-09-04 — Reattach compatibility includes the service port
+
+- Audit found `source_compatible` compared scheme, host, and path but not the
+  port. Reattach could therefore accept a renewed source from the same host and
+  path on a different service port. Query changes remain allowed for expiring
+  token renewal.
+- Added `port_or_known_default()` to the compatibility check. Explicit
+  `https:443` remains equivalent to omitted HTTPS port, while `8443` and `9443`
+  are rejected as different endpoints. The regression covers both cases.
+- Rust suite: 36/36. `git diff --check` clean. Only this comparison and its
+  test are mine; the sibling's two `wait_for_transfer_idle` hunks remain
+  unstaged in `src-tauri/src/main.rs`.

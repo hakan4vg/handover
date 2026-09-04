@@ -480,7 +480,7 @@ fn domain(source: &str) -> String { reqwest::Url::parse(source).ok().and_then(|u
 fn source_compatible(existing: &str, candidate: &str) -> bool {
     let Some(existing) = reqwest::Url::parse(existing).ok() else { return false; };
     let Some(candidate) = reqwest::Url::parse(candidate).ok() else { return false; };
-    existing.scheme() == candidate.scheme() && existing.host() == candidate.host() && existing.path() == candidate.path()
+    existing.scheme() == candidate.scheme() && existing.host() == candidate.host() && existing.port_or_known_default() == candidate.port_or_known_default() && existing.path() == candidate.path()
 }
 
 fn safe_filename(value: &str) -> String {
@@ -1833,6 +1833,8 @@ mod capture_tests {
         assert!(source_compatible("https://cdn.example.test/vod/a.mp4?token=1", "https://cdn.example.test/vod/a.mp4?token=2"));
         assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "https://cdn.example.test/vod/b.mp4"));
         assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "http://cdn.example.test/vod/a.mp4"));
+        assert!(!source_compatible("https://cdn.example.test:8443/vod/a.mp4", "https://cdn.example.test:9443/vod/a.mp4"));
+        assert!(source_compatible("https://cdn.example.test/vod/a.mp4", "https://cdn.example.test:443/vod/a.mp4"));
     }
 
     #[test]

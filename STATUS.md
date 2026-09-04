@@ -870,3 +870,16 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   --manifest-path src-tauri/Cargo.toml` 31/31; `cargo build
   --manifest-path src-tauri/Cargo.toml`; `git diff --check`; direct rustfmt check
   for `src-tauri/src/lifecycle.rs`. `fixtures/server.py` remains untouched.
+
+## 2026-09-04 — Limiter + redirect regression on the generation-aware engine
+
+- Rebuilt the binary at HEAD (includes the uncommitted
+  `wait_for_transfer_idle` commit-path guard) and re-ran two committed
+  probes against the reworked transfer ownership, isolated HOMEs:
+  - limiter default (global 1 MB/s, 8 MiB range): 0.79 MB/s, byte-identical.
+    In band; on the low side with the box under load (prior runs on the older
+    engine: 0.98/0.84), signal unchanged (paced vs >50 unpaced).
+  - acquire redirect (302 -> range.bin): 8,388,608 bytes byte-identical.
+- Full suite on the same worktree: Rust 31/31, vitest 17/17, `tsc -b`
+  clean. No repo edits in this check; the `main.rs` working change was left
+  untouched. `fixtures/server.py` untouched.

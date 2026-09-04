@@ -983,3 +983,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   vitest 21/21 (3 files), `tsc -b` clean, `cargo build` clean, headless
   limiter probe PASS (8 MiB byte-identical, paced). No test rigs left
   running. `fixtures/server.py` untouched.
+
+## 2026-09-04 — Settings patch→restart round-trip test (persistence seam)
+
+- Audited the settings write path for a real bug first: `update_settings`
+  mutates the snapshot but never touches the DB directly — however every
+  settings writer ends in `emit_snapshot`, which calls `save_snapshot`
+  (settings row + jobs table), so patches do persist. No bug; but the seam
+  had zero direct coverage (only the corrupt-row boot probe touched it).
+- New `settings_patch_survives_database_round_trip` test: in-memory
+  `CoreState` → `apply_settings_patch` → `save_snapshot` → raw SQL read →
+  `settings_from_stored` → asserts values survive. Stated honestly, this is
+  a characterization test, not RED-first: it passed on the first run and
+  exists to lock the patch→DB→boot chain against future schema drift.
+  Suite now Rust 33/33.
+- Also verified while here: both adapters send partial patches (mock merges,
+  native forwards `{patch}`), consistent with the per-key backend; the
+  `?job=` default (`'job-2'`) self-heals via the existing fallback
+  (`snapshot.jobs[0]` + ID check), so no bug there either; `open_path`
+  backend command exists per-OS, so all in-app notification actions are
+  wired end to end.
+  `fixtures/server.py` untouched.

@@ -1877,6 +1877,25 @@ mod capture_tests {
         assert_eq!(next.max_connections, current.max_connections);
     }
 
+    #[test]
+    fn settings_patch_survives_database_round_trip() {
+        use super::{apply_settings_patch, default_settings, save_snapshot, settings_from_stored, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        let state = CoreState { snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![] }), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) };
+        // Simulate a live patch, then a restart: the patched values must
+        // come back through the same SQL row and boot parser the app uses.
+        let patched = apply_settings_patch(&default_settings(), &serde_json::json!({"maxConnections": 4, "bandwidthLimit": 1048576}));
+        state.snapshot.lock().unwrap().settings = patched;
+        save_snapshot(&state);
+        let payload: String = state.database.lock().unwrap().query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
+        let rebooted = settings_from_stored(&payload);
+        assert_eq!(rebooted.max_connections, 4);
+        assert_eq!(rebooted.bandwidth_limit, Some(1048576));
+    }
+
     fn ranges(pairs: &[(u64, u64)]) -> Vec<super::ByteRange> {
         pairs.iter().map(|(start, end)| super::ByteRange { start: *start, end: *end }).collect()
     }

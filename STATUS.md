@@ -1215,3 +1215,16 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Evidence: Rust suite `37/37` and cargo build passed; `git diff --check`
   passed. The sibling's two `wait_for_transfer_idle` hunks remain unstaged in
   `src-tauri/src/main.rs`.
+
+## 2026-09-04 — Resume identity requires a validator
+
+- Audit found `identities_match` treating equal length plus equal absence of
+  ETag and Last-Modified as proof that partial bytes belonged to the same
+  resource. The first-byte check was not enough to safely stitch same-length
+  replacements.
+- Resume now requires at least one validator and rejects any validator that is
+  missing or different on either side. Equal length alone restarts safely.
+- Regression evidence: Rust suite `38/38`; cargo build and `git diff --check`
+  passed. Redirect, one-use, bounded-503, limiter, and byte-identity probes
+  passed again. The sibling's two `wait_for_transfer_idle` hunks remain
+  unstaged in `src-tauri/src/main.rs`.

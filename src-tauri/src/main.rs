@@ -551,7 +551,20 @@ fn identity_from_response(response: &reqwest::Response, length: u64) -> Resource
 
 fn identities_match(existing: Option<&ResourceIdentity>, current: &ResourceIdentity) -> bool {
     let Some(existing) = existing else { return false; };
-    existing.length == current.length && existing.etag == current.etag && existing.last_modified == current.last_modified
+    let etag_match = match (&existing.etag, &current.etag) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        _ => false,
+    };
+    let last_modified_match = match (&existing.last_modified, &current.last_modified) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        _ => false,
+    };
+    existing.length == current.length
+        && (existing.etag.is_some() || existing.last_modified.is_some())
+        && etag_match
+        && last_modified_match
 }
 
 fn valid_range_identity(response: &reqwest::Response, expected: &ResourceIdentity) -> bool {
@@ -1869,6 +1882,13 @@ mod capture_tests {
     #[test]
     fn browser_policy_rejects_incomplete_payload() {
         assert!(browser_policy_from_value(&json!({ "interceptDownloads": true })).is_none());
+    }
+
+    #[test]
+    fn resource_identity_requires_a_validator_when_resuming() {
+        use super::{identities_match, ResourceIdentity};
+        let current = ResourceIdentity { length: 123, etag: None, last_modified: None };
+        assert!(!identities_match(Some(&current), &current));
     }
 
     #[test]

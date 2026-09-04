@@ -344,8 +344,44 @@ fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolic
     emit_snapshot(app, state);
 }
 
+fn cleanup_media_track_files(temp_path: &str) {
+    let path = Path::new(temp_path);
+    let Some(parent) = path.parent() else { return; };
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else { return; };
+    let prefix = format!("{name}.track-");
+    let Ok(entries) = std::fs::read_dir(parent) else { return; };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let is_track_file = entry.file_type().map(|kind| kind.is_file()).unwrap_or(false)
+            && entry.file_name().to_string_lossy().starts_with(&prefix);
+        if is_track_file { let _ = std::fs::remove_file(entry_path); }
+    }
+}
+
+fn is_orphaned_media_track_name(name: &str) -> bool {
+    let Some((primary, index)) = name.split_once(".part.track-") else { return false; };
+    primary.starts_with("provisional-") && !index.is_empty() && index.chars().all(|value| value.is_ascii_digit())
+}
+
+fn cleanup_orphaned_media_track_files(temp_folder: &str, preserved_temp_paths: &[String]) {
+    let root = Path::new(temp_folder);
+    let Ok(entries) = std::fs::read_dir(root) else { return; };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue; };
+        if !file_type.is_file() { continue; }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue; };
+        if !is_orphaned_media_track_name(name) { continue; }
+        let Some((primary, _)) = name.split_once(".part.track-") else { continue; };
+        let primary_path = root.join(format!("{primary}.part"));
+        if preserved_temp_paths.iter().any(|path| Path::new(path) == primary_path) { continue; }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSnapshot {
     let mut jobs = Vec::new();
+    let mut preserved_temp_paths = Vec::new();
     if let Ok(mut statement) = database.prepare("SELECT payload FROM jobs ORDER BY created_at DESC") {
         if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
             for payload in rows.flatten() {
@@ -353,13 +389,18 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
                     if job.provisional == Some(true) {
                         let _ = std::fs::remove_file(&job.temp_path);
                         let _ = std::fs::remove_dir_all(format!("{}.segments", job.temp_path));
+                        cleanup_media_track_files(&job.temp_path);
                         continue;
+                    }
+                    if ["connecting", "downloading", "finalizing"].contains(&job.state.as_str()) {
+                        preserved_temp_paths.push(job.temp_path.clone());
                     }
                     jobs.push(job);
                 }
             }
         }
     }
+    cleanup_orphaned_media_track_files(&settings.temp_folder, &preserved_temp_paths);
     AppSnapshot { jobs, settings, connected: true, aggregate_speed: 0, notifications: vec![] }
 }
 
@@ -931,6 +972,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     let identity = segment_identity(&tracks);
     if stored_identity.as_deref() != Some(identity.as_str()) {
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
+        cleanup_media_track_files(&temp_path);
     }
     tokio::fs::create_dir_all(&segment_dir).await.map_err(|error| error.to_string())?;
     let total_segments = total_segments as u32;
@@ -1032,6 +1074,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         if replace_existing { let _ = tokio::fs::remove_file(&committed.1).await; }
         move_completed_file(&final_path, &committed.1).await?;
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
+        cleanup_media_track_files(&temp_path);
     }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event(if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" }, Some("warning"))); } });
     emit_snapshot(&app, &state);
@@ -1225,7 +1268,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
         snapshot.jobs.retain(|job| !(job.id == id && job.provisional == Some(true)));
         if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { job.state = "failed".into(); job.error = Some("Cancelled by user".into()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Cancelled by user", Some("warning"))); }
     }
-    if let Some(path) = temp_path { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); }
+    if let Some(path) = temp_path { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); cleanup_media_track_files(&path); }
     if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(id); }
     emit_snapshot(app, state);
 }
@@ -1234,7 +1277,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
 fn cancel_job(app: AppHandle, state: State<'_, CoreState>, id: String) { cancel_job_internal(&app, &state, &id); }
 
 #[tauri::command]
-fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); abort_transfer(state.inner(), &id); let mut temporary = None; if let Ok(mut snapshot) = state.snapshot.lock() { temporary = snapshot.jobs.iter().find(|job| job.id == id && job.state != "completed").map(|job| job.temp_path.clone()); snapshot.jobs.retain(|job| job.id != id); } if let Ok(mut buckets) = state.inner().job_bandwidth.lock() { buckets.remove(&id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } emit_snapshot(&app, &state); }
+fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); abort_transfer(state.inner(), &id); let mut temporary = None; let mut track_cleanup = None; if let Ok(mut snapshot) = state.snapshot.lock() { if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id) { track_cleanup = Some(job.temp_path.clone()); if job.state != "completed" { temporary = Some(job.temp_path.clone()); } } snapshot.jobs.retain(|job| job.id != id); } if let Ok(mut buckets) = state.inner().job_bandwidth.lock() { buckets.remove(&id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } if let Some(path) = track_cleanup { cleanup_media_track_files(&path); } emit_snapshot(&app, &state); }
 
 #[tauri::command]
 fn pause_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(&app, &state); }
@@ -1348,7 +1391,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         if let Some(parent) = PathBuf::from(&ready.2).parent() { let _ = std::fs::create_dir_all(parent); }
         if ready.3 { let _ = std::fs::remove_file(&ready.2); }
         match move_completed_file(&final_path, &ready.2).await {
-            Ok(()) => { if ready.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", ready.1)); } emit_job(&state, &id, |job| { complete_job(job); job.eta = None; }); add_notification(&app, &state, &id, "completed"); },
+            Ok(()) => { if ready.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", ready.1)); } cleanup_media_track_files(&ready.1); emit_job(&state, &id, |job| { complete_job(job); job.eta = None; }); add_notification(&app, &state, &id, "completed"); },
             Err(error) => emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); }),
         }
     }
@@ -1537,8 +1580,43 @@ fn main() {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, provisional_input_from_message, source_compatible, tray_status_text};
+    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, source_compatible, tray_status_text};
     use serde_json::json;
+
+    #[test]
+    fn cleanup_removes_media_track_artifacts_but_keeps_primary_part() {
+        let root = std::env::temp_dir().join(format!("dm-track-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let temp = root.join("job.part");
+        std::fs::write(&temp, b"primary").unwrap();
+        std::fs::write(format!("{}.track-00", temp.display()), b"video").unwrap();
+        std::fs::write(format!("{}.track-01", temp.display()), b"audio").unwrap();
+        cleanup_media_track_files(temp.to_str().unwrap());
+        assert!(temp.exists());
+        assert!(!root.join("job.part.track-00").exists());
+        assert!(!root.join("job.part.track-01").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_orphaned_track_sweep_is_bounded_and_preserves_active_job_tracks() {
+        let root = std::env::temp_dir().join(format!("dm-orphan-track-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = root.join("provisional-stale.part");
+        let active = root.join("provisional-active.part");
+        std::fs::write(format!("{}.track-00", stale.display()), b"stale-video").unwrap();
+        std::fs::write(format!("{}.track-01", stale.display()), b"stale-audio").unwrap();
+        std::fs::write(format!("{}.track-00", active.display()), b"active-video").unwrap();
+        std::fs::write(root.join("provisional-stale.part.track-xx"), b"not-a-track-index").unwrap();
+        std::fs::write(root.join("job.part.track-00"), b"unrelated").unwrap();
+        cleanup_orphaned_media_track_files(root.to_str().unwrap(), &[active.to_string_lossy().into_owned()]);
+        assert!(!root.join("provisional-stale.part.track-00").exists());
+        assert!(!root.join("provisional-stale.part.track-01").exists());
+        assert!(root.join("provisional-active.part.track-00").exists());
+        assert!(root.join("provisional-stale.part.track-xx").exists());
+        assert!(root.join("job.part.track-00").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn tray_tooltip_reports_idle_and_live_state() {

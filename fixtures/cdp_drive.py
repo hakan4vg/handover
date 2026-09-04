@@ -17,7 +17,10 @@ import urllib.request
 
 PORT, URL, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
 SCRIPTS = sys.argv[4:]
-# DM_CDP_TARGET: substring the target URL must contain (default: first page).
+# DM_CDP_TARGET_ID selects one exact target id. DM_CDP_TARGET is a URL
+# substring fallback. Explicit selection avoids driving a stale page when a
+# browser reuses a tab and leaves old page targets in /json/list.
+WANT_ID = os.environ.get("DM_CDP_TARGET_ID", "")
 WANT = os.environ.get("DM_CDP_TARGET", "")
 
 
@@ -117,7 +120,9 @@ class CDP:
             "Runtime.evaluate",
             {"expression": expression, "returnByValue": True, "awaitPromise": True},
         )
-        remote = res.get("result", {}).get("result", {})
+        remote = res.get("result", {})
+        if "exceptionDetails" in res:
+            raise RuntimeError(f"Runtime.evaluate exception: {res['exceptionDetails']}")
         return remote.get("value", remote.get("description"))
 
 
@@ -126,29 +131,51 @@ def main():
         urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/list", timeout=15)
     )
     pages = [t for t in targets if t["type"] == "page"]
-    if WANT:
-        pool = [t for t in targets if WANT in t["url"]]
+    if WANT_ID:
+        pool = [t for t in pages if t.get("id") == WANT_ID]
         if not pool:
-            raise SystemExit(f"no target matching {WANT!r}")
+            raise SystemExit(f"no page target with exact id {WANT_ID!r}")
+        page = pool[0]
+    elif WANT:
+        pool = [t for t in pages if WANT in t["url"]]
+        if not pool:
+            raise SystemExit(f"no page target matching {WANT!r}")
         page = pool[0]
     else:
-        page = next(t for t in pages)
+        page = next(iter(pages), None)
+        if page is None:
+            raise SystemExit("no page target available")
     ws_url = page["webSocketDebuggerUrl"]
     path = ws_url.split(f"127.0.0.1:{PORT}", 1)[1]
     cdp = CDP(ws_connect(PORT, path))
+    cdp.call("Runtime.enable")
     if URL != "-":
         cdp.call("Page.enable")
         cdp.call("Page.navigate", {"url": URL})
         import time
 
+        reached = False
+        last_location = None
         for _ in range(60):
             time.sleep(0.5)
             try:
-                state = cdp.evaluate("document.readyState")
-            except RuntimeError:
+                state = cdp.evaluate(
+                    "JSON.stringify({readyState: document.readyState, href: location.href})"
+                )
+                details = json.loads(state) if isinstance(state, str) else state
+                last_location = details
+            except (RuntimeError, json.JSONDecodeError, TypeError):
                 continue
-            if state == "complete":
+            if not isinstance(details, dict):
+                continue
+            if details.get("readyState") == "complete" and details.get("href") == URL:
+                reached = True
                 break
+        if not reached:
+            raise SystemExit(
+                f"navigation did not reach requested URL {URL!r}; "
+                f"last document={last_location!r} target={page.get('id')}"
+            )
         time.sleep(2)  # let React render + mock timeouts fire
     else:
         import time

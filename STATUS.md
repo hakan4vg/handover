@@ -770,18 +770,44 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   audio. The Add Download actions were invoked through WebKit inspection, not
   XTEST. Artifacts are under `/tmp/dm-mp-e2e-20260904/`, including
   `two-players-fresh.png`, `navigation-data.png`, and the final DB readback.
-- Same-tab navigation to a fresh 200 HTML document with a playable in-memory
-  blob player displayed the real Download Manager button. Clicking it created
-  no third row and no output file: the prior document's manifest candidates
-  were not reused. The post-navigation DB remained exactly the two completed
-  player rows above.
-- Harness findings: Chromium's native-host manifest must be present under the
-  disposable profile's `NativeMessagingHosts/` directory, and an app launched
-  without `DM_EXTENSION_ID` overwrote the manifest without the unpacked
-  extension origin. The final run used the correct profile-local manifest and
-  `DM_EXTENSION_ID`; this is test-rig setup, not a product-path failure.
+- Same-tab navigation was rerun with a corrected CDP driver that selects one
+  exact page target ID, enables the Runtime domain, parses the Runtime result
+  envelope correctly, and waits for the requested document URL rather than
+  merely waiting for any `complete` document. The same target
+  `A6703CCB07DE05DFFB851E1ABC6AA158` stayed selected while navigating from
+  `http://127.0.0.1:18902/page/video.html?same-tab-old` to the fresh 200 HTML
+  document at `http://127.0.0.1:18905/?same-tab-fresh`.
+- The fresh page's one visible control belonged to its current in-memory
+  `data:` video, not to the previous manifest. Clicking it produced no new
+  native job. The saved readback shows SQLite `1 -> 1`, Downloads `2 -> 2`,
+  no `stale-guard` row/file, and unchanged 86,836-byte `player-a.mp4` and
+  `player-b.mp4` hashes. This proves no stale managed candidate was reused;
+  it does not claim a managed capture for the data URL.
+- The original disposable HTTP server on `:18904` was accepting connections
+  but returning empty replies because its inherited output pipe had closed.
+  The proof replaced it with a redirected server on `:18905`; the application
+  and fixture source were not changed.
 - Verification: `npx vitest run extension/src/shared.test.ts`,
   `npm run build:extension`, `npx tsc -b`, `npm test`, `npm run build:all`,
   `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo build
   --manifest-path src-tauri/Cargo.toml`, and `git diff --check` all passed.
   `fixtures/server.py` remains untouched.
+
+## 2026-09-04 — Media track artifact cleanup and bounded orphan sweep
+
+- Added `cleanup_media_track_files(temp_path)` to remove only files matching
+  the temporary primary file's `<name>.track-*` pattern. The primary `.part`
+  remains intact. Provisional cleanup, cancellation, removal, segment-identity
+  replacement, and successful media finalization now call it.
+- A startup sweep now removes only direct files named
+  `provisional-*.part.track-<digits>` in the configured temp folder. It keeps
+  track files whose primary `.part` belongs to an active committed job and
+  leaves unrelated, malformed, nested, or non-track files untouched.
+- Deterministic Rust coverage passes for both direct cleanup and the bounded
+  orphan sweep, including preservation of the primary `.part` and active-job
+  tracks.
+- Fresh real Tauri/WebKit cancellation proof used a unique multi-track DASH
+  provisional. The row reached `finalizing` with all 6 segments downloaded and
+  both `.part.track-00` and `.part.track-01` present. The real `cancel_job`
+  command then removed the DB row, all job temp artifacts, and the destination
+  was never created. Artifact script: `/tmp/dm-mp-e2e-20260904/run_segmented_cancel.py`.

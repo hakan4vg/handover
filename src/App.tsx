@@ -5,6 +5,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createAdapter, formatBytes, formatSpeed } from './adapters';
 import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
 import { Icon, type IconName } from './icons';
+import { settingsPageFromSearch } from './settings-route';
 import type {
   AppSettings,
   AppSnapshot,
@@ -83,7 +84,7 @@ function Disconnected({ message }: { message: string }) {
 
 function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
   const [filter, setFilter] = useState<FilterKey>(() => new URLSearchParams(window.location.search).has('settings') ? 'settings' as FilterKey : 'all');
-  const [settingsPage, setSettingsPage] = useState<SettingsPage>(() => (new URLSearchParams(window.location.search).get('settings') as SettingsPage | null) ?? 'general');
+  const [settingsPage, setSettingsPage] = useState<SettingsPage>(() => settingsPageFromSearch(window.location.search));
   const [selectedId, setSelectedId] = useState(() => new URLSearchParams(window.location.search).get('job') ?? 'job-2');
   const [addWindowId, setAddWindowId] = useState<string | null>(null);
   const [showManualAdd, setShowManualAdd] = useState(false);

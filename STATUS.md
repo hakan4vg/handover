@@ -905,3 +905,23 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `media.rs`) — pre-existing style drift from recent sessions, not mine; left
   alone rather than reformatting under someone else's in-flight change.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Settings deep-link validation (?settings= route guard)
+
+- The tray "Set Bandwidth Limit" item navigates the manager to
+  `?settings=network`, and `Manager` read that param with an unchecked cast:
+  any unknown value (`?settings=bogus`, `?settings=` , wrong case) fell
+  through every page branch and rendered a blank Settings content area.
+- Fix: new `src/settings-route.ts` with `settingsPageFromSearch` (known-page
+  allowlist, fallback `'general'`), wired into `Manager`'s initial state.
+  TDD: `src/settings-route.test.ts` (4 tests) failed first (module missing),
+  then green. Suite: vitest 21/21 (3 files), `tsc -b` clean, `npm run build`
+  clean (256.60 kB / 77.18 kB gzip).
+- Browser proof (CDP rig, no XTEST): mock UI at `?settings=bogus` renders the
+  General page with full content (`/tmp/dm-settings-bogus.png`);
+  `?settings=network` renders Network with bandwidth controls
+  (`/tmp/dm-settings-network.png`). Vision-verified 2/2. Rig torn down after.
+- Housekeeping: the teardown also reaped a stale `:4317` vite mock
+  (PIDs 1706871/91/92, `--host 127.0.0.1`) predating this session — leftover
+  from an earlier rig, not mine, ports confirmed down after.
+  `fixtures/server.py` untouched.

@@ -83,6 +83,14 @@ describe('media candidate selection', () => {
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/index.m3u8');
   });
 
+  it('chooses the most recently observed manifest, not the last inserted one', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/selected.m3u8', tabId: 4, frameId: 0, at: 20, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/old.m3u8', tabId: 4, frameId: 0, at: 10, role: 'manifest', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/selected.m3u8');
+  });
+
   it('refuses to cross-select another player when the clicked player has no evidence', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/a/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },

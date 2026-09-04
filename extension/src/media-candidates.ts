@@ -42,12 +42,13 @@ export function choosePlayerEvidence(players: MediaPlayerEvidence[], tabId: numb
 export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): string | undefined {
   const scoped = candidates.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId));
   const chooseFromPool = (pool: MediaCandidate[]): string | undefined => {
-    const manifest = [...pool].reverse().find((item) => item.role === 'manifest');
+    const newest = [...pool].sort((left, right) => right.at - left.at);
+    const manifest = newest.find((item) => item.role === 'manifest');
     if (manifest) return manifest.url;
     // Once segmented traffic is present, an unknown MP4 may be only an MSE
     // initialization fragment. Never promote it to a complete download.
     if (pool.some((item) => item.role === 'segment')) return undefined;
-    return [...pool].reverse().find((item) => item.role !== 'segment')?.url;
+    return newest.find((item) => item.role !== 'segment')?.url;
   };
   if (!playerKey) return chooseFromPool(scoped);
 

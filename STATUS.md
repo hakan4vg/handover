@@ -2514,5 +2514,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `SEQUENTIAL-PAUSE: PASS (state=paused, completed=1/4,
   downloaded=262144, rejected_overlaps=4,
   requests={'seg0.ts': 1, 'seg1.ts': 2, 'seg2.ts': 1, 'seg3.ts': 1})`.
-  The resident remained alive, one valid fragment was retained, and no error was
+- The resident remained alive, one valid fragment was retained, and no error was
   recorded. This closes the real pause-during-sequential-fallback case.
+
+## 2026-09-04 — Prove adaptive HLS representation selection
+
+- Added `fixtures/adaptive_hls_quality_probe.py` against the official hls.js demo
+  and its public multi-level Big Buck Bunny HLS master
+  `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`. The real page is
+  blob/MSE-backed and exposes the hls.js manual-level API. The probe changed
+  `window.hls.currentLevel` from `3` to level `1` (`512x288`, `460560` bitrate)
+  and waited for the selected `url_4` variant playlist and segment traffic.
+- The first real quality run exposed a product defect: the selected variant was
+  observed, but candidate selection used insertion order and forwarded an older
+  re-observed `url_0` manifest. The captured job therefore targeted the wrong
+  representation (`177374616` bytes). A deterministic regression now requires
+  the newest `at` timestamp to win, and the selector sorts by observation time
+  before preferring manifests.
+- The final real run created one native job from the selected `url_4` manifest,
+  committed it, and completed raw MPEG-TS output. Browser-context fetch plus
+  Web Crypto recorded `64` ordered segments, `39392016` bytes, SHA-256
+  `cb796a641c60e28e47bbbf09e9a260c3e16d2fe29bfdadb50298907f42d9a8c1`. Native
+  output was exactly `39392016` bytes with the same SHA-256.
+- Trusted right-click and Ctrl-click on the ordinary browser-owned link remained
+  `isTrusted=true` and `defaultPrevented=false`; there was one native job and no
+  Chromium Downloads artifact. The run ended with
+  `ADAPTIVE-HLS-QUALITY-PROBE: PASS`.
+- This closes the v1 quality-switch acceptance case for a real adaptive HLS
+  player. It does not add a quality browser or site-specific resolver. The
+  already-proven static DASH and HLS paths remain intact.

@@ -69,6 +69,11 @@ export function sanitizeSettingsPatch(patch: Partial<AppSettings>): Partial<AppS
   return next;
 }
 
+export function resumePlan(provisional: DownloadJob['provisional'], progress: number): { state: 'finalizing' | 'downloading'; shouldStart: boolean } {
+  const ready = provisional === true && progress >= 100;
+  return ready ? { state: 'finalizing', shouldStart: false } : { state: 'downloading', shouldStart: true };
+}
+
 function event(message: string, tone: JobEvent['tone'] = 'normal'): JobEvent {
   return { at: timeLabel(), message, tone };
 }
@@ -209,7 +214,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async resumeJob(id: string) {
-    this.update(id, (job) => job.state === 'paused' || job.state === 'pending' ? { ...job, state: 'downloading', speed: job.speed || 12.4 * 1024 ** 2, connections: Math.min(job.maxConnections, 4), started: job.started ?? 'Just now', eta: job.total ? `${Math.max(1, Math.ceil((job.total - job.downloaded) / (job.speed || 1)))}s left` : 'Connecting…', events: [event('Resumed', 'success'), ...job.events] } : job);
+    this.update(id, (job) => { const plan = resumePlan(job.provisional, job.progress); return job.state === 'paused' || job.state === 'pending' ? { ...job, state: plan.state, speed: plan.shouldStart ? (job.speed || 12.4 * 1024 ** 2) : 0, connections: plan.shouldStart ? Math.min(job.maxConnections, 4) : 0, started: job.started ?? 'Just now', eta: plan.shouldStart ? (job.total ? `${Math.max(1, Math.ceil((job.total - job.downloaded) / (job.speed || 1)))}s left` : 'Connecting…') : 'Ready to save', events: [event('Resumed', 'success'), ...job.events] } : job; });
   }
 
   async retryJob(id: string) {
@@ -233,7 +238,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async resumeAll() {
-    this.snapshot.jobs = this.snapshot.jobs.map((job) => ['paused', 'pending'].includes(job.state) ? { ...job, state: 'downloading' as const, speed: 11.2 * 1024 ** 2, connections: Math.min(job.maxConnections, 3), eta: job.total ? '1m left' : 'Connecting…', events: [event('Resumed with Resume All', 'success'), ...job.events] } : job);
+    this.snapshot.jobs = this.snapshot.jobs.map((job) => { const plan = resumePlan(job.provisional, job.progress); return ['paused', 'pending'].includes(job.state) ? { ...job, state: plan.state, speed: plan.shouldStart ? 11.2 * 1024 ** 2 : 0, connections: plan.shouldStart ? Math.min(job.maxConnections, 3) : 0, eta: plan.shouldStart ? (job.total ? '1m left' : 'Connecting…') : 'Ready to save', events: [event('Resumed with Resume All', 'success'), ...job.events] } : job; });
     this.emit();
   }
 

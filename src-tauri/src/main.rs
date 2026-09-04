@@ -1339,14 +1339,19 @@ fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     emit_snapshot(&app, &state);
 }
 
+fn resume_all_plan(provisional: Option<bool>, progress: f64) -> (&'static str, bool) {
+    let ready = provisional == Some(true) && progress >= 100.0;
+    (if ready { "finalizing" } else { "downloading" }, !ready)
+}
+
 #[tauri::command]
 fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     let _lifecycle = state.lifecycle.lock().ok();
     if transfer_is_active(state.inner(), &id) { return; }
-    let Some((source, ready)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| (job.source.clone(), job.provisional == Some(true) && job.progress >= 100.0))) else { return; };
-    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = if ready { "finalizing" } else { "downloading" }.into(); job.connections = 0; job.eta = Some(if ready { "Ready to save" } else { "Resuming" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
+    let Some((source, next_state, should_spawn)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| { let (next_state, should_spawn) = resume_all_plan(job.provisional, job.progress); (job.source.clone(), next_state, should_spawn) })) else { return; };
+    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = next_state.into(); job.connections = 0; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
     emit_snapshot(&app, &state);
-    if !ready && !spawn_transfer(&app, state.inner(), id, source) { return; }
+    if should_spawn && !spawn_transfer(&app, state.inner(), id, source) { return; }
 }
 
 #[tauri::command]
@@ -1377,7 +1382,7 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _li
 fn pause_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(&app, &state); }
 
 #[tauri::command]
-fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { job.state = "downloading".into(); job.connections = 1; sources.push((job.id.clone(), job.source.clone())); } } } emit_snapshot(&app, &state); for (id, source) in sources { let _ = spawn_transfer(&app, state.inner(), id, source); } }
+fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn) = resume_all_plan(job.provisional, job.progress); job.state = next_state.into(); job.connections = if should_spawn { 1 } else { 0 }; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(&app, &state); for (id, source) in sources { let _ = spawn_transfer(&app, state.inner(), id, source); } }
 
 fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput, show_window: bool) -> Result<String, String> {
     let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable")?;
@@ -1930,6 +1935,15 @@ mod capture_tests {
         let rebooted = settings_from_stored(&stored);
         assert!(!rebooted.default_folder.trim().is_empty());
         assert!(!rebooted.temp_folder.trim().is_empty());
+    }
+
+    #[test]
+    fn resume_all_preserves_ready_provisionals_without_respawning() {
+        use super::resume_all_plan;
+        assert_eq!(resume_all_plan(Some(true), 100.0), ("finalizing", false));
+        assert_eq!(resume_all_plan(Some(true), 99.9), ("downloading", true));
+        assert_eq!(resume_all_plan(Some(false), 100.0), ("downloading", true));
+        assert_eq!(resume_all_plan(None, 0.0), ("downloading", true));
     }
 
     #[test]

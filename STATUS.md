@@ -1120,3 +1120,21 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Sibling safety: only my filename hunks will be staged; the sibling's
   16-line `wait_for_transfer_idle` change in `src-tauri/src/main.rs` remains
   unstaged. `fixtures/server.py` untouched.
+
+## 2026-09-04 — Resume All preserves ready provisional acquisitions
+
+- Audit found an inconsistency in the reachable lifecycle commands. `resume_job`
+  already restored a completed provisional to `finalizing` / “Ready to save”,
+  while `resume_all` changed every paused job to `downloading` and respawned it.
+  Pause All followed by Resume All could therefore reacquire a one-use source
+  instead of preserving the pending user decision.
+- Added the tested `resume_all_plan` decision in Rust and used it from both
+  resume commands. A ready provisional (`provisional=true`, progress >= 100)
+  returns to `finalizing`, has zero connections, and is not spawned; all other
+  paused/pending jobs retain the existing resume path. The mock adapter uses the
+  matching `resumePlan` seam so mock UI behavior does not diverge from native.
+- Rust suite: 36/36. Frontend/extension suite: 27/27 across 6 files.
+  `npx tsc -b` clean. `cargo build --manifest-path src-tauri/Cargo.toml`
+  completed successfully. `git diff --check` clean.
+- The sibling's `wait_for_transfer_idle` changes remain unstaged in
+  `src-tauri/src/main.rs`; no sibling hunks are included in this slice.

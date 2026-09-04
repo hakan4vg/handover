@@ -1502,12 +1502,60 @@ fn create_provisional(app: AppHandle, state: State<'_, CoreState>, input: Provis
     start_provisional(app, state.inner(), input, false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitDecision { Accept, WaitForIdle, Reject }
+
+fn commit_is_ready(provisional: Option<bool>, state: Option<&str>, progress: f64, transfer_active: bool) -> bool {
+    provisional == Some(true) && !transfer_active && state == Some("finalizing") && progress >= 100.0
+}
+
+fn commit_decision(provisional: Option<bool>, state: Option<&str>, progress: f64, transfer_active: bool) -> CommitDecision {
+    if provisional != Some(true) || state.is_none() || state == Some("failed") { return CommitDecision::Reject; }
+    if progress >= 100.0 && !matches!(state, Some("downloading") | Some("finalizing")) { return CommitDecision::Reject; }
+    let ready = matches!(state, Some("downloading") | Some("finalizing")) && (state == Some("finalizing") || progress >= 100.0);
+    if ready && transfer_active { return CommitDecision::WaitForIdle; }
+    CommitDecision::Accept
+}
+
+fn commit_still_owned(state: &CoreState, id: &str) -> bool {
+    state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0)).unwrap_or(false)
+}
+
+async fn commit_wait_for_transfer_idle(state: &CoreState, id: &str) -> bool {
+    for _ in 0..300 {
+        if !transfer_is_active(state, id) { return true; }
+        sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
 #[tauri::command]
 async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: String, input: CommitInput) -> Result<(), String> {
-    let ready = {
+    let (decision, ready_at_start) = {
+        let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
+        let job = snapshot.jobs.iter().find(|job| job.id == id).ok_or_else(|| "Acquisition no longer exists".to_string())?;
+        let active = transfer_is_active(state.inner(), &id);
+        let ready = job.state == "finalizing" || job.progress >= 100.0;
+        (commit_decision(job.provisional, Some(job.state.as_str()), job.progress, active), ready)
+    };
+    if decision == CommitDecision::Reject { return Err("Acquisition is no longer available for commit".into()); }
+    if decision == CommitDecision::WaitForIdle {
+        if !commit_wait_for_transfer_idle(state.inner(), &id).await {
+            let still_exists = state.snapshot.lock().ok().map(|snapshot| snapshot.jobs.iter().any(|job| job.id == id)).unwrap_or(false);
+            return Err(if still_exists { "Timed out waiting for the active acquisition to finish" } else { "Acquisition was cancelled before it became ready" }.into());
+        }
+    }
+    let accepted = {
+        let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable")?;
         let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let collision = snapshot.settings.collision_behavior.clone();
-        let job = snapshot.jobs.iter_mut().find(|job| job.id == id).ok_or_else(|| "Acquisition no longer exists".to_string())?;
+        let active = transfer_is_active(state.inner(), &id);
+        let job = snapshot.jobs.iter_mut().find(|job| job.id == id).ok_or_else(|| "Acquisition was cancelled before it could be committed".to_string())?;
+        let decision = commit_decision(job.provisional, Some(job.state.as_str()), job.progress, active);
+        if ready_at_start && (decision != CommitDecision::Accept || !commit_is_ready(job.provisional, Some(job.state.as_str()), job.progress, active)) {
+            return Err("Acquisition is no longer ready to save".into());
+        }
+        if decision == CommitDecision::Reject { return Err("Acquisition is no longer available for commit".into()); }
         let name = if input.name.trim().is_empty() { job.name.clone() } else { safe_filename(&input.name) };
         let requested_destination = if input.destination.trim().is_empty() { job.destination.clone() } else { input.destination.trim().to_string() };
         job.name = name;
@@ -1525,33 +1573,57 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         // Keep the acquisition mode's verified resumability. Single-stream
         // fallback is intentionally non-resumable until range resume exists.
         job.events.insert(0, job_event("Accepted as managed download", Some("success")));
-        (job.state == "finalizing" || job.progress >= 100.0, job.temp_path.clone(), job.destination.clone(), collision == "replace", job.mode == "segments", job.media_tracks.unwrap_or(1))
+        (ready_at_start, job.temp_path.clone(), job.destination.clone(), collision == "replace", job.mode == "segments", job.media_tracks.unwrap_or(1))
     };
-    if ready.0 {
-        let final_path = if ready.4 && ready.5 > 1 {
-            let track_paths = (0..ready.5 as usize).map(|track| format!("{}.track-{track:02}", ready.1)).collect::<Vec<_>>();
-            let mux_path = format!("{}.mux.{}", ready.1, media_extension(&ready.2));
-            if let Err(error) = mux_media_tracks(&track_paths, &mux_path).await {
+    emit_snapshot(&app, &state);
+    if !accepted.0 { return Ok(()); }
+    if !commit_still_owned(state.inner(), &id) {
+        emit_snapshot(&app, &state);
+        return Err("Acquisition was paused or cancelled before finalization".into());
+    }
+    let final_path = if accepted.4 && accepted.5 > 1 {
+        let track_paths = (0..accepted.5 as usize).map(|track| format!("{}.track-{track:02}", accepted.1)).collect::<Vec<_>>();
+        let mux_path = format!("{}.mux.{}", accepted.1, media_extension(&accepted.2));
+        if let Err(error) = mux_media_tracks(&track_paths, &mux_path).await {
+            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
+            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Media finalization failed; downloaded parts were preserved", Some("error"))); });
+            emit_snapshot(&app, &state);
+            return Err(error);
+        }
+        if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
+        mux_path
+    } else {
+        if accepted.4 {
+            if let Err(error) = finalize_media(&accepted.1, &accepted.2).await {
+                if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
                 emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Media finalization failed; downloaded parts were preserved", Some("error"))); });
                 emit_snapshot(&app, &state);
                 return Err(error);
             }
-            mux_path
-        } else {
-            if ready.4 {
-                if let Err(error) = finalize_media(&ready.1, &ready.2).await {
-                    emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Media finalization failed; downloaded parts were preserved", Some("error"))); });
-                    emit_snapshot(&app, &state);
-                    return Err(error);
-                }
-            }
-            ready.1.clone()
-        };
-        if let Some(parent) = PathBuf::from(&ready.2).parent() { let _ = std::fs::create_dir_all(parent); }
-        if ready.3 { let _ = std::fs::remove_file(&ready.2); }
-        match move_completed_file(&final_path, &ready.2).await {
-            Ok(()) => { if ready.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", ready.1)); } cleanup_media_track_files(&ready.1); emit_job(&state, &id, |job| { complete_job(job); job.eta = None; }); add_notification(&app, &state, &id, "completed"); },
-            Err(error) => emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); }),
+            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
+        }
+        accepted.1.clone()
+    };
+    if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
+    if let Some(parent) = PathBuf::from(&accepted.2).parent() { let _ = std::fs::create_dir_all(parent); }
+    if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
+    if accepted.3 { let _ = std::fs::remove_file(&accepted.2); }
+    if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
+    match move_completed_file(&final_path, &accepted.2).await {
+        Ok(()) => {
+            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
+            if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }
+            cleanup_media_track_files(&accepted.1);
+            let mut completed = false;
+            emit_job(&state, &id, |job| { if job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0 { complete_job(job); job.eta = None; completed = true; } });
+            if !completed { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before completion".into()); }
+            add_notification(&app, &state, &id, "completed");
+        }
+        Err(error) => {
+            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
+            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
+            emit_snapshot(&app, &state);
+            return Err(error.to_string());
         }
     }
     emit_snapshot(&app, &state);
@@ -2025,6 +2097,27 @@ mod capture_tests {
     }
 
     #[test]
+    fn commit_during_active_acquisition_requires_idle_then_finalizing_recheck() {
+        use super::{commit_decision, CommitDecision};
+        assert_eq!(commit_decision(Some(true), Some("finalizing"), 100.0, true), CommitDecision::WaitForIdle);
+        assert_eq!(commit_decision(Some(true), Some("finalizing"), 100.0, false), CommitDecision::Accept);
+        assert_eq!(commit_decision(Some(true), Some("downloading"), 48.0, true), CommitDecision::Accept);
+        assert_eq!(commit_decision(Some(true), Some("paused"), 48.0, false), CommitDecision::Accept);
+        assert_eq!(commit_decision(Some(true), Some("paused"), 100.0, false), CommitDecision::Reject);
+        assert_eq!(commit_decision(Some(false), Some("finalizing"), 100.0, false), CommitDecision::Reject);
+        assert_eq!(commit_decision(None, None, 0.0, false), CommitDecision::Reject);
+    }
+
+    #[test]
+    fn commit_post_wait_recheck_rejects_cancellation_and_non_finalizing_states() {
+        use super::commit_is_ready;
+        assert!(commit_is_ready(Some(true), Some("finalizing"), 100.0, false));
+        assert!(!commit_is_ready(Some(true), Some("paused"), 100.0, false));
+        assert!(!commit_is_ready(Some(true), Some("failed"), 100.0, false));
+        assert!(!commit_is_ready(None, None, 0.0, false));
+        assert!(!commit_is_ready(Some(true), Some("finalizing"), 100.0, true));
+    }
+    #[test]
     fn settings_patch_rejects_blank_folders() {
         use super::{apply_settings_patch, default_settings, settings_from_stored};
         let mut current = default_settings();
@@ -2112,5 +2205,28 @@ mod capture_tests {
         );
         // Zero-length resources need no ranges.
         assert!(missing_ranges(0, &[], 8).is_empty());
+    }
+
+    #[test]
+    fn commit_idle_wait_observes_active_owner_release() {
+        let state = std::sync::Arc::new(super::CoreState {
+            snapshot: std::sync::Mutex::new(super::AppSnapshot { jobs: Vec::new(), settings: super::default_settings(), connected: false, aggregate_speed: 0, notifications: Vec::new() }),
+            database: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+            reattach_target: std::sync::Mutex::new(None),
+            bandwidth: std::sync::Mutex::new(super::BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
+            job_bandwidth: std::sync::Mutex::new(std::collections::HashMap::new()),
+            transfer_controls: super::TransferRegistry::default(),
+            lifecycle: std::sync::Mutex::new(()),
+            tray_checks: std::sync::Mutex::new(None),
+        });
+        let (generation, _) = state.transfer_controls.claim_with_generation("job-1").expect("active owner");
+        let release_state = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            release_state.transfer_controls.release_if_current("job-1", generation);
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        assert!(runtime.block_on(super::commit_wait_for_transfer_idle(&state, "job-1")));
+        assert!(!state.transfer_controls.is_active("job-1"));
     }
 }

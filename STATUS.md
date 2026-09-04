@@ -1253,3 +1253,33 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Regression evidence: native Rust suite `40/40`; focused sanitizer Vitest
   `5/5`; full frontend/extension suite `30/30`; TypeScript clean; application
   and extension production builds passed; `git diff --check` passed.
+
+## 2026-09-04 — Provisional commit waits without stealing cancellation
+
+- Race audit of `commit_provisional` found that it changed `provisional` to
+  `false` before waiting for an active transfer owner. A cancellation during
+  that wait could then be treated as a managed failure, preserving a temporary
+  part instead of removing the provisional acquisition. A timeout also returned
+  an error after silently changing ownership. The old post-wait path could
+  overwrite a pause/cancel transition during media or file finalization.
+- Commit now makes no ownership change before the idle wait. It rechecks the
+  row, provisional flag, `finalizing` state, 100% progress, and transfer owner
+  under the lifecycle lock before accepting a ready acquisition. Timeout,
+  cancellation, and non-finalizing transitions return errors without accepting
+  the row. Finalization and completion use ownership checkpoints and the final
+  state update is guarded, so pause/cancel is not overwritten.
+- Added state-machine regressions for active-owner wait, post-wait cancellation
+  and finalizing transitions, plus a deterministic async owner-release test.
+  Focused test passed; full native Rust suite is now `43/43`.
+- Real native Tauri probe used `create_provisional` followed immediately by
+  `commit_provisional` for fixture `slow.bin` while acquisition was active.
+  The isolated row completed as `state=completed, provisional=false`; output
+  `/tmp/dm-commit-probe-home-tAe0rJ/Downloads/active.bin` is `524288` bytes and
+  the provisional part was removed. The modal commit path was also verified
+  with `slow.bin` and produced the same completed state.
+- Full frontend/extension suite: `30/30`; `npx tsc -b` clean; `cargo build`
+  passed; `npm run build:all` passed; `git diff --check` passed. Cargo reports
+  one dead-code warning only for the sibling's separate uncommitted
+  `wait_for_transfer_idle` helper.
+- The sibling's 16-line `wait_for_transfer_idle` change remains unstaged and
+  unmodified in `src-tauri/src/main.rs`; this slice stages no sibling hunk.

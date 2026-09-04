@@ -2561,3 +2561,45 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   (`isTrusted=true`, `defaultPrevented=false`), with one native job and no
   Chromium Downloads artifact. The run ended with
   `COLD-START-CHROMIUM-PROBE: PASS`.
+
+## 2026-09-04 — Prove adaptive DASH representation selection
+
+- Added `fixtures/adaptive_dash_quality_probe.py` against the official DASH-IF
+  reference player and the static Akamai Big Buck Bunny MPD
+  `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps_shortened.mpd`.
+  The player exposed ten video representations and one audio representation.
+  The probe disabled dash.js video ABR only for the deterministic test, changed
+  `window.player` from `bbb_30fps_3840x2160_12000k` to
+  `bbb_30fps_320x180_200k`, and recorded exact `.m4v`/`.m4a` URLs from CDP
+  `Network.requestWillBeSent` events.
+- The first real run exposed a product defect: the browser switched to the
+  320x180 representation, but native DASH capture always selected the first
+  1024x576 representation from the shared MPD. The final real run also exposed
+  that the extension classified `.m4s` but not the actual `.m4v`/`.m4a` traffic,
+  so no selector hints were reaching native capture.
+- The fix carries up to eight recent, ownership-scoped HTTP(S) segment hints in
+  the native capture message. Rust resolves those URLs against every
+  representation's expanded DASH template and persists the hints in the job so
+  retry/resume keeps the selected representation. Existing callers still use
+  `parse_dash_tracks()` with the first representation when no hint exists.
+  `.m4a`, `.m4s`, and `.m4v` are now classified as media segments.
+- The corrected real run recorded six selected video requests and four selected
+  audio requests. Browser-context fetch plus Web Crypto recorded selected video
+  bytes `505512` with SHA-256
+  `44af089c298d873c8991226a0e22c635e2e55b8be57dee175204c4fcf6177f22`, and
+  selected audio bytes `133555` with SHA-256
+  `b8499fa98450954c841d9ec7933d6394c0a8cb4c8eb594556ca56a2f436f5638`.
+  The native job completed `1065647` assembled bytes and produced
+  `1060566` output bytes. FFprobe reported video `320x180` plus audio and
+  duration `32.085333` seconds.
+- The run retained the eight browser segment hints in SQLite, created one native
+  job, and left Chromium Downloads empty. Trusted right-click and Ctrl-click on
+  the ordinary browser-owned link remained `isTrusted=true` and
+  `defaultPrevented=false`. Final output:
+  `ADAPTIVE-DASH-QUALITY: PASS (selected=bbb_30fps_320x180_200k,
+  video_requests=6, audio_requests=4, output_bytes=1060566,
+  output_sha256=9e92c69c7143d6662ef7fe9b98778bf133272aa1cd349aa7d0ce4addece6c24c,
+  browser_downloads=[])` and `ADAPTIVE-DASH-QUALITY-PROBE: PASS`.
+- Rust verification passed `57/57`; focused extension verification passed
+  `14/14`; `npm run build:extension` and `npx tsc -b` passed. The only Rust
+  warning remains the protected sibling `wait_for_transfer_idle` helper.

@@ -24,10 +24,15 @@ export interface MediaPlayerEvidence {
   visible: boolean;
 }
 
+export interface MediaSelection {
+  source: string;
+  selectedSegments: string[];
+}
+
 export function roleFor(url: string, contentType = ''): MediaRole {
   const hint = `${contentType} ${url}`.toLowerCase();
   if (hint.includes('mpegurl') || hint.includes('dash+xml') || /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url)) return 'manifest';
-  if (hint.includes('video/mp2t') || hint.includes('iso.segment') || /(?:^|[./_-])(?:m4s|ts|cmf[av])(?:[?#]|$)/i.test(url)) return 'segment';
+  if (hint.includes('video/mp2t') || hint.includes('iso.segment') || /(?:^|[./_-])(?:m4[asv]|ts|cmf[av])(?:[?#]|$)/i.test(url)) return 'segment';
   return 'unknown';
 }
 
@@ -39,16 +44,20 @@ export function choosePlayerEvidence(players: MediaPlayerEvidence[], tabId: numb
   })[0];
 }
 
-export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): string | undefined {
+export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): MediaSelection | undefined {
   const scoped = candidates.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId));
-  const chooseFromPool = (pool: MediaCandidate[]): string | undefined => {
+  const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
     const newest = [...pool].sort((left, right) => right.at - left.at);
     const manifest = newest.find((item) => item.role === 'manifest');
-    if (manifest) return manifest.url;
     // Once segmented traffic is present, an unknown MP4 may be only an MSE
     // initialization fragment. Never promote it to a complete download.
-    if (pool.some((item) => item.role === 'segment')) return undefined;
-    return newest.find((item) => item.role !== 'segment')?.url;
+    if (!manifest && pool.some((item) => item.role === 'segment')) return undefined;
+    const source = manifest?.url ?? newest.find((item) => item.role !== 'segment')?.url;
+    if (!source) return undefined;
+    return {
+      source,
+      selectedSegments: newest.filter((item) => item.role === 'segment').slice(0, 8).map((item) => item.url),
+    };
   };
   if (!playerKey) return chooseFromPool(scoped);
 
@@ -63,4 +72,8 @@ export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number
     ? (assignedToOther ? owned : [...owned, ...scoped.filter((item) => !item.playerKey)])
     : scoped.filter((item) => !item.playerKey);
   return chooseFromPool(pool);
+}
+
+export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): string | undefined {
+  return chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId)?.source;
 }

@@ -1,5 +1,5 @@
 import { DEFAULT_POLICY, NATIVE_HOST, isHttp, type BrowserPolicy } from './shared';
-import { chooseMediaCandidate, choosePlayerEvidence, roleFor, type MediaCandidate, type MediaPlayerEvidence } from './media-candidates';
+import { chooseMediaSelection, choosePlayerEvidence, roleFor, type MediaCandidate, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 
@@ -196,15 +196,18 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const documentId = sender.documentId;
       const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey : (sender.tab?.id === undefined ? undefined : activePlayerKey(sender.tab.id, sender.frameId ?? 0, documentId));
       let source = typeof payload.source === 'string' ? payload.source : '';
+      let selectedSegments: string[] = [];
       if (!isHttp(source) && sender.tab?.id !== undefined) {
         // blob:/MSE player — resolve to the real traffic behind the element.
-        source = chooseMediaCandidate(recentMedia, sender.tab.id, sender.frameId ?? 0, playerKey, documentId) ?? '';
+        const selection = chooseMediaSelection(recentMedia, sender.tab.id, sender.frameId ?? 0, playerKey, documentId);
+        source = selection?.source ?? '';
+        selectedSegments = selection?.selectedSegments ?? [];
       }
       if (!isHttp(source)) {
         reply({ ok: false, error: 'no acquirable source for this media' });
         return;
       }
-      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source } }));
+      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments } }));
     } else if (type === 'open-manager') {
       reply(await sendNative({ type: 'open-manager' }));
     } else {

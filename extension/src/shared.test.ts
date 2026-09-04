@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_POLICY, isHttp, siteOf } from './shared';
 import {
   chooseMediaCandidate,
+  chooseMediaSelection,
   choosePlayerEvidence,
   roleFor,
   type MediaCandidate,
   type MediaPlayerEvidence,
+  type MediaSelection,
 } from './media-candidates';
 
 // Locks the URL-gating semantics the whole capture flow depends on:
@@ -60,6 +62,8 @@ describe('media candidate selection', () => {
     expect(roleFor('https://cdn.test/vod/playlist.m3u8')).toBe('manifest');
     expect(roleFor('https://cdn.test/vod/manifest', 'application/dash+xml')).toBe('manifest');
     expect(roleFor('https://cdn.test/vod/part-04.m4s', 'video/mp4')).toBe('segment');
+    expect(roleFor('https://cdn.test/vod/part-04.m4v', 'video/mp4')).toBe('segment');
+    expect(roleFor('https://cdn.test/vod/part-04.m4a', 'audio/mp4')).toBe('segment');
     expect(roleFor('https://cdn.test/vod/segment.ts', 'video/mp2t')).toBe('segment');
     expect(roleFor('https://cdn.test/vod/file.bin', 'application/octet-stream')).toBe('unknown');
   });
@@ -89,6 +93,19 @@ describe('media candidate selection', () => {
       { url: 'https://cdn.test/vod/old.m3u8', tabId: 4, frameId: 0, at: 10, role: 'manifest', playerKey: 'player-a' },
     ];
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/selected.m3u8');
+  });
+
+  it('returns recent browser segment hints with the selected manifest', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/old-1.m4s', tabId: 4, frameId: 0, at: 2, role: 'segment', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/new-1.m4s', tabId: 4, frameId: 0, at: 3, role: 'segment', playerKey: 'player-a' },
+    ];
+    const selection: MediaSelection | undefined = chooseMediaSelection(candidates, 4, 0, 'player-a');
+    expect(selection).toEqual({
+      source: 'https://cdn.test/vod/manifest.mpd',
+      selectedSegments: ['https://cdn.test/vod/new-1.m4s', 'https://cdn.test/vod/old-1.m4s'],
+    });
   });
 
   it('refuses to cross-select another player when the clicked player has no evidence', () => {

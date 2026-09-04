@@ -64,6 +64,8 @@ struct DownloadJob {
     resource_identity: Option<ResourceIdentity>,
     #[serde(default)]
     destination_reservation: Option<String>,
+    #[serde(default)]
+    selected_segments: Vec<String>,
     events: Vec<JobEvent>,
 }
 
@@ -126,7 +128,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1444,7 +1446,7 @@ fn segment_identity(tracks: &[media::MediaTrack]) -> String {
     format!("{hash:016x}")
 }
 
-async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, _mime: Option<String>, generation: u64) -> Result<(), String> {
+async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, _mime: Option<String>, selected_segments: Vec<String>, generation: u64) -> Result<(), String> {
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     let client = http_client();
     let mut manifest_source = source;
@@ -1479,7 +1481,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             tracks.push(media::MediaTrack { kind, segments: media::parse_hls(&source, &body)? });
         }
         tracks
-    } else if is_hls { vec![media::MediaTrack { kind: "video".into(), segments: media::parse_hls(&manifest_source, &manifest_body)? }] } else { media::parse_dash_tracks(&manifest_source, &manifest_body)? };
+    } else if is_hls { vec![media::MediaTrack { kind: "video".into(), segments: media::parse_hls(&manifest_source, &manifest_body)? }] } else { media::parse_dash_tracks_for_segments(&manifest_source, &manifest_body, &selected_segments)? };
     // Name the acquisition after its container, not the manifest: suggesting
     // "vod.m3u8" for MPEG-TS bytes guarantees a doomed FFmpeg remux later.
     // HLS without an EXT-X-MAP carries MPEG-TS; everything else assembles to MP4.
@@ -1640,6 +1642,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
 async fn acquire_once(app: AppHandle, id: String, source: String, generation: u64) -> bool {
     let state = app.state::<CoreState>();
     let client = http_client();
+    let selected_segments = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.selected_segments.clone())).unwrap_or_default();
     let mut response = match client.get(&source).header(reqwest::header::RANGE, "bytes=0-0").send().await {
         Ok(response) if response.status().is_success() => response,
         _ => match client.get(&source).send().await {
@@ -1673,7 +1676,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         let result = match body {
             Ok(body) => {
                 if !transfer_can_continue(&app, &id, generation) { return false; }
-                acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone(), generation).await
+                acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone(), selected_segments.clone(), generation).await
             }
             Err(error) => Err(error),
         };
@@ -1906,6 +1909,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
             let accepted = !transfer_is_active(state, &target_id) && state.snapshot.lock().ok().map(|mut snapshot| {
                 let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == target_id && job.provisional != Some(true) && source_compatible(&job.source, &input.source)) else { return false; };
                 job.source = input.source.clone();
+                job.selected_segments = input.selected_segments.clone();
                 job.domain = domain(&input.source);
                 job.state = "connecting".into();
                 job.error = None;
@@ -1925,7 +1929,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     }
     let id = format!("provisional-{}", Uuid::new_v4());
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, events: vec![job_event("Provisional acquisition created", None)] };
+    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
@@ -2142,7 +2146,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
     let media = message_type == "media-capture" || payload.get("media").and_then(Value::as_bool).unwrap_or(false);
     // Bytes/sec; absent, zero, or non-numeric means no per-job cap.
     let bandwidth_limit = payload.get("bandwidthLimit").and_then(Value::as_u64).filter(|value| *value > 0);
-    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit })
+    let selected_segments = payload.get("selectedSegments").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).filter_map(|value| { let parsed = reqwest::Url::parse(value).ok()?; matches!(parsed.scheme(), "http" | "https").then(|| value.to_string()) }).take(8).collect()).unwrap_or_default();
+    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments })
 }
 
 fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {
@@ -2449,6 +2454,13 @@ mod capture_tests {
         let message = json!({ "type": "capture-acquisition", "payload": { "url": "  http://127.0.0.1:8901/range.bin  " } });
         let input = provisional_input_from_message(&message).expect("url alias");
         assert_eq!(input.source, "http://127.0.0.1:8901/range.bin");
+    }
+
+    #[test]
+    fn selected_dash_segments_are_limited_to_http_urls() {
+        let message = json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/manifest.mpd", "selectedSegments": ["https://cdn.example.test/vod/one.m4v", "blob:https://cdn.example.test/no", "file:///tmp/no", "http://cdn.example.test/two.m4a"] } });
+        let input = provisional_input_from_message(&message).expect("valid media capture");
+        assert_eq!(input.selected_segments, ["https://cdn.example.test/vod/one.m4v", "http://cdn.example.test/two.m4a"]);
     }
 
     #[test]

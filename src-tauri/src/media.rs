@@ -96,6 +96,10 @@ pub fn parse_dash(source: &str, body: &str) -> Result<Vec<Segment>, String> {
 }
 
 pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, String> {
+    parse_dash_tracks_for_segments(source, body, &[])
+}
+
+pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segments: &[String]) -> Result<Vec<MediaTrack>, String> {
     let lower = body.to_ascii_lowercase();
     if lower.contains("type=\"dynamic\"") || lower.contains("type='dynamic'") || lower.contains("minimumupdateperiod=") || lower.contains("timeshiftbufferdepth=") { return Err("Live media is not supported; a static MPD is required".into()); }
     let mut reader = Reader::from_str(body);
@@ -115,10 +119,12 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                     current_track = Some(DashTrackBuilder::new(attribute(&element, b"contentType").or_else(|| attribute(&element, b"mimeType"))));
                 } else if name.as_slice() == b"representation" {
                     if let Some(track) = current_track.as_mut() {
+                        let representation_id = attribute(&element, b"id").unwrap_or_default();
+                        track.representation_ids.push(representation_id.clone());
                         if !track.selected_representation {
                             track.selected_representation = true;
                             track.representation_open = true;
-                            track.representation_id = attribute(&element, b"id").unwrap_or_default();
+                            track.representation_id = representation_id;
                             track.bandwidth = attribute(&element, b"bandwidth").unwrap_or_default();
                             if let Some(kind) = attribute(&element, b"contentType").or_else(|| attribute(&element, b"mimeType")).and_then(|value| track_kind(&value)) { track.kind = kind; }
                         }
@@ -154,9 +160,11 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                 if name.as_slice() == b"adaptationset" && current_track.is_none() { current_track = Some(DashTrackBuilder::new(attribute(&element, b"contentType").or_else(|| attribute(&element, b"mimeType")))); }
                 if name.as_slice() == b"representation" {
                     if let Some(track) = current_track.as_mut() {
+                        let representation_id = attribute(&element, b"id").unwrap_or_default();
+                        track.representation_ids.push(representation_id.clone());
                         if !track.selected_representation {
                             track.selected_representation = true;
-                            track.representation_id = attribute(&element, b"id").unwrap_or_default();
+                            track.representation_id = representation_id;
                             track.bandwidth = attribute(&element, b"bandwidth").unwrap_or_default();
                             if let Some(kind) = attribute(&element, b"contentType").or_else(|| attribute(&element, b"mimeType")).and_then(|value| track_kind(&value)) { track.kind = kind; }
                         }
@@ -197,7 +205,7 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                     if name.as_slice() == b"baseurl" { track.base_text_depth = None; }
                     if name.as_slice() == b"representation" && track.representation_open { track.representation_open = false; }
                     if name.as_slice() == b"adaptationset" {
-                        let finished = current_track.take().and_then(|track| track.finish(source, global_base_urls.first().map(String::as_str), presentation_duration));
+                        let finished = current_track.take().and_then(|track| track.finish(source, global_base_urls.first().map(String::as_str), presentation_duration, selected_segments));
                         if let Some(track) = finished { tracks.push(track); }
                     }
                 } else if name.as_slice() == b"baseurl" { global_base_text_depth = None; }
@@ -208,7 +216,7 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
             _ => {}
         }
     }
-    if let Some(track) = current_track.take().and_then(|track| track.finish(source, global_base_urls.first().map(String::as_str), presentation_duration)) { tracks.push(track); }
+    if let Some(track) = current_track.take().and_then(|track| track.finish(source, global_base_urls.first().map(String::as_str), presentation_duration, selected_segments)) { tracks.push(track); }
     if tracks.is_empty() { return Err("The static MPD did not contain downloadable segments".into()); }
     Ok(tracks)
 }
@@ -220,18 +228,32 @@ struct DashTrackBuilder {
     template: Option<DashTemplate>,
     representation_id: String,
     bandwidth: String,
+    representation_ids: Vec<String>,
     selected_representation: bool,
     representation_open: bool,
     base_text_depth: Option<usize>,
 }
 
 impl DashTrackBuilder {
-    fn new(kind: Option<String>) -> Self { Self { kind: kind.as_deref().and_then(track_kind).unwrap_or_default(), base_urls: Vec::new(), segment_refs: Vec::new(), template: None, representation_id: String::new(), bandwidth: String::new(), selected_representation: false, representation_open: false, base_text_depth: None } }
+    fn new(kind: Option<String>) -> Self { Self { kind: kind.as_deref().and_then(track_kind).unwrap_or_default(), base_urls: Vec::new(), segment_refs: Vec::new(), template: None, representation_id: String::new(), bandwidth: String::new(), representation_ids: Vec::new(), selected_representation: false, representation_open: false, base_text_depth: None } }
 
-    fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>) -> Option<MediaTrack> {
+    fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>, selected_segments: &[String]) -> Option<MediaTrack> {
         let base = self.base_urls.first().map(String::as_str).or(inherited_base).unwrap_or(source);
-        let mut segments = self.segment_refs.into_iter().filter_map(|(value, range)| resolve(base, &value).map(|url| Segment { url, range })).collect::<Vec<_>>();
-        if segments.is_empty() { if let Some(template) = self.template { segments = expand_dash_template(&template, base, &self.representation_id, &self.bandwidth, presentation_duration).ok()?; } }
+        let representation_ids = if self.representation_ids.is_empty() { vec![self.representation_id.clone()] } else { self.representation_ids.clone() };
+        let mut segments = self.segment_refs.iter().filter_map(|(value, range)| resolve(base, value).map(|url| Segment { url, range: *range })).collect::<Vec<_>>();
+        if segments.is_empty() {
+            let Some(template) = self.template.as_ref() else { return None; };
+            let mut chosen_id = self.representation_id.as_str();
+            for representation_id in &representation_ids {
+                if let Ok(candidate) = expand_dash_template(template, base, representation_id, &self.bandwidth, presentation_duration) {
+                    if selected_segments.iter().any(|selected| candidate.iter().any(|segment| &segment.url == selected)) {
+                        chosen_id = representation_id;
+                        break;
+                    }
+                }
+            }
+            segments = expand_dash_template(template, base, chosen_id, &self.bandwidth, presentation_duration).ok()?;
+        }
         if segments.is_empty() { return None; }
         Some(MediaTrack { kind: self.kind, segments })
     }
@@ -451,6 +473,15 @@ mod tests {
         assert_eq!(segments[1].range, Some((100, 10)));
         assert_eq!(segments[2].range, Some((110, 10)));
         assert!(parse_dash("https://cdn.example.test/manifest.mpd", "<MPD type=\"static\"><Period><AdaptationSet><Representation><SegmentList><SegmentURL media=\"one.m4s\" mediaRange=\"10-2\"/></SegmentList></Representation></AdaptationSet></Period></MPD>").is_err());
+    }
+
+    #[test]
+    fn selects_dash_representation_matching_browser_segment() {
+        let body = "<MPD type=\"static\" mediaPresentationDuration=\"PT4S\"><Period><AdaptationSet contentType=\"video\"><SegmentTemplate timescale=\"1\" duration=\"2\" media=\"$RepresentationID$-$Number$.m4s\" initialization=\"$RepresentationID$-init.m4s\"/><Representation id=\"low\"/><Representation id=\"high\"/></AdaptationSet><AdaptationSet contentType=\"audio\"><Representation id=\"audio\"><SegmentList><Initialization sourceURL=\"audio-init.m4s\"/><SegmentURL media=\"audio-1.m4s\"/><SegmentURL media=\"audio-2.m4s\"/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+        let tracks = parse_dash_tracks_for_segments("https://cdn.example.test/vod/manifest.mpd", body, &["https://cdn.example.test/vod/high-1.m4s".into()]).expect("selected DASH representation");
+        assert_eq!(tracks[0].segments[0].url, "https://cdn.example.test/vod/high-init.m4s");
+        assert_eq!(tracks[0].segments[1].url, "https://cdn.example.test/vod/high-1.m4s");
+        assert_eq!(tracks[0].segments[2].url, "https://cdn.example.test/vod/high-2.m4s");
     }
 
     #[test]

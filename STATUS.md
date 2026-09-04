@@ -2162,3 +2162,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
   with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
   distinct output names and hashes.
+
+## 2026-09-04 — Report replace rollback failures and retain the backup
+
+- The explicit-replace fallback previously ignored errors while restoring the
+  old destination after a failed staged install. The resulting failure could
+  hide the only remaining copy under a generated backup path.
+- Added `restore_replacement_backup` and report its error, including the exact
+  retained backup path, while leaving the backup untouched for recovery.
+- Added the deterministic Rust regression
+  `replacement_rollback_reports_preserved_backup_on_restore_failure`. It
+  injects a restoration failure and verifies the backup remains and no false
+  destination is created.
+- Fresh native verification passed `53/53` tests and Cargo build. The only
+  warning remains the protected sibling `wait_for_transfer_idle` helper being
+  unused.
+- Fresh fail-fast real-binary probes all exited successfully:
+  `MOVE-CANCEL-RACE: PASS` with one 268435456-byte output and SHA-256
+  `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`;
+  `MANAGED-RENAME-COLLISION: PASS`; `REPLACE-COLLISION: PASS`;
+  `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
+  with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
+  distinct output names and hashes.

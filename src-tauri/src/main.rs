@@ -827,6 +827,27 @@ fn fail_source_cleanup_for_test() -> bool {
 #[cfg(not(test))]
 fn fail_source_cleanup_for_test() -> bool { false }
 
+#[cfg(test)]
+static FAIL_REPLACEMENT_RESTORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn inject_replacement_restore_failure_for_test() {
+    FAIL_REPLACEMENT_RESTORE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn fail_replacement_restore_for_test() -> bool {
+    FAIL_REPLACEMENT_RESTORE.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn fail_replacement_restore_for_test() -> bool { false }
+
+async fn restore_replacement_backup(backup: &str, destination: &str) -> Result<(), String> {
+    if fail_replacement_restore_for_test() { return Err("injected replacement rollback failure".into()); }
+    tokio::fs::rename(backup, destination).await.map_err(|error| error.to_string())
+}
+
 async fn remove_completed_source(source: &str) -> Result<(), String> {
     if fail_source_cleanup_for_test() { return Err("injected source cleanup failure".into()); }
     tokio::fs::remove_file(source).await.map_err(|error| error.to_string())
@@ -958,8 +979,15 @@ async fn move_completed_file(source: &str, destination: &str, replace_existing: 
                 }
                 Err(rename_error) => {
                     let _ = tokio::fs::remove_file(&staging).await;
-                    if had_existing { let _ = tokio::fs::rename(&backup, destination).await; }
-                    Err(format!("{error}; fallback move failed: {rename_error}"))
+                    let restoration_error = if had_existing {
+                        match restore_replacement_backup(&backup, destination).await {
+                            Ok(()) => None,
+                            Err(error) => Some(format!("; original destination restoration failed: {error}; backup preserved at {backup}")),
+                        }
+                    } else {
+                        None
+                    };
+                    Err(format!("{error}; fallback move failed: {rename_error}{}", restoration_error.unwrap_or_default()))
                 }
             }
         }
@@ -2617,6 +2645,24 @@ mod capture_tests {
         assert!(source.exists(), "failed source cleanup must leave the source for diagnosis/retry");
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn replacement_rollback_reports_preserved_backup_on_restore_failure() {
+        use super::{inject_replacement_restore_failure_for_test, restore_replacement_backup};
+        let root = std::env::temp_dir().join(format!("download-manager-replace-rollback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backup = root.join("destination.backup");
+        let destination = root.join("destination.bin");
+        std::fs::write(&backup, b"old-output").unwrap();
+        inject_replacement_restore_failure_for_test();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(restore_replacement_backup(backup.to_str().unwrap(), destination.to_str().unwrap()));
+        assert!(result.is_err(), "fault injection must make backup restoration fail");
+        assert!(backup.exists(), "backup must remain available after restoration failure");
+        assert!(!destination.exists(), "failed restoration must not fabricate a destination");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn reserved_staging_install_restores_marker_when_final_rename_fails() {
         use super::{inject_reserved_install_failure_for_test, install_reserved_staging};

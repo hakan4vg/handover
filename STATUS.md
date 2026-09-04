@@ -2267,3 +2267,20 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   SHA-256 `0d819259a1693bddf406312b22fc8572f168064422e992ccf35ac952be3b115c`.
   The server observed exactly `bytes=0-4`, `bytes=5-10`, and `bytes=20-26`
   (concurrent arrival order was intentionally not assumed).
+
+## 2026-09-04 — Support DASH SegmentList byte ranges
+
+- Audited static DASH `SegmentList` handling and found that `mediaRange` and
+  `Initialization range` attributes were discarded, causing whole shared
+  resources to be fetched for each logical segment.
+- Extended the shared segment model and DASH parser to preserve explicit byte
+  ranges, validate `start-end` arithmetic, include ranges in segmented identity,
+  and use the existing strict HTTP range-response path.
+- Unit coverage passed for ranged initialization/media entries and malformed
+  reversed ranges.
+- Full native verification passed: Rust `54/54`; Cargo build passed. The only
+  warning remains the protected unused `wait_for_transfer_idle` helper.
+- Added and ran `fixtures/dash_byterange_probe.py` against the rebuilt binary.
+  It completed `3/3` segments and produced the expected 15-byte concatenation,
+  SHA-256 `a9342f061651954a0223ba72bfa54ff6629ecfe72d97c975e5effe289d740f53`.
+  The server observed exactly `bytes=0-4`, `bytes=20-25`, and `bytes=30-33`.

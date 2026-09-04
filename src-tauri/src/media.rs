@@ -136,8 +136,13 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                         } else {
                             b"media".as_slice()
                         };
+                        let range_name = if name.as_slice() == b"initialization" {
+                            b"range".as_slice()
+                        } else {
+                            b"mediaRange".as_slice()
+                        };
                         if let Some(value) = attribute(&element, attribute_name) {
-                            track.segment_refs.push(value);
+                            track.segment_refs.push((value, dash_range(&element, range_name)?));
                         }
                     }
                 } else if name.as_slice() == b"baseurl" { global_base_text_depth = Some(stack.len() + 1); }
@@ -167,8 +172,13 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                         } else {
                             b"media".as_slice()
                         };
+                        let range_name = if name.as_slice() == b"initialization" {
+                            b"range".as_slice()
+                        } else {
+                            b"mediaRange".as_slice()
+                        };
                         if let Some(value) = attribute(&element, attribute_name) {
-                            track.segment_refs.push(value);
+                            track.segment_refs.push((value, dash_range(&element, range_name)?));
                         }
                     }
                     if name.as_slice() == b"s" && (track.representation_open || !track.selected_representation) { if let Some(template) = track.template.as_mut() { template.timeline.push(DashTimeline::from_element(&element)); } }
@@ -206,7 +216,7 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
 struct DashTrackBuilder {
     kind: String,
     base_urls: Vec<String>,
-    segment_refs: Vec<String>,
+    segment_refs: Vec<(String, Option<(u64, u64)>)>,
     template: Option<DashTemplate>,
     representation_id: String,
     bandwidth: String,
@@ -220,7 +230,7 @@ impl DashTrackBuilder {
 
     fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>) -> Option<MediaTrack> {
         let base = self.base_urls.first().map(String::as_str).or(inherited_base).unwrap_or(source);
-        let mut segments = self.segment_refs.into_iter().filter_map(|value| resolve(base, &value)).map(|url| Segment { url, range: None }).collect::<Vec<_>>();
+        let mut segments = self.segment_refs.into_iter().filter_map(|(value, range)| resolve(base, &value).map(|url| Segment { url, range })).collect::<Vec<_>>();
         if segments.is_empty() { if let Some(template) = self.template { segments = expand_dash_template(&template, base, &self.representation_id, &self.bandwidth, presentation_duration).ok()?; } }
         if segments.is_empty() { return None; }
         Some(MediaTrack { kind: self.kind, segments })
@@ -356,6 +366,15 @@ fn parse_hls_byterange(value: &str) -> Result<(u64, Option<u64>), String> {
 }
 
 
+fn dash_range(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Result<Option<(u64, u64)>, String> {
+    let Some(value) = attribute(element, key) else { return Ok(None); };
+    let Some((start, end)) = value.split_once('-') else { return Err(format!("Invalid DASH byte range: {value}")); };
+    let start = start.parse::<u64>().map_err(|_| format!("Invalid DASH byte range start: {value}"))?;
+    let end = end.parse::<u64>().map_err(|_| format!("Invalid DASH byte range end: {value}"))?;
+    let length = end.checked_sub(start).and_then(|length| length.checked_add(1)).ok_or_else(|| format!("Invalid DASH byte range: {value}"))?;
+    Ok(Some((start, length)))
+}
+
 fn attribute(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     element.attributes().flatten().find(|attribute| attribute.key.as_ref().eq_ignore_ascii_case(key)).and_then(|attribute| attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|value| value.into_owned()))
 }
@@ -425,9 +444,13 @@ mod tests {
 
     #[test]
     fn parses_adaptation_level_dash_segment_list() {
-        let body = "<MPD type=\"static\"><Period><AdaptationSet contentType=\"video\"><SegmentList><Initialization sourceURL=\"init.mp4\"/><SegmentURL media=\"one.m4s\"/><SegmentURL media=\"two.m4s\"/></SegmentList><Representation id=\"video\"><BaseURL>https://cdn.example.test/vod/</BaseURL></Representation></AdaptationSet></Period></MPD>";
+        let body = "<MPD type=\"static\"><Period><AdaptationSet contentType=\"video\"><SegmentList><Initialization sourceURL=\"init.mp4\" range=\"30-31\"/><SegmentURL media=\"one.m4s\" mediaRange=\"100-109\"/><SegmentURL media=\"two.m4s\" mediaRange=\"110-119\"/></SegmentList><Representation id=\"video\"><BaseURL>https://cdn.example.test/vod/</BaseURL></Representation></AdaptationSet></Period></MPD>";
         let segments = parse_dash("https://cdn.example.test/manifest.mpd", body).expect("adaptation-level segment list");
         assert_eq!(segments.iter().map(|segment| segment.url.as_str()).collect::<Vec<_>>(), ["https://cdn.example.test/vod/init.mp4", "https://cdn.example.test/vod/one.m4s", "https://cdn.example.test/vod/two.m4s"]);
+        assert_eq!(segments[0].range, Some((30, 2)));
+        assert_eq!(segments[1].range, Some((100, 10)));
+        assert_eq!(segments[2].range, Some((110, 10)));
+        assert!(parse_dash("https://cdn.example.test/manifest.mpd", "<MPD type=\"static\"><Period><AdaptationSet><Representation><SegmentList><SegmentURL media=\"one.m4s\" mediaRange=\"10-2\"/></SegmentList></Representation></AdaptationSet></Period></MPD>").is_err());
     }
 
     #[test]

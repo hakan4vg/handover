@@ -322,17 +322,24 @@ fn settings_policy(settings: &AppSettings) -> BrowserPolicy {
 fn settings_from_stored(stored: &str) -> AppSettings {
     let defaults = default_settings();
     let Ok(overlay) = serde_json::from_str::<Value>(stored) else { return defaults; };
-    apply_settings_patch(&defaults, &overlay)
+    let mut settings = apply_settings_patch(&defaults, &overlay);
+    if settings.default_folder.trim().is_empty() { settings.default_folder = defaults.default_folder.clone(); }
+    if settings.temp_folder.trim().is_empty() { settings.temp_folder = defaults.temp_folder.clone(); }
+    settings
 }
 
 // Per-key patch application shared by boot recovery and the live
 // update_settings command: overlay entries onto a base, keeping an entry
 // only if the whole struct still parses. Non-object patches leave the base
 // untouched. One bad value can no longer veto the good keys around it.
+// Blank folder paths are rejected outright: the folder fields are free-text
+// inputs, and an empty download folder would silently turn every later
+// destination into a relative path into the process working directory.
 fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
     let Value::Object(entries) = patch else { return current.clone(); };
     let mut merged = serde_json::to_value(current).unwrap_or(Value::Null);
     for (key, value) in entries {
+        if (key == "defaultFolder" || key == "tempFolder") && value.as_str().is_some_and(|text| text.trim().is_empty()) { continue; }
         let previous = if let Value::Object(ref mut base) = merged { base.insert(key.clone(), value.clone()) } else { break; };
         if serde_json::from_value::<AppSettings>(merged.clone()).is_err() {
             if let Value::Object(ref mut base) = merged {
@@ -1894,6 +1901,26 @@ mod capture_tests {
         let rebooted = settings_from_stored(&payload);
         assert_eq!(rebooted.max_connections, 4);
         assert_eq!(rebooted.bandwidth_limit, Some(1048576));
+    }
+
+    #[test]
+    fn settings_patch_rejects_blank_folders() {
+        use super::{apply_settings_patch, default_settings, settings_from_stored};
+        let mut current = default_settings();
+        current.default_folder = String::from("/dl");
+        current.temp_folder = String::from("/tmp-parts");
+        let patch = serde_json::json!({"defaultFolder": "   ", "tempFolder": "", "maxConnections": 6});
+        let next = apply_settings_patch(&current, &patch);
+        assert_eq!(next.default_folder, "/dl");
+        assert_eq!(next.temp_folder, "/tmp-parts");
+        assert_eq!(next.max_connections, 6);
+        let patch = serde_json::json!({"defaultFolder": "/new-dl"});
+        let next = apply_settings_patch(&current, &patch);
+        assert_eq!(next.default_folder, "/new-dl");
+        let stored = serde_json::json!({"defaultFolder": "", "tempFolder": "  "}).to_string();
+        let rebooted = settings_from_stored(&stored);
+        assert!(!rebooted.default_folder.trim().is_empty());
+        assert!(!rebooted.temp_folder.trim().is_empty());
     }
 
     fn ranges(pairs: &[(u64, u64)]) -> Vec<super::ByteRange> {

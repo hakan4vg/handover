@@ -1036,3 +1036,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   source-verified. Screenshot `/tmp/dm-tray-boot-window.png`; rig torn down
   (process + boot HOME removed), `:99` Xvfb left running as found.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Blank folder paths rejected (live patch + boot)
+
+- Real, reachable bug: the folder fields are free-text inputs, so clearing
+  one sends a blank `defaultFolder`/`tempFolder` straight through the
+  per-key patch (empty strings parse fine). Every later destination then
+  joins onto an empty path and lands relative to the process working
+  directory, with no feedback at the Settings surface. Zero-limit and
+  zero-connection cases were audited first and are already safe
+  (`effective_rate` filters non-positive rates; `clamp_connections` +
+  per-site `.clamp(1, …)` at every spawn site) — folders were the open hole.
+- Fix in the owned routine: `apply_settings_patch` skips blank folder
+  values (stored folder kept, good keys in the same patch still apply);
+  `settings_from_stored` falls back to the platform default when a stored
+  folder is blank. TDD: `settings_patch_rejects_blank_folders` failed first
+  (assertion, blank applied), green after — suite Rust 34/34, build clean.
+- Process note (earned the hard way): never backslash-escape quotes inside
+  patch/write parameters — they are written verbatim, so typed backslashes
+  land in the file as literal backslashes and break string literals. Two
+  mangled attempts were repaired by excising the broken hunk via
+  `git diff` → hunk-filter script (`/tmp/dm-filter.py`) → `git apply -R`
+  full + `git apply` filtered, which restored the sibling's uncommitted
+  slice byte-identically (re-verified: 16 insertions, 33/33 green before
+  re-adding). Type plain quotes, always.
+- Commit hygiene as before: split-staged only my hunks (`@@ -322`,
+  `@@ -1896`); the sibling's 16-line `wait_for_transfer_idle` slice stays
+  uncommitted in the working tree. `fixtures/server.py` untouched.

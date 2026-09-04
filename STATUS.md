@@ -1902,3 +1902,39 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   unstaged. The next audit should test automatic-finalization failure and
   cancellation after a destination reservation, especially whether a
   persisted renamed destination can be safely retried without stale ownership.
+
+## 2026-09-04 — Recover persisted destination reservations safely
+
+- The next ownership audit found a crash window after `create_new` reserved a
+  final path but before the completed bytes replaced the placeholder. An empty
+  placeholder had no ownership marker, so startup could leave it behind and
+  retry at a suffixed path. This was unsafe for cleanup and could create a
+  duplicate destination on recovery.
+- Product repair: rename-mode reservations now write a random
+  `download-manager-reservation-v1:` marker and persist it as the optional
+  `destinationReservation` job field before the move. Startup reconciles that
+  field before spawning recovery: an exact marker is removed and retried at the
+  original path; any different file is preserved as a completed move and the
+  active job is completed; unreadable paths are left untouched. Normal success,
+  cancellation-before-move, and move-error paths clear the persisted marker.
+  Explicit replace mode does not create a reservation marker.
+- Added the Rust regression
+  `destination_reservation_recovery_removes_only_its_marker`, which proves an
+  exact marker is reclaimed while completed output bytes survive. The old
+  collision unit now exercises the marker-producing reservation function
+  directly; the protected sibling `wait_for_transfer_idle` hunk remains
+  unstaged.
+- Added `fixtures/startup_reservation_probe.py`. It seeds a real SQLite job
+  with a complete persisted temp file, a matching destination marker, and a
+  `destinationReservation` field, then relaunches the real binary. The probe
+  exited `0` with:
+  `STARTUP-RESERVATION-RECOVERY: PASS
+  (job=startup-reservation-recovery, destination=managed.bin,
+  sha256=3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87)`.
+  The final database field was cleared, the original destination was reused,
+  the marker was replaced by the expected bytes, and the only network request
+  was `GET /changed.bin?variant=1` with `Range: bytes=0-0` and HTTP `206`.
+- Current complete verification passed after this slice: Rust `47/47`; Cargo
+  build; Vitest frontend/extension `7` files and `31/31` tests; `npx tsc -b`;
+  and `npm run build:all` (frontend plus extension). The only native warning
+  is the protected sibling `wait_for_transfer_idle` helper being unused.

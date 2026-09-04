@@ -62,6 +62,8 @@ struct DownloadJob {
     completed_ranges: Vec<ByteRange>,
     #[serde(default)]
     resource_identity: Option<ResourceIdentity>,
+    #[serde(default)]
+    destination_reservation: Option<String>,
     events: Vec<JobEvent>,
 }
 
@@ -433,7 +435,22 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
     if let Ok(mut statement) = database.prepare("SELECT payload FROM jobs ORDER BY created_at DESC") {
         if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
             for payload in rows.flatten() {
-                if let Ok(job) = serde_json::from_str::<DownloadJob>(&payload) {
+                if let Ok(mut job) = serde_json::from_str::<DownloadJob>(&payload) {
+                    if let Some(marker) = job.destination_reservation.clone() {
+                        match reconcile_destination_reservation(Path::new(&job.destination), &marker) {
+                            DestinationReservationRecovery::Retry | DestinationReservationRecovery::Missing => job.destination_reservation = None,
+                            DestinationReservationRecovery::Completed => {
+                                job.destination_reservation = None;
+                                if ["connecting", "downloading", "finalizing"].contains(&job.state.as_str()) {
+                                    complete_job(&mut job);
+                                    let _ = std::fs::remove_file(&job.temp_path);
+                                    let _ = std::fs::remove_dir_all(format!("{}.segments", job.temp_path));
+                                    cleanup_media_track_files(&job.temp_path);
+                                }
+                            }
+                            DestinationReservationRecovery::Unknown => {}
+                        }
+                    }
                     if job.provisional == Some(true) {
                         let _ = std::fs::remove_file(&job.temp_path);
                         let _ = std::fs::remove_dir_all(format!("{}.segments", job.temp_path));
@@ -461,6 +478,14 @@ fn save_snapshot(state: &CoreState) {
                 let _ = database.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", params![job.id, job.created, serde_json::to_string(job).unwrap_or_default()]);
             }
         }
+    }
+}
+
+fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
+    let had_reservation = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.destination_reservation.is_some())).unwrap_or(false);
+    if had_reservation {
+        emit_job(state, id, |job| job.destination_reservation = None);
+        emit_snapshot(app, state);
     }
 }
 
@@ -538,15 +563,41 @@ fn collision_destination(path: &str, behavior: &str) -> String {
     path.to_string()
 }
 
-fn reserve_collision_destination(path: &str) -> Result<String, String> {
+const DESTINATION_RESERVATION_PREFIX: &str = "download-manager-reservation-v1:";
+
+#[derive(Debug, PartialEq, Eq)]
+enum DestinationReservationRecovery { Retry, Completed, Missing, Unknown }
+
+fn destination_reservation_marker() -> String { format!("{DESTINATION_RESERVATION_PREFIX}{}", Uuid::new_v4()) }
+
+fn reconcile_destination_reservation(path: &Path, marker: &str) -> DestinationReservationRecovery {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes == marker.as_bytes() => match std::fs::remove_file(path) {
+            Ok(()) => DestinationReservationRecovery::Retry,
+            Err(_) => DestinationReservationRecovery::Unknown,
+        },
+        Ok(_) => DestinationReservationRecovery::Completed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DestinationReservationRecovery::Missing,
+        Err(_) => DestinationReservationRecovery::Unknown,
+    }
+}
+
+fn reserve_collision_destination_with_marker(path: &str) -> Result<(String, String), String> {
     let candidate = PathBuf::from(path);
     let stem = candidate.file_stem().and_then(|value| value.to_str()).unwrap_or("download");
     let extension = candidate.extension().and_then(|value| value.to_str()).map(|value| format!(".{value}")).unwrap_or_default();
+    let marker = destination_reservation_marker();
     for index in 0..10000 {
         let mut next = candidate.clone();
         if index > 0 { next.set_file_name(format!("{stem} ({index}){extension}")); }
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&next) {
-            Ok(_) => return Ok(next.to_string_lossy().into_owned()),
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(marker.as_bytes()).and_then(|_| file.sync_all()) {
+                    let _ = std::fs::remove_file(&next);
+                    return Err(error.to_string());
+                }
+                return Ok((next.to_string_lossy().into_owned(), marker));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.to_string()),
         }
@@ -554,8 +605,8 @@ fn reserve_collision_destination(path: &str) -> Result<String, String> {
     Err("Could not reserve a unique destination".into())
 }
 
-fn managed_destination(path: &str, replace_existing: bool) -> Result<(String, bool), String> {
-    if replace_existing { Ok((path.to_string(), false)) } else { reserve_collision_destination(path).map(|destination| (destination, true)) }
+fn managed_destination(path: &str, replace_existing: bool) -> Result<(String, bool, Option<String>), String> {
+    if replace_existing { Ok((path.to_string(), false, None)) } else { reserve_collision_destination_with_marker(path).map(|(destination, marker)| (destination, true, Some(marker))) }
 }
 
 fn header_string(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
@@ -1046,20 +1097,27 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         }
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        let (destination, reserved) = managed_destination(&committed.1, replace_existing)?;
-        if destination != committed.1 {
+        let (destination, reserved, reservation) = managed_destination(&committed.1, replace_existing)?;
+        if destination != committed.1 || reservation.is_some() {
+            let reservation_marker = reservation.clone();
             emit_job(&state, &id, |job| {
                 job.destination = destination.clone();
-                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
-                job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+                job.destination_reservation = reservation_marker;
+                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != committed.1 { job.name = file_name.to_string(); } }
+                if destination != committed.1 { job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning"))); }
             });
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
             if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
-        move_completed_file(&temp_path, &destination, replace_existing, reserved).await?;
+        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reserved).await {
+            clear_destination_reservation(&app, &state, &id);
+            return Err(error);
+        }
+        clear_destination_reservation(&app, &state, &id);
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     }
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
@@ -1264,20 +1322,27 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         }
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        let (destination, reserved) = managed_destination(&committed.1, replace_existing)?;
-        if destination != committed.1 {
+        let (destination, reserved, reservation) = managed_destination(&committed.1, replace_existing)?;
+        if destination != committed.1 || reservation.is_some() {
+            let reservation_marker = reservation.clone();
             emit_job(&state, &id, |job| {
                 job.destination = destination.clone();
-                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
-                job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+                job.destination_reservation = reservation_marker;
+                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != committed.1 { job.name = file_name.to_string(); } }
+                if destination != committed.1 { job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning"))); }
             });
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
             if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
-        move_completed_file(&final_path, &destination, replace_existing, reserved).await?;
+        if let Err(error) = move_completed_file(&final_path, &destination, replace_existing, reserved).await {
+            clear_destination_reservation(&app, &state, &id);
+            return Err(error);
+        }
+        clear_destination_reservation(&app, &state, &id);
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
@@ -1405,7 +1470,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             if !transfer_can_continue(&app, &id, generation) { return false; }
         }
         if !transfer_can_continue(&app, &id, generation) { return false; }
-        let (destination, reserved) = match managed_destination(&committed.1, replace_existing) {
+        let (destination, reserved, reservation) = match managed_destination(&committed.1, replace_existing) {
             Ok(value) => value,
             Err(error) => {
                 emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Could not reserve a unique destination", Some("error"))); });
@@ -1414,25 +1479,30 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 return false;
             }
         };
-        if destination != committed.1 {
+        if destination != committed.1 || reservation.is_some() {
+            let reservation_marker = reservation.clone();
             emit_job(&state, &id, |job| {
                 job.destination = destination.clone();
-                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
-                job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+                job.destination_reservation = reservation_marker;
+                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != committed.1 { job.name = file_name.to_string(); } }
+                if destination != committed.1 { job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning"))); }
             });
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
             if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            clear_destination_reservation(&app, &state, &id);
             return false;
         }
         if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reserved).await {
+            clear_destination_reservation(&app, &state, &id);
             if !transfer_can_continue(&app, &id, generation) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
             add_notification(&app, &state, &id, "failed");
             return false;
         }
+        clear_destination_reservation(&app, &state, &id);
     }
     if !transfer_can_continue(&app, &id, generation) { return false; }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
@@ -1572,7 +1642,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     }
     let id = format!("provisional-{}", Uuid::new_v4());
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, events: vec![job_event("Provisional acquisition created", None)] };
+    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
@@ -1708,13 +1778,13 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
     let mut destination = accepted.2.clone();
     if let Some(parent) = PathBuf::from(&destination).parent() { let _ = std::fs::create_dir_all(parent); }
     if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
-    let reserved = if accepted.3 {
-        false
+    let (reserved, reservation) = if accepted.3 {
+        (false, None)
     } else {
-        match reserve_collision_destination(&destination) {
-            Ok(path) => {
+        match reserve_collision_destination_with_marker(&destination) {
+            Ok((path, marker)) => {
                 destination = path;
-                true
+                (true, Some(marker))
             }
             Err(error) => {
                 emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Could not reserve a unique destination", Some("error"))); });
@@ -1723,16 +1793,19 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
             }
         }
     };
-    if destination != accepted.2 {
+    if destination != accepted.2 || reservation.is_some() {
+        let reservation_marker = reservation.clone();
         emit_job(&state, &id, |job| {
             job.destination = destination.clone();
-            if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
-            job.events.insert(0, job_event("Destination renamed to avoid a concurrent collision", Some("warning")));
+            job.destination_reservation = reservation_marker;
+            if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != accepted.2 { job.name = file_name.to_string(); } }
+            if destination != accepted.2 { job.events.insert(0, job_event("Destination renamed to avoid a concurrent collision", Some("warning"))); }
         });
         emit_snapshot(&app, &state);
     }
     if !commit_still_owned(state.inner(), &id) {
         if reserved { let _ = std::fs::remove_file(&destination); }
+        clear_destination_reservation(&app, &state, &id);
         emit_snapshot(&app, &state);
         return Err("Acquisition was paused or cancelled before the file move".into());
     }
@@ -1742,7 +1815,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
             if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }
             cleanup_media_track_files(&accepted.1);
             let mut completed = false;
-            emit_job(&state, &id, |job| { if job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0 { complete_job(job); job.eta = None; completed = true; } });
+            emit_job(&state, &id, |job| { if job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0 { job.destination_reservation = None; complete_job(job); job.eta = None; completed = true; } });
             if !completed { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before completion".into()); }
             add_notification(&app, &state, &id, "completed");
         }
@@ -2295,17 +2368,33 @@ mod capture_tests {
 
     #[test]
     fn collision_reservation_allocates_distinct_paths_before_moves() {
-        use super::reserve_collision_destination;
+        use super::reserve_collision_destination_with_marker;
         let root = std::env::temp_dir().join(format!("download-manager-collision-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let requested = root.join("same.bin").to_string_lossy().into_owned();
-        let first = reserve_collision_destination(&requested).unwrap();
-        let second = reserve_collision_destination(&requested).unwrap();
+        let first = reserve_collision_destination_with_marker(&requested).unwrap().0;
+        let second = reserve_collision_destination_with_marker(&requested).unwrap().0;
         assert_eq!(first, requested);
         assert_eq!(second, root.join("same (1).bin").to_string_lossy());
         std::fs::remove_file(first).unwrap();
         std::fs::remove_file(second).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn destination_reservation_recovery_removes_only_its_marker() {
+        use super::{destination_reservation_marker, reconcile_destination_reservation, DestinationReservationRecovery};
+        let root = std::env::temp_dir().join(format!("download-manager-reservation-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("managed.bin");
+        let marker = destination_reservation_marker();
+        std::fs::write(&target, marker.as_bytes()).unwrap();
+        assert_eq!(reconcile_destination_reservation(&target, &marker), DestinationReservationRecovery::Retry);
+        assert!(!target.exists());
+        std::fs::write(&target, b"completed-output").unwrap();
+        assert_eq!(reconcile_destination_reservation(&target, &marker), DestinationReservationRecovery::Completed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"completed-output");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

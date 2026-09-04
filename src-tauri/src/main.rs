@@ -482,8 +482,9 @@ fn save_snapshot(state: &CoreState) {
 }
 
 fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
-    let had_reservation = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.destination_reservation.is_some())).unwrap_or(false);
-    if had_reservation {
+    let reservation = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).and_then(|job| job.destination_reservation.as_ref().map(|marker| (job.destination.clone(), marker.clone()))));
+    if let Some((destination, marker)) = reservation {
+        if std::fs::read(&destination).ok().as_deref() == Some(marker.as_bytes()) { let _ = std::fs::remove_file(destination); }
         emit_job(state, id, |job| job.destination_reservation = None);
         emit_snapshot(app, state);
     }
@@ -750,17 +751,121 @@ fn move_needs_fallback(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::AlreadyExists || matches!(error.raw_os_error(), Some(17) | Some(18) | Some(183))
 }
 
-async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reserved: bool) -> Result<(), String> {
+async fn remove_owned_reservation(destination: &str, marker: Option<&str>) {
+    let Some(marker) = marker else { return; };
+    if tokio::fs::read(destination).await.ok().as_deref() == Some(marker.as_bytes()) {
+        let _ = tokio::fs::remove_file(destination).await;
+    }
+}
+
+#[cfg(test)]
+static FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn inject_reserved_install_failure_for_test() {
+    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn fail_reserved_install_after_marker_removal() -> bool {
+    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn fail_reserved_install_after_marker_removal() -> bool { false }
+
+enum ReservationRestore {
+    Restored,
+    DestinationChanged,
+    Failed(String),
+}
+
+async fn restore_reservation_marker(destination: &str, marker: &str) -> ReservationRestore {
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(destination).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return ReservationRestore::DestinationChanged,
+        Err(error) => return ReservationRestore::Failed(error.to_string()),
+    };
+    if let Err(error) = file.write_all(marker.as_bytes()).await {
+        return ReservationRestore::Failed(error.to_string());
+    }
+    if let Err(error) = file.sync_all().await {
+        return ReservationRestore::Failed(error.to_string());
+    }
+    ReservationRestore::Restored
+}
+
+fn reservation_restore_message(result: &ReservationRestore) -> String {
+    match result {
+        ReservationRestore::Restored => "reservation marker restored".into(),
+        ReservationRestore::DestinationChanged => "destination changed; reservation marker not restored".into(),
+        ReservationRestore::Failed(error) => format!("could not restore reservation marker: {error}"),
+    }
+}
+
+async fn install_reserved_staging(staging: &str, destination: &str, marker: &str) -> Result<(), String> {
+    let owns_reservation = tokio::fs::read(destination).await.ok().as_deref() == Some(marker.as_bytes());
+    if !owns_reservation {
+        let _ = tokio::fs::remove_file(staging).await;
+        return Err("fallback destination reservation changed".into());
+    }
+    if let Err(remove_error) = tokio::fs::remove_file(destination).await {
+        let restoration = if remove_error.kind() == std::io::ErrorKind::NotFound {
+            Some(restore_reservation_marker(destination, marker).await)
+        } else {
+            None
+        };
+        let _ = tokio::fs::remove_file(staging).await;
+        return Err(match restoration {
+            Some(result) => format!("reservation removal failed: {remove_error}; {}", reservation_restore_message(&result)),
+            None => format!("reservation removal failed: {remove_error}"),
+        });
+    }
+
+    if fail_reserved_install_after_marker_removal() {
+        let restoration = restore_reservation_marker(destination, marker).await;
+        let _ = tokio::fs::remove_file(staging).await;
+        return Err(format!("injected final staging rename failure; {}", reservation_restore_message(&restoration)));
+    }
+
+    match tokio::fs::rename(staging, destination).await {
+        Ok(()) => Ok(()),
+        Err(install_error) => {
+            let restoration = restore_reservation_marker(destination, marker).await;
+            let _ = tokio::fs::remove_file(staging).await;
+            Err(format!("final staging rename failed: {install_error}; {}", reservation_restore_message(&restoration)))
+        }
+    }
+}
+
+async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reservation_marker: Option<&str>) -> Result<(), String> {
+    let reserved = reservation_marker.is_some();
     if let Some(parent) = PathBuf::from(destination).parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
     match tokio::fs::rename(source, destination).await {
         Ok(()) => Ok(()),
         Err(error) if move_needs_fallback(&error) && reserved => {
-            match tokio::fs::copy(source, destination).await {
-                Ok(_) => match tokio::fs::remove_file(source).await {
-                    Ok(()) => Ok(()),
-                    Err(remove_error) => { let _ = tokio::fs::remove_file(destination).await; Err(remove_error.to_string()) }
-                },
-                Err(copy_error) => { let _ = tokio::fs::remove_file(destination).await; Err(format!("{error}; fallback copy failed: {copy_error}")) }
+            let staging = format!("{destination}.download-manager-staging-{}", uuid::Uuid::new_v4());
+            if let Err(copy_error) = tokio::fs::copy(source, &staging).await {
+                let _ = tokio::fs::remove_file(&staging).await;
+                remove_owned_reservation(destination, reservation_marker).await;
+                return Err(format!("{error}; fallback copy failed: {copy_error}"));
+            }
+            match tokio::fs::rename(&staging, destination).await {
+                Ok(()) => {}
+                Err(rename_error) if move_needs_fallback(&rename_error) => {
+                    if let Err(install_error) = install_reserved_staging(&staging, destination, reservation_marker.expect("reserved fallback has marker")).await {
+                        return Err(format!("{error}; {install_error}"));
+                    }
+                }
+                Err(rename_error) => {
+                    let _ = tokio::fs::remove_file(&staging).await;
+                    remove_owned_reservation(destination, reservation_marker).await;
+                    return Err(format!("{error}; fallback move failed: {rename_error}"));
+                }
+            }
+            match tokio::fs::remove_file(source).await {
+                Ok(()) => Ok(()),
+                Err(remove_error) => { let _ = tokio::fs::remove_file(destination).await; Err(remove_error.to_string()) }
             }
         }
         Err(error) if move_needs_fallback(&error) && replace_existing => {
@@ -1121,7 +1226,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
-        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reserved).await {
+        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reservation.as_deref()).await {
             clear_destination_reservation(&app, &state, &id);
             return Err(error);
         }
@@ -1345,7 +1450,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
-        if let Err(error) = move_completed_file(&final_path, &destination, replace_existing, reserved).await {
+        if let Err(error) = move_completed_file(&final_path, &destination, replace_existing, reservation.as_deref()).await {
             clear_destination_reservation(&app, &state, &id);
             return Err(error);
         }
@@ -1500,7 +1605,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             clear_destination_reservation(&app, &state, &id);
             return false;
         }
-        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reserved).await {
+        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reservation.as_deref()).await {
             clear_destination_reservation(&app, &state, &id);
             if !transfer_can_continue(&app, &id, generation) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
@@ -1815,7 +1920,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         emit_snapshot(&app, &state);
         return Err("Acquisition was paused or cancelled before the file move".into());
     }
-    match move_completed_file(&final_path, &destination, accepted.3, reserved).await {
+    match move_completed_file(&final_path, &destination, accepted.3, reservation.as_deref()).await {
         Ok(()) => {
             if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }
             cleanup_media_track_files(&accepted.1);
@@ -2395,6 +2500,25 @@ mod capture_tests {
         assert!(!move_needs_fallback(&std::io::Error::from_raw_os_error(13)));
     }
 
+    #[test]
+    fn reserved_staging_install_restores_marker_when_final_rename_fails() {
+        use super::{inject_reserved_install_failure_for_test, install_reserved_staging};
+        let root = std::env::temp_dir().join(format!("download-manager-reservation-rollback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("managed.bin");
+        let staging = root.join("managed.bin.download-manager-staging-test");
+        let marker = "download-manager-reservation-v1:test-marker";
+        std::fs::write(&destination, marker.as_bytes()).unwrap();
+        std::fs::write(&staging, b"complete-output").unwrap();
+        inject_reserved_install_failure_for_test();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(install_reserved_staging(staging.to_str().unwrap(), destination.to_str().unwrap(), marker));
+        assert!(result.is_err(), "fault injection must make the final install fail");
+        assert_eq!(std::fs::read(&destination).unwrap(), marker.as_bytes(), "reservation marker must be restored");
+        assert!(!staging.exists(), "failed install must clean staging");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn destination_reservation_recovery_removes_only_its_marker() {
         use super::{destination_reservation_marker, reconcile_destination_reservation, DestinationReservationRecovery};

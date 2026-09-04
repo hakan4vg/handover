@@ -21,8 +21,10 @@ def main() -> int:
     upstream = None
     app = None
     client = None
+    app_log = None
     try:
         xvfb, display = replace.reattach.start_xvfb()
+        setattr(replace.reattach, "DISPLAY", display)
         replace.reattach.support.DISPLAY = display
         upstream_port = replace.reattach.support.free_port()
         upstream = subprocess.Popen(
@@ -47,14 +49,19 @@ def main() -> int:
             '"unused"',
         )
         inspector_port = replace.reattach.support.free_port()
+        app_log = open(Path(home) / "app.log", "w", encoding="utf-8")
         app = subprocess.Popen(
             [replace.reattach.BIN],
             env=replace.reattach.support.app_env(home, inspector_port),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=app_log,
+            stderr=subprocess.STDOUT,
         )
         replace.reattach.wait_db(db)
-        client = replace.reattach.support.wait_inspector(inspector_port)
+        try:
+            client = replace.reattach.support.wait_inspector(inspector_port)
+        except Exception:
+            app_log.flush()
+            raise RuntimeError(f"WebKit inspector startup failed; app log:\n{Path(home, 'app.log').read_text(errors='replace')}")
         replace.reattach.support.wait_tauri(client)
         replace.reattach.send_capture(home, source, "replace-failure.bin")
         job = replace.wait_source_job(db, source)
@@ -77,6 +84,8 @@ def main() -> int:
             client.close()
         if app is not None:
             replace.reattach.support.terminate_only(app, "replace failure app")
+        if app_log is not None:
+            app_log.close()
         if upstream is not None:
             replace.reattach.support.terminate_only(upstream, "replace failure fixture")
         if xvfb is not None:

@@ -50,6 +50,7 @@ def main() -> int:
     upstream = None
     app = None
     client = None
+    app_log = None
     commit_thread = None
     commit_result: list[object] = []
     paused = False
@@ -69,14 +70,19 @@ def main() -> int:
         reattach.boot_and_stop(home)
         db = reattach.db_path(home)
         inspector_port = reattach.support.free_port()
+        app_log = open(Path(home) / "app.log", "w", encoding="utf-8")
         app = subprocess.Popen(
             [reattach.BIN],
             env=reattach.support.app_env(home, inspector_port),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=app_log,
+            stderr=subprocess.STDOUT,
         )
         reattach.wait_db(db)
-        client = reattach.support.wait_inspector(inspector_port)
+        try:
+            client = reattach.support.wait_inspector(inspector_port)
+        except Exception:
+            app_log.flush()
+            raise RuntimeError(f"WebKit inspector startup failed; app log:\n{Path(home, 'app.log').read_text(errors='replace')}")
         reattach.support.wait_tauri(client)
         reattach.send_capture(home, source, JOB_NAME)
         job = wait_source_job(db, source)
@@ -98,12 +104,14 @@ def main() -> int:
         deadline = time.time() + 30.0
         while time.time() < deadline:
             output = Path(destination)
-            if output.exists() and output.stat().st_size > 1024 * 1024:
+            staging = list(Path(output_root).glob(f"{JOB_NAME}.download-manager-staging-*"))
+            if any(path.stat().st_size > 1024 * 1024 for path in staging if path.exists()):
+                assert output.exists() and output.stat().st_size < 1024, (output, output.stat().st_size if output.exists() else None)
                 client.evaluate("window.__TAURI_INTERNALS__.invoke('pause_job', %s)" % json.dumps({"id": job_id}))
                 paused = True
                 break
             time.sleep(0.001)
-        assert paused, f"fallback copy did not become observable; destination={destination}"
+        assert paused, f"atomic fallback staging copy did not become observable; destination={destination}"
         commit_thread.join(timeout=60.0)
         assert not commit_thread.is_alive(), "commit did not finish"
         assert not isinstance(commit_result[0], BaseException), commit_result
@@ -129,6 +137,8 @@ def main() -> int:
             client.close()
         if app is not None:
             reattach.support.terminate_only(app, "move cancel app")
+        if app_log is not None:
+            app_log.close()
         if upstream is not None:
             reattach.support.terminate_only(upstream, "move cancel fixture")
         if xvfb is not None:

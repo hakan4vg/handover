@@ -1996,3 +1996,67 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   move probe was rerun against the rebuilt binary and passed with one durable
   268435456-byte output and SHA-256
   `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`.
+
+## 2026-09-04 — Stage cross-filesystem reserved moves atomically
+
+- The move-helper audit found that reserved cross-filesystem fallback copied
+  directly into the final destination. A reader could observe partial bytes,
+  and cleanup removed the destination without checking that it still belonged
+  to the manager.
+- `move_completed_file` now copies reserved moves to a same-filesystem
+  `.download-manager-staging-*` path, renames the complete staging file into
+  place, and removes a reservation only when its marker still matches. The
+  reservation token is passed from all four finalization callers. Windows
+  replacement of the marker is handled by an ownership check before removing
+  the marker; explicit replace fallback keeps its existing backup path.
+- The corrected `fixtures/cancel_during_move_probe.py` retains application logs
+  on startup failure and watches the staging path. Against the rebuilt binary it
+  exited `0` with:
+  `MOVE-CANCEL-RACE: PASS
+  (job=provisional-e3e324f6-02fc-4192-a49e-c0d00690a33c, state=completed,
+  bytes=268435456,
+  sha256=a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b)`.
+  During the copy the final destination stayed below 1 KiB; pause then arrived
+  after staging exceeded 1 MiB. The final output was the only output, and both
+  temp and staging files were removed.
+
+## 2026-09-04 — Restore reservations after a failed staging handoff
+
+- The remaining handoff audit found a Windows-style failure window: after the
+  marker was removed to permit installation, a failed final staging rename
+  could leave neither the destination nor an owned reservation. A caller would
+  then clear the persisted reservation field, making the incomplete move
+  unrecoverable.
+- `install_reserved_staging` now verifies the exact marker before removal. If
+  the final install fails, it recreates the marker with exclusive `create_new`
+  semantics only when the destination is absent. If another actor has created a
+  destination, it preserves that path and reports that ownership changed. The
+  unique staging file is cleaned on every failed handoff. `clear_destination_reservation`
+  now removes a restored marker only after checking its exact bytes, keeping the
+  persisted field and filesystem ownership aligned during normal cleanup while
+  leaving both available for startup recovery if the process crashes first.
+- Added the deterministic Rust regression
+  `reserved_staging_install_restores_marker_when_final_rename_fails`. A
+  test-only fault is injected immediately after marker removal; the helper
+  returns the expected error, restores the exact marker, and removes staging.
+  The fault hook is compiled out of production binaries.
+- Fresh real-binary probe run used `set -euo pipefail`; every command exited
+  successfully:
+  `MOVE-CANCEL-RACE: PASS`
+  (job=provisional-c67cadcd-0d5b-4d73-b6ee-da062ada114e,
+  state=completed, bytes=268435456,
+  sha256=a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b);
+  `MANAGED-RENAME-COLLISION: PASS` with output `managed (1).bin` and the
+  pre-existing target preserved;
+  `REPLACE-COLLISION: PASS`;
+  `REPLACE-FAILURE-CLEANUP: PASS` with the old destination preserved after a
+  missing-source error;
+  `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS` with one `bytes=0-0`
+  request and the expected output hash; and
+  `COLLISION-RESERVATION: PASS` with distinct `same.bin`/`same (1).bin`
+  outputs and distinct hashes.
+- Native verification at this checkpoint passed `49/49` tests and Cargo build.
+  The only warning remains the protected sibling `wait_for_transfer_idle`
+  helper being unused. The replacement-failure probe also received display
+  propagation and retained app-log diagnostics after one harness-only
+  inspector-startup failure; its isolated rerun exited `0`.

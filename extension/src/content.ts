@@ -21,6 +21,21 @@ function isHttp(url: string): boolean {
   }
 }
 
+function mediaSourceFromValues(
+  currentSrc: string | null | undefined,
+  elementSrc: string | null | undefined,
+  childSrc: string | null | undefined,
+  baseUrl: string,
+): string {
+  const raw = currentSrc?.trim() || elementSrc?.trim() || childSrc?.trim() || '';
+  if (!raw) return '';
+  try {
+    return new URL(raw, baseUrl).href;
+  } catch {
+    return raw;
+  }
+}
+
 const BUTTON_ID = 'dm-media-download-button';
 const MIN_SIZE = 120;
 
@@ -129,12 +144,21 @@ function keyFor(el: HTMLMediaElement): string {
   return key;
 }
 
+function sourceFor(el: HTMLMediaElement): string {
+  const child = el.querySelector('source[src]')?.getAttribute('src');
+  return mediaSourceFromValues(el.currentSrc, el.src, child, document.baseURI);
+}
+
+function usable(el: HTMLMediaElement): boolean {
+  return !el.hasAttribute('disabled') && !!sourceFor(el);
+}
+
 function reportPlayer(el: HTMLMediaElement, force = false): void {
   if (!active()) return;
   const now = Date.now();
   if (!force && now - (lastPlayerReports.get(el) ?? 0) < 500) return;
   lastPlayerReports.set(el, now);
-  const source = el.currentSrc || el.src || '';
+  const source = sourceFor(el);
   void chrome.runtime.sendMessage({
     type: 'media-player-state',
     payload: {
@@ -168,13 +192,13 @@ function pick(): HTMLVideoElement | HTMLAudioElement | null {
   const hovered = document.querySelectorAll('video, audio');
   for (const el of hovered) {
     const media = el as HTMLVideoElement | HTMLAudioElement;
-    if (media.matches(':hover') && visible(media)) return media;
+    if (media.matches(':hover') && visible(media) && usable(media)) return media;
   }
   let best: HTMLVideoElement | HTMLAudioElement | null = null;
   let bestArea = 0;
   document.querySelectorAll('video, audio').forEach((el) => {
     const media = el as HTMLVideoElement | HTMLAudioElement;
-    if (media.paused || media.ended || !visible(media)) return;
+    if (media.paused || media.ended || !visible(media) || !usable(media)) return;
     const rect = media.getBoundingClientRect();
     const area = rect.width * rect.height;
     if (area > bestArea) {
@@ -207,7 +231,7 @@ function ensureButton(): HTMLButtonElement {
 let loopCount = 0;
 
 function positionButton(): boolean {
-  if (!current || !active() || !current.isConnected || !visible(current)) {
+  if (!current || !active() || !current.isConnected || !visible(current) || !usable(current)) {
     button?.remove();
     button = null;
     return false;
@@ -262,7 +286,7 @@ function track(): void {
 async function capture(): Promise<void> {
   if (!current) return;
   const el = current as HTMLVideoElement;
-  const source = el.currentSrc || el.src || window.location.href;
+  const source = sourceFor(el);
   try {
     const response = (await chrome.runtime.sendMessage({
       type: 'media-capture',

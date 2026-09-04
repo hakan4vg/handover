@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_POLICY, isHttp, siteOf } from './shared';
+import { DEFAULT_POLICY, isHttp, mediaSourceFromValues, siteOf } from './shared';
 import {
   chooseMediaCandidate,
   chooseMediaSelection,
@@ -47,6 +47,20 @@ describe('siteOf', () => {
   });
 });
 
+describe('mediaSourceFromValues', () => {
+  it('prefers the browser-selected source over element and child fallbacks', () => {
+    expect(mediaSourceFromValues('https://cdn.test/current.webm', 'https://cdn.test/element.mp4', 'child.webm', 'https://page.test/watch')).toBe('https://cdn.test/current.webm');
+    expect(mediaSourceFromValues('', 'https://cdn.test/element.mp4', 'child.webm', 'https://page.test/watch')).toBe('https://cdn.test/element.mp4');
+  });
+
+  it('resolves a source child relative to the player document', () => {
+    expect(mediaSourceFromValues('', '', '../media/clip.webm', 'https://page.test/player/index.html')).toBe('https://page.test/media/clip.webm');
+  });
+
+  it('does not invent the page URL when no media source exists', () => {
+    expect(mediaSourceFromValues('', '', '', 'https://page.test/watch')).toBe('');
+  });
+});
 describe('DEFAULT_POLICY', () => {
   it('starts with interception and media buttons on, nothing excluded', () => {
     expect(DEFAULT_POLICY).toEqual({

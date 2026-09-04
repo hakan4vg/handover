@@ -1369,10 +1369,75 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     })).buffer_unordered(worker_count);
     let mut transfer_error = None;
     while let Some(result) = transfers.next().await { if let Err(error) = result { transfer_error = Some(error); } }
-    if let Some(error) = transfer_error {
+    if let Some(initial_error) = transfer_error {
         if !transfer_is_current(&app, &id, generation) { return Ok(()); }
         if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused with verified byte ranges preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
-        return Err(error);
+        let mut fallback_completed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.completed_ranges.clone())).unwrap_or_default();
+        fallback_completed.sort_by_key(|range| (range.start, range.end));
+        fallback_completed = fallback_completed.into_iter().fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
+        let fallback_ranges = missing_ranges(total, &fallback_completed, 1);
+        emit_job(&state, &id, |job| { job.connections = if fallback_ranges.is_empty() { 0 } else { 1 }; job.speed = 0; job.eta = Some("Retrying with one connection".into()); job.events.insert(0, job_event("Parallel range acquisition was rejected; retrying with one connection", Some("warning"))); });
+        emit_snapshot(&app, &state);
+        let fallback_client = http_client();
+        let mut fallback_error = None;
+        // Give a rate-limiting server a short quiet period before switching to
+        // one connection. The range probe and the failed workers have already
+        // consumed the server's burst allowance.
+        sleep(Duration::from_millis(500)).await;
+        for (start, end) in fallback_ranges {
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            let bytes = match range_bytes(&fallback_client, &app, &id, &source, start, end, retry_count.max(1), &identity, generation).await {
+                Ok(bytes) => bytes,
+                Err(error) => { fallback_error = Some(error); break; }
+            };
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            let mut file = match OpenOptions::new().write(true).open(&temp_path).await {
+                Ok(file) => file,
+                Err(error) => { fallback_error = Some(error.to_string()); break; }
+            };
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if let Err(error) = file.seek(SeekFrom::Start(start)).await {
+                fallback_error = Some(error.to_string());
+                break;
+            }
+            if let Err(error) = file.write_all(&bytes).await {
+                fallback_error = Some(error.to_string());
+                break;
+            }
+            let total_downloaded = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            emit_job(&state, &id, |job| { job.downloaded = total_downloaded; job.speed = 0; job.eta = Some("Retrying with one connection".into()); job.progress = total_downloaded as f64 / total as f64 * 100.0; job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end }); job.connections = 1; });
+            emit_snapshot(&app, &state);
+        }
+        if let Some(_error) = fallback_error {
+            emit_job(&state, &id, |job| { job.connections = 1; job.speed = 0; job.eta = Some("Retrying as one stream".into()); job.events.insert(0, job_event("Range requests remained unavailable; retrying as one stream", Some("warning"))); });
+            emit_snapshot(&app, &state);
+            sleep(Duration::from_secs(3)).await;
+            let stream_client = http_client();
+            let response = match stream_client.get(&source).send().await {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) => return Err(format!("{initial_error}; one-stream fallback failed: source returned {}", response.status())),
+                Err(stream_error) => return Err(format!("{initial_error}; one-stream fallback failed: {stream_error}")),
+            };
+            let fallback_mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string);
+            let mut file = File::create(&temp_path).await.map_err(|stream_error| format!("{initial_error}; one-stream fallback failed: {stream_error}"))?;
+            let mut full_downloaded = 0u64;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                if !transfer_is_downloading(&app, &id, generation) { return Ok(()); }
+                let bytes = chunk.map_err(|stream_error| format!("{initial_error}; one-stream fallback failed: {stream_error}"))?;
+                file.write_all(&bytes).await.map_err(|stream_error| format!("{initial_error}; one-stream fallback failed: {stream_error}"))?;
+                full_downloaded = full_downloaded.saturating_add(bytes.len() as u64);
+                if !throttle(&app, &id, bytes.len(), generation).await { return Ok(()); }
+                let progress = full_downloaded as f64 / total as f64 * 100.0;
+                emit_job(&state, &id, |job| { job.downloaded = full_downloaded; job.progress = progress; job.speed = 0; job.eta = Some("Retrying as one stream".into()); job.connections = 1; });
+                emit_snapshot(&app, &state);
+            }
+            drop(file);
+            if full_downloaded != total { return Err(format!("{initial_error}; one-stream fallback returned {full_downloaded} bytes, expected {total}")); }
+            downloaded.store(full_downloaded, Ordering::Relaxed);
+            emit_job(&state, &id, |job| { job.downloaded = full_downloaded; job.progress = 100.0; job.speed = 0; job.connections = 1; job.resumable = false; job.mode = "single-stream".into(); job.completed_ranges = Vec::new(); job.mime = fallback_mime.clone(); job.eta = Some("Finalizing".into()); });
+            emit_snapshot(&app, &state);
+        }
     }
     if !transfer_is_current(&app, &id, generation) { return Ok(()); }
     if job_state(&app, &id).as_deref() != Some("downloading") {

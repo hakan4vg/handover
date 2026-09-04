@@ -2633,3 +2633,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   basename (`master`) before its final Content-Disposition filename is known;
   the probe deliberately chooses `ordinary-fallback.zip` at commit and records
   this filename handoff as a remaining UX refinement, not a data-loss defect.
+
+## 2026-09-05 — HTML5 source children and range-rate-limit recovery
+
+- The real public-player audit reached a Commons/Video.js class of HTML5 player
+  that keeps its URL on a child `<source src>` while `currentSrc` and the video
+  `src` property are empty during lazy initialization. The old media button
+  could therefore fall back to the page URL and capture HTML. The content path
+  now resolves `currentSrc`, element `src`, then a child source attribute against
+  `document.baseURI`, and refuses disabled/no-source placeholder videos. The
+  classic MV3 content bundle keeps this helper local; importing the shared
+  module caused a real classic-script load failure and was removed.
+- The native ranged whole-object path previously returned the first worker
+  error. A host that advertises ranges but returns HTTP 429 for parallel/nonzero
+  ranges now retries missing ranges with one connection, then waits for the
+  observed rate-limit reset and retries as a fresh no-Range stream. The fallback
+  clears ranged metadata and marks the job `single-stream` and non-resumable
+  before reusing the existing safe commit path.
+- Deterministic real-binary fixture: `fixtures/range_fallback_probe.py`. Its
+  server accepted `bytes=0-0`, rejected later ranges with 429, and served one
+  plain GET. Output:
+  `RANGE-FALLBACK: PASS (ready=3145851 bytes, output=3145851 bytes,
+  sha256=c1dfec107e18567f102212e5cecae4a1675353d55bee9b9cedbc5025e9700162,
+  ranged_requests=31, plain_gets=1, mode=single-stream, resumable=False)` and
+  `RANGE-FALLBACK-PROBE: PASS`.
+- Public-site exploration is not claimed as acceptance in this entry. The
+  YouTube embed returned the documented player Error 153. The Commons player
+  exposed disabled placeholder videos before its real source was instantiated;
+  later native requests reached HTTP 429 on the public edge. The Video.js probe
+  then hit `ConnectionRefusedError: [Errno 111]` while querying Chromium
+  `/json/list` during startup, before page navigation. The next pass must repair
+  that CDP lifetime and obtain a retained public initiation result.
+- Verification on the exact worktree passed Rust `58/58`, Vitest `37/37`,
+  `npx tsc -b`, `npm run build:all`, Python compilation, and the real range
+  fallback probe. The only Rust warning is the pre-existing protected sibling
+  `wait_for_transfer_idle` helper. No public Chromium PASS is claimed here.

@@ -20,6 +20,21 @@ export function siteOf(url: string): string {
   }
 }
 
+export function mediaSourceFromValues(
+  currentSrc: string | null | undefined,
+  elementSrc: string | null | undefined,
+  childSrc: string | null | undefined,
+  baseUrl: string,
+): string {
+  const raw = currentSrc?.trim() || elementSrc?.trim() || childSrc?.trim() || '';
+  if (!raw) return '';
+  try {
+    return new URL(raw, baseUrl).href;
+  } catch {
+    return raw;
+  }
+}
+
 export function isHttp(url: string): boolean {
   try {
     const scheme = new URL(url).protocol;

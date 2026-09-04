@@ -2248,3 +2248,22 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - The retry refetched the two HLS playlist manifests but fetched zero media
   fragments again. The four preserved parts were removed after successful
   finalization.
+
+## 2026-09-04 — Support HLS byte-range media segments
+
+- Audited finite HLS handling against RFC 8216 `EXT-X-BYTERANGE` and found
+  that each `Segment` stored only a URL, so a playlist that sliced one resource
+  would download the entire resource for every media entry.
+- Added optional `(start, length)` ranges to HLS segments, including
+  `EXT-X-MAP:BYTERANGE`, strict offset/overflow validation, range-aware
+  segmented identity, and HTTP `Range`/`206 Content-Range` validation.
+- Added parser coverage for explicit offsets, implicit continuation on the same
+  resource, ranged initialization maps, and rejection of an unsafe first
+  implicit range.
+- Full native verification passed: Rust `54/54`; Cargo build passed. The only
+  warning remains the protected unused `wait_for_transfer_idle` helper.
+- Added and ran `fixtures/hls_byterange_probe.py` against the rebuilt binary.
+  It completed `3/3` segments and produced the expected 18-byte concatenation,
+  SHA-256 `0d819259a1693bddf406312b22fc8572f168064422e992ccf35ac952be3b115c`.
+  The server observed exactly `bytes=0-4`, `bytes=5-10`, and `bytes=20-26`
+  (concurrent arrival order was intentionally not assumed).

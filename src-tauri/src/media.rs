@@ -2,9 +2,11 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Url;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub url: String,
+    /// Optional HTTP byte range: (start offset, length).
+    pub range: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,13 +56,35 @@ pub fn hls_variant_tracks(source: &str, body: &str) -> Option<Vec<(String, Strin
 pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
     if !body.lines().any(|line| line.trim().eq_ignore_ascii_case("#EXT-X-ENDLIST")) { return Err("Live media is not supported; a finite VOD playlist is required".into()); }
     let mut segments = Vec::new();
+    let mut pending_range = None;
+    let mut previous_range: Option<(String, u64)> = None;
     for line in body.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            pending_range = Some(parse_hls_byterange(value)?);
+            continue;
+        }
         if line.is_empty() || line.starts_with('#') { continue; }
-        if let Some(url) = resolve(source, line) { segments.push(Segment { url }); }
+        let Some(url) = resolve(source, line) else { continue; };
+        let range = if let Some((length, offset)) = pending_range.take() {
+            let start = match offset {
+                Some(start) => start,
+                None => previous_range.as_ref().filter(|(previous_url, _)| previous_url == &url).map(|(_, end)| *end).ok_or_else(|| "An HLS byte range omitted its offset without a preceding range on the same resource".to_string())?,
+            };
+            let end = start.checked_add(length).ok_or_else(|| "An HLS byte range exceeds the addressable resource size".to_string())?;
+            previous_range = Some((url.clone(), end));
+            Some((start, length))
+        } else {
+            previous_range = None;
+            None
+        };
+        segments.push(Segment { url, range });
     }
     if segments.is_empty() { return Err("The VOD playlist did not contain any media fragments".into()); }
-    if let Some(map) = body.lines().map(str::trim).find_map(hls_map_uri) {
-        if let Some(url) = resolve(source, &map) { segments.insert(0, Segment { url }); }
+    if let Some(line) = body.lines().map(str::trim).find(|line| line.starts_with("#EXT-X-MAP")) {
+        let Some(map) = hls_map_segment(line)? else { return Err("The HLS initialization map is missing its URI".into()); };
+        if let Some(url) = resolve(source, &map.0) {
+            segments.insert(0, Segment { url, range: map.1 });
+        }
     }
     Ok(segments)
 }
@@ -196,7 +220,7 @@ impl DashTrackBuilder {
 
     fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>) -> Option<MediaTrack> {
         let base = self.base_urls.first().map(String::as_str).or(inherited_base).unwrap_or(source);
-        let mut segments = self.segment_refs.into_iter().filter_map(|value| resolve(base, &value)).map(|url| Segment { url }).collect::<Vec<_>>();
+        let mut segments = self.segment_refs.into_iter().filter_map(|value| resolve(base, &value)).map(|url| Segment { url, range: None }).collect::<Vec<_>>();
         if segments.is_empty() { if let Some(template) = self.template { segments = expand_dash_template(&template, base, &self.representation_id, &self.bandwidth, presentation_duration).ok()?; } }
         if segments.is_empty() { return None; }
         Some(MediaTrack { kind: self.kind, segments })
@@ -253,7 +277,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
     let mut segments = Vec::new();
     if let Some(initialization) = template.initialization.as_deref() {
         let value = expand_template(initialization, template.start_number, 0, representation_id, bandwidth);
-        if let Some(url) = resolve(base, &value) { segments.push(Segment { url }); }
+        if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None }); }
     }
     let mut number = template.start_number;
     let mut current_time = 0u64;
@@ -265,7 +289,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
             for offset in 0..repeat.min(100_000) {
                 let time = start.saturating_add(offset.saturating_mul(item.duration));
                 let value = expand_template(media, number, time, representation_id, bandwidth);
-                if let Some(url) = resolve(base, &value) { segments.push(Segment { url }); }
+                if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None }); }
                 number = number.saturating_add(1);
             }
             current_time = start.saturating_add(repeat.saturating_mul(item.duration));
@@ -275,7 +299,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
         for index in 0..count {
             let time = index.saturating_mul(segment_duration);
             let value = expand_template(media, number, time, representation_id, bandwidth);
-            if let Some(url) = resolve(base, &value) { segments.push(Segment { url }); }
+            if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None }); }
             number = number.saturating_add(1);
         }
     }
@@ -310,11 +334,11 @@ fn parse_duration(value: &str) -> Option<u64> {
     Some(seconds.ceil() as u64)
 }
 
-fn hls_map_uri(line: &str) -> Option<String> {
-    if !line.starts_with("#EXT-X-MAP") { return None; }
-    let start = line.find("URI=\"")? + 5;
-    let rest = &line[start..];
-    Some(rest.split('"').next()?.to_string())
+fn hls_map_segment(line: &str) -> Result<Option<(String, Option<(u64, u64)>)>, String> {
+    if !line.starts_with("#EXT-X-MAP") { return Ok(None); }
+    let Some(uri) = hls_attribute(line, "URI") else { return Ok(None); };
+    let range = hls_attribute(line, "BYTERANGE").map(|value| parse_hls_byterange(&value).map(|(length, offset)| (offset.unwrap_or(0), length))).transpose()?;
+    Ok(Some((uri, range)))
 }
 
 fn hls_attribute(line: &str, key: &str) -> Option<String> {
@@ -322,6 +346,15 @@ fn hls_attribute(line: &str, key: &str) -> Option<String> {
     let start = line.find(&marker)? + marker.len();
     Some(line[start..].split('\"').next()?.to_string())
 }
+
+fn parse_hls_byterange(value: &str) -> Result<(u64, Option<u64>), String> {
+    let (length, offset) = value.split_once('@').map_or((value, None), |(length, offset)| (length, Some(offset)));
+    let length = length.parse::<u64>().map_err(|_| "Invalid HLS byte-range length".to_string())?;
+    if length == 0 { return Err("An HLS byte range must have a positive length".into()); }
+    let offset = offset.map(|value| value.parse::<u64>().map_err(|_| "Invalid HLS byte-range offset".to_string())).transpose()?;
+    Ok((length, offset))
+}
+
 
 fn attribute(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     element.attributes().flatten().find(|attribute| attribute.key.as_ref().eq_ignore_ascii_case(key)).and_then(|attribute| attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|value| value.into_owned()))
@@ -340,6 +373,17 @@ mod tests {
         let body = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2,\none.m4s\n#EXTINF:2,\ntwo.m4s\n#EXT-X-ENDLIST";
         let segments = parse_hls("https://cdn.example.test/vod/index.m3u8", body).expect("finite playlist");
         assert_eq!(segments.iter().map(|segment| segment.url.as_str()).collect::<Vec<_>>(), ["https://cdn.example.test/vod/init.mp4", "https://cdn.example.test/vod/one.m4s", "https://cdn.example.test/vod/two.m4s"]);
+    }
+
+    #[test]
+    fn parses_hls_byte_ranges_and_rejects_unsafe_implicit_offsets() {
+        let body = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MAP:URI=\"shared.mp4\",BYTERANGE=\"2@30\"\n#EXTINF:2,\n#EXT-X-BYTERANGE:4@0\nshared.mp4\n#EXTINF:2,\n#EXT-X-BYTERANGE:3\nshared.mp4\n#EXT-X-ENDLIST";
+        let segments = parse_hls("https://cdn.example.test/vod/index.m3u8", body).expect("byte-range playlist");
+        assert_eq!(segments[0].url, "https://cdn.example.test/vod/shared.mp4");
+        assert_eq!(segments[0].range, Some((30, 2)));
+        assert_eq!(segments[1].range, Some((0, 4)));
+        assert_eq!(segments[2].range, Some((4, 3)));
+        assert!(parse_hls("https://cdn.example.test/vod/index.m3u8", "#EXTM3U\n#EXT-X-BYTERANGE:3\nshared.mp4\n#EXT-X-ENDLIST").is_err());
     }
 
     #[test]

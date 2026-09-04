@@ -1132,12 +1132,28 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize, generation: u64) -> b
     transfer_can_continue(app, id, generation)
 }
 
-async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source: &str, retries: u32, generation: u64) -> Result<Vec<u8>, String> {
+async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source: &str, byte_range: Option<(u64, u64)>, retries: u32, generation: u64) -> Result<Vec<u8>, String> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
+    let expected_length = byte_range.map(|(_, length)| length);
     for _ in 0..attempts {
-        match client.get(source).send().await {
+        let mut request = client.get(source);
+        if let Some((start, length)) = byte_range {
+            let Some(end) = start.checked_add(length).and_then(|value| value.checked_sub(1)) else {
+                return Err("The HLS byte range exceeds the addressable resource size".into());
+            };
+            request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+        }
+        match request.send().await {
             Ok(response) if response.status().is_success() => {
+                if let Some((start, length)) = byte_range {
+                    let valid_range = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                        && content_range(&response).map(|(actual_start, actual_end, _)| actual_start == start && actual_end == start.saturating_add(length).saturating_sub(1)).unwrap_or(false);
+                    if !valid_range {
+                        last_error = "The server returned an invalid HLS byte range".into();
+                        continue;
+                    }
+                }
                 let mut bytes = Vec::new();
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
@@ -1145,11 +1161,13 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
                         Ok(chunk) => {
                             if !throttle(app, id, chunk.len(), generation).await { return Err("paused".to_string()); }
                             bytes.extend_from_slice(&chunk);
+                            if expected_length.map(|length| bytes.len() as u64 > length).unwrap_or(false) { last_error = "The server returned an overlong HLS byte range".into(); bytes.clear(); break; }
                         }
                         Err(error) => { last_error = error.to_string(); bytes.clear(); break; }
                     }
                 }
-                if !bytes.is_empty() { return Ok(bytes); }
+                if expected_length.map(|length| bytes.len() as u64 == length).unwrap_or(!bytes.is_empty()) { return Ok(bytes); }
+                if expected_length.is_some() { last_error = "The server returned an incomplete HLS byte range".into(); }
             }
             Ok(response) => last_error = format!("source returned {}", response.status()),
             Err(error) => last_error = error.to_string(),
@@ -1338,10 +1356,11 @@ fn manifest_segment_path(directory: &Path, track: usize, index: usize, track_cou
     if track_count == 1 { directory.join(format!("{index:08}.part")) } else { directory.join(format!("{track:02}")).join(format!("{index:08}.part")) }
 }
 
-// Identity of a segmented resource: track kinds plus every segment URL.
-// Positional part-files are only reusable when this matches; otherwise the
-// directory is wiped and refetched rather than stitching a new manifest onto
-// old bytes (SPEC §8.8: restart when identity cannot be established safely).
+// Identity of a segmented resource: track kinds plus every segment URL and
+// byte range. Positional part-files are only reusable when this matches;
+// otherwise the directory is wiped and refetched rather than stitching a new
+// manifest onto old bytes (SPEC §8.8: restart when identity cannot be
+// established safely).
 fn segment_identity(tracks: &[media::MediaTrack]) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for track in tracks {
@@ -1351,6 +1370,10 @@ fn segment_identity(tracks: &[media::MediaTrack]) -> String {
         }
         for segment in &track.segments {
             for byte in segment.url.bytes().chain([0xfe]) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            for byte in segment.range.iter().flat_map(|(start, length)| start.to_le_bytes().into_iter().chain(length.to_le_bytes())).chain([0xfd]) {
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x100000001b3);
             }
@@ -1453,7 +1476,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let downloaded = downloaded.clone();
         async move {
             if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
-            let bytes = fragment_bytes(&client, &app, &id, &fragment.url, retry_count, generation).await?;
+            let bytes = fragment_bytes(&client, &app, &id, &fragment.url, fragment.range, retry_count, generation).await?;
             if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }
             if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
             if !transfer_can_continue(&app, &id, generation) { return Err("paused".to_string()); }

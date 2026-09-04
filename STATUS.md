@@ -1771,3 +1771,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Only `fixtures/reattach_scope_probe.py` and this status entry belong in this
   slice. The sibling `wait_for_transfer_idle` hunk remains untouched and must
   not be staged.
+
+## 2026-09-04 — Rapid captures keep independent provisional jobs
+
+- Audited SPEC §7.4 against the real single-instance capture path. Added
+  `fixtures/simultaneous_capture_probe.py`, which launches the resident app in
+  an isolated HOME, waits for WebKit/Tauri readiness, and sends two rapid
+  captures for different deterministic resource variants.
+- The real application created two distinct provisional IDs. Each row retained
+  its own source URL and filename, and each temporary output matched its own
+  independently fetched variant. No row was retargeted to the other capture.
+- The proxy recorded four range requests total: the expected `0-0` probe and
+  one missing-range request for each of the two resources. Both provisional
+  rows reached `finalizing` with truthful state and remained independently
+  addressable.
+- Command `python3 -m py_compile fixtures/simultaneous_capture_probe.py &&
+  python3 fixtures/simultaneous_capture_probe.py` exited `0` with
+  `SIMULTANEOUS-CAPTURES: PASS` and `CAPTURE-SOURCES: PASS`. No production
+  source change was needed.
+- A first attempt launched two native-instance processes at exactly the same
+  instant and hit the disposable single-instance launcher's startup race
+  before row inspection. The durable probe uses two rapid sequential launches,
+  which isolates the §7.4 capture-addressing contract from that launcher race.
+- This closes the ordinary repeated-capture isolation case. The next audit can
+  move to adjacent collision/overwrite and duplicate-destination semantics.
+- Only `fixtures/simultaneous_capture_probe.py` and this status entry belong in
+  this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
+  must not be staged.

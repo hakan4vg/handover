@@ -6,7 +6,7 @@ Stdlib only. Serves the shapes the transfer engine must handle:
   redirects (single + chain) / token auth / one-use URL / changed identity
   finite HLS (TS) / HLS master+variant / live HLS (must be rejected)
   static DASH SegmentList with separate audio+video / SegmentTemplate /
-  dynamic DASH (must be rejected) / progressive media
+  adaptation-level SegmentList / dynamic DASH (must be rejected) / progressive media
   retryable 503 / plain 404
 
 All payload bytes are deterministic (seeded PRNG stream), so resume and
@@ -252,6 +252,15 @@ class Handler(BaseHTTPRequestHandler):
                 f"<BaseURL>/dash/</BaseURL><SegmentList><Initialization sourceURL=\"a-init.mp4\"/>{a}</SegmentList>"
                 "</Representation></AdaptationSet>"
                 "</Period></MPD>"
+            )
+            return self._send_bytes(body.encode(), 200, {"Content-Type": "application/dash+xml"})
+        if path == "/dash/adaptation-list.mpd":
+            segments = "".join(f'<SegmentURL media="v-{i}.m4s"/>' for i in range(DASH_V_SEGS))
+            body = (
+                '<MPD type="static"><Period><AdaptationSet contentType="video">'
+                '<BaseURL>/dash/</BaseURL><SegmentList><Initialization sourceURL="v-init.mp4"/>'
+                f"{segments}</SegmentList><Representation id=\"video\"/>"
+                '</AdaptationSet></Period></MPD>'
             )
             return self._send_bytes(body.encode(), 200, {"Content-Type": "application/dash+xml"})
         if path == "/dash/template.mpd":

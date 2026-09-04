@@ -104,9 +104,17 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                     if name.as_slice() == b"baseurl" { track.base_text_depth = Some(stack.len() + 1); }
                     if name.as_slice() == b"segmenttemplate" && track.template.is_none() { track.template = Some(DashTemplate::from_element(&element)); }
                     if name.as_slice() == b"s" && (track.representation_open || !track.selected_representation) { if let Some(template) = track.template.as_mut() { template.timeline.push(DashTimeline::from_element(&element)); } }
-                    if track.representation_open {
-                        if name.as_slice() == b"initialization" { if let Some(value) = attribute(&element, b"sourceURL") { track.segment_refs.push(value); } }
-                        if name.as_slice() == b"segmenturl" { if let Some(value) = attribute(&element, b"media") { track.segment_refs.push(value); } }
+                    if (name.as_slice() == b"initialization" || name.as_slice() == b"segmenturl")
+                        && (track.representation_open || !track.selected_representation)
+                    {
+                        let attribute_name = if name.as_slice() == b"initialization" {
+                            b"sourceURL".as_slice()
+                        } else {
+                            b"media".as_slice()
+                        };
+                        if let Some(value) = attribute(&element, attribute_name) {
+                            track.segment_refs.push(value);
+                        }
                     }
                 } else if name.as_slice() == b"baseurl" { global_base_text_depth = Some(stack.len() + 1); }
                 stack.push(name.to_vec());
@@ -115,10 +123,30 @@ pub fn parse_dash_tracks(source: &str, body: &str) -> Result<Vec<MediaTrack>, St
                 let name = element.name().as_ref().to_ascii_lowercase();
                 if name.as_slice() == b"mpd" { presentation_duration = attribute(&element, b"mediaPresentationDuration").and_then(|value| parse_duration(&value)); }
                 if name.as_slice() == b"adaptationset" && current_track.is_none() { current_track = Some(DashTrackBuilder::new(attribute(&element, b"contentType").or_else(|| attribute(&element, b"mimeType")))); }
+                if name.as_slice() == b"representation" {
+                    if let Some(track) = current_track.as_mut() {
+                        if !track.selected_representation {
+                            track.selected_representation = true;
+                            track.representation_id = attribute(&element, b"id").unwrap_or_default();
+                            track.bandwidth = attribute(&element, b"bandwidth").unwrap_or_default();
+                            if let Some(kind) = attribute(&element, b"contentType").or_else(|| attribute(&element, b"mimeType")).and_then(|value| track_kind(&value)) { track.kind = kind; }
+                        }
+                    }
+                }
                 if let Some(track) = current_track.as_mut() {
                     if name.as_slice() == b"segmenttemplate" && track.template.is_none() { track.template = Some(DashTemplate::from_element(&element)); }
-                    if name.as_slice() == b"initialization" && track.representation_open { if let Some(value) = attribute(&element, b"sourceURL") { track.segment_refs.push(value); } }
-                    if name.as_slice() == b"segmenturl" && track.representation_open { if let Some(value) = attribute(&element, b"media") { track.segment_refs.push(value); } }
+                    if (name.as_slice() == b"initialization" || name.as_slice() == b"segmenturl")
+                        && (track.representation_open || !track.selected_representation)
+                    {
+                        let attribute_name = if name.as_slice() == b"initialization" {
+                            b"sourceURL".as_slice()
+                        } else {
+                            b"media".as_slice()
+                        };
+                        if let Some(value) = attribute(&element, attribute_name) {
+                            track.segment_refs.push(value);
+                        }
+                    }
                     if name.as_slice() == b"s" && (track.representation_open || !track.selected_representation) { if let Some(template) = track.template.as_mut() { template.timeline.push(DashTimeline::from_element(&element)); } }
                 }
             }
@@ -349,6 +377,13 @@ mod tests {
         assert_eq!(tracks.iter().map(|track| track.kind.as_str()).collect::<Vec<_>>(), ["video", "audio"]);
         assert_eq!(tracks[0].segments[1].url, "https://cdn.example.test/v/one.m4s");
         assert_eq!(tracks[1].segments[1].url, "https://cdn.example.test/a/one.m4s");
+    }
+
+    #[test]
+    fn parses_adaptation_level_dash_segment_list() {
+        let body = "<MPD type=\"static\"><Period><AdaptationSet contentType=\"video\"><SegmentList><Initialization sourceURL=\"init.mp4\"/><SegmentURL media=\"one.m4s\"/><SegmentURL media=\"two.m4s\"/></SegmentList><Representation id=\"video\"><BaseURL>https://cdn.example.test/vod/</BaseURL></Representation></AdaptationSet></Period></MPD>";
+        let segments = parse_dash("https://cdn.example.test/manifest.mpd", body).expect("adaptation-level segment list");
+        assert_eq!(segments.iter().map(|segment| segment.url.as_str()).collect::<Vec<_>>(), ["https://cdn.example.test/vod/init.mp4", "https://cdn.example.test/vod/one.m4s", "https://cdn.example.test/vod/two.m4s"]);
     }
 
     #[test]

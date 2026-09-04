@@ -1228,3 +1228,17 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   passed. Redirect, one-use, bounded-503, limiter, and byte-identity probes
   passed again. The sibling's two `wait_for_transfer_idle` hunks remain
   unstaged in `src-tauri/src/main.rs`.
+
+## 2026-09-04 — DASH adaptation-level SegmentList support
+
+- Audit found `parse_dash_tracks` only captured `Initialization` and `SegmentURL`
+  elements while a `Representation` was open. Valid MPDs may inherit a
+  `SegmentList` from `AdaptationSet`.
+- The parser now collects those refs before the first representation and treats
+  self-closing `Representation` elements as the selected representation.
+- Added a deterministic `/dash/adaptation-list.mpd` fixture and real-binary
+  `dash-adaptation-list` probe. The assembled init plus three media fragments
+  matched byte-for-byte: `DASH-ADAPTATION-LIST: PASS (32058 bytes assembled)`.
+- Regression evidence: Rust suite `39/39`; cargo build and `git diff --check`
+  passed. No-range, redirect, one-use, bounded-503, ranged-manifest, limiter,
+  and byte-identity probes passed again.

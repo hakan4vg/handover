@@ -163,6 +163,26 @@ def no_range_mode():
         app.wait(timeout=15)
 
 
+def dash_adaptation_list_mode():
+    base = f"http://127.0.0.1:{os.environ.get('DM_FIXTURE_PORT', '8901')}"
+    source = f"{base}/dash/adaptation-list.mpd"
+    app = run_capture(source, "adaptation-list.mp4")
+    try:
+        (job,) = wait_state(("finalizing", "completed"))
+        expected = b"".join(
+            urllib.request.urlopen(
+                f"{base}/dash/{name}", timeout=30
+            ).read()
+            for name in ["v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s"]
+        )
+        actual = temp_bytes(job, len(expected))
+        assert actual == expected, "adaptation-level DASH bytes differ from fixture"
+        print(f"DASH-ADAPTATION-LIST: PASS ({len(actual)} bytes assembled)", flush=True)
+    finally:
+        app.terminate()
+        app.wait(timeout=15)
+
+
 def ranged_manifest_mode():
     source = "http://127.0.0.1:8902/hls/ranged-vod.m3u8"
     app = run_capture(source, "ranged-vod.m3u8")
@@ -186,7 +206,7 @@ def main():
     shutil.rmtree(HOME, ignore_errors=True)
     os.makedirs(HOME, exist_ok=True)
     print(f"mode={MODE}", flush=True)
-    {"redirect": redirect_mode, "one-use": one_use_mode, "retry-503": retry_mode, "no-range": no_range_mode, "ranged-manifest": ranged_manifest_mode}[
+    {"redirect": redirect_mode, "one-use": one_use_mode, "retry-503": retry_mode, "no-range": no_range_mode, "dash-adaptation-list": dash_adaptation_list_mode, "ranged-manifest": ranged_manifest_mode}[
         MODE
     ]()
     print("ACQUIRE-PROBE: PASS", flush=True)

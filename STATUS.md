@@ -1081,3 +1081,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   contains only the sibling's 16-line uncommitted `wait_for_transfer_idle`
   slice; it was not staged.
 - `fixtures/server.py` untouched.
+
+## 2026-09-04 — Filename path escape closed
+
+- Fresh audit found `start_provisional` joining the caller-provided filename
+  directly onto the configured download folder. A manual Add URL name or a
+  native capture payload containing `../../outside.bin` could therefore write
+  outside the configured folder; a Windows-style `C:\\...` name was also not
+  treated as a leaf on the cross-platform test host. This violated the
+  filename/save-folder split in the Add Download UI.
+- TDD red test covered slash and backslash traversal, whitespace, dot-only
+  names, NUL, and the resulting destination. Added `safe_filename` and
+  `destination_for_filename`: only the trimmed final path component is kept;
+  empty, dot, dot-dot, and NUL-containing names become `download.bin`.
+  Provisional destination creation and committed display-name updates use the
+  helper. The explicit user-selected destination remains unchanged.
+- Real binary probe: `--capture` against local `/file/range.bin` with name
+  `../../outside.bin` produced `NAME: outside.bin` and a destination inside
+  the isolated `Downloads/` folder. Rust tests 35/35 and `cargo build` passed.
+- Sibling safety: only my filename hunks will be staged; the sibling's
+  16-line `wait_for_transfer_idle` change in `src-tauri/src/main.rs` remains
+  unstaged. `fixtures/server.py` untouched.

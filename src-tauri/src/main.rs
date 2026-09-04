@@ -483,6 +483,15 @@ fn source_compatible(existing: &str, candidate: &str) -> bool {
     existing.scheme() == candidate.scheme() && existing.host() == candidate.host() && existing.path() == candidate.path()
 }
 
+fn safe_filename(value: &str) -> String {
+    let leaf = value.trim().rsplit(|character| character == '/' || character == '\\').next().unwrap_or("").trim();
+    if leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\0') { "download.bin".into() } else { leaf.into() }
+}
+
+fn destination_for_filename(folder: &str, name: &str) -> String {
+    Path::new(folder).join(safe_filename(name)).to_string_lossy().into_owned()
+}
+
 fn source_name(source: &str) -> String { reqwest::Url::parse(source).ok().and_then(|url| url.path_segments().and_then(|segments| segments.last()).map(str::to_string)).filter(|name| !name.is_empty()).unwrap_or_else(|| "download.bin".into()) }
 
 fn collision_destination(path: &str, behavior: &str) -> String {
@@ -1398,7 +1407,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
         }
     }
     let id = format!("provisional-{}", Uuid::new_v4());
-    let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| source_name(&input.source)); let destination = Path::new(&snapshot.settings.default_folder).join(&name).to_string_lossy().into_owned(); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
+    let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
     let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
@@ -1435,7 +1444,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let collision = snapshot.settings.collision_behavior.clone();
         let job = snapshot.jobs.iter_mut().find(|job| job.id == id).ok_or_else(|| "Acquisition no longer exists".to_string())?;
-        let name = if input.name.trim().is_empty() { job.name.clone() } else { input.name.trim().to_string() };
+        let name = if input.name.trim().is_empty() { job.name.clone() } else { safe_filename(&input.name) };
         let requested_destination = if input.destination.trim().is_empty() { job.destination.clone() } else { input.destination.trim().to_string() };
         job.name = name;
         job.destination = collision_destination(&requested_destination, &collision);
@@ -1921,6 +1930,16 @@ mod capture_tests {
         let rebooted = settings_from_stored(&stored);
         assert!(!rebooted.default_folder.trim().is_empty());
         assert!(!rebooted.temp_folder.trim().is_empty());
+    }
+
+    #[test]
+    fn user_filename_is_reduced_to_a_safe_leaf() {
+        use super::{destination_for_filename, safe_filename};
+        assert_eq!(safe_filename("../escape.bin"), "escape.bin");
+        assert_eq!(safe_filename(r"C:\\Users\\kaz\\escape.bin"), "escape.bin");
+        assert_eq!(safe_filename("  report.pdf  "), "report.pdf");
+        assert_eq!(safe_filename("../"), "download.bin");
+        assert_eq!(destination_for_filename("/downloads", "../../outside.bin"), "/downloads/outside.bin");
     }
 
     fn ranges(pairs: &[(u64, u64)]) -> Vec<super::ByteRange> {

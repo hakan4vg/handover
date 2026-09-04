@@ -791,6 +791,22 @@ fn force_reserved_fallback_for_test() -> bool {
 fn force_reserved_fallback_for_test() -> bool { false }
 
 #[cfg(test)]
+static FORCE_RESERVED_NONFALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn inject_reserved_nonfallback_for_test() {
+    FORCE_RESERVED_NONFALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn force_reserved_nonfallback_for_test() -> bool {
+    FORCE_RESERVED_NONFALLBACK.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn force_reserved_nonfallback_for_test() -> bool { false }
+
+#[cfg(test)]
 static FAIL_SOURCE_CLEANUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
@@ -878,7 +894,9 @@ async fn install_reserved_staging(staging: &str, destination: &str, marker: &str
 async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reservation_marker: Option<&str>) -> Result<(), String> {
     let reserved = reservation_marker.is_some();
     if let Some(parent) = PathBuf::from(destination).parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
-    let initial_move = if reserved && force_reserved_fallback_for_test() {
+    let initial_move = if reserved && force_reserved_nonfallback_for_test() {
+        Err(std::io::Error::from_raw_os_error(13))
+    } else if reserved && force_reserved_fallback_for_test() {
         Err(std::io::Error::from_raw_os_error(18))
     } else {
         tokio::fs::rename(source, destination).await
@@ -940,7 +958,7 @@ async fn move_completed_file(source: &str, destination: &str, replace_existing: 
                 }
             }
         }
-        Err(error) => { if reserved { let _ = tokio::fs::remove_file(destination).await; } Err(error.to_string()) },
+        Err(error) => { if reserved { remove_owned_reservation(destination, reservation_marker).await; } Err(error.to_string()) },
     }
 }
 
@@ -2542,6 +2560,24 @@ mod capture_tests {
         assert!(!move_needs_fallback(&std::io::Error::from_raw_os_error(13)));
     }
 
+    #[test]
+    fn reserved_nonfallback_error_preserves_changed_destination() {
+        use super::{inject_reserved_nonfallback_for_test, move_completed_file};
+        let root = std::env::temp_dir().join(format!("download-manager-reservation-owner-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.part");
+        let destination = root.join("managed.bin");
+        let marker = "download-manager-reservation-v1:test-owner";
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"foreign-output").unwrap();
+        inject_reserved_nonfallback_for_test();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(move_completed_file(source.to_str().unwrap(), destination.to_str().unwrap(), false, Some(marker)));
+        assert!(result.is_err(), "injected non-fallback move failure must be reported");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"foreign-output", "changed destination must not be deleted");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn durable_reserved_destination_survives_source_cleanup_failure() {
         use super::{inject_reserved_fallback_for_test, inject_source_cleanup_failure_for_test, move_completed_file};

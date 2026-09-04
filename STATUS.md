@@ -2089,3 +2089,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS` with one `bytes=0-0`
   request; and `COLLISION-RESERVATION: PASS` with distinct output names and
   hashes.
+
+## 2026-09-04 — Preserve changed destinations on reserved move errors
+
+- The next ownership audit found that the generic initial-move error branch
+  removed every reserved destination without checking its marker. A destination
+  replaced by another actor could therefore be deleted after an unrelated move
+  error.
+- Reserved cleanup now uses the exact-marker ownership check already used by
+  reservation rollback. Matching markers are reclaimable; changed or unreadable
+  destinations are left untouched. A test-only initial-error injection makes
+  this race deterministic without affecting production builds.
+- Added the Rust regression
+  `reserved_nonfallback_error_preserves_changed_destination`. It forces a
+  non-fallback move error after the reservation path points at a foreign file,
+  verifies the error is returned, and verifies the foreign bytes survive.
+- Fresh native verification passed `51/51` tests and Cargo build. The only
+  warning remains the protected sibling `wait_for_transfer_idle` helper being
+  unused.
+- Fresh fail-fast real-binary probes all exited successfully:
+  `MOVE-CANCEL-RACE: PASS` with one 268435456-byte output and SHA-256
+  `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`;
+  `MANAGED-RENAME-COLLISION: PASS`; `REPLACE-COLLISION: PASS`;
+  `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
+  with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
+  distinct output names and hashes.

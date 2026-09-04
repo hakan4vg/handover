@@ -2543,3 +2543,21 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - This closes the v1 quality-switch acceptance case for a real adaptive HLS
   player. It does not add a quality browser or site-specific resolver. The
   already-proven static DASH and HLS paths remain intact.
+
+## 2026-09-04 — Prove cold-start Chromium capture
+
+- Added `fixtures/cold_start_chromium_probe.py` with a fresh HOME/profile and
+  no resident application process before the browser action. The real W3Schools
+  player exposed the media button and was playing the direct MP4.
+- The first run read the newly-created SQLite file before its `jobs` table was
+  initialized (`no such table: jobs`). The probe now waits for schema readiness;
+  that was harness synchronization, not product evidence.
+- The corrected run launched the resident through the native messaging host,
+  created and committed one native job, and completed `788493` bytes. Browser
+  fetch plus Web Crypto produced SHA-256
+  `3bb938fb70049e3e45f533b37ccae995ae96516e04c2f35b0c1142e47b2a39c1`, matching
+  the native output exactly.
+- Trusted right-click and Ctrl-click remained browser-owned
+  (`isTrusted=true`, `defaultPrevented=false`), with one native job and no
+  Chromium Downloads artifact. The run ended with
+  `COLD-START-CHROMIUM-PROBE: PASS`.

@@ -1004,3 +1004,17 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   backend command exists per-OS, so all in-app notification actions are
   wired end to end.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Acceptance top-up on the final tree (no new code)
+
+- Acquire matrix re-run against the closing worktree binary (all slices +
+  sibling's wait-guard): redirect PASS (8 MiB via 302, identical),
+  one-use PASS (sole consumer), retry-503 PASS (bounded, honest fail).
+- `cargo clippy`: 18 warnings tree-wide, none in this run's added code
+  (checked locations: pre-existing items in older regions + `media.rs` +
+  capture-area helpers). Left alone — cleaning others' lines is churn.
+- `npm run build:all` green (app 1.35s + extension 215ms).
+- `/tmp` still ~91%: my probe HOMEs and screenshots are the only things I
+  added and the HOMEs are removed; the remainder is the sibling's active
+  footprint plus another project's files — not mine to delete.
+  `fixtures/server.py` untouched.

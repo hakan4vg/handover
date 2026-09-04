@@ -1716,3 +1716,31 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Only `fixtures/startup_finalizing_probe.py` and this status entry belong in
   this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
   must not be staged.
+
+## 2026-09-04 — Startup invalidates stale segmented identities
+
+- Continued the §8.8–§8.9 audit with a persisted `finalizing` job whose six
+  local segment files were deliberately replaced by stale-generation bytes.
+  Its stored identity described generation 1, while startup received a
+  generation-2 manifest with a query-bearing URL for every segment.
+- Added `fixtures/startup_identity_probe.py`. The real rebuilt binary starts
+  with no UI command or browser input. The proxy records manifest and fragment
+  requests; its generation-2 manifest forwards valid fixture fragments while
+  the on-disk positional files remain stale.
+- Startup fetched the manifest once and then fetched each of the six new
+  generation-2 fragments exactly once: `v-init`, `v-0`, `v-1`, `v-2`,
+  `a-init`, and `a-0`. It did not reuse the stale files.
+- The job completed once, the stale `.segments` directory and `.part` were
+  removed, and output matched the independent FFmpeg reference: `86836` bytes
+  with SHA-256
+  `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`.
+  Command `python3 -m py_compile fixtures/startup_identity_probe.py &&
+  python3 fixtures/startup_identity_probe.py` exited `0` with
+  `STARTUP-IDENTITY-INVALIDATION: PASS`.
+- This closes startup invalidation when the persisted segmented identity no
+  longer matches the manifest. The next targeted-reattach check is that an
+  incompatible capture leaves the selected target armed and creates its own
+  provisional job instead of binding the wrong source.
+- Only `fixtures/startup_identity_probe.py` and this status entry belong in
+  this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
+  must not be staged.

@@ -2698,3 +2698,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verification for this slice passed Python compilation, the repaired fresh
   Chromium E2E, and `git diff --check`. The known Inspector limitation remains
   `Target.getTargets -> -32601`; the probe uses the resident `--commit` control.
+
+## 2026-09-05 — Prove public top-level audio initiation
+
+- W3Schools' HTML Audio article and MDN's interactive audio example were
+  inspected as possible targets. Both put their live audio element inside an
+  iframe; the top-level CDP document exposed zero media elements, so neither
+  could produce a native initiation with the current all-frame/document policy.
+  A separate top-level GitHub Pages audio demo exposed a playing source but hid
+  the underlying element at `0x0`, so the visibility rule correctly refused it.
+- Added `fixtures/public_paciello_audio_chromium_probe.py` against The Paciello
+  Group's public accessibility test page
+  `https://thepaciellogroup.github.io/AT-browser-tests/acc-name-test/audio.html`.
+  The fresh Chromium profile reported one visible native audio player at
+  `300x54`, `readyState=4`, `paused=false`, duration `437.565306`, and browser
+  source `https://thepaciellogroup.github.io/AT-browser-tests/audio/jeffbob.mp3`.
+  The real extension media button was visible and activated through trusted CDP
+  mouse input.
+- The native host created exactly one media job from that browser-observed MP3.
+  Resident `--commit` returned exit `0`; the row became `completed` with
+  `provisional=false`. Browser-context fetch plus Web Crypto recorded
+  `4104320` bytes and SHA-256
+  `a60b3d66d9bb9cacbe697b7bfc18ce31dd53d1fadec33e5d8f71bb780e6f551a`.
+  The managed native output matched both size and hash. Chromium's Downloads
+  directory remained empty.
+- Retained output:
+  `AUDIO-CHROMIUM: PASS (page=https://thepaciellogroup.github.io/AT-browser-tests/acc-name-test/audio.html,
+  source=https://thepaciellogroup.github.io/AT-browser-tests/audio/jeffbob.mp3,
+  output_bytes=4104320,
+  output_sha256=a60b3d66d9bb9cacbe697b7bfc18ce31dd53d1fadec33e5d8f71bb780e6f551a,
+  traffic=1, jobs=1, browser_downloads=[])` and `AUDIO-CHROMIUM-PROBE: PASS`.
+- Verification for this public slice passed Python compilation and the real
+  fresh-profile Chromium/native E2E. The known appindicator deprecation warning
+  was the only resident log warning; no product error was recorded.

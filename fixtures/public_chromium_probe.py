@@ -323,6 +323,25 @@ def main() -> int:
         anchor_size, anchor_hash = sha256_browser(browser_client, anchor_source)
         assert Path(anchor_dest).stat().st_size == anchor_size, (anchor_done, anchor_size)
         assert support.sha256(anchor_dest) == anchor_hash, (anchor_done, anchor_hash)
+
+        ownership_raw = browser_client.evaluate(
+            "JSON.stringify((()=>{const old=document.querySelector('#dm-save-as-probe');old?.remove();"
+            "const a=document.createElement('a');a.id='dm-save-as-probe';a.href=new URL('/html/mov_bbb.mp4?dm_save_as_probe=1',location.href).href;a.textContent='Save as probe';a.style.cssText='position:fixed;top:24px;left:24px;z-index:2147483647;padding:12px;background:#fff;color:#000';document.body.append(a);"
+            "window.__dmOwnership={context:null,click:null};"
+            "document.addEventListener('contextmenu',e=>{if(e.target.closest('#dm-save-as-probe')){window.__dmOwnership.context={defaultPrevented:e.defaultPrevented,isTrusted:e.isTrusted,button:e.button};e.preventDefault();}},false);"
+            "document.addEventListener('click',e=>{if(e.target.closest('#dm-save-as-probe')){window.__dmOwnership.click={defaultPrevented:e.defaultPrevented,isTrusted:e.isTrusted,ctrlKey:e.ctrlKey,button:e.button};e.preventDefault();}},false);"
+            "const r=a.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};})())"
+        )
+        ownership_point = json.loads(ownership_raw)
+        for button, modifiers in (("right", 0), ("left", 2)):
+            browser_client.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": ownership_point["x"], "y": ownership_point["y"], "button": button, "clickCount": 1, "modifiers": modifiers})
+            browser_client.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": ownership_point["x"], "y": ownership_point["y"], "button": button, "clickCount": 1, "modifiers": modifiers})
+        ownership = json.loads(browser_client.evaluate("JSON.stringify(window.__dmOwnership)"))
+        assert ownership["context"] and not ownership["context"]["defaultPrevented"] and ownership["context"]["isTrusted"], ownership
+        assert ownership["click"] and not ownership["click"]["defaultPrevented"] and ownership["click"]["isTrusted"] and ownership["click"]["ctrlKey"], ownership
+        assert len(jobs(db)) == 2, jobs(db)
+        print(f"BROWSER-OWNERSHIP: PASS ({json.dumps(ownership, sort_keys=True)})", flush=True)
+
         browser_files = [str(path.relative_to(profile)) for path in downloads.rglob("*")] if downloads.exists() else []
         assert not browser_files, browser_files
         print(

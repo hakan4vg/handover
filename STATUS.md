@@ -2428,3 +2428,11 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Plain Python reference fetching was rejected by W3Schools with HTTP 403; the
   fixture now uses same-page `fetch()` plus Web Crypto SHA-256 so the reference
   uses browser-equivalent headers and creates no download.
+- Follow-up real run exercised browser ownership after both captures. A trusted
+  CDP right-click (`button=2`) and trusted Ctrl-click (`button=0`, `ctrlKey=true`)
+  on a normal HTTP link reached the page with `defaultPrevented=false` and
+  `isTrusted=true`; the page canceled navigation afterward. The native job count
+  remained exactly two and Chromium's Downloads directory stayed empty. Output:
+  `BROWSER-OWNERSHIP: PASS ({"click":{"button":0,"ctrlKey":true,
+  "defaultPrevented":false,"isTrusted":true},"context":{"button":2,
+  "defaultPrevented":false,"isTrusted":true}})`.

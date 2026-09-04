@@ -2184,3 +2184,13 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
   with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
   distinct output names and hashes.
+
+## 2026-09-04 — Verify HLS fMP4 alternate-audio finalization
+
+- Reran the previously unconfirmed `fixtures/hls_fmp4_probe.py` against the
+  rebuilt binary. It uses only local finite fixture bytes and exercises HLS
+  master/video/audio manifests, `EXT-X-MAP` fMP4 initialization fragments,
+  parallel acquisition, and native FFmpeg muxing.
+- The real probe passed with 6/6 segments, video plus alternate audio, each
+  manifest and segment fetched exactly once, and an 86836-byte output with
+  SHA-256 `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`.

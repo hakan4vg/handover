@@ -1841,3 +1841,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87`.
 - The next audit should cover replace-mode failure cleanup under a deliberately
   unwritable destination, without staging the sibling hunk.
+
+## 2026-09-04 — Preserve replace targets when final move fails
+
+- Follow-up audit found that replace mode removed the existing destination before
+  moving the completed temp file. If the temp disappeared between finalization
+  and commit, the old file was lost. The fallback copy path also removed its
+  destination after a copy error, which could destroy an existing replacement
+  target.
+- Product repair: `move_completed_file` now receives explicit
+  `replace_existing` and `reserved` flags. Replace mode keeps the old target
+  until the new file is ready; cross-device/Windows fallback copies to a fresh
+  staging path, temporarily backs up the old file, restores it if the final
+  swap fails, and cleans staging artifacts. Rename reservations use direct copy
+  into their owned empty reservation on fallback and remove it on failure.
+- The three automatic finalization call sites no longer pre-delete their
+  destinations. They pass the collision mode to the move helper. Automatic
+  rename-mode reservation remains the next adjacent audit; this slice fixes
+  failure safety without claiming that broader path is closed.
+- Added `fixtures/replace_failure_probe.py`. It created a real provisional job,
+  waited for `finalizing`, wrote an existing destination, deleted only the
+  persisted temp file, and issued replace-mode commit through WebKit/Tauri IPC.
+  The real rebuilt binary returned the expected failure and preserved the old
+  destination. Result: `REPLACE-FAILURE-CLEANUP: PASS`; error was
+  `No such file or directory (os error 2)` and the old bytes remained.
+- Native tests passed `46/46` and Cargo build passed. The only warning remains
+  the protected sibling `wait_for_transfer_idle` being unused.

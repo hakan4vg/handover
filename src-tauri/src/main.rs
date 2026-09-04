@@ -687,17 +687,47 @@ fn ffmpeg_remux_failure(status: &std::process::ExitStatus) -> String {
     }
 }
 
-async fn move_completed_file(source: &str, destination: &str) -> Result<(), String> {
+async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reserved: bool) -> Result<(), String> {
     if let Some(parent) = PathBuf::from(destination).parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
     match tokio::fs::rename(source, destination).await {
         Ok(()) => Ok(()),
-        Err(error) if matches!(error.raw_os_error(), Some(17) | Some(18)) => {
+        Err(error) if matches!(error.raw_os_error(), Some(17) | Some(18)) && reserved => {
             match tokio::fs::copy(source, destination).await {
                 Ok(_) => match tokio::fs::remove_file(source).await {
                     Ok(()) => Ok(()),
                     Err(remove_error) => { let _ = tokio::fs::remove_file(destination).await; Err(remove_error.to_string()) }
                 },
                 Err(copy_error) => { let _ = tokio::fs::remove_file(destination).await; Err(format!("{error}; fallback copy failed: {copy_error}")) }
+            }
+        }
+        Err(error) if matches!(error.raw_os_error(), Some(17) | Some(18)) && replace_existing => {
+            let staging = format!("{destination}.download-manager-staging-{}", uuid::Uuid::new_v4());
+            if let Err(copy_error) = tokio::fs::copy(source, &staging).await {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return Err(format!("{error}; fallback copy failed: {copy_error}"));
+            }
+            let backup = format!("{destination}.download-manager-backup-{}", uuid::Uuid::new_v4());
+            let had_existing = match tokio::fs::rename(destination, &backup).await {
+                Ok(()) => true,
+                Err(rename_error) if rename_error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(rename_error) => {
+                    let _ = tokio::fs::remove_file(&staging).await;
+                    return Err(format!("{error}; could not stage existing destination: {rename_error}"));
+                }
+            };
+            match tokio::fs::rename(&staging, destination).await {
+                Ok(()) => {
+                    if had_existing { let _ = tokio::fs::remove_file(&backup).await; }
+                    match tokio::fs::remove_file(source).await {
+                        Ok(()) => Ok(()),
+                        Err(remove_error) => { let _ = tokio::fs::remove_file(destination).await; if had_existing { let _ = tokio::fs::rename(&backup, destination).await; } Err(remove_error.to_string()) }
+                    }
+                }
+                Err(rename_error) => {
+                    let _ = tokio::fs::remove_file(&staging).await;
+                    if had_existing { let _ = tokio::fs::rename(&backup, destination).await; }
+                    Err(format!("{error}; fallback move failed: {rename_error}"))
+                }
             }
         }
         Err(error) => Err(error.to_string()),
@@ -1011,12 +1041,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             let _ = tokio::fs::create_dir_all(parent).await;
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         }
-        if replace_existing {
-            let _ = tokio::fs::remove_file(&committed.1).await;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        }
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        move_completed_file(&temp_path, &committed.1).await?;
+        move_completed_file(&temp_path, &committed.1, replace_existing, false).await?;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     }
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
@@ -1220,12 +1245,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             let _ = tokio::fs::create_dir_all(parent).await;
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         }
-        if replace_existing {
-            let _ = tokio::fs::remove_file(&committed.1).await;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        }
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        move_completed_file(&final_path, &committed.1).await?;
+        move_completed_file(&final_path, &committed.1, replace_existing, false).await?;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
@@ -1352,12 +1372,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             let _ = std::fs::create_dir_all(parent);
             if !transfer_can_continue(&app, &id, generation) { return false; }
         }
-        if replace_existing {
-            let _ = std::fs::remove_file(&committed.1);
-            if !transfer_can_continue(&app, &id, generation) { return false; }
-        }
-        if !transfer_can_continue(&app, &id, generation) { return false; }
-        if let Err(error) = move_completed_file(&temp_path, &committed.1).await {
+        if let Err(error) = move_completed_file(&temp_path, &committed.1, replace_existing, false).await {
             if !transfer_can_continue(&app, &id, generation) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
@@ -1662,13 +1677,12 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         });
         emit_snapshot(&app, &state);
     }
-    if accepted.3 { let _ = std::fs::remove_file(&destination); }
     if !commit_still_owned(state.inner(), &id) {
         if reserved { let _ = std::fs::remove_file(&destination); }
         emit_snapshot(&app, &state);
         return Err("Acquisition was paused or cancelled before the file move".into());
     }
-    match move_completed_file(&final_path, &destination).await {
+    match move_completed_file(&final_path, &destination, accepted.3, reserved).await {
         Ok(()) => {
             if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
             if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }

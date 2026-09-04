@@ -292,11 +292,27 @@ fn browser_policy_value(policy: &BrowserPolicy) -> Value {
     json!({ "interceptDownloads": policy.0, "showMediaButtons": policy.1, "excludedSites": policy.2 })
 }
 
+fn normalize_policy_site(value: &str) -> String {
+    let input = value.trim();
+    if input.is_empty() { return String::new(); }
+    let candidate = if input.starts_with("//") {
+        format!("https:{input}")
+    } else if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{input}")
+    };
+    reqwest::Url::parse(&candidate)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.trim_start_matches("www.").to_ascii_lowercase()))
+        .unwrap_or_else(|| input.split(['/', '?', '#']).next().unwrap_or("").trim_start_matches("www.").to_ascii_lowercase())
+}
+
 fn browser_policy_from_value(value: &Value) -> Option<BrowserPolicy> {
     let payload = value.get("payload").unwrap_or(value);
     let intercept = payload.get("interceptDownloads").and_then(Value::as_bool)?;
     let media = payload.get("showMediaButtons").and_then(Value::as_bool)?;
-    let excluded = payload.get("excludedSites").and_then(Value::as_array)?.iter().filter_map(Value::as_str).map(|site| site.trim().to_ascii_lowercase()).filter(|site| !site.is_empty()).collect::<Vec<_>>();
+    let excluded = payload.get("excludedSites").and_then(Value::as_array)?.iter().filter_map(Value::as_str).map(normalize_policy_site).filter(|site| !site.is_empty()).collect::<Vec<_>>();
     Some((intercept, media, excluded))
 }
 
@@ -1837,6 +1853,17 @@ mod capture_tests {
         assert_eq!(parsed.0, true);
         assert_eq!(parsed.1, false);
         assert_eq!(parsed.2, vec!["example.com".to_string(), "cdn.example.test".to_string()]);
+    }
+
+    #[test]
+    fn browser_policy_migrates_url_and_www_site_entries() {
+        let value = json!({
+            "interceptDownloads": true,
+            "showMediaButtons": true,
+            "excludedSites": [" https://www.Example.com/watch/ ", "example.com:8443/path"]
+        });
+        let parsed = browser_policy_from_value(&value).expect("legacy policy");
+        assert_eq!(parsed.2, vec!["example.com".to_string(), "example.com".to_string()]);
     }
 
     #[test]

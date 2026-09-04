@@ -1203,3 +1203,15 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   full frontend/extension suite passes `28/28`; TypeScript and `npm run
   build:all` are clean. The sibling's two `wait_for_transfer_idle` hunks remain
   unstaged in `src-tauri/src/main.rs`.
+
+## 2026-09-04 — Native policy reload migrates legacy site values
+
+- Audit found the Rust policy-file parser only lowercased entries. Legacy values
+  containing schemes, paths, ports, or `www.` therefore could not match the
+  extension's hostname-only comparison.
+- Added native normalization through URL hostname parsing, matching the
+  extension and Settings behavior. The existing round-trip and incomplete
+  payload tests remain intact; a regression covers URL/path/port migration.
+- Evidence: Rust suite `37/37` and cargo build passed; `git diff --check`
+  passed. The sibling's two `wait_for_transfer_idle` hunks remain unstaged in
+  `src-tauri/src/main.rs`.

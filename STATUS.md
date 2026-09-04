@@ -1574,7 +1574,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `lifecycle::tests` passed `5/5`, full Rust passed `45/45`, and `cargo build`
   passed. `npm test` passed `31/31`, `npx tsc -b` passed, and
   `npm run build:all` passed. Cargo reported only the sibling's existing
-  unused `wait_for_transfer_idle` warning.
+  `wait_for_transfer_idle` warning.
+
+## 2026-09-04 — Progressive MP4 remains byte-identical
+
+- Audited SPEC §9.1 against `acquire_once`: progressive single-stream media
+  moves the completed `.part` directly to the committed destination; segmented
+  media alone uses `finalize_media`. A real-binary red probe was added at
+  `fixtures/progressive_mp4_probe.py` to verify this branch.
+- The probe launched a disposable app under a dedicated Xvfb and served the
+  existing `fixtures/real.mp4` through a local counting proxy. It invoked the
+  real `create_provisional` and `commit_provisional` commands.
+- The provisional temp file was `34524` bytes and had the source SHA-256
+  `c5dba3fa0bbbf13a6c8981b1941f9713dc85bd5fb9522bee98945ba0592932c9`.
+- The committed destination was also `34524` bytes with the identical SHA-256.
+  The proxy recorded exactly one `/media/real.mp4` request. No remux or second
+  fetch occurred. This closes the progressive MP4 byte-preservation gap with
+  no production-code change.
+- The probe's first two launches hit the known disposable WebKit/SIGSEGV race;
+  after owned probe-root cleanup, the same scenario passed. The final run
+  exited `0` and retained only its small E2E root for inspection.
+- The sibling `wait_for_transfer_idle` helper remains the only unstaged change.
 
 ## 2026-09-04 — HLS fragmented MP4 with alternate audio
 

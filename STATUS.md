@@ -1018,3 +1018,21 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   added and the HOMEs are removed; the remainder is the sibling's active
   footprint plus another project's files — not mine to delete.
   `fixtures/server.py` untouched.
+
+## 2026-09-04 — Real-app boot smoke for the tray-handle code (§21.8/§21.10)
+
+- The tray-sync slice was compile- + source-verified only, and SPEC §21.10
+  says that is never sufficient. So: booted the real worktree binary on the
+  shared `:99` Xvfb rig with a fresh isolated HOME (no XTEST — boot, observe,
+  screenshot, kill). Result: clean start, no panic, no error in the log;
+  `libayatana-appindicator` tray backend initialized; main window
+  `Download Manager 1180x760` plus the tray host window both present;
+  rendered UI vision-verified (sidebar, empty state, Add URL, status bar
+  "Connected · Browser integration on · 0 active").
+- Precisely what this proves: `install_tray` with the new handle-store lines
+  executes at startup without panic, and the app runs normally with the
+  tray installed. What it does not prove: checkmark visuals on click (needs
+  GUI event injection, out of bounds) — that direction stays
+  source-verified. Screenshot `/tmp/dm-tray-boot-window.png`; rig torn down
+  (process + boot HOME removed), `:99` Xvfb left running as found.
+  `fixtures/server.py` untouched.

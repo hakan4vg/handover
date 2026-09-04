@@ -351,10 +351,25 @@ fn settings_from_stored(stored: &str) -> AppSettings {
 // Blank folder paths are rejected outright: the folder fields are free-text
 // inputs, and an empty download folder would silently turn every later
 // destination into a relative path into the process working directory.
+fn valid_setting_value(key: &str, value: &Value) -> bool {
+    match key {
+        "closeBehavior" => matches!(value.as_str(), Some("tray" | "exit")),
+        "collisionBehavior" => matches!(value.as_str(), Some("rename" | "replace")),
+        "bandwidthLimit" => value.is_null() || value.as_u64().is_some_and(|limit| limit > 0),
+        "bandwidthUnit" => matches!(value.as_str(), Some("KB/s" | "MB/s" | "GB/s")),
+        "maxConnections" => value.as_u64().is_some_and(|count| (1..=32).contains(&count)),
+        "maxRetries" => value.as_u64().is_some_and(|count| count <= 20),
+        "theme" => matches!(value.as_str(), Some("system" | "light" | "dark")),
+        "density" => matches!(value.as_str(), Some("comfortable" | "compact")),
+        _ => true,
+    }
+}
+
 fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
     let Value::Object(entries) = patch else { return current.clone(); };
     let mut merged = serde_json::to_value(current).unwrap_or(Value::Null);
     for (key, value) in entries {
+        if !valid_setting_value(key, value) { continue; }
         if (key == "defaultFolder" || key == "tempFolder") && value.as_str().is_some_and(|text| text.trim().is_empty()) { continue; }
         let previous = if let Value::Object(ref mut base) = merged { base.insert(key.clone(), value.clone()) } else { break; };
         if serde_json::from_value::<AppSettings>(merged.clone()).is_err() {
@@ -1980,6 +1995,33 @@ mod capture_tests {
         let rebooted = settings_from_stored(&payload);
         assert_eq!(rebooted.max_connections, 4);
         assert_eq!(rebooted.bandwidth_limit, Some(1048576));
+    }
+
+    #[test]
+    fn settings_patch_rejects_invalid_enum_and_zero_limit_values() {
+        use super::{apply_settings_patch, default_settings};
+        let current = default_settings();
+        let patch = serde_json::json!({
+            "closeBehavior": "unexpected",
+            "collisionBehavior": "overwrite-everything",
+            "bandwidthLimit": 0,
+            "bandwidthUnit": "bits/s",
+            "maxConnections": 0,
+            "maxRetries": 21,
+            "theme": "neon",
+            "density": "tiny"
+        });
+        let next = apply_settings_patch(&current, &patch);
+        assert_eq!(next.close_behavior, current.close_behavior);
+        assert_eq!(next.collision_behavior, current.collision_behavior);
+        assert_eq!(next.bandwidth_limit, current.bandwidth_limit);
+        assert_eq!(next.bandwidth_unit, current.bandwidth_unit);
+        assert_eq!(next.max_connections, current.max_connections);
+        assert_eq!(next.max_retries, current.max_retries);
+        assert_eq!(next.theme, current.theme);
+        assert_eq!(next.density, current.density);
+        let next = apply_settings_patch(&current, &serde_json::json!({"maxRetries": 3}));
+        assert_eq!(next.max_retries, 3);
     }
 
     #[test]

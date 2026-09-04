@@ -59,13 +59,21 @@ function persistSettings(settings: AppSettings) {
  * Client-side parity guard for the native settings patch contract.
  *
  * Rust's apply_settings_patch remains authoritative for schema validation and
- * persistence. This narrow helper only prevents the mock/native adapters from
- * sending a blank folder value that Rust deliberately ignores.
+ * persistence. This helper mirrors its supported enum and numeric bounds so
+ * mock/native adapter paths do not accept values the native core will ignore.
  */
 export function sanitizeSettingsPatch(patch: Partial<AppSettings>): Partial<AppSettings> {
   const next = { ...patch };
   if (typeof next.defaultFolder === 'string' && next.defaultFolder.trim().length === 0) delete next.defaultFolder;
   if (typeof next.tempFolder === 'string' && next.tempFolder.trim().length === 0) delete next.tempFolder;
+  if (next.closeBehavior !== undefined && !['tray', 'exit'].includes(next.closeBehavior)) delete next.closeBehavior;
+  if (next.collisionBehavior !== undefined && !['rename', 'replace'].includes(next.collisionBehavior)) delete next.collisionBehavior;
+  if (next.bandwidthLimit !== undefined && next.bandwidthLimit !== null && (!Number.isInteger(next.bandwidthLimit) || next.bandwidthLimit <= 0)) delete next.bandwidthLimit;
+  if (next.bandwidthUnit !== undefined && !['KB/s', 'MB/s', 'GB/s'].includes(next.bandwidthUnit)) delete next.bandwidthUnit;
+  if (next.maxConnections !== undefined && (!Number.isInteger(next.maxConnections) || next.maxConnections < 1 || next.maxConnections > 32)) delete next.maxConnections;
+  if (next.maxRetries !== undefined && (!Number.isInteger(next.maxRetries) || next.maxRetries < 0 || next.maxRetries > 20)) delete next.maxRetries;
+  if (next.theme !== undefined && !['system', 'light', 'dark'].includes(next.theme)) delete next.theme;
+  if (next.density !== undefined && !['comfortable', 'compact'].includes(next.density)) delete next.density;
   return next;
 }
 

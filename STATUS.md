@@ -1242,3 +1242,14 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Regression evidence: Rust suite `39/39`; cargo build and `git diff --check`
   passed. No-range, redirect, one-use, bounded-503, ranged-manifest, limiter,
   and byte-identity probes passed again.
+
+## 2026-09-04 — Settings reject invalid enum and numeric values
+
+- Native per-key settings recovery now rejects unknown close/collision/theme/
+  density/unit values, zero or fractional bandwidth limits, and connection or
+  retry counts outside their UI bounds. Valid sibling keys still apply.
+- The frontend sanitizer mirrors those bounds for MockAdapter and NativeAdapter
+  calls; Rust remains the source of truth.
+- Regression evidence: native Rust suite `40/40`; focused sanitizer Vitest
+  `5/5`; full frontend/extension suite `30/30`; TypeScript clean; application
+  and extension production builds passed; `git diff --check` passed.

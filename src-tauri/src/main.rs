@@ -758,6 +758,10 @@ async fn remove_owned_reservation(destination: &str, marker: Option<&str>) {
     }
 }
 
+async fn cleanup_reserved_destination(destination: &str, marker: Option<&str>) {
+    remove_owned_reservation(destination, marker).await;
+}
+
 #[cfg(test)]
 static FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1282,7 +1286,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
-            if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
             clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
@@ -1506,7 +1510,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
-            if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
             clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
@@ -1661,7 +1665,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
-            if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
             clear_destination_reservation(&app, &state, &id);
             return false;
         }
@@ -1975,7 +1979,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         emit_snapshot(&app, &state);
     }
     if !commit_still_owned(state.inner(), &id) {
-        if reserved { let _ = std::fs::remove_file(&destination); }
+        if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
         clear_destination_reservation(&app, &state, &id);
         emit_snapshot(&app, &state);
         return Err("Acquisition was paused or cancelled before the file move".into());
@@ -1990,7 +1994,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
             add_notification(&app, &state, &id, "completed");
         }
         Err(error) => {
-            if reserved { let _ = std::fs::remove_file(&destination); }
+            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
             if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
@@ -2560,6 +2564,20 @@ mod capture_tests {
         assert!(!move_needs_fallback(&std::io::Error::from_raw_os_error(13)));
     }
 
+    #[test]
+    fn abort_cleanup_preserves_changed_reserved_destination() {
+        use super::cleanup_reserved_destination;
+        let root = std::env::temp_dir().join(format!("download-manager-abort-owner-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("managed.bin");
+        let marker = "download-manager-reservation-v1:test-abort";
+        std::fs::write(&destination, b"foreign-output").unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(cleanup_reserved_destination(destination.to_str().unwrap(), Some(marker)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"foreign-output", "abort cleanup must not delete changed destination");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn reserved_nonfallback_error_preserves_changed_destination() {
         use super::{inject_reserved_nonfallback_for_test, move_completed_file};

@@ -2114,3 +2114,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
   with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
   distinct output names and hashes.
+
+## 2026-09-04 — Keep foreign files safe during reservation abort cleanup
+
+- The next audit found five cancellation/commit cleanup branches that still
+  called unconditional `remove_file(destination)` whenever a reservation flag
+  was set. If a foreign file replaced the marker before cancellation or move
+  failure, cleanup could delete that file.
+- Added `cleanup_reserved_destination`, which delegates to exact-marker
+  ownership verification, and routed all five branches through it. Matching
+  markers are removed; changed, unreadable, or missing destinations are not
+  touched.
+- Added the deterministic Rust regression
+  `abort_cleanup_preserves_changed_reserved_destination`. It presents a
+  foreign destination under a reservation token, runs the abort cleanup seam,
+  and verifies the foreign bytes remain.
+- Fresh native verification passed `52/52` tests and Cargo build. The only
+  warning remains the protected sibling `wait_for_transfer_idle` helper being
+  unused.
+- Fresh fail-fast real-binary probes all exited successfully:
+  `MOVE-CANCEL-RACE: PASS` with one 268435456-byte output and SHA-256
+  `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`;
+  `MANAGED-RENAME-COLLISION: PASS`; `REPLACE-COLLISION: PASS`;
+  `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
+  with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
+  distinct output names and hashes.

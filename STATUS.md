@@ -2233,3 +2233,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   application logs contained only the existing libayatana-appindicator
   deprecation warning and no product error. The independent startup-finalizing
   rerun passed; the earlier retained HLS pass remains the media-path evidence.
+
+## 2026-09-04 — Prove retry after missing FFmpeg preserves media parts
+
+- Added `fixtures/missing_ffmpeg_recovery_probe.py` for the single-track HLS
+  fMP4 path that calls `finalize_media` rather than the separate-track muxer.
+- The real application ran with an isolated PATH containing no FFmpeg. Commit
+  reached `failed` with the explicit error `FFmpeg is required to finalize
+  segmented media; downloaded parts were preserved`; all four fragments stayed
+  on disk and no destination file was created.
+- Adding the real FFmpeg executable to that same PATH and invoking the normal
+  Retry action completed the job at 32057 bytes with SHA-256
+  `6b6875bc6d4c6233f362624c1d5e919993e49f0e7530fc007cfb2d6d17167861`.
+- The retry refetched the two HLS playlist manifests but fetched zero media
+  fragments again. The four preserved parts were removed after successful
+  finalization.

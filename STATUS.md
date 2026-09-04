@@ -1362,3 +1362,42 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Re-fetching the same token returns `410` — the native acquisition was the
   sole consumer; nothing re-fetched or duplicated the one-shot transaction.
 - No code change; probe evidence only.
+
+## 2026-09-04 — Registered unpacked extension native bridge and fallback e2e
+
+- Rebuilt the app and extension, then loaded the unpacked extension from
+  `extension/dist` in a disposable Chromium profile. Its exact runtime ID was
+  `mogdhelapdlmkfgeeaogeehnlclhcnkn`.
+- Started the rebuilt app under the same isolated HOME with
+  `DM_EXTENSION_ID=mogdhelapdlmkfgeeaogeehnlclhcnkn`. The generated Chromium
+  host manifest contained both the published origin and this runtime ID, and
+  pointed at the executable wrapper in that isolated HOME.
+- Direct service-worker evidence: `chrome.runtime.sendNativeMessage` for
+  `get-policy` returned `{ok:true, interceptDownloads:true,
+  showMediaButtons:true}` with `lastError=null`. A direct
+  `capture-acquisition` message also returned `{ok:true}` with no error.
+- Ordinary browser capture evidence: a real `<a download>` click on the
+  fixture page returned `dispatchReturned=false` and
+  `defaultPrevented=true`; the browser created no fallback file. The app DB
+  gained the named provisional job at `finalizing 100% (65536 bytes)`, with a
+  real `.part` whose SHA256 was
+  `96ba4f57e721a5b66c8cc934a9df430390c0fb371df4bce778cdd5c845846f71`.
+  A second request for the one-use source returned `410`.
+- Fallback evidence was run in a separate disposable Chromium profile with no
+  host manifest. The service-worker callback returned the exact Chromium error
+  `Specified native messaging host not found.` The ordinary click was still
+  intercepted (`dispatchReturned=false`, `defaultPrevented=true`), then
+  `chrome.downloads.search` reported a complete browser download at
+  `65536/65536` bytes with `error=null`. The app DB stayed at exactly the
+  three native jobs, and a second request for the fallback one-use source
+  returned `410`.
+- Initial host-not-found results came from placing `--user-data-dir` outside
+  the isolated HOME; Chromium searched that profile's own
+  `NativeMessagingHosts` directory. Relaunching with the disposable data
+  directory at `$HOME/.config/chromium` matched the app's registered path and
+  made the native handshake succeed. No product code change was needed.
+- Verification after the probe: frontend/extension suite `31/31`, TypeScript
+  clean through `npm run build:all`, Rust suite `44/44`, cargo build passed,
+  and `git diff --check` passed. The sibling's `wait_for_transfer_idle` helper
+  remains the only unstaged worktree change and is unmodified; this evidence
+  slice stages no sibling hunk.

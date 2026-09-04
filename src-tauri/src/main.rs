@@ -538,6 +538,22 @@ fn collision_destination(path: &str, behavior: &str) -> String {
     path.to_string()
 }
 
+fn reserve_collision_destination(path: &str) -> Result<String, String> {
+    let candidate = PathBuf::from(path);
+    let stem = candidate.file_stem().and_then(|value| value.to_str()).unwrap_or("download");
+    let extension = candidate.extension().and_then(|value| value.to_str()).map(|value| format!(".{value}")).unwrap_or_default();
+    for index in 0..10000 {
+        let mut next = candidate.clone();
+        if index > 0 { next.set_file_name(format!("{stem} ({index}){extension}")); }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&next) {
+            Ok(_) => return Ok(next.to_string_lossy().into_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Could not reserve a unique destination".into())
+}
+
 fn header_string(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
     response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_string)
 }
@@ -1620,11 +1636,39 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         accepted.1.clone()
     };
     if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
-    if let Some(parent) = PathBuf::from(&accepted.2).parent() { let _ = std::fs::create_dir_all(parent); }
+    let mut destination = accepted.2.clone();
+    if let Some(parent) = PathBuf::from(&destination).parent() { let _ = std::fs::create_dir_all(parent); }
     if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
-    if accepted.3 { let _ = std::fs::remove_file(&accepted.2); }
-    if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
-    match move_completed_file(&final_path, &accepted.2).await {
+    let reserved = if accepted.3 {
+        false
+    } else {
+        match reserve_collision_destination(&destination) {
+            Ok(path) => {
+                destination = path;
+                true
+            }
+            Err(error) => {
+                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Could not reserve a unique destination", Some("error"))); });
+                emit_snapshot(&app, &state);
+                return Err(error);
+            }
+        }
+    };
+    if destination != accepted.2 {
+        emit_job(&state, &id, |job| {
+            job.destination = destination.clone();
+            if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
+            job.events.insert(0, job_event("Destination renamed to avoid a concurrent collision", Some("warning")));
+        });
+        emit_snapshot(&app, &state);
+    }
+    if accepted.3 { let _ = std::fs::remove_file(&destination); }
+    if !commit_still_owned(state.inner(), &id) {
+        if reserved { let _ = std::fs::remove_file(&destination); }
+        emit_snapshot(&app, &state);
+        return Err("Acquisition was paused or cancelled before the file move".into());
+    }
+    match move_completed_file(&final_path, &destination).await {
         Ok(()) => {
             if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
             if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }
@@ -1635,6 +1679,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
             add_notification(&app, &state, &id, "completed");
         }
         Err(error) => {
+            if reserved { let _ = std::fs::remove_file(&destination); }
             if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
@@ -2178,6 +2223,21 @@ mod capture_tests {
         assert_eq!(resume_all_plan(Some(true), 99.9), ("downloading", true));
         assert_eq!(resume_all_plan(Some(false), 100.0), ("downloading", true));
         assert_eq!(resume_all_plan(None, 0.0), ("downloading", true));
+    }
+
+    #[test]
+    fn collision_reservation_allocates_distinct_paths_before_moves() {
+        use super::reserve_collision_destination;
+        let root = std::env::temp_dir().join(format!("download-manager-collision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let requested = root.join("same.bin").to_string_lossy().into_owned();
+        let first = reserve_collision_destination(&requested).unwrap();
+        let second = reserve_collision_destination(&requested).unwrap();
+        assert_eq!(first, requested);
+        assert_eq!(second, root.join("same (1).bin").to_string_lossy());
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

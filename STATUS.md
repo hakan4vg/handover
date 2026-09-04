@@ -1798,3 +1798,41 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Only `fixtures/simultaneous_capture_probe.py` and this status entry belong in
   this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
   must not be staged.
+
+## 2026-09-04 — Reserve collision destinations at the final move boundary
+
+- Audited SPEC §11.2 and the commit path. The previous `collision_destination`
+  check ran before asynchronous finalization, so two ready provisional jobs
+  could both select the same free path. On Unix, the later rename could replace
+  the earlier completed file.
+- Added `reserve_collision_destination` in `src-tauri/src/main.rs`. Rename
+  behavior now claims the selected path with exclusive `create_new` semantics
+  immediately before moving the completed file. A competing commit advances to
+  the next `(n)` name. If the move fails, the reservation is removed; replace
+  behavior remains explicit and unchanged.
+- Added native regression
+  `collision_reservation_allocates_distinct_paths_before_moves`. It passed with
+  `1 passed; 45 filtered out`.
+- Added `fixtures/collision_commit_probe.py`. The real rebuilt application
+  created two provisional captures, waited until both were `finalizing`, and
+  issued concurrent `commit_provisional` calls through WebKit/Tauri IPC. It
+  completed both rows at distinct destinations:
+  `/tmp/.../Downloads/same.bin` and `/tmp/.../Downloads/same (1).bin`.
+- The two output hashes were, in job order,
+  `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87` and
+  `437838d6112dca73f4bd8d08c2e792c43207e999336d1422faed6a28744af307`,
+  matching the two independent fixture variants. No output was overwritten.
+- The first probe versions exposed harness errors rather than product behavior:
+  exact-concurrent launcher startup raced, WebKit void-return serialization
+  was `{}`, and pre-seeded `finalizing`/provisional rows mixed startup recovery
+  into the test. The final probe uses the already-proven bootstrap, one paused
+  managed setup row, real single-instance captures, SQLite row discovery, and
+  concurrent commit IPC. The successful run exited `0` with
+  `COMMIT-RESULT: {}` and `COLLISION-RESERVATION: PASS`.
+- After the reservation cleanup repair, the affected and full checks passed:
+  native `46/46`, Cargo build, frontend/extension `31/31`, TypeScript build,
+  and `npm run build:all`. The only warning is the protected sibling
+  `wait_for_transfer_idle` helper being unused.
+- This closes the verified concurrent rename-collision case. The next audit
+  should cover replace-mode collision behavior and failure cleanup under a
+  deliberately unwritable destination, without staging the sibling hunk.

@@ -1833,6 +1833,11 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   native `46/46`, Cargo build, frontend/extension `31/31`, TypeScript build,
   and `npm run build:all`. The only warning is the protected sibling
   `wait_for_transfer_idle` helper being unused.
-- This closes the verified concurrent rename-collision case. The next audit
-  should cover replace-mode collision behavior and failure cleanup under a
-  deliberately unwritable destination, without staging the sibling hunk.
+- This closes the verified concurrent rename-collision case.
+- Follow-up verification added `fixtures/replace_commit_probe.py`. With an
+  existing `replace.bin` and `collisionBehavior=replace`, the real provisional
+  job completed at the same path and replaced the old bytes. Result:
+  `REPLACE-COLLISION: PASS`, output SHA-256
+  `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87`.
+- The next audit should cover replace-mode failure cleanup under a deliberately
+  unwritable destination, without staging the sibling hunk.

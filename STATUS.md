@@ -1189,3 +1189,17 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   and stopped afterward.
 - The sibling's two `wait_for_transfer_idle` hunks remain unstaged in
   `src-tauri/src/main.rs`.
+
+## 2026-09-04 — Excluded media sites normalize to hostnames
+
+- Settings previously stripped only a leading scheme and one trailing slash.
+  Input such as `https://www.Example.com/watch/` was stored as a path-bearing
+  value, while the extension matches only `example.com`; exclusion therefore
+  silently failed.
+- Added `normalizeSite`, using URL hostname parsing, lowercase, and the same
+  `www.` removal as the extension. Browser Integration now stores the exact
+  representation used for matching and deduplicates reliably.
+- Regression evidence: `src/site.test.ts` covers URL/path/port input and the
+  full frontend/extension suite passes `28/28`; TypeScript and `npm run
+  build:all` are clean. The sibling's two `wait_for_transfer_idle` hunks remain
+  unstaged in `src-tauri/src/main.rs`.

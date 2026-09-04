@@ -6,6 +6,7 @@ import { createAdapter, formatBytes, formatSpeed } from './adapters';
 import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
 import { Icon, type IconName } from './icons';
 import { settingsPageFromSearch } from './settings-route';
+import { normalizeSite } from './site';
 import type {
   AppSettings,
   AppSnapshot,
@@ -382,7 +383,7 @@ function DownloadSettings({ settings, update }: { settings: AppSettings; update:
 
 function BrowserSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
   const [newSite, setNewSite] = useState('');
-  const addSite = () => { const site = newSite.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, ''); if (site && !settings.excludedSites.includes(site)) update({ excludedSites: [...settings.excludedSites, site] }); setNewSite(''); };
+  const addSite = () => { const site = normalizeSite(newSite); if (site && !settings.excludedSites.includes(site)) update({ excludedSites: [...settings.excludedSites, site] }); setNewSite(''); };
   return <><SettingsHeading title="Browser Integration" /><SettingCard><SettingToggle title="Intercept browser downloads" description="Detect downloads from supported browsers." checked={settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} /><SettingToggle title="Show media buttons" description="Display download buttons on videos and media." checked={settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} /></SettingCard><SettingCard><FieldHeading title="Excluded media sites" description="These sites are excluded from browser integration." /><div className="excluded-list">{settings.excludedSites.map((site) => <div className="excluded-item" key={site}><span>{site}</span><button aria-label={`Remove ${site}`} onClick={() => update({ excludedSites: settings.excludedSites.filter((item) => item !== site) })}><Icon name="close" size={15} /></button></div>)}<div className="add-site"><input value={newSite} onChange={(event) => setNewSite(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && addSite()} placeholder="Add a site, such as example.com" /><button className="button" onClick={addSite}>Add</button></div></div><div className="info-callout"><Icon name="info" size={16} /><span>Excluded sites are shared with the extension popup.</span></div></SettingCard></>;
 }
 

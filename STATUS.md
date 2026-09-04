@@ -1618,3 +1618,46 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   python3 fixtures/hls_fmp4_probe.py` exited `0` with
   `HLS-FMP4-PROBE: PASS`. No product source changed; the sibling's
   `wait_for_transfer_idle` helper remains the only unstaged worktree change.
+
+## 2026-09-04 — Targeted reattach reuses compatible partial data safely
+
+- Audited SPEC §§8.8–8.9 against `source_compatible` and `acquire_ranges`.
+  Reattach is one-shot and targeted: the selected job ID is stored, the next
+  visible normal/media capture is accepted only when scheme, host, effective
+  service port, and path match; query renewal is allowed.
+- Added `fixtures/reattach_probe.py`, using the real rebuilt binary, isolated
+  HOME/database, disposable Xvfb/WebKit IPC, the existing deterministic
+  `changed.bin` fixture, and a local counting proxy. The seeded committed
+  partials use the same full-length sparse `.part` shape as production: the
+  first `65536` bytes are present and the file is preallocated to `262144`.
+- The compatible renewal URL changed only its query. It produced exactly two
+  requests, not a duplicate full acquisition: `Range: bytes=0-0` returned
+  `206`, `Content-Range: bytes 0-0/262144`, `1` byte, ETag `"v1"`; then
+  `Range: bytes=65536-262143` returned `206`, `196608` bytes, the same ETag.
+  The existing first `65536` bytes were reused, one selected job completed,
+  and its output SHA-256 was
+  `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87`.
+- The changed-resource URL kept the path but returned ETag `"v2"` and
+  different bytes. It produced `Range: bytes=0-0` followed by
+  `Range: bytes=1-262143`, both `206`; the second response was `262143`
+  bytes. The final SHA-256 was
+  `437838d6112dca73f4bd8d08c2e792c43207e999336d1422faed6a28744af307`,
+  different from the compatible output. This proves the old partial was not
+  silently stitched into a resource with a changed validator.
+- The first probe run reported two `/changed.bin` requests because its coarse
+  counter treated the validator probe and the range fetch alike. Instrumenting
+  Range, status, Content-Range, ETag, and byte count resolved that as expected
+  protocol behavior. The same run also exposed and corrected a harness-only
+  mismatch: its partial file was not preallocated to the persisted total.
+- Extended the native regression `reattach_compatibility_ignores_query_but_not_path`
+  to reject a changed host as well as changed path, scheme, and service port.
+  Focused command: `cargo test --manifest-path src-tauri/Cargo.toml
+  reattach_compatibility_ignores_query_but_not_path -- --nocapture` passed
+  `1/1` (44 filtered out). The only warning was the protected sibling helper.
+- Real probe command `python3 -m py_compile fixtures/reattach_probe.py &&
+  python3 fixtures/reattach_probe.py` exited `0` and printed
+  `REATTACH-COMPATIBLE: PASS`, `REATTACH-IDENTITY-CHANGE: PASS`, and the
+  exact request records above. No production implementation change was needed.
+- Only the probe, this status entry, and the host-identity test hunk belong in
+  this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
+  must not be staged.

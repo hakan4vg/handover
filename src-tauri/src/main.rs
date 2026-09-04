@@ -1997,6 +1997,7 @@ mod capture_tests {
     fn reattach_compatibility_ignores_query_but_not_path() {
         assert!(source_compatible("https://cdn.example.test/vod/a.mp4?token=1", "https://cdn.example.test/vod/a.mp4?token=2"));
         assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "https://cdn.example.test/vod/b.mp4"));
+        assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "https://other.example.test/vod/a.mp4"));
         assert!(!source_compatible("https://cdn.example.test/vod/a.mp4", "http://cdn.example.test/vod/a.mp4"));
         assert!(!source_compatible("https://cdn.example.test:8443/vod/a.mp4", "https://cdn.example.test:9443/vod/a.mp4"));
         assert!(source_compatible("https://cdn.example.test/vod/a.mp4", "https://cdn.example.test:443/vod/a.mp4"));

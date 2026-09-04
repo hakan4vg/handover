@@ -2139,3 +2139,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
   with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
   distinct output names and hashes.
+
+## 2026-09-04 — Do not reclaim another job's reservation marker
+
+- Startup recovery previously treated every file beginning with
+  `download-manager-reservation-v1:` as the persisted job's marker. A stale
+  job could therefore delete a different job's full reservation token.
+- Recovery now removes the marker only when its bytes exactly match the
+  persisted token, or when the file is a strict byte-prefix of that token and
+  therefore an interrupted write from the same job. A different full token is
+  treated as completed output and is preserved.
+- Extended `destination_reservation_recovery_removes_only_its_marker` with a
+  mismatched-token regression. The old prefix-only predicate failed with
+  `left: Retry, right: Completed`; the corrected predicate passes.
+- Fresh native verification passed `52/52` tests and Cargo build. The only
+  warning remains the protected sibling `wait_for_transfer_idle` helper being
+  unused.
+- Fresh fail-fast real-binary probes all exited successfully:
+  `MOVE-CANCEL-RACE: PASS` with one 268435456-byte output and SHA-256
+  `a292ece20ee4810922263532e87657a77cc95e190389cc2b197a5db9114f7b8b`;
+  `MANAGED-RENAME-COLLISION: PASS`; `REPLACE-COLLISION: PASS`;
+  `REPLACE-FAILURE-CLEANUP: PASS`; `STARTUP-INCOMPLETE-RESERVATION-RECOVERY: PASS`
+  with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
+  distinct output names and hashes.

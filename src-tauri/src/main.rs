@@ -573,7 +573,7 @@ fn destination_reservation_marker() -> String { format!("{DESTINATION_RESERVATIO
 
 fn reconcile_destination_reservation(path: &Path, marker: &str, allow_empty_completed: bool) -> DestinationReservationRecovery {
     match std::fs::read(path) {
-        Ok(bytes) if bytes == marker.as_bytes() || bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => match std::fs::remove_file(path) {
+        Ok(bytes) if bytes == marker.as_bytes() || (bytes.len() < marker.len() && marker.as_bytes().starts_with(&bytes) && bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes())) => match std::fs::remove_file(path) {
             Ok(()) => DestinationReservationRecovery::Retry,
             Err(_) => DestinationReservationRecovery::Unknown,
         },
@@ -2642,6 +2642,11 @@ mod capture_tests {
         std::fs::create_dir_all(&root).unwrap();
         let target = root.join("managed.bin");
         let marker = destination_reservation_marker();
+        let other_marker = destination_reservation_marker();
+        assert_ne!(other_marker, marker);
+        std::fs::write(&target, other_marker.as_bytes()).unwrap();
+        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Completed);
+        assert_eq!(std::fs::read(&target).unwrap(), other_marker.as_bytes());
         std::fs::write(&target, marker.as_bytes()).unwrap();
         assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Retry);
         assert!(!target.exists());

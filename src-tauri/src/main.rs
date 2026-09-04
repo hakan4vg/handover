@@ -1191,7 +1191,22 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     let response_mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string);
     if media::is_manifest_source(&source, response_mime.as_deref()) {
         if !transfer_can_continue(&app, &id, generation) { return false; }
-        let result = match response.text().await { Ok(body) => { if !transfer_can_continue(&app, &id, generation) { return false; } acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone(), generation).await }, Err(error) => Err(error.to_string()) };
+        let body = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            match client.get(&source).send().await {
+                Ok(full) if full.status().is_success() => full.text().await.map_err(|error| error.to_string()),
+                Ok(full) => Err(format!("Manifest source returned {}", full.status())),
+                Err(error) => Err(error.to_string()),
+            }
+        } else {
+            response.text().await.map_err(|error| error.to_string())
+        };
+        let result = match body {
+            Ok(body) => {
+                if !transfer_can_continue(&app, &id, generation) { return false; }
+                acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone(), generation).await
+            }
+            Err(error) => Err(error),
+        };
         if let Err(error) = result {
             if !transfer_is_current(&app, &id, generation) { return false; }
             if job_state(&app, &id).as_deref() == Some("paused") {

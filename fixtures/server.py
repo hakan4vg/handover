@@ -197,6 +197,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/hls/master.m3u8":
             body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nvod.m3u8\n"
             return self._send_bytes(body.encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/hls/ranged-vod.m3u8":
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:0"]
+            for i in range(SEG_TS_COUNT):
+                lines += ["#EXTINF:2.0,", f"seg{i}.ts"]
+            lines.append("#EXT-X-ENDLIST")
+            body = ("\n".join(lines) + "\n").encode()
+            range_header = self.headers.get("Range")
+            if range_header:
+                parsed = parse_range(range_header, len(body))
+                if parsed is None:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{len(body)}")
+                    self.end_headers()
+                    return
+                start, end = parsed
+                return self._send_bytes(body[start:end + 1], 206, {"Content-Type": "application/vnd.apple.mpegurl", "Content-Range": f"bytes {start}-{end}/{len(body)}", "Accept-Ranges": "bytes"})
+            return self._send_bytes(body, 200, {"Content-Type": "application/vnd.apple.mpegurl", "Accept-Ranges": "bytes"})
         if path == "/hls/vod.m3u8":
             lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:0"]
             for i in range(SEG_TS_COUNT):

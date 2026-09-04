@@ -1151,3 +1151,20 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Rust suite: 36/36. `git diff --check` clean. Only this comparison and its
   test are mine; the sibling's two `wait_for_transfer_idle` hunks remain
   unstaged in `src-tauri/src/main.rs`.
+
+## 2026-09-04 — Ranged manifest probe now fetches the full manifest
+
+- A real fixture probe reproduced a valid finite HLS playlist failing when the
+  server honored the initial `Range: bytes=0-0` request. The parser was given
+  that one-byte `206` response instead of the complete manifest.
+- `acquire_once` now performs one un-ranged GET for manifest sources when the
+  probe response is partial, checks that recovery response is successful, and
+  parses the full body. Non-manifest range probing remains unchanged.
+- Added `/hls/ranged-vod.m3u8` to the isolated fixture and a
+  `ranged-manifest` acquire-probe mode. Real binary evidence after rebuild:
+  `RANGED-MANIFEST: PASS (18048 bytes after full-manifest recovery)` and byte
+  equality against all six fixture segments. Existing redirect, one-use,
+  bounded-503, and limiter/byte-identity probes also passed.
+- Rust suite: 36/36; frontend/extension suite: 27/27 across 6 files;
+  `npx tsc -b` clean; cargo build and `git diff --check` passed. The sibling's
+  two `wait_for_transfer_idle` hunks remain unstaged in `src-tauri/src/main.rs`.

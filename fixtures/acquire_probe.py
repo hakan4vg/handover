@@ -147,11 +147,30 @@ def retry_mode():
         app.wait(timeout=15)
 
 
+def ranged_manifest_mode():
+    source = "http://127.0.0.1:8902/hls/ranged-vod.m3u8"
+    app = run_capture(source, "ranged-vod.m3u8")
+    try:
+        (job,) = wait_state(("finalizing", "completed"))
+        actual = temp_bytes(job, 6 * 188 * 16)
+        expected = b"".join(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:8902/hls/seg{i}.ts", timeout=30
+            ).read()
+            for i in range(6)
+        )
+        assert actual == expected, "ranged manifest bytes differ from HLS segments"
+        print(f"RANGED-MANIFEST: PASS ({len(actual)} bytes after full-manifest recovery)", flush=True)
+    finally:
+        app.terminate()
+        app.wait(timeout=15)
+
+
 def main():
     shutil.rmtree(HOME, ignore_errors=True)
     os.makedirs(HOME, exist_ok=True)
     print(f"mode={MODE}", flush=True)
-    {"redirect": redirect_mode, "one-use": one_use_mode, "retry-503": retry_mode}[
+    {"redirect": redirect_mode, "one-use": one_use_mode, "retry-503": retry_mode, "ranged-manifest": ranged_manifest_mode}[
         MODE
     ]()
     print("ACQUIRE-PROBE: PASS", flush=True)

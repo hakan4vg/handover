@@ -811,3 +811,39 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   both `.part.track-00` and `.part.track-01` present. The real `cancel_job`
   command then removed the DB row, all job temp artifacts, and the destination
   was never created. Artifact script: `/tmp/dm-mp-e2e-20260904/run_segmented_cancel.py`.
+
+## 2026-09-04 — Generation-aware transfer ownership verified
+
+- Lifecycle audit found that a canceled worker could finish after a replacement
+  transfer claimed the same job id. Persisted state alone could not distinguish
+  the stale worker from the replacement.
+- `TransferRegistry` now assigns a monotonic generation to every owner. The
+  async acquisition chain carries that generation through probe, range,
+  fragment, manifest, throttle, retry, file-write, mux, finalization, and
+  publication boundaries. Stale workers no-op and cannot release a replacement.
+  `abort()` removes the current owner before aborting its future, so a replacement
+  can claim immediately without being cleared by the old worker.
+- Removed obsolete non-generation `claim()`/`release()` wrappers. Lifecycle tests
+  now exercise the generation-aware API directly; the previous dead-code warning
+  is gone.
+- Fresh disposable fixture server on `127.0.0.1:18906` was verified with the
+  range object and DASH manifest. The first range/retry attempt was rejected as
+  evidence because a pre-existing single-instance disposable app forwarded both
+  requests into another HOME. After terminating only that disposable process,
+  isolated reruns passed:
+  - `/tmp/dm-acquire-probe-18906.py`, `DM_MODE=redirect`: `REDIRECT: PASS`,
+    8,388,608 bytes byte-identical through the 302 redirect.
+  - `/tmp/dm-acquire-probe-18906.py`, `DM_MODE=retry-503`: `RETRY-503: PASS`,
+    honest 503 failure after bounded retries with retry events recorded.
+  - `/tmp/run_segmented_cancel-18906.py`: `SEGMENTED_CANCEL: PASS`; the
+    generation-specific DASH job reached `finalizing` at 6/6 segments and
+    87,235 downloaded bytes, then its DB row, `.part.segments`, both track files,
+    and destination were absent after cancellation.
+- Verification after the final lifecycle edits: Rust 31/31; `cargo build
+  --manifest-path src-tauri/Cargo.toml`; JavaScript 17/17; `npm run build:all`;
+  `npx tsc -b`; direct `rustfmt --edition 2021 --check
+  src-tauri/src/lifecycle.rs`; and `git diff --check` all passed. The repository
+  `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` remains
+  non-zero only because existing compact formatting in unrelated `main.rs` and
+  `media.rs` would require a mass reformat; those files were not reformatted.
+  `fixtures/server.py` remains untouched.

@@ -1,6 +1,9 @@
 use futures_util::future::{AbortHandle, AbortRegistration};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 
 pub(crate) fn state_allows_transfer(state: Option<&str>) -> bool {
     matches!(
@@ -9,34 +12,57 @@ pub(crate) fn state_allows_transfer(state: Option<&str>) -> bool {
     )
 }
 
+struct TransferOwner {
+    generation: u64,
+    abort: AbortHandle,
+}
+
 #[derive(Default)]
 pub(crate) struct TransferRegistry {
-    controls: Mutex<HashMap<String, AbortHandle>>,
+    controls: Mutex<HashMap<String, TransferOwner>>,
+    next_generation: AtomicU64,
 }
 
 impl TransferRegistry {
-    pub(crate) fn claim(&self, id: &str) -> Option<AbortRegistration> {
-        let (abort, registration) = AbortHandle::new_pair();
+    pub(crate) fn claim_with_generation(&self, id: &str) -> Option<(u64, AbortRegistration)> {
         let mut controls = self.controls.lock().ok()?;
         if controls.contains_key(id) {
             return None;
         }
-        controls.insert(id.to_string(), abort);
-        Some(registration)
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let (abort, registration) = AbortHandle::new_pair();
+        controls.insert(id.to_string(), TransferOwner { generation, abort });
+        Some((generation, registration))
     }
 
-    pub(crate) fn release(&self, id: &str) {
+    pub(crate) fn release_if_current(&self, id: &str, generation: u64) {
         if let Ok(mut controls) = self.controls.lock() {
-            controls.remove(id);
+            if controls
+                .get(id)
+                .is_some_and(|owner| owner.generation == generation)
+            {
+                controls.remove(id);
+            }
         }
     }
 
     pub(crate) fn abort(&self, id: &str) {
-        if let Ok(controls) = self.controls.lock() {
-            if let Some(control) = controls.get(id) {
-                control.abort();
+        if let Ok(mut controls) = self.controls.lock() {
+            if let Some(owner) = controls.remove(id) {
+                owner.abort.abort();
             }
         }
+    }
+
+    pub(crate) fn is_current(&self, id: &str, generation: u64) -> bool {
+        self.controls
+            .lock()
+            .map(|controls| {
+                controls
+                    .get(id)
+                    .is_some_and(|owner| owner.generation == generation)
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn is_active(&self, id: &str) -> bool {
@@ -57,11 +83,32 @@ mod tests {
     fn transfer_claim_is_exclusive_until_released() {
         let registry = TransferRegistry::default();
 
-        assert!(registry.claim("job-1").is_some());
-        assert!(registry.claim("job-1").is_none());
+        let (generation, _) = registry
+            .claim_with_generation("job-1")
+            .expect("first owner");
+        assert!(registry.claim_with_generation("job-1").is_none());
 
-        registry.release("job-1");
-        assert!(registry.claim("job-1").is_some());
+        registry.release_if_current("job-1", generation);
+        assert!(registry.claim_with_generation("job-1").is_some());
+    }
+
+    #[test]
+    fn stale_owner_cannot_release_replacement() {
+        let registry = TransferRegistry::default();
+        let (first_generation, _) = registry
+            .claim_with_generation("job-1")
+            .expect("first owner");
+        registry.release_if_current("job-1", first_generation);
+        let (second_generation, _) = registry
+            .claim_with_generation("job-1")
+            .expect("replacement owner");
+
+        assert_ne!(first_generation, second_generation);
+        assert!(!registry.is_current("job-1", first_generation));
+        registry.release_if_current("job-1", first_generation);
+        assert!(registry.is_current("job-1", second_generation));
+        registry.release_if_current("job-1", second_generation);
+        assert!(!registry.is_current("job-1", second_generation));
     }
 
     #[test]
@@ -77,7 +124,7 @@ mod tests {
             let winners = std::sync::Arc::clone(&winners);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                if registry.claim("job-1").is_some() {
+                if registry.claim_with_generation("job-1").is_some() {
                     winners.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }));
@@ -93,7 +140,10 @@ mod tests {
     #[test]
     fn aborting_claim_cancels_pending_transfer_and_allows_reclaim() {
         let registry = TransferRegistry::default();
-        let registration = registry.claim("job-1").expect("first owner");
+        let registration = registry
+            .claim_with_generation("job-1")
+            .expect("first owner")
+            .1;
         let mut transfer = Box::pin(futures_util::future::Abortable::new(
             std::future::pending::<()>(),
             registration,
@@ -111,8 +161,7 @@ mod tests {
             Poll::Ready(Err(_))
         ));
 
-        registry.release("job-1");
-        assert!(registry.claim("job-1").is_some());
+        assert!(registry.claim_with_generation("job-1").is_some());
     }
 
     #[test]

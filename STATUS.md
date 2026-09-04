@@ -2140,18 +2140,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   with one `bytes=0-0` request; and `COLLISION-RESERVATION: PASS` with
   distinct output names and hashes.
 
-## 2026-09-04 — Do not reclaim another job's reservation marker
+## 2026-09-04 — Defer foreign reservation tokens instead of false completion
 
-- Startup recovery previously treated every file beginning with
-  `download-manager-reservation-v1:` as the persisted job's marker. A stale
-  job could therefore delete a different job's full reservation token.
-- Recovery now removes the marker only when its bytes exactly match the
-  persisted token, or when the file is a strict byte-prefix of that token and
-  therefore an interrupted write from the same job. A different full token is
-  treated as completed output and is preserved.
-- Extended `destination_reservation_recovery_removes_only_its_marker` with a
-  mismatched-token regression. The old prefix-only predicate failed with
-  `left: Retry, right: Completed`; the corrected predicate passes.
+- Auditing the previous mismatch-token fix found a second semantic risk: returning
+  `Completed` for a different job's reservation token would mark the persisted
+  job complete and discard its resumable temp state.
+- Recovery now returns `Unknown` for a different full reservation token. The
+  marker remains untouched, and startup leaves the job's state and temp data
+  available for safe retry or inspection. Exact markers and strict own-token
+  prefixes still return `Retry` and are reclaimed.
+- The recovery regression now asserts `Unknown` plus preserved bytes for the
+  mismatched token. Before this correction it failed with `left: Completed,
+  right: Unknown`; it now passes.
 - Fresh native verification passed `52/52` tests and Cargo build. The only
   warning remains the protected sibling `wait_for_transfer_idle` helper being
   unused.

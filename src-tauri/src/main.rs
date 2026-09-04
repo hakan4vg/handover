@@ -577,6 +577,7 @@ fn reconcile_destination_reservation(path: &Path, marker: &str, allow_empty_comp
             Ok(()) => DestinationReservationRecovery::Retry,
             Err(_) => DestinationReservationRecovery::Unknown,
         },
+        Ok(bytes) if bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => DestinationReservationRecovery::Unknown,
         Ok(bytes) if bytes.is_empty() && !allow_empty_completed => match std::fs::remove_file(path) {
             Ok(()) => DestinationReservationRecovery::Retry,
             Err(_) => DestinationReservationRecovery::Unknown,
@@ -2645,7 +2646,7 @@ mod capture_tests {
         let other_marker = destination_reservation_marker();
         assert_ne!(other_marker, marker);
         std::fs::write(&target, other_marker.as_bytes()).unwrap();
-        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Completed);
+        assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Unknown);
         assert_eq!(std::fs::read(&target).unwrap(), other_marker.as_bytes());
         std::fs::write(&target, marker.as_bytes()).unwrap();
         assert_eq!(reconcile_destination_reservation(&target, &marker, false), DestinationReservationRecovery::Retry);

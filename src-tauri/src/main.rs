@@ -2286,7 +2286,7 @@ fn main() {
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         let close_to_tray = close_handle.state::<CoreState>().snapshot.lock().map(|snapshot| snapshot.settings.close_behavior == "tray").unwrap_or(true);
-                        if close_to_tray { api.prevent_close(); if let Some(main) = close_handle.get_webview_window("main") { let _ = main.hide(); } }
+                        if close_to_tray { api.prevent_close(); if let Some(main) = close_handle.get_webview_window("main") { let _ = main.hide(); } } else { let exit_handle = close_handle.clone(); tauri::async_runtime::spawn(async move { sleep(Duration::from_millis(100)).await; exit_handle.exit(0); }); }
                     }
                 });
             }

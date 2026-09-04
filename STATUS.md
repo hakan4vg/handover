@@ -2367,3 +2367,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `wait_for_transfer_idle` helper. The successful pause probe log contained
   only the shared-Xvfb accessibility-bus warning and the known
   libayatana-appindicator deprecation warning.
+
+## 2026-09-04 — Verify exit behavior through native window state
+
+- The direct Inspector Tauri getter could not be used: object and primitive
+  command results were serialized as `{}` by this WebKit bridge. The probe
+  therefore seeds the isolated settings row with `closeBehavior=exit` and
+  verifies the rendered Settings `<select>` value instead.
+- JavaScript `current.close()` did not produce a native `CloseRequested` event
+  in this headless runtime. The final probe asserts the manager window is
+  `IsViewable` and sends a real X11 `WM_DELETE_WINDOW` with `xdotool`.
+- The rebuilt product lets the native close complete, then schedules the
+  documented Tauri `AppHandle::exit(0)` request. The resident process
+  terminated and did not exit by `SIGSEGV`:
+  `EXIT-BEHAVIOR: PASS (closeBehavior=exit, resident_exit=1,
+  native_close=WM_DELETE_WINDOW)`.
+- Headless Xvfb/GTK reported `BadDrawable` after the window-close message, so
+  this environment returns exit code `1` despite the process termination. The
+  retained log contained only that GTK warning and the known
+  libayatana-appindicator deprecation warning. This is recorded as a harness
+  limitation, not hidden as a clean exit code.
+- Full native verification after the change passed Rust `54/54`; Cargo build
+  passed. The only Rust warning remains the protected unused sibling helper.

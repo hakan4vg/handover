@@ -1352,3 +1352,13 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   sibling's unused-helper warning), `git diff --check` clean.
 - The sibling's `wait_for_transfer_idle` helper remains unstaged and unmodified
   in `src-tauri/src/main.rs`; this slice stages no sibling hunk.
+
+## 2026-09-04 — One-use URL consumed exactly once via native path
+
+- Minted `http://127.0.0.1:8904/one-use/t1`, created the provisional through the
+  live app's real `create_provisional` command: reached `finalizing 100%
+  (65536 bytes)`. `commit_provisional` completed it (`state=completed,
+  error=None`), output `oneuse.bin` (sha256 `96ba4f57…45f71`).
+- Re-fetching the same token returns `410` — the native acquisition was the
+  sole consumer; nothing re-fetched or duplicated the one-shot transaction.
+- No code change; probe evidence only.

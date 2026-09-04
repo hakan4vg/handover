@@ -732,15 +732,17 @@ async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String
     let result = tokio::task::spawn_blocking(move || Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i", &input, "-map", "0", "-c", "copy", &output]).status()).await.map_err(|error| error.to_string())?;
     match result {
         Ok(status) if status.success() => { tokio::fs::rename(&output_path, temp_path).await.map_err(|error| error.to_string())?; Ok(()) }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ffmpeg_missing_failure()),
         Err(error) => Err(error.to_string()),
         Ok(status) => { let _ = tokio::fs::remove_file(&output_path).await; Err(ffmpeg_remux_failure(&status)) }
     }
 }
 
-// A failed remux must name its cause: the previous generic string discarded
-// ffmpeg's exit status, leaving "Media finalization failed" with no way to
-// tell corrupt input apart from a broken toolchain.
+// A missing remuxer is a finalization failure, not a successful raw-file move.
+fn ffmpeg_missing_failure() -> String {
+    "FFmpeg is required to finalize segmented media; downloaded parts were preserved".into()
+}
+
 fn ffmpeg_remux_failure(status: &std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("Media remux failed (ffmpeg exit {code}); downloaded parts were preserved"),
@@ -2531,6 +2533,7 @@ mod capture_tests {
         let message = ffmpeg_remux_failure(&failed);
         assert!(message.contains("ffmpeg exit 1"), "{message}");
         assert!(message.contains("parts were preserved"), "{message}");
+        assert!(super::ffmpeg_missing_failure().contains("FFmpeg is required"));
     }
     #[test]
     fn settings_patch_rejects_blank_folders() {

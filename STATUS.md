@@ -2211,3 +2211,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   segmented identity invalidation, simultaneous independent captures, and
   progressive MP4 byte preservation. The progressive result was 34524 bytes
   with SHA-256 `c5dba3fa0bbbf13a6c8981b1941f9713dc85bd5fb9522bee98945a0592932c9`.
+
+## 2026-09-04 — Preserve segmented parts when FFmpeg is unavailable
+
+- `finalize_media` previously treated an absent `ffmpeg` executable as success.
+  That could allow unremuxed segmented bytes to move as a completed output.
+- Missing FFmpeg now returns an explicit finalization failure:
+  `FFmpeg is required to finalize segmented media; downloaded parts were preserved`.
+  The existing temporary media file and downloaded parts remain available for
+  retry or diagnosis.
+- Added focused coverage to keep the missing-tool message distinct from a
+  non-zero FFmpeg exit while asserting the parts-preserved contract.
+- Focused remux regression passed. The complete native suite passed `53/53`,
+  Cargo build passed, Vitest passed with `7` files and `31/31` tests, TypeScript
+  compilation passed, and both frontend and extension builds passed.
+- Fresh real-binary probes passed: HLS fMP4 alternate-audio finalization
+  (`ready=6/6`, video plus audio, 86836 bytes, SHA-256
+  `b69a17e4dad7e0b7e664b8e31dffbdd92268c3ec57532c87584e500678bbcbf0`) and
+  startup finalizing recovery with one manifest request and the same hash.
+- Two later isolated HLS retries exited `-11` before Inspector readiness. Their
+  application logs contained only the existing libayatana-appindicator
+  deprecation warning and no product error. The independent startup-finalizing
+  rerun passed; the earlier retained HLS pass remains the media-path evidence.

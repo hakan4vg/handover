@@ -1744,3 +1744,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Only `fixtures/startup_identity_probe.py` and this status entry belong in
   this slice. The sibling `wait_for_transfer_idle` hunk remains untouched and
   must not be staged.
+
+## 2026-09-04 — Incompatible capture does not consume a reattach target
+
+- Completed the remaining targeted §8.9 bridge safety check with
+  `fixtures/reattach_scope_probe.py`. A committed target was explicitly armed
+  through real WebKit/Tauri IPC, then an unrelated path was sent through the
+  real single-instance `--capture` path.
+- The unrelated capture created its own provisional row and failed independently
+  after exactly two bounded requests (`Range: bytes=0-0` and an unbounded
+  fallback), both HTTP 404. The selected target stayed `pending`, retained its
+  original `/changed.bin` source, and remained the only row with its target ID.
+- A subsequent renewed query for the target path reattached that same job. It
+  completed with the expected validator probe plus missing-range fetch, output
+  SHA-256 `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87`,
+  and no duplicate target row.
+- Command `python3 -m py_compile fixtures/reattach_scope_probe.py &&
+  python3 fixtures/reattach_scope_probe.py` exited `0` with
+  `REATTACH-INCOMPATIBLE-ISOLATED: PASS` and
+  `REATTACH-COMPATIBLE-AFTERWARD: PASS`. No production source change was
+  needed; the existing one-shot target restoration behaves as intended.
+- This closes the targeted reattach lifecycle cases covered by §8.9: explicit
+  one-job selection, compatible query renewal, validator-change restart, and
+  isolation of incompatible captures. The next audit should move to adjacent
+  resource-identity/duplicate-transfer behavior rather than reattach itself.
+- Only `fixtures/reattach_scope_probe.py` and this status entry belong in this
+  slice. The sibling `wait_for_transfer_idle` hunk remains untouched and must
+  not be staged.

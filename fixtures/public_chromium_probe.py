@@ -111,8 +111,13 @@ def wait_chrome(port: int, timeout: float = 30.0) -> None:
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as response:
-                if json.load(response).get("webSocketDebuggerUrl"):
-                    return
+                if not json.load(response).get("webSocketDebuggerUrl"):
+                    raise RuntimeError("Chromium version endpoint has no websocket")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as response:
+                targets = json.load(response)
+            if any(item.get("type") == "page" and item.get("webSocketDebuggerUrl") for item in targets):
+                return
+            last = RuntimeError(f"Chromium has no page target yet: {targets}")
         except Exception as error:
             last = error
         time.sleep(0.2)
@@ -138,15 +143,19 @@ def extension_diagnostic(port: int, timeout: float = 15.0) -> dict:
     deadline = time.time() + timeout
     targets: list[dict] = []
     worker = None
+    last_error = None
     while time.time() < deadline:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=10) as response:
-            targets = json.load(response)
-        worker = next((item for item in targets if item.get("type") == "service_worker" and item.get("url", "").endswith("/background.js")), None)
-        if worker is not None:
-            break
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as response:
+                targets = json.load(response)
+            worker = next((item for item in targets if item.get("type") == "service_worker" and item.get("url", "").endswith("/background.js")), None)
+            if worker is not None:
+                break
+        except Exception as error:
+            last_error = repr(error)
         time.sleep(0.2)
     if worker is None:
-        return {"error": "background service worker target missing", "workers": [item.get("url") for item in targets if item.get("type") == "service_worker"]}
+        return {"error": "background service worker target missing", "workers": [item.get("url") for item in targets if item.get("type") == "service_worker"], "last_error": last_error}
     path = worker["webSocketDebuggerUrl"].split(f"127.0.0.1:{port}", 1)[1]
     client = cdp_drive.CDP(cdp_drive.ws_connect(port, path))
     client.call("Runtime.enable")

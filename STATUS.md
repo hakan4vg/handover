@@ -2668,3 +2668,33 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `npx tsc -b`, `npm run build:all`, Python compilation, and the real range
   fallback probe. The only Rust warning is the pre-existing protected sibling
   `wait_for_transfer_idle` helper. No public Chromium PASS is claimed here.
+
+## 2026-09-05 — Prove real Video.js public-player initiation
+
+- The public Chromium harness now waits for both `/json/version` and `/json/list`
+  to expose a page target before opening the service-worker target. Its
+  `/json/list` polling tolerates transient connection refusal and reports the
+  final error if the browser really dies. This fixes the prior startup race;
+  no product behavior was changed by the CDP repair.
+- Added `fixtures/public_videojs_chromium_probe.py` against the official
+  Video.js demo page `https://videojs.github.io/video.js/`. A fresh Chromium
+  profile loaded the real player, which reported `readyState=4`, `paused=false`,
+  duration `46.613333`, and source `https://vjs.zencdn.net/v/oceans.mp4`.
+  The extension's real media button was visible and activated through trusted
+  CDP mouse input.
+- The native host created exactly one media job from the browser-observed source.
+  Resident `--commit` returned exit `0`; the job became `completed` with
+  `provisional=false`. Browser-context fetch plus Web Crypto recorded
+  `23014356` bytes and SHA-256
+  `9f8f979374969429263495ffcaac832cd603b1efe4c66a05fafd6729dffef9af`.
+  The managed native output had the same size and hash. Chromium's Downloads
+  directory remained empty.
+- Retained output:
+  `VIDEOJS-CHROMIUM: PASS (page=https://videojs.github.io/video.js/,
+  source=https://vjs.zencdn.net/v/oceans.mp4, output_bytes=23014356,
+  output_sha256=9f8f979374969429263495ffcaac832cd603b1efe4c66a05fafd6729dffef9af,
+  traffic=1, jobs=1, browser_downloads=[])` and
+  `VIDEOJS-CHROMIUM-PROBE: PASS`.
+- Verification for this slice passed Python compilation, the repaired fresh
+  Chromium E2E, and `git diff --check`. The known Inspector limitation remains
+  `Target.getTargets -> -32601`; the probe uses the resident `--commit` control.

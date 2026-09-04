@@ -2303,3 +2303,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   was empty. No product error was observed.
 - The probe disables Python bytecode generation so shared fixture imports do
   not leave disposable `fixtures/__pycache__` files in the worktree.
+
+## 2026-09-04 — Prove close-to-tray keeps the resident transfer alive
+
+- Added `fixtures/close_to_tray_probe.py` for SPEC §19.1. It starts the real
+  application with a fresh HOME, forwards a capture through a second process,
+  and uses the actual manager Close button while the transfer is active.
+- The probe first observed a non-zero `downloading` job, then clicked
+  `button[aria-label="Close"]`. The native window was subsequently reported
+  by `xwininfo` as `Map State: IsUnMapped` while the resident PID remained
+  alive and `/proc` still reported exactly one product process.
+- The same provisional job continued to `finalizing` with all 67108864 bytes
+  downloaded. The local slow source observed exactly one request, so closing
+  the manager did not cancel or duplicate the transfer.
+- Real probe output:
+  `CLOSE-TO-TRAY-DIAGNOSTIC: plugin_is_visible={}; manager_id=0x200003; Map State: IsUnMapped`
+  and
+  `CLOSE-TO-TRAY: PASS (main_visible={}, resident_pid=2395598, processes=1, state=finalizing, bytes=67108864, source_requests=1)`.
+- The raw Inspector `is_visible` getter returned `{}` through this direct
+  bridge, so the probe uses the native X11 map state as the visibility proof.
+  The resident log contained only the known libayatana-appindicator
+  deprecation warning and no product error.

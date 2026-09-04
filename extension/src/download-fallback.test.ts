@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
-import { restoreBrowserDownload } from './download-fallback';
+import { captureNeedsBrowserRestore, restoreBrowserDownload } from './download-fallback';
 
 describe('restoreBrowserDownload', () => {
   it('replays the prevented anchor as a browser download', () => {
@@ -23,5 +23,15 @@ describe('restoreBrowserDownload', () => {
     }]);
     expect(document.querySelector('[data-dm-browser-fallback]')).toBeNull();
     click.mockRestore();
+  });
+});
+
+describe('captureNeedsBrowserRestore', () => {
+  it('restores only when the worker did not report success', () => {
+    expect(captureNeedsBrowserRestore({ ok: true })).toBe(false);
+    expect(captureNeedsBrowserRestore({ ok: false, error: 'native host and browser fallback unavailable' })).toBe(true);
+    expect(captureNeedsBrowserRestore({})).toBe(true);
+    expect(captureNeedsBrowserRestore(null)).toBe(true);
+    expect(captureNeedsBrowserRestore(undefined)).toBe(true);
   });
 });

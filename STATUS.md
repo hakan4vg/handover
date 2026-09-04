@@ -1283,3 +1283,23 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `wait_for_transfer_idle` helper.
 - The sibling's 16-line `wait_for_transfer_idle` change remains unstaged and
   unmodified in `src-tauri/src/main.rs`; this slice stages no sibling hunk.
+
+## 2026-09-04 — Ordinary capture restores the browser download on ok:false
+
+- Audit found `content.ts` preventDefaulted the explicit `<a download>` click,
+  then only restored the browser download when `sendMessage` rejected. A
+  background reply of `{ok:false}` (native unreachable and its own
+  downloads-API fallback failed) resolved successfully, so the user download
+  silently disappeared after interception.
+- Added pure `captureNeedsBrowserRestore` in `download-fallback.ts`: any answer
+  other than explicit `{ok:true}` requires the synthetic-anchor replay. The
+  click path now checks the reply in `.then` as well as `.catch`; background
+  answers `ok:false` only after its own fallback failed, so the anchor replay
+  is a last resort via a different mechanism, not a duplicate. The fallback
+  marker still prevents recursion.
+- Regression evidence: focused `download-fallback` Vitest `2/2`; full
+  frontend/extension suite `31/31`; `npx tsc -b` clean; native Rust suite
+  `43/43`; `npm run build:all` passed (app + extension, incl. `content.js`
+  4.82 kB); `git diff --check` passed.
+- The sibling's `wait_for_transfer_idle` helper remains unstaged and unmodified
+  in `src-tauri/src/main.rs`; this slice stages no sibling hunk.

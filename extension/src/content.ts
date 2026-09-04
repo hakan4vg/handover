@@ -1,4 +1,4 @@
-import { restoreBrowserDownload } from './download-fallback';
+import { captureNeedsBrowserRestore, restoreBrowserDownload } from './download-fallback';
 
 // Local copies (not imported): MV3 content scripts must be classic scripts,
 // so they cannot share an ES module chunk with the service worker.
@@ -61,15 +61,20 @@ function interceptDownloadClick(event: MouseEvent): void {
   if (!isHttp(source)) return;
   event.preventDefault();
   event.stopImmediatePropagation();
+  const name = cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source);
   void chrome.runtime.sendMessage({
     type: 'ordinary-capture',
     payload: {
       source,
-      name: cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source),
+      name,
       pageUrl: window.location.href,
     },
+  }).then((response) => {
+    // Background answers ok:false only after its own downloads-API fallback
+    // failed; the synthetic anchor is the last resort, not a duplicate.
+    if (captureNeedsBrowserRestore(response)) restoreBrowserDownload(source, name);
   }).catch(() => {
-    restoreBrowserDownload(source, cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source));
+    restoreBrowserDownload(source, name);
   });
 }
 

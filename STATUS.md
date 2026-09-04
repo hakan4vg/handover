@@ -847,3 +847,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   non-zero only because existing compact formatting in unrelated `main.rs` and
   `media.rs` would require a mass reformat; those files were not reformatted.
   `fixtures/server.py` remains untouched.
+
+## 2026-09-04 — Post-await ownership guard hardening
+
+- A follow-up lifecycle audit found filesystem await boundaries that could still
+  perform another write, destination move, or cleanup before checking whether the
+  worker's generation remained current. Added generation gates after range-file
+  setup/initialization, segmented identity reset and directory discovery, media
+  assembly, and single-stream destination preparation and handoff.
+- The first rerun of range/retry while the fresh WebKit instance was alive was
+  rejected as evidence because the application's single-instance forwarding left
+  those probe HOMEs empty. After stopping only that disposable instance, both
+  isolated reruns passed against the rebuilt binary:
+  - `DM_MODE=redirect`: 8,388,608 bytes byte-identical through the 302 redirect.
+  - `DM_MODE=retry-503`: honest 503 failure after five bounded retries, with
+    retry events persisted in the job record.
+- A fresh isolated WebKit cancellation run passed again with job
+  `provisional-e58a2345-a59d-445a-835c-f6c27830fecb`: `finalizing`, 6/6 segments,
+  87,235 downloaded bytes, then no DB row, no `.part.segments`, no track files,
+  and no destination output.
+- Verification before this follow-up commit: `cargo test
+  --manifest-path src-tauri/Cargo.toml` 31/31; `cargo build
+  --manifest-path src-tauri/Cargo.toml`; `git diff --check`; direct rustfmt check
+  for `src-tauri/src/lifecycle.rs`. `fixtures/server.py` remains untouched.

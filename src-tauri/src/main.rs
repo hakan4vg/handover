@@ -826,25 +826,34 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     if first.len() != 1 { return Err("The range probe returned an unexpected payload".into()); }
     let Some(parent) = PathBuf::from(&temp_path).parent().map(PathBuf::from) else { return Err("Temporary path is invalid".into()); };
     tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
+    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     let existing = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.resource_identity.clone(), job.completed_ranges.clone())));
     let mut completed_ranges = existing.as_ref().filter(|(stored_identity, ranges)| identities_match(stored_identity.as_ref(), &identity) && !ranges.is_empty()).map(|(_, ranges)| ranges.iter().filter(|range| range.start <= range.end && range.end < total).cloned().collect::<Vec<_>>()).unwrap_or_default();
     completed_ranges = completed_ranges.into_iter().fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
     let mut can_resume = !completed_ranges.is_empty() && tokio::fs::metadata(&temp_path).await.map(|metadata| metadata.len() == total).unwrap_or(false);
+    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     if can_resume {
         let mut existing_file = File::open(&temp_path).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let mut existing_first = [0u8; 1];
         can_resume = existing_file.read_exact(&mut existing_first).await.is_ok() && existing_first[0] == first[0];
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     }
     if !can_resume {
         completed_ranges = vec![ByteRange { start: 0, end: 0 }];
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let mut initial = File::create(&temp_path).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         initial.write_all(&first).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         initial.set_len(total).await.map_err(|error| error.to_string())?;
     } else if !completed_ranges.iter().any(|range| range.start == 0) {
         let mut initial = OpenOptions::new().write(true).open(&temp_path).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         initial.seek(SeekFrom::Start(0)).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         initial.write_all(&first).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         completed_ranges = merge_range(&completed_ranges, ByteRange { start: 0, end: 0 });
     }
     let ranges = missing_ranges(total, &completed_ranges, max_connections);
@@ -901,7 +910,19 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
     }
     let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    if committed.0 && !committed.1.is_empty() { if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = tokio::fs::create_dir_all(parent).await; } if replace_existing { let _ = tokio::fs::remove_file(&committed.1).await; } move_completed_file(&temp_path, &committed.1).await?; }
+    if committed.0 && !committed.1.is_empty() {
+        if let Some(parent) = PathBuf::from(&committed.1).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        }
+        if replace_existing {
+            let _ = tokio::fs::remove_file(&committed.1).await;
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        }
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        move_completed_file(&temp_path, &committed.1).await?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+    }
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
     emit_snapshot(&app, &state);
@@ -986,18 +1007,24 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     let identity = segment_identity(&tracks);
     if stored_identity.as_deref() != Some(identity.as_str()) {
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         cleanup_media_track_files(&temp_path);
     }
     tokio::fs::create_dir_all(&segment_dir).await.map_err(|error| error.to_string())?;
+    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     let total_segments = total_segments as u32;
     let concurrency = max_connections.clamp(1, total_segments) as usize;
     let mut existing_segments: Vec<(usize, usize)> = Vec::new();
     let mut existing_bytes = 0u64;
     for (track, length) in track_lengths.iter().enumerate() {
-        if track_count > 1 { tokio::fs::create_dir_all(segment_dir.join(format!("{track:02}"))).await.map_err(|error| error.to_string())?; }
+        if track_count > 1 {
+            tokio::fs::create_dir_all(segment_dir.join(format!("{track:02}"))).await.map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        }
         for index in 0..*length {
             let path = manifest_segment_path(&segment_dir, track, index, track_count);
             if let Ok(metadata) = tokio::fs::metadata(path).await {
+                if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
                 if metadata.is_file() && metadata.len() > 0 { existing_segments.push((track, index)); existing_bytes = existing_bytes.saturating_add(metadata.len()); }
             }
         }
@@ -1093,10 +1120,19 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
             temp_path.clone()
         };
-        if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = tokio::fs::create_dir_all(parent).await; }
-        if replace_existing { let _ = tokio::fs::remove_file(&committed.1).await; }
+        if let Some(parent) = PathBuf::from(&committed.1).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        }
+        if replace_existing {
+            let _ = tokio::fs::remove_file(&committed.1).await;
+            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        }
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         move_completed_file(&final_path, &committed.1).await?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         cleanup_media_track_files(&temp_path);
     }
     emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event(if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" }, Some("warning"))); } });
@@ -1201,8 +1237,15 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     let replace_existing = state.snapshot.lock().ok().map(|snapshot| snapshot.settings.collision_behavior == "replace").unwrap_or(false);
     let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() {
-        if let Some(parent) = PathBuf::from(&committed.1).parent() { let _ = std::fs::create_dir_all(parent); }
-        if replace_existing { let _ = std::fs::remove_file(&committed.1); }
+        if let Some(parent) = PathBuf::from(&committed.1).parent() {
+            let _ = std::fs::create_dir_all(parent);
+            if !transfer_can_continue(&app, &id, generation) { return false; }
+        }
+        if replace_existing {
+            let _ = std::fs::remove_file(&committed.1);
+            if !transfer_can_continue(&app, &id, generation) { return false; }
+        }
+        if !transfer_can_continue(&app, &id, generation) { return false; }
         if let Err(error) = move_completed_file(&temp_path, &committed.1).await {
             if !transfer_can_continue(&app, &id, generation) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_POLICY, isHttp, mediaSourceFromValues, siteOf } from './shared';
+import { DEFAULT_POLICY, isHttp, mediaSourceFromValues, siteOf, siteOfDocument } from './shared';
 import {
   chooseMediaCandidate,
   chooseMediaSelection,
@@ -44,6 +44,14 @@ describe('siteOf', () => {
     expect(siteOf('')).toBe('');
     expect(siteOf('not a url')).toBe('');
     expect(siteOf('blob:https://x.test/abc')).toBe('');
+  });
+});
+
+describe('siteOfDocument', () => {
+  it('uses the document URL first and the parent referrer for opaque frames', () => {
+    expect(siteOfDocument('https://child.example.test/player', 'https://parent.example.test/page')).toBe('child.example.test');
+    expect(siteOfDocument('about:blank', 'https://www.Parent.EXAMPLE.test/page')).toBe('parent.example.test');
+    expect(siteOfDocument('blob:https://child.example.test/id', 'https://parent.example.test/page')).toBe('parent.example.test');
   });
 });
 

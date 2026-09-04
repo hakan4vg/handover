@@ -12,6 +12,10 @@ function siteOf(url: string): string {
   }
 }
 
+function siteOfDocument(url: string, referrer: string): string {
+  return siteOf(url) || siteOf(referrer);
+}
+
 function isHttp(url: string): boolean {
   try {
     const scheme = new URL(url).protocol;
@@ -120,7 +124,7 @@ async function refreshPolicy(): Promise<void> {
 
 function active(): boolean {
   if (!policy?.showMediaButtons) return false;
-  const site = siteOf(window.location.href);
+  const site = siteOfDocument(window.location.href, document.referrer);
   return !!site && !policy.excludedSites.includes(site);
 }
 

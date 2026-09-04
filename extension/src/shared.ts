@@ -20,6 +20,10 @@ export function siteOf(url: string): string {
   }
 }
 
+export function siteOfDocument(url: string, referrer: string): string {
+  return siteOf(url) || siteOf(referrer);
+}
+
 export function mediaSourceFromValues(
   currentSrc: string | null | undefined,
   elementSrc: string | null | undefined,

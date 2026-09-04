@@ -2731,3 +2731,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verification for this public slice passed Python compilation and the real
   fresh-profile Chromium/native E2E. The known appindicator deprecation warning
   was the only resident log warning; no product error was recorded.
+
+## 2026-09-05 — About:blank frame policy fallback (W3Schools blocker)
+
+- Chrome's content-script documentation confirms that `all_frames` covers matching
+  frames, while `match_about_blank`/`match_origin_as_fallback` are needed for
+  `about:`/opaque child documents. MDN documents that an iframe's
+  `Document.referrer` is initially the parent window URL (full URL for
+  same-origin frames, parent origin by default cross-origin).
+- Added the pure `siteOfDocument(url, referrer)` helper and a focused regression:
+  an ordinary child URL wins, `about:blank` falls back to the parent referrer,
+  and `www` normalization remains unchanged for policy exclusions. Mirrored the
+  helper in the classic content script and changed only `active()` to use it.
+- The focused extension regression passed `18/18`; `npm run build:extension`
+  rebuilt `extension/dist` successfully. The manifest worktree change retains
+  HTTP/HTTPS matching, `all_frames`, `match_about_blank`, and
+  `match_origin_as_fallback` for the opaque-frame path.
+- Fresh-profile command:
+  `timeout 360s python3 fixtures/public_w3_iframe_audio_chromium_probe.py`
+  exited `1`. Chromium reached
+  `https://www.w3schools.com/html/tryit.asp?filename=tryhtml5_audio_all` and
+  observed the real nested player source
+  `https://www.w3schools.com/html/horse.ogg`, `readyState=4`, `paused=false`,
+  duration `1.515102`, and child media geometry `300x54`. The result frame's
+  top-document geometry was `top=62`, `bottom=62`, `height=0`; the probe saw
+  `button=false`, `buttonRect=null`, and no trusted button click/native job.
+  The second `about:blank` frame was an unrelated `data:` MP4 ad. This is a
+  concrete public-page layout/injection limitation, not evidence of a completed
+  browser/native capture, so no size/hash/job PASS is claimed.
+- The protected Rust `wait_for_transfer_idle` sibling hunk remains untouched.

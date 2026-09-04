@@ -2603,3 +2603,33 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Rust verification passed `57/57`; focused extension verification passed
   `14/14`; `npm run build:extension` and `npx tsc -b` passed. The only Rust
   warning remains the protected sibling `wait_for_transfer_idle` helper.
+
+## 2026-09-04 — Prove ordinary plain-link download fallback
+
+- Added `fixtures/ordinary_download_chromium_probe.py` against the official
+  GitHub `octocat/Hello-World` repository archive
+  `https://github.com/octocat/Hello-World/archive/refs/heads/master.zip`.
+  Header validation confirmed the redirect to `codeload.github.com` and
+  `Content-Disposition: attachment; filename=Hello-World-master.zip`.
+- In a fresh Chromium profile, the probe injected a plain `<a>` with no
+  `download` attribute and clicked it through CDP input. The event was not
+  pre-browser intercepted; Chromium completed download id `1` with
+  `bytesReceived=351`, `error=null`, final URL
+  `https://codeload.github.com/octocat/Hello-World/zip/refs/heads/master`,
+  and SHA-256
+  `acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233`.
+- The observe-only `downloads.onCreated` fallback created exactly one native
+  provisional job from the final URL. After resident `--commit`, it completed
+  one managed output with the same `351` bytes and the same SHA-256. Final
+  output:
+  `ORDINARY-DOWNLOAD: PASS (browser_bytes=351,
+  sha256=acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233,
+  native_bytes=351,
+  native_sha256=acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233,
+  browser_state=complete, jobs=1)` and `ORDINARY-DOWNLOAD-PROBE: PASS`.
+- This proves the least-destructive fallback: the browser download is never
+  cancelled, the native copy is independently managed, and both copies are
+  byte-identical. The current event timing exposes the browser's interim URL
+  basename (`master`) before its final Content-Disposition filename is known;
+  the probe deliberately chooses `ordinary-fallback.zip` at commit and records
+  this filename handoff as a remaining UX refinement, not a data-loss defect.

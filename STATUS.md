@@ -883,3 +883,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Full suite on the same worktree: Rust 31/31, vitest 17/17, `tsc -b`
   clean. No repo edits in this check; the `main.rs` working change was left
   untouched. `fixtures/server.py` untouched.
+
+## 2026-09-04 — Per-key live settings patches (no more all-or-nothing)
+
+- `update_settings` had the same flaw boot recovery once had: it merged the
+  whole patch, then a single `from_value` decided everything. One mistyped
+  value in a multi-key patch (e.g. a float `bandwidthLimit` next to a valid
+  `maxConnections`) silently discarded the good keys too.
+- Fix: extracted `apply_settings_patch` (per-key keep-if-parses, unknown keys
+  ignored, non-object patch = no-op). `settings_from_stored` now delegates to
+  it, so boot recovery and live patches share one routine. TDD: new test
+  `settings_patch_keeps_good_keys_when_one_key_is_bad` failed first (E0432,
+  fn did not exist), then passed after the refactor.
+- Suite: Rust 32/32 (incl. pre-existing `settings_fallbacks_stay_sane`,
+  which now covers the shared routine), build clean, no new warnings.
+- Commit hygiene: the file also holds the sibling session's uncommitted
+  `wait_for_transfer_idle` slice (16 lines, commit path). Split-staged only
+  my hunks (`git apply --cached` on a filtered patch); their 16 lines stay
+  uncommitted in the working tree for their session to land.
+- Note: `cargo fmt --check` flags the whole file tree-wide (200+ hunks incl.
+  `media.rs`) — pre-existing style drift from recent sessions, not mine; left
+  alone rather than reformatting under someone else's in-flight change.
+  `fixtures/server.py` untouched.

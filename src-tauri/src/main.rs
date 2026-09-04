@@ -321,17 +321,26 @@ fn settings_policy(settings: &AppSettings) -> BrowserPolicy {
 // to its default. Runs once per boot, so the per-key re-parse cost is trivial.
 fn settings_from_stored(stored: &str) -> AppSettings {
     let defaults = default_settings();
-    let Ok(Value::Object(overlay)) = serde_json::from_str::<Value>(stored) else { return defaults; };
-    let mut current = serde_json::to_value(&defaults).unwrap_or(Value::Null);
-    for (key, value) in overlay {
-        let previous = if let Value::Object(ref mut base) = current { base.insert(key.clone(), value) } else { break; };
-        if serde_json::from_value::<AppSettings>(current.clone()).is_err() {
-            if let Value::Object(ref mut base) = current {
-                if let Some(old) = previous { base.insert(key, old); } else { base.remove(&key); }
+    let Ok(overlay) = serde_json::from_str::<Value>(stored) else { return defaults; };
+    apply_settings_patch(&defaults, &overlay)
+}
+
+// Per-key patch application shared by boot recovery and the live
+// update_settings command: overlay entries onto a base, keeping an entry
+// only if the whole struct still parses. Non-object patches leave the base
+// untouched. One bad value can no longer veto the good keys around it.
+fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
+    let Value::Object(entries) = patch else { return current.clone(); };
+    let mut merged = serde_json::to_value(current).unwrap_or(Value::Null);
+    for (key, value) in entries {
+        let previous = if let Value::Object(ref mut base) = merged { base.insert(key.clone(), value.clone()) } else { break; };
+        if serde_json::from_value::<AppSettings>(merged.clone()).is_err() {
+            if let Value::Object(ref mut base) = merged {
+                if let Some(old) = previous { base.insert(key.clone(), old); } else { base.remove(key); }
             }
         }
     }
-    serde_json::from_value(current).unwrap_or_else(|_| defaults)
+    serde_json::from_value(merged).unwrap_or_else(|_| current.clone())
 }
 
 fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolicy) {
@@ -1471,9 +1480,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
 fn update_settings(app: AppHandle, state: State<'_, CoreState>, patch: Value) {
     if let Ok(mut snapshot) = state.snapshot.lock() {
         if let Value::Object(patch) = patch.get("patch").cloned().unwrap_or(patch) {
-            let mut current = serde_json::to_value(&snapshot.settings).unwrap_or_else(|_| json!({}));
-            if let Value::Object(ref mut object) = current { for (key, value) in patch { object.insert(key, value); } }
-            if let Ok(settings) = serde_json::from_value(current) { snapshot.settings = settings; }
+            snapshot.settings = apply_settings_patch(&snapshot.settings, &Value::Object(patch));
             write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings));
         }
     }
@@ -1822,6 +1829,26 @@ mod capture_tests {
         let parsed = settings_from_stored(&round);
         assert_eq!(parsed.max_connections, defaults.max_connections);
         assert_eq!(parsed.bandwidth_limit, defaults.bandwidth_limit);
+    }
+
+    #[test]
+    fn settings_patch_keeps_good_keys_when_one_key_is_bad() {
+        use super::{apply_settings_patch, default_settings};
+        let current = default_settings();
+        // A float limit is rejected by the u64 schema, but maxConnections
+        // in the same patch must still apply.
+        let patch = serde_json::json!({"maxConnections": 4, "bandwidthLimit": 1.5});
+        let next = apply_settings_patch(&current, &patch);
+        assert_eq!(next.max_connections, 4);
+        assert_eq!(next.bandwidth_limit, None);
+        // Clean patches apply fully; unknown future keys are ignored.
+        let patch = serde_json::json!({"maxRetries": 3, "unknownFutureKey": true});
+        let next = apply_settings_patch(&current, &patch);
+        assert_eq!(next.max_connections, current.max_connections);
+        assert_eq!(next.max_retries, 3);
+        // Non-object patches leave settings untouched.
+        let next = apply_settings_patch(&current, &serde_json::json!("nope"));
+        assert_eq!(next.max_connections, current.max_connections);
     }
 
     fn ranges(pairs: &[(u64, u64)]) -> Vec<super::ByteRange> {

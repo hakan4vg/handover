@@ -2389,3 +2389,42 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   limitation, not hidden as a clean exit code.
 - Full native verification after the change passed Rust `54/54`; Cargo build
   passed. The only Rust warning remains the protected unused sibling helper.
+
+## 2026-09-04 — Prove real Chromium public-site capture paths
+
+- Headless Chrome for Testing 149 uses a custom-profile native-host lookup that
+  was not covered by the old fixture manifest placement. The probe initially
+  reported `Specified native messaging host not found`; writing the manifest
+  into the profile's `NativeMessagingHosts` directory and isolating
+  `XDG_CONFIG_HOME` fixed the test boundary. Product registration now also
+  includes `google-chrome-for-testing`, matching Chrome's documented user-level
+  directory.
+- The service-worker diagnostic proved the intended MV3 worker was loaded:
+  `chrome-extension://mogdhelapdlmkfgeeaogeehnlclhcnkn/background.js`,
+  `dm-policy={interceptDownloads:true,showMediaButtons:true,excludedSites:[]}`,
+  and native `lastError=null` with `{ok:true}`. The first `button=false` gate
+  was the fixture: it played the first W3Schools video after moving the page to
+  a non-scrollable/off-viewport position. The fixture now drives the visible
+  top-frame player without changing the product visibility rule. MDN's compact
+  example was rejected as a coverage target because its player is inside an
+  iframe and the manifest intentionally does not inject into all frames.
+- The WebKit Inspector could not provide app control in this environment:
+  `Target.getTargets` returned `-32601`, `"'Target.getTargets' was not found"`.
+  The probe records this limitation once and uses a different path: the
+  resident application's single-instance `--commit` control, which calls the
+  same `commit_provisional` implementation. Added parser coverage for that
+  control; the focused test passed.
+- Added and ran `fixtures/public_chromium_probe.py` with a fresh Chrome
+  profile/HOME, the built extension, the real native host, the real binary, and
+  the public W3Schools player. The real media-button capture and explicit
+  generated `<a download>` capture each created one job, were committed through
+  the resident CLI, reached `state=completed` with `provisional=false`, and
+  matched browser-side byte/hash references: `media_bytes=788493`,
+  `anchor_bytes=788493`. Final output:
+  `PUBLIC-CHROMIUM: PASS (page=https://www.w3schools.com/html/html5_video.asp,
+  media_source=https://www.w3schools.com/html/mov_bbb.mp4, media_bytes=788493,
+  anchor_source=https://www.w3schools.com/html/mov_bbb.mp4?dm_public_anchor=1,
+  anchor_bytes=788493, jobs=2, browser_downloads=[])`.
+- Plain Python reference fetching was rejected by W3Schools with HTTP 403; the
+  fixture now uses same-page `fetch()` plus Web Crypto SHA-256 so the reference
+  uses browser-equivalent headers and creates no download.

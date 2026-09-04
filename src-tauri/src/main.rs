@@ -217,6 +217,12 @@ fn sync_startup(enabled: bool) {
     let _ = enabled;
 }
 
+fn native_host_browser_directories() -> &'static [&'static str] {
+    // Chrome for Testing uses its own user-level directory from Chrome 146;
+    // keep the ordinary Chromium-family directories registered as well.
+    &["google-chrome", "google-chrome-for-testing", "chromium", "microsoft-edge", "vivaldi"]
+}
+
 fn register_native_host(root: &Path) {
     let Ok(executable) = std::env::current_exe() else { return; };
     let _ = std::fs::create_dir_all(root);
@@ -254,7 +260,7 @@ fn register_native_host(root: &Path) {
         let Ok(contents) = serde_json::to_string_pretty(&manifest) else { return; };
         let _ = std::fs::write(root.join("com.downloadmanager.host.json"), &contents);
         let config = home_dir().join(".config");
-        for browser in ["google-chrome", "chromium", "microsoft-edge", "vivaldi"] {
+        for browser in native_host_browser_directories() {
             let dir = config.join(browser).join("NativeMessagingHosts");
             if std::fs::create_dir_all(&dir).is_ok() {
                 let _ = std::fs::write(dir.join("com.downloadmanager.host.json"), &contents);
@@ -2152,6 +2158,24 @@ fn policy_from_args(args: &[String]) -> Option<BrowserPolicy> {
     browser_policy_from_value(&serde_json::from_str(raw).ok()?)
 }
 
+fn commit_from_args(args: &[String]) -> Option<(String, CommitInput)> {
+    let index = args.iter().position(|value| value == "--commit")?;
+    let raw = args.get(index + 1)?;
+    let message: Value = serde_json::from_str(raw).ok()?;
+    let payload = message.get("payload").unwrap_or(&message);
+    let id = payload.get("id").and_then(Value::as_str)?.to_string();
+    let input = serde_json::from_value(payload.get("input")?.clone()).ok()?;
+    Some((id, input))
+}
+
+fn spawn_commit(app: AppHandle, id: String, input: CommitInput) {
+    let state_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = state_app.state::<CoreState>();
+        let _ = commit_provisional(app, state, id, input).await;
+    });
+}
+
 fn native_host() {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
@@ -2262,7 +2286,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|value| value == "--native-host") { native_host(); return; }
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| { if let Some(policy) = policy_from_args(&argv) { let state = app.state::<CoreState>(); apply_browser_policy(app, state.inner(), policy); } else if let Some(input) = capture_input_from_args(&argv) { if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); } let state = app.state::<CoreState>(); let _ = start_provisional(app.clone(), state.inner(), input, true); } else if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }))
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| { if let Some(policy) = policy_from_args(&argv) { let state = app.state::<CoreState>(); apply_browser_policy(app, state.inner(), policy); } else if let Some((id, input)) = commit_from_args(&argv) { spawn_commit(app.clone(), id, input); } else if let Some(input) = capture_input_from_args(&argv) { if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); } let state = app.state::<CoreState>(); let _ = start_provisional(app.clone(), state.inner(), input, true); } else if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }))
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let root = app_data_root();
@@ -2294,6 +2318,9 @@ fn main() {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let state = app.state::<CoreState>();
                 apply_browser_policy(app.handle(), state.inner(), policy);
+            } else if let Some((id, input)) = commit_from_args(&std::env::args().collect::<Vec<_>>()) {
+                if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
+                spawn_commit(app.handle().clone(), id, input);
             } else if let Some(input) = capture_input_from_args(&std::env::args().collect::<Vec<_>>()) {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let state = app.state::<CoreState>();
@@ -2313,6 +2340,25 @@ fn main() {
 mod capture_tests {
     use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, source_compatible, tray_status_text};
     use serde_json::json;
+
+    #[test]
+    fn native_host_registration_includes_chrome_for_testing() {
+        let browsers = super::native_host_browser_directories();
+        assert!(browsers.contains(&"google-chrome-for-testing"));
+    }
+
+    #[test]
+    fn commit_args_parse_id_and_input() {
+        let args = vec![
+            "download-manager".to_string(),
+            "--commit".to_string(),
+            serde_json::json!({"id": "provisional-test", "input": {"name": "file.bin", "destination": "/tmp/file.bin"}}).to_string(),
+        ];
+        let (id, input) = super::commit_from_args(&args).expect("valid commit args");
+        assert_eq!(id, "provisional-test");
+        assert_eq!(input.name, "file.bin");
+        assert_eq!(input.destination, "/tmp/file.bin");
+    }
 
     #[test]
     fn cleanup_removes_media_track_artifacts_but_keeps_primary_part() {

@@ -38,7 +38,7 @@ def main() -> int:
     client = None
     try:
         xvfb, display = reattach.start_xvfb()
-        reattach.DISPLAY = display
+        setattr(reattach, "DISPLAY", display)
         reattach.support.DISPLAY = display
         upstream_port = reattach.support.free_port()
         upstream = subprocess.Popen(
@@ -61,15 +61,23 @@ def main() -> int:
         reattach.seed_job(db, home, "http://127.0.0.1:9/unused.bin", "collision-setup", "setup.bin", data_a, '"unused"')
 
         inspector_port = reattach.support.free_port()
+        app_log_path = Path(home) / "app.log"
+        app_log = open(app_log_path, "wb")
         app = subprocess.Popen(
             [reattach.BIN],
             env=reattach.support.app_env(home, inspector_port),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=app_log,
+            stderr=subprocess.STDOUT,
         )
+        app_log.close()
         reattach.wait_db(db)
-        client = reattach.support.wait_inspector(inspector_port)
-        reattach.support.wait_tauri(client)
+        try:
+            client = reattach.support.wait_inspector(inspector_port)
+            reattach.support.wait_tauri(client)
+        except Exception:
+            print(f"APP: poll={app.poll()}", flush=True)
+            print(f"APP-LOG: {app_log_path.read_text(errors='replace')}", flush=True)
+            raise
         for index, source in enumerate(sources, start=1):
             reattach.send_capture(home, source, f"capture-{index}.bin")
         captured = wait_source_jobs(db, sources)

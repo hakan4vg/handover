@@ -554,6 +554,10 @@ fn reserve_collision_destination(path: &str) -> Result<String, String> {
     Err("Could not reserve a unique destination".into())
 }
 
+fn managed_destination(path: &str, replace_existing: bool) -> Result<(String, bool), String> {
+    if replace_existing { Ok((path.to_string(), false)) } else { reserve_collision_destination(path).map(|destination| (destination, true)) }
+}
+
 fn header_string(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
     response.headers().get(name).and_then(|value| value.to_str().ok()).map(str::to_string)
 }
@@ -730,7 +734,7 @@ async fn move_completed_file(source: &str, destination: &str, replace_existing: 
                 }
             }
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => { if reserved { let _ = tokio::fs::remove_file(destination).await; } Err(error.to_string()) },
     }
 }
 
@@ -1041,7 +1045,21 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             let _ = tokio::fs::create_dir_all(parent).await;
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         }
-        move_completed_file(&temp_path, &committed.1, replace_existing, false).await?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        let (destination, reserved) = managed_destination(&committed.1, replace_existing)?;
+        if destination != committed.1 {
+            emit_job(&state, &id, |job| {
+                job.destination = destination.clone();
+                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
+                job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+            });
+            emit_snapshot(&app, &state);
+        }
+        if !transfer_can_continue(&app, &id, generation) {
+            if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            return Ok(());
+        }
+        move_completed_file(&temp_path, &destination, replace_existing, reserved).await?;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     }
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
@@ -1245,7 +1263,21 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
             let _ = tokio::fs::create_dir_all(parent).await;
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         }
-        move_completed_file(&final_path, &committed.1, replace_existing, false).await?;
+        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        let (destination, reserved) = managed_destination(&committed.1, replace_existing)?;
+        if destination != committed.1 {
+            emit_job(&state, &id, |job| {
+                job.destination = destination.clone();
+                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
+                job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+            });
+            emit_snapshot(&app, &state);
+        }
+        if !transfer_can_continue(&app, &id, generation) {
+            if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            return Ok(());
+        }
+        move_completed_file(&final_path, &destination, replace_existing, reserved).await?;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
@@ -1372,7 +1404,29 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             let _ = std::fs::create_dir_all(parent);
             if !transfer_can_continue(&app, &id, generation) { return false; }
         }
-        if let Err(error) = move_completed_file(&temp_path, &committed.1, replace_existing, false).await {
+        if !transfer_can_continue(&app, &id, generation) { return false; }
+        let (destination, reserved) = match managed_destination(&committed.1, replace_existing) {
+            Ok(value) => value,
+            Err(error) => {
+                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Could not reserve a unique destination", Some("error"))); });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+                return false;
+            }
+        };
+        if destination != committed.1 {
+            emit_job(&state, &id, |job| {
+                job.destination = destination.clone();
+                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
+                job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+            });
+            emit_snapshot(&app, &state);
+        }
+        if !transfer_can_continue(&app, &id, generation) {
+            if reserved { let _ = tokio::fs::remove_file(&destination).await; }
+            return false;
+        }
+        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reserved).await {
             if !transfer_can_continue(&app, &id, generation) { return false; }
             emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);

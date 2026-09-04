@@ -1867,3 +1867,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `No such file or directory (os error 2)` and the old bytes remained.
 - Native tests passed `46/46` and Cargo build passed. The only warning remains
   the protected sibling `wait_for_transfer_idle` being unused.
+
+## 2026-09-04 — Automatic finalization reserves managed destinations
+
+- Re-audited the collision fix at all three automatic final-move boundaries:
+  ranged objects, segmented media, and single-stream objects. Rename mode now
+  reserves the destination with exclusive `create_new` semantics immediately
+  before the move, while explicit `replace` mode keeps its replacement path.
+  When a reservation changes the path, the persisted job name/destination and
+  warning event are updated before completion.
+- The reservation cleanup path now removes its owned empty destination on an
+  ordinary move error as well as on cancellation. The existing sibling
+  `wait_for_transfer_idle` helper was not staged or changed.
+- Real managed-download probe `python3 fixtures/managed_collision_probe.py`
+  exited `0` with:
+  `MANAGED-RENAME-COLLISION: PASS (job=managed-collision,
+  destination=/tmp/dm-managed-collision-.../home/Downloads/managed (1).bin,
+  sha256=3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87)`.
+  The pre-existing `managed.bin` retained `OLD-MANAGED-DOWNLOAD`, and the
+  completed output at `managed (1).bin` matched the fixture bytes.
+- The concurrent provisional collision probe was rerun after this change and
+  exited `0`: `same.bin` and `same (1).bin` were distinct, with hashes
+  `3f1703cb2b1a99b9b700d46a1d2bdfbec74fd50a2fcee3df1070fa6e53e81f87` and
+  `437838d6112dca73f4bd8d08c2e792c43207e999336d1422faed6a28744af307`.
+  The initial inspector failure was harness-only; the corrected probe uses
+  propagated Xvfb display state and retained application logs.
+- The current full verification passed: Rust `46/46`; Cargo build; Vitest
+  frontend/extension `7` files and `31/31` tests; `npx tsc -b`; and
+  `npm run build:all` (frontend plus extension). The only warning is the
+  protected sibling `wait_for_transfer_idle` helper being unused.
+- The index contains only the owned automatic-finalization changes,
+  `fixtures/collision_commit_probe.py`, `fixtures/managed_collision_probe.py`,
+  and this STATUS entry. `fixtures/__pycache__` remains untracked and
+  unstaged. The next audit should test automatic-finalization failure and
+  cancellation after a destination reservation, especially whether a
+  persisted renamed destination can be safely retried without stale ownership.

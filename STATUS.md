@@ -3798,3 +3798,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `BROWSER-NATIVE-FAILURE-FALLBACK-CHROMIUM-PROBE: PASS`.
 - The protected `src-tauri/src/main.rs` sibling remains unchanged and is not
   included in this slice.
+
+## 2026-09-05 — Ordinary browser download preserved after fallback guard fix
+
+- Re-ran `fixtures/ordinary_download_chromium_probe.py` in a fresh Chromium
+  profile/HOME after commit `eb1d1f6`. The safe public source was GitHub's
+  `octocat/Hello-World` archive, which redirected to the codeload URL.
+- The plain link had no `download` attribute. Chromium created one browser
+  item, `id=1`, `state=complete`, `error=null`, with `351` bytes. The
+  observe-only `downloads.onCreated` path created one native provisional job;
+  resident `--commit` exited `0` and the job ended `completed`,
+  `provisional=false`.
+- Browser and native artifacts were both `351` bytes with the identical
+  SHA-256 `acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233`.
+  The database contained exactly one job. Exact output ended with
+  `ORDINARY-DOWNLOAD: PASS (browser_bytes=351,
+  sha256=acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233,
+  native_bytes=351,
+  native_sha256=acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233,
+  browser_state=complete, jobs=1)` and
+  `ORDINARY-DOWNLOAD-PROBE: PASS`.
+- This is a regression check of the normal browser-owned path, not a new
+  interception policy: the browser copy remains intact while the resident app
+  receives one observe-only capture. The protected Rust sibling remains
+  untouched.

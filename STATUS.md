@@ -2821,6 +2821,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   browser Downloads. No product policy change or candidate fixture rewrite was
   made for this failure.
 
+## 2026-09-05 — Public iframe candidates reconciled (repeatable boundary)
+
+- Re-ran all three existing candidates with the built extension, fresh profiles,
+  fresh native-app HOME directories, and the resident `--commit` path. Every run
+  reached the extension worker but exited `1` before player activation:
+  - MDN: contexts `2` and `4`, both origin `https://developer.mozilla.org`;
+    `Page.getFrameTree` contained only
+    `https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/audio`.
+  - Iframe Tester/Paciello: one context, origin `https://iframe.verekia.com`;
+    only the wrapper URL was in `Page.getFrameTree`.
+  - Sa11y/SoundCloud: one context, origin `https://panzi.github.io`;
+    only `https://panzi.github.io/embedplayer/` was in `Page.getFrameTree`.
+- None exposed the expected child frame, child media element, injected Download
+  button, trusted click, or native job. The extension manifest already requests
+  `all_frames`, `match_about_blank`, and `match_origin_as_fallback`; the worker
+  was present in all runs. This is therefore a public-page loading/embedding or
+  Chromium CDP frame-boundary limitation, not a reachable extension policy or
+  injection defect. No product hardening or policy change was made.
+
 ## 2026-09-05 — Prove native-failure browser download fallback
 
 - Added `fixtures/browser_fallback_chromium_probe.py` for SPEC §5.1.1. The
@@ -2850,3 +2869,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   fallback anchor did not recursively re-enter ordinary interception. No
   product code was changed; the existing fallback unit tests remain the
   relevant code-path regression.
+
+## 2026-09-05 — Prove integration-off leaves Chromium alone
+
+- Added `fixtures/integration_off_chromium_probe.py` for SPEC §§17.1 and 19.2.
+  It uses a fresh Chromium profile and HOME, loads the real extension, changes
+  only the extension's persisted policy through an extension-origin page, and
+  then navigates to a safe local fixture.
+- The worker reported `{interceptDownloads:false, showMediaButtons:true,
+  excludedSites:[]}`. A trusted CDP left-click targeted a visible explicit
+  `<a download>` link. Chromium completed exactly one browser-owned download
+  (id `1`) with `byExtensionId=null`, `bytesReceived=49152`, `error=null`, and
+  one local server request. The downloaded bytes matched the fixture at size
+  `49152`, SHA-256
+  `bb33c3eac7269e51cea14832f2cc1fdeb718bb5f85cd22fafb15b3aae81ce8a0`.
+- No Download Manager database or native binary process was created. The exact
+  output ended with `INTEGRATION-OFF: PASS (browser_bytes=49152,
+  sha256=bb33c3eac7269e51cea14832f2cc1fdeb718bb5f85cd22fafb15b3aae81ce8a0,
+  downloads=1, source_requests=1, browser_initiator=page, native_jobs=0,
+  native_processes=0)` and `INTEGRATION-OFF-CHROMIUM-PROBE: PASS`.
+- The expected native-job count is `0` for this contract case: with
+  interception disabled, Chromium owns the download and the manager does
+  nothing. The existing protected Rust sibling hunk remains untouched.

@@ -4059,3 +4059,40 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Exact output ended with `MANAGER-FILTERS-CONTEXT-PROBE: PASS`; the probe
   returned `0`. These are mock-adapter UI checks; no native application or
   external service was touched. The protected Rust sibling remains clean.
+
+## 2026-09-05 — Multiple-player page selects the interacted audio player
+
+- Added `fixtures/public_ableplayer_audio_selection_chromium_probe.py` for the
+  current-media selection case on a page exposing both audio and video. It uses
+  the official Able Player external5 demo, where a trusted `Show players` click
+  exposes `audio#audio1` and `video#video1` side by side. The audio's declared
+  sources are `smallf.ogg` first then `smallf.mp3`, so `currentSrc` is the Ogg.
+- The probe trusted-clicked the audio wrapper's real `Play` control
+  (`aria-label=Play`, wrapper `640x105` while the native `<audio>` box is `0x0`,
+  so this also exercises the zero-box wrapper geometry path). The audio reached
+  `readyState=4`, `paused=false`, duration `231.893333`, with the product
+  Download button anchored inside the audio wrapper at
+  `x=894.9453125, y=571.4765625`.
+- The trusted button activation created exactly one native media job for
+  `https://ableplayer.github.io/ableplayer/media/smallf.ogg` — the interacted
+  audio player, not the larger `640x480` video. Resident `--commit` exited `0`;
+  the job completed with `provisional=false`.
+- Browser-context fetch of the same source recorded `4600399` bytes and
+  SHA-256
+  `09e3151c902c2fef6f98075a6ee23067ca8e1faca249932dc1ce530f379b2159`; the
+  managed native output matched both values. Chromium Downloads was empty and
+  the database contained exactly one job.
+- Exact output ended with
+  `ABLEPLAYER-AUDIO-SELECTION: PASS (page=https://ableplayer.github.io/ableplayer/demos/external5.html,
+  source=https://ableplayer.github.io/ableplayer/media/smallf.ogg,
+  output_bytes=4600399,
+  output_sha256=09e3151c902c2fef6f98075a6ee23067ca8e1faca249932dc1ce530f379b2159,
+  jobs=1, browser_downloads=[], trusted_audio_click=true)` and
+  `ABLEPLAYER-AUDIO-SELECTION-CHROMIUM-PROBE: PASS`; the complete log is
+  `/tmp/dm-ableplayer-audio-selection.log`.
+- Recorded observation only, no product change: the media capture message
+  names every non-manifest capture after the page title plus `.mp4`, so this
+  Ogg provisional was named `… | Able Player Demos.mp4` until commit renamed
+  it. That is a separate naming-polish item, not a selection or data defect.
+- No product source changed; the protected `src-tauri/src/main.rs` sibling
+  remains clean.

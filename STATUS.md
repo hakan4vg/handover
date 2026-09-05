@@ -3312,3 +3312,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `W3C-SOURCE-SWITCH-CHROMIUM-PROBE: PASS`. This closes a reachable recycled
   player/source-update path without product changes. The protected Rust sibling
   remains untouched.
+
+## 2026-09-05 — MediaElement.js custom player capture
+
+- Added `fixtures/public_mediaelement_chromium_probe.py` against the official
+  MediaElement.js homepage at `https://mediaelement.github.io/mediaelement/`.
+  Its live HTML exposes top-level `#player1` with the library's custom player
+  and GitHub-hosted Big Buck Bunny MP4 source.
+- The probe used a generic source-based player selector and trusted CDP click,
+  avoiding the stale page-specific selector from the earlier copied harness.
+  Chromium reported `readyState=4`, `paused=false`, duration `60.095011`, and
+  the injected Download button. Network evidence captured the GitHub source,
+  raw redirect, and final `raw.githubusercontent.com` asset.
+- Exactly one native media job was created. Resident `--commit` returned exit
+  `0`; the job completed with `provisional=false`.
+- The browser same-origin reference recorded `5510872` bytes and SHA-256
+  `543a4ad9fef4c9e0004ec9482cb7225c2574b0f889291e8270b1c4d61dbc1ab8`.
+  The managed native output matched both values. Chromium Downloads was empty.
+- The first run exposed and corrected a probe-only query-string selector bug:
+  the real GitHub source ends in `big_buck_bunny.mp4?raw=true`, so the helper
+  now checks the URL path before its query. The final output ended with
+  `MEDIAELEMENT-CHROMIUM: PASS (page=https://mediaelement.github.io/mediaelement/,
+  output_bytes=5510872,
+  output_sha256=543a4ad9fef4c9e0004ec9482cb7225c2574b0f889291e8270b1c4d61dbc1ab8,
+  traffic=5, jobs=1, browser_downloads=[])` and
+  `MEDIAELEMENT-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

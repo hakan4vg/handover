@@ -69,9 +69,19 @@ function basenameFromUrl(url: string): string | undefined {
 // exposes safely. Capture in the document's capture phase, before page
 // handlers/default navigation can consume a one-use URL. Other browser-owned
 // downloads retain the observe-only downloads.onCreated fallback.
+function policySite(): string {
+  return siteOfDocument(window.location.href, document.referrer, window.location.ancestorOrigins?.item(0) ?? '');
+}
+
+function siteAllowed(): boolean {
+  if (!policy) return false;
+  const site = policySite();
+  return !!site && !policy.excludedSites.includes(site);
+}
+
 function interceptDownloadClick(event: MouseEvent): void {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  if (!policy?.interceptDownloads) return;
+  if (!policy?.interceptDownloads || !siteAllowed()) return;
   const target = event.target;
   if (!(target instanceof Element)) return;
   const anchor = target.closest('a');
@@ -123,9 +133,7 @@ async function refreshPolicy(): Promise<void> {
 }
 
 function active(): boolean {
-  if (!policy?.showMediaButtons) return false;
-  const site = siteOfDocument(window.location.href, document.referrer, window.location.ancestorOrigins?.item(0) ?? '');
-  return !!site && !policy.excludedSites.includes(site);
+  return !!policy?.showMediaButtons && siteAllowed();
 }
 
 function visible(el: HTMLMediaElement): boolean {

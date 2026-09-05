@@ -3020,3 +3020,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   when the native client closed after the error response; the probe exited `0`.
   OS-level toast delivery remains unasserted. The protected Rust sibling remains
   untouched.
+
+## 2026-09-05 — Excluded-site browser ownership
+
+- The first exclusion probe run showed a reachable defect: the worker policy
+  correctly reported `excludedSites=["127.0.0.1"]`, but a trusted explicit
+  anchor click still produced an extension-owned browser record
+  (`byExtensionId=mogdhelapdlmkfgeeaogeehnlclhcnkn`). The probe’s first failure
+  also had cleanup/path assumptions, which were corrected without product
+  changes.
+- The product fix adds one `siteAllowed()` decision in `content.ts`, using the
+  existing document/referrer/ancestor-origin derivation. Both media-button
+  activation and ordinary `<a download>` interception now require a derived
+  site that is not in `excludedSites`; global interception remains enabled.
+- Full extension tests passed `38/38`; `npx tsc -b`, `npm run build:extension`,
+  and `git diff --check` passed. The rebuilt extension was tested with a fresh
+  Chromium profile and no native-host registration. The trusted excluded click
+  produced exactly one browser-owned artifact: `65536` bytes,
+  SHA-256 `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a`,
+  `browser_initiator=page`, one source request, and `native_jobs=0`.
+- Exact output ended with
+  `EXCLUDED-SITE-CHROMIUM-PROBE: PASS (site=127.0.0.1, browser_bytes=65536,
+  sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  browser_initiator=page, downloads=['[DISPOSABLE-PATH]/browser-fallback.bin'],
+  source_requests=1, native_jobs=0)`. This proves excluded sites bypass both
+  native capture and extension fallback. The protected Rust sibling remains
+  untouched.

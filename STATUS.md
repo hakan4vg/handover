@@ -2975,4 +2975,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   output_sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
   jobs=1, source_requests=2, browser_downloads=[], ui_matches=1)` and
   `ADD-WINDOW-CHROMIUM-PROBE: PASS`. No XTEST automation was used and the
-  protected Rust sibling remains untouched.
+-  protected Rust sibling remains untouched.
+
+## 2026-09-05 — Completion notification and in-app Notifications surface
+
+- Added `fixtures/notification_surface_probe.py`. It used the built native
+  binary, a fresh native-app HOME/Xvfb, and the safe local 64 KiB fixture. The
+  native `--capture` forwarding path created one provisional job; resident
+  `--commit` returned exit `0`; the main window was brought back with the
+  normal single-instance launch.
+- The real completed job produced `65536` bytes with SHA-256
+  `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a` and one
+  source request. The rendered route was
+  `tauri://localhost/?view=notifications`, with one completion card containing
+  `Download completed` and `notification-surface.bin · 64 KB`.
+- The card exposed exactly the action labels `Open` and `Show in folder`.
+  Exact output ended with
+  `NOTIFICATION-SURFACE-PROBE: PASS (job=provisional-319bc2e0-5793-4721-bf35-0fab59bac845,
+  output_bytes=65536, output_sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  notification_type=completed, cards=1, buttons=['Open', 'Show in folder'], source_requests=1)`.
+- The first retry hit the known intermittent Inspector connection refusal
+  before any job; the fresh retry passed. This verifies in-app notification
+  state and action rendering. OS-level toast delivery was not independently
+  asserted. The protected Rust sibling remains untouched.

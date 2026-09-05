@@ -99,6 +99,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
   const active = snapshot.jobs.filter((job) => ['connecting', 'downloading', 'finalizing'].includes(job.state));
   const paused = snapshot.jobs.filter((job) => job.state === 'paused' || job.state === 'pending');
   const selected = snapshot.jobs.find((job) => job.id === selectedId) ?? snapshot.jobs[0];
+  const contextJob = contextJobId ? snapshot.jobs.find((job) => job.id === contextJobId) : undefined;
   const filteredJobs = useMemo(() => {
     const jobs = snapshot.jobs.filter((job) => {
       if (filter === 'all') return true;
@@ -188,7 +189,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
                 <div className="rows">
                   {filteredJobs.length ? filteredJobs.map((job) => <DownloadRow key={job.id} job={job} selected={job.id === selected?.id} onSelect={() => { setSelectedId(job.id); setInspectorOpen(true); setContextJobId(null); }} onPause={() => run(adapter.pauseJob(job.id))} onResume={() => run(adapter.resumeJob(job.id))} onRetry={() => run(adapter.retryJob(job.id))} onMenu={() => setContextJobId(contextJobId === job.id ? null : job.id)} />) : <EmptyState filter={filter} onAdd={openAdd} />}
                 </div>
-                {contextJobId && <JobContextMenu job={snapshot.jobs.find((job) => job.id === contextJobId)!} adapter={adapter} onClose={() => setContextJobId(null)} onNotice={setNotice} />}
+                {contextJob && <JobContextMenu job={contextJob} adapter={adapter} onClose={() => setContextJobId(null)} onNotice={setNotice} />}
               </section>
               {selected && (inspectorOpen ? <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} /> : <button className="inspector-reopen" onClick={() => setInspectorOpen(true)} aria-label="Open inspector"><Icon name="chevron-left" size={17} /><span>Details</span></button>)}
             </div>

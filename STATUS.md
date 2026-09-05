@@ -3971,3 +3971,31 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   Chromium Downloads was empty. The exact run ended with
   `PUBLIC-LIVE-REJECTION-CHROMIUM-PROBE: PASS`.
 - No product source changed; `src-tauri/src/main.rs` remains clean.
+
+## 2026-09-05 — Manager filters and context actions target the right job
+
+- Added `fixtures/manager_filters_context_chromium_probe.py` for SPEC
+  §§10.1, 10.5, and 19.6. It runs the explicit `npm run dev` mock adapter in
+  a fresh Chromium profile and drives the rendered manager with trusted CDP
+  mouse input.
+- The first real run exposed a product race rather than a probe-only failure:
+  clicking `Remove from list` emitted a new snapshot before the context menu
+  closed. `contextJobId` still named the removed row, so the render passed
+  `undefined` through the non-null assertion and the React surface became
+  blank. The failure was reproduced with the target button hit by a trusted
+  event and the post-action DOM at zero rows.
+- The minimal fix in `src/App.tsx` derives `contextJob` from the current
+  snapshot and renders `JobContextMenu` only while that job exists. No native
+  state or action semantics changed.
+- The retained fresh-profile rerun verified all filter row sets and heading
+  counts: All `14`, Active `3`, Paused `1`, Completed `8`, Failed `2`, and
+  Media `7`. It then trusted-clicked the `backup-manifest.json` row's
+  `More actions`, observed menu labels `Retry`, `Open containing folder`,
+  `Copy source URL`, `Reattach download`, and `Remove from list`, and removed
+  only that row. The manager stayed rendered with `13` rows; the selected
+  `Big Buck Bunny (1080p).mkv` row and inspector remained selected.
+- Exact output ended with `MANAGER-FILTERS-CONTEXT-PROBE: PASS`; no native
+  application or external service was touched. The protected Rust sibling
+  remains clean.
+- Verification after the repair passed `npm run build:all`, `npx tsc -b`,
+  Vitest `38/38`, Rust `58/58`, fixture compilation, and `git diff --check`.

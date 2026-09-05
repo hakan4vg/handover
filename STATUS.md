@@ -3686,3 +3686,34 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `WET-AUDIO-CHROMIUM: PASS (page=https://wet-boew.github.io/wet-boew/demos/multimedia/multimedia-audio-en.html, source=https://www.archive.org/download/RideOfTheValkyries/ride_of_the_valkyries_2.mp3, output_bytes=3942417, output_sha256=d712ccb817a8a205292283eec45d814f3d3805a68ecfde1d4c7e59792fd8fc3d, traffic=3, jobs=1, browser_downloads=[])` and
   `WET-AUDIO-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — Custom Video Player trusted play control
+
+- Added `fixtures/public_custom_video_player_chromium_probe.py` against the
+  safe GitHub Pages demo
+  `https://chrisnajman.github.io/custom-video-player/`. Its live page exposes
+  one top-level `<video>` with three source formats, captions, a transcript,
+  and a JavaScript custom control bar.
+- The fresh Chromium profile loaded the paused video at `readyState=4`,
+  duration `70.542222`, and source
+  `https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4`.
+  A trusted CDP click on the page's actual `#playpause` control changed the
+  state from `paused=true`, `text="Play"` to `paused=false`, `text="Pause"`.
+  The product's player-bound Download button then appeared. This proves a
+  custom page control can initiate playback before media capture without
+  script-only `video.play()` being used by the probe.
+- The product Download button was activated by trusted CDP input. Exactly one
+  native media job was created. Resident `--commit` forwarded it and exited
+  `0`; final state was `completed` with `provisional=false`.
+- Browser-context fetch recorded `15,256,787` bytes and SHA-256
+  `8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451`.
+  The managed native output matched both values. Chromium Downloads was empty
+  and the database contained exactly one job.
+- The first probe attempt had one harness-only assertion typo: its control
+  diagnostic omitted the already-observed `video=true` field and rejected a
+  valid paused surface. After adding that field, `py_compile` and the real
+  fresh-profile Chromium/native rerun passed without product changes. Exact
+  output ended with
+  `CUSTOM-PLAYER-HTML5-CHROMIUM: PASS (page=https://chrisnajman.github.io/custom-video-player/, source=https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4, output_bytes=15256787, output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451, traffic=1, jobs=1, browser_downloads=[])` and
+  `CUSTOM-PLAYER-HTML5-CHROMIUM-PROBE: PASS`. No product code changed; the
+  protected Rust sibling remains untouched.

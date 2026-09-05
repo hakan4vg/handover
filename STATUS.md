@@ -3208,3 +3208,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `MOZILLA-HTML5-CHROMIUM-PROBE: PASS`. This adds an independent top-level
   HTML5 custom-controls path without product changes. The protected Rust
   sibling remains untouched.
+
+## 2026-09-05 — VidPly public accessibility-player capture
+
+- Added `fixtures/public_vidply_chromium_probe.py` against the VidPly project’s
+  main demo at `https://matthiaspeltzer.github.io/vidply/demo/demo.html`.
+  The fresh real Chromium profile exposed six top-level media elements. The
+  first visible player reported `readyState=4`, `paused=false`, duration
+  `76.81161`, and used `https://matthiaspeltzer.github.io/vidply/demo/media/deadline.mp4`
+  from a multi-source, WebVTT-enabled player.
+- The page produced nine observed public media requests. Trusted CDP mouse
+  activation of the injected player-bound Download button created exactly one
+  native media job. Resident `--commit` returned exit `0`; the job completed
+  with `provisional=false`.
+- Browser-context fetch recorded `12769545` bytes and SHA-256
+  `249d6ec925db1ed34b66f66882030a25800138da8d9ed6af89987e0ff612d74f`.
+  The managed native output matched both values. Chromium Downloads was empty.
+- Exact output ended with
+  `VIDPLY-CHROMIUM: PASS (page=https://matthiaspeltzer.github.io/vidply/demo/demo.html,
+  source=https://matthiaspeltzer.github.io/vidply/demo/media/deadline.mp4,
+  output_bytes=12769545,
+  output_sha256=249d6ec925db1ed34b66f66882030a25800138da8d9ed6af89987e0ff612d74f,
+  traffic=9, jobs=1, browser_downloads=[])` and
+  `VIDPLY-CHROMIUM-PROBE: PASS`. This adds an independent public accessibility
+  player path without product changes. The protected Rust sibling remains
+  untouched.

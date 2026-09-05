@@ -3762,5 +3762,39 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Result: `MDN-STYLED-HTML5-CHROMIUM-PROBE: FAIL` at the external page-control
   assertion. This is a retained external browser/page trusted-input boundary,
   not a Download Manager capture failure; no native job or PASS is claimed.
-  The probe's compile passed. The retained disposable profile was used only for
+- The probe's compile passed. The retained disposable profile was used only for
   diagnosis and is cleaned after this run.
+
+## 2026-09-05 — Native failure restores one browser download without recursion
+
+- Added `fixtures/browser_native_failure_fallback_chromium_probe.py` for the
+  host-present failure branch of SPEC §5.1.1. It registers a disposable stdio
+  native host that answers `get-policy` successfully but returns
+  `{"ok":false,"error":"simulated native capture failure"}` for
+  `capture-acquisition`. The fixture uses a fresh Chromium profile/HOME and a
+  safe local 64 KiB object.
+- The first fresh-profile run exposed a real extension defect. The prevented
+  explicit-download click sent one native capture, then the fallback
+  `chrome.downloads.download()` caused `downloads.onCreated` to send a second
+  native capture. Chromium's second event had the same source but
+  `pageUrl=null` and an empty filename; `byExtensionId` was not populated in
+  this headless run. The run was rejected rather than claimed as PASS.
+- The focused fix is in `extension/src/background.ts`. Before invoking the
+  Downloads API, the worker records a bounded, 30-second source/name marker.
+  The `onCreated` listener consumes a matching marker before its observe-only
+  native forwarding path. It still keeps the documented `byExtensionId` guard,
+  and does not cancel browser downloads or alter native acquisition policy.
+- Rebuilt with `npm run build:extension` and ran `npx tsc -b`; both exited `0`.
+  The corrected real Chromium/native rerun produced exactly one
+  `capture-acquisition` message for the user click, exactly one browser
+  download (id `1`), one local source request, and no native DB, native job, or
+  native binary process. The browser item was `complete`, `error=null`,
+  `bytesReceived=65536`, and the saved artifact was `65536` bytes with SHA-256
+  `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a`.
+- Exact terminal output ended with
+  `BROWSER-NATIVE-FAILURE-FALLBACK: PASS (browser_bytes=65536,
+  sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  downloads=1, source_requests=1, native_jobs=0, native_processes=0)` and
+  `BROWSER-NATIVE-FAILURE-FALLBACK-CHROMIUM-PROBE: PASS`.
+- The protected `src-tauri/src/main.rs` sibling remains unchanged and is not
+  included in this slice.

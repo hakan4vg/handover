@@ -16,6 +16,33 @@ const PLAYER_BUFFER_MS = 15_000;
 
 let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 
+type PendingBrowserFallback = { source: string; name?: string; at: number };
+const pendingBrowserFallbacks: PendingBrowserFallback[] = [];
+const BROWSER_FALLBACK_TTL_MS = 30_000;
+const BROWSER_FALLBACK_MAX = 20;
+
+function pruneBrowserFallbacks(now = Date.now()): void {
+  while (pendingBrowserFallbacks.length && now - pendingBrowserFallbacks[0].at > BROWSER_FALLBACK_TTL_MS) pendingBrowserFallbacks.shift();
+  while (pendingBrowserFallbacks.length > BROWSER_FALLBACK_MAX) pendingBrowserFallbacks.shift();
+}
+
+function rememberBrowserFallback(source: string, name?: string): void {
+  pruneBrowserFallbacks();
+  pendingBrowserFallbacks.push({ source, name, at: Date.now() });
+}
+
+function consumeBrowserFallback(item: chrome.downloads.DownloadItem): boolean {
+  pruneBrowserFallbacks();
+  const name = cleanFilename(item.filename);
+  const index = pendingBrowserFallbacks.findIndex((pending) =>
+    (pending.source === item.url || pending.source === item.finalUrl) &&
+    (!pending.name || !name || pending.name === name),
+  );
+  if (index < 0) return false;
+  pendingBrowserFallbacks.splice(index, 1);
+  return true;
+}
+
 async function loadPolicy(): Promise<void> {
   try {
     const stored = await chrome.storage.local.get(POLICY_KEY);
@@ -104,6 +131,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   // unavailable, preserve the user's download through the extension API;
   // the onCreated listener ignores downloads started by this extension.
   try {
+    rememberBrowserFallback(source, cleanFilename(payload.name));
     const id = await chrome.downloads.download({
       url: source,
       filename: cleanFilename(payload.name),
@@ -157,7 +185,8 @@ chrome.webRequest.onHeadersReceived.addListener(
 // download — destroying a one-use/tokenized transaction to pretend takeover
 // succeeded is worse than a duplicate. Replaced by the pre-browser M0 proof.
 chrome.downloads.onCreated.addListener((item) => {
-  if (!policy.interceptDownloads || item.byExtensionId === chrome.runtime.id) return;
+  if (!policy.interceptDownloads) return;
+  if (consumeBrowserFallback(item) || item.byExtensionId === chrome.runtime.id) return;
   if (!item.url || !isHttp(item.url)) return;
   void sendNative({
     type: 'capture-acquisition',

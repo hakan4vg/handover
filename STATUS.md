@@ -3184,3 +3184,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - This proves the browser remains intact for a form-originated attachment
   while the native fallback replays a safe GET. It does not claim to preserve
   arbitrary POST bodies for native replay; no product change was needed.
+
+## 2026-09-05 — Mozilla top-level HTML5 player capture
+
+- Added `fixtures/public_mozilla_chromium_probe.py` against the official
+  cross-browser HTML5 player at `https://iandevlin.github.io/mdn/video-player/`.
+  The page exposed one visible top-level `<video>` with three `<source>`
+  children (MP4, WebM, and Ogg). Chromium selected the MP4 source
+  `https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4`.
+- The fresh real Chromium profile reported `readyState=4`, `paused=false`,
+  duration `70.542222`, and a visible player-bound Download button. Trusted
+  CDP mouse activation created exactly one native media job. Resident `--commit`
+  returned exit `0`; the job completed with `provisional=false`.
+- Browser-context fetch recorded `15256787` bytes and SHA-256
+  `8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451`.
+  The managed native output matched both values. Chromium Downloads was empty.
+- Exact output ended with
+  `MOZILLA-HTML5-CHROMIUM: PASS (page=https://iandevlin.github.io/mdn/video-player/,
+  source=https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4,
+  output_bytes=15256787,
+  output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451,
+  traffic=1, jobs=1, browser_downloads=[])` and
+  `MOZILLA-HTML5-CHROMIUM-PROBE: PASS`. This adds an independent top-level
+  HTML5 custom-controls path without product changes. The protected Rust
+  sibling remains untouched.

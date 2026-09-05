@@ -3541,3 +3541,32 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   traffic=2, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — dynamic Able Player audio and zero-native-box fallback
+
+- Added `fixtures/public_ableplayer_dynamic_audio_chromium_probe.py` for the
+  official dynamic-player page
+  `https://ableplayer.github.io/ableplayer/demos/external6.html`. The real
+  `#addAudio` control created `audio#audio1` with the verified
+  `https://ableplayer.github.io/ableplayer/media/smallf.mp3` source.
+- The first real Chromium/native run exposed a concrete gap: the playing audio
+  reached `readyState=4`, `paused=false`, duration `232.0521`, and its Able
+  wrapper was visible at `640x105`, but the native `<audio>` box was `0x0` and
+  no Download button or native job appeared. The fixture exited `1`.
+- The focused fix in `extension/src/content.ts` keeps normal video and visible
+  audio geometry unchanged. For a playing, enabled `<audio>` with a zero-sized
+  own box, visibility, ranking, and button placement may use a visible,
+  non-root ancestor within five levels. Hidden or paused media remains
+  ineligible.
+- Rebuilt the extension with `npm run build:extension` and ran `npx tsc -b`;
+  both exited `0`. The rerun passed the same real scenario: one native media
+  job, resident `--commit` exit `0`, final `completed` and `provisional=false`,
+  `4,690,721` native/browser bytes, matching SHA-256
+  `60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de`, and no
+  Chromium Downloads.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/external6.html,
+  source=https://ableplayer.github.io/ableplayer/media/smallf.mp3,
+  output_bytes=4690721, output_sha256=60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de,
+  traffic=2, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`.

@@ -137,7 +137,7 @@ function active(): boolean {
 }
 
 function visible(el: HTMLMediaElement): boolean {
-  const rect = el.getBoundingClientRect();
+  const rect = anchorRect(el);
   return (
     rect.width >= MIN_SIZE &&
     rect.height >= MIN_SIZE / 3 &&
@@ -146,6 +146,33 @@ function visible(el: HTMLMediaElement): boolean {
     rect.top < window.innerHeight &&
     rect.left < window.innerWidth
   );
+}
+
+function anchorRect(el: HTMLMediaElement): DOMRect {
+  const own = el.getBoundingClientRect();
+  if (own.width > 0 && own.height > 0) return own;
+  // Custom audio players commonly hide the native <audio> box while keeping
+  // their rendered controls in a visible wrapper. Keep the generic policy
+  // narrow: only a playing, enabled audio element may borrow a non-root
+  // ancestor's visible rectangle. Hidden/paused media remains ineligible.
+  if (!(el instanceof HTMLAudioElement) || el.paused || el.ended) return own;
+  let parent = el.parentElement;
+  for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
+    if (parent === document.body || parent === document.documentElement) continue;
+    const style = getComputedStyle(parent);
+    const rect = parent.getBoundingClientRect();
+    if (
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      rect.width >= MIN_SIZE &&
+      rect.height >= MIN_SIZE / 3 &&
+      rect.bottom > 0 &&
+      rect.right > 0 &&
+      rect.top < window.innerHeight &&
+      rect.left < window.innerWidth
+    ) return rect;
+  }
+  return own;
 }
 
 function keyFor(el: HTMLMediaElement): string {
@@ -211,7 +238,7 @@ function pick(): HTMLVideoElement | HTMLAudioElement | null {
   document.querySelectorAll('video, audio').forEach((el) => {
     const media = el as HTMLVideoElement | HTMLAudioElement;
     if (media.paused || media.ended || !visible(media) || !usable(media)) return;
-    const rect = media.getBoundingClientRect();
+    const rect = anchorRect(media);
     const area = rect.width * rect.height;
     if (area > bestArea) {
       bestArea = area;
@@ -249,7 +276,7 @@ function positionButton(): boolean {
     return false;
   }
   const el = ensureButton();
-  const rect = current.getBoundingClientRect();
+  const rect = anchorRect(current);
   el.style.top = `${Math.max(8, rect.top + 10)}px`;
   el.style.left = `${Math.max(8, rect.right - el.offsetWidth - 12)}px`;
   return true;

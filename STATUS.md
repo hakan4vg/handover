@@ -3715,7 +3715,6 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   fresh-profile Chromium/native rerun passed without product changes. Exact
   output ended with
   `CUSTOM-PLAYER-HTML5-CHROMIUM: PASS (page=https://chrisnajman.github.io/custom-video-player/, source=https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4, output_bytes=15256787, output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451, traffic=1, jobs=1, browser_downloads=[])` and
-  `CUSTOM-PLAYER-HTML5-CHROMIUM: PASS (page=https://chrisnajman.github.io/custom-video-player/, source=https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4, output_bytes=15256787, output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451, traffic=1, jobs=1, browser_downloads=[])` and
   `CUSTOM-PLAYER-HTML5-CHROMIUM-PROBE: PASS`. No product code changed; the
   protected Rust sibling remains untouched.
 

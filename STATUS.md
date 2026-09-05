@@ -3233,3 +3233,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `VIDPLY-CHROMIUM-PROBE: PASS`. This adds an independent public accessibility
   player path without product changes. The protected Rust sibling remains
   untouched.
+
+## 2026-09-05 — MDN top-level WebM player capture
+
+- Added `fixtures/public_mdn_webm_chromium_probe.py` against the official MDN
+  learning-area example at
+  `https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/simple-video.html`.
+  The page exposed one visible top-level HTML5 `<video>` whose source was the
+  finite WebM resource
+  `https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/rabbit320.webm`.
+- The fresh real Chromium profile reported `readyState=4`, `paused=false`,
+  duration `7.8`, and a visible player-bound Download button. Trusted CDP
+  mouse activation created exactly one native media job. Resident `--commit`
+  returned exit `0`; the job completed with `provisional=false`.
+- Browser-context fetch recorded `330618` bytes and SHA-256
+  `074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e`.
+  The managed native output matched both values. Chromium Downloads was empty.
+- Exact output ended with
+  `MDN-WEBM-CHROMIUM: PASS (page=https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/simple-video.html,
+  source=https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/rabbit320.webm,
+  output_bytes=330618,
+  output_sha256=074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e,
+  traffic=1, jobs=1, browser_downloads=[])` and
+  `MDN-WEBM-CHROMIUM-PROBE: PASS`. This closes a finite WebM top-level player
+  path without product changes. The protected Rust sibling remains untouched.

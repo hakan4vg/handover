@@ -3494,3 +3494,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   source_requests={'one.bin': 1, 'three.bin': 1, 'two.bin': 1})` and
   `MULTIPLE-ADD-WINDOWS-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — Able Player hidden-player exposure
+
+- Added `fixtures/public_ableplayer_hidden_chromium_probe.py` against the
+  official demo at
+  `https://ableplayer.github.io/ableplayer/demos/external5.html`. Both media
+  elements began inside `div.able { display:none }`. A trusted CDP click on
+  `#showPlayers` changed both containers to `display:block`; the runtime then
+  exposed one audio and one video player.
+- The video source was
+  `https://ableplayer.github.io/ableplayer/media/wwa.mp4`. Chromium reported
+  `readyState=4`, `paused=false`, duration `52.406826`, and observed seven
+  range requests across the exposed players. The Download button was present.
+- The native database contained one media job. Resident `--commit` exited `0`.
+  Final job state was `completed` with `provisional=false`. The managed output
+  and browser-context reference were both `5,613,210` bytes with matching
+  SHA-256
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/external5.html,
+  traffic=7, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

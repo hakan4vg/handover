@@ -3595,3 +3595,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   output_bytes=3895621, output_sha256=e89bbffc3889ee44f63de9960b715ddab12301c008fe9fe988053814181d0a4b,
   traffic=3, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`.
+
+## 2026-09-05 — Able Player autoplay at a non-zero start time
+
+- Added `fixtures/public_ableplayer_autoplay_audio_chromium_probe.py` for the
+  official page
+  `https://ableplayer.github.io/ableplayer/demos/audio3.html`. The real
+  `audio#audio1` element has `data-start-time="140"` and `autoplay`; the probe
+  required the page itself to reach `currentTime=140` while playing before
+  capture.
+- Chromium reported `readyState=4`, `paused=false`, duration `232.0521`, source
+  `https://ableplayer.github.io/ableplayer/media/smallf.mp3`, and the product
+  Download button. Two range requests were observed.
+- Resident `--commit` exited `0`. Final job state was `completed` with
+  `provisional=false`. The managed output and browser-context reference were
+  both `4,690,721` bytes with matching SHA-256
+  `60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/audio3.html,
+  source=https://ableplayer.github.io/ableplayer/media/smallf.mp3,
+  output_bytes=4690721, output_sha256=60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de,
+  traffic=2, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`.

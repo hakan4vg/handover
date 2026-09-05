@@ -3972,7 +3972,7 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `PUBLIC-LIVE-REJECTION-CHROMIUM-PROBE: PASS`.
 - No product source changed; `src-tauri/src/main.rs` remains clean.
 
-## 2026-09-05 — Manager filters and context actions target the right job
+## 2026-09-05 — Manager stale-context guard fixed; end-to-end evidence pending
 
 - Added `fixtures/manager_filters_context_chromium_probe.py` for SPEC
   §§10.1, 10.5, and 19.6. It runs the explicit `npm run dev` mock adapter in
@@ -3987,15 +3987,39 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - The minimal fix in `src/App.tsx` derives `contextJob` from the current
   snapshot and renders `JobContextMenu` only while that job exists. No native
   state or action semantics changed.
-- The retained fresh-profile rerun verified all filter row sets and heading
-  counts: All `14`, Active `3`, Paused `1`, Completed `8`, Failed `2`, and
-  Media `7`. It then trusted-clicked the `backup-manifest.json` row's
-  `More actions`, observed menu labels `Retry`, `Open containing folder`,
-  `Copy source URL`, `Reattach download`, and `Remove from list`, and removed
-  only that row. The manager stayed rendered with `13` rows; the selected
-  `Big Buck Bunny (1080p).mkv` row and inspector remained selected.
-- Exact output ended with `MANAGER-FILTERS-CONTEXT-PROBE: PASS`; no native
-  application or external service was touched. The protected Rust sibling
-  remains clean.
+- A later fresh-profile command returned exit `0`, but its detailed stdout was
+  not retained. Therefore the filter row sets, heading counts, context-menu
+  labels, row removal, and inspector-selection assertions are not accepted as
+  durable PASS evidence yet. They require a rerun with the complete output
+  captured and read back.
+- No native application or external service was touched during the mock probe.
+  The protected Rust sibling remains clean.
 - Verification after the repair passed `npm run build:all`, `npx tsc -b`,
   Vitest `38/38`, Rust `58/58`, fixture compilation, and `git diff --check`.
+
+## 2026-09-05 — Extension popup and manager handoff pass
+
+- Ran `fixtures/extension_popup_chromium_probe.py` against the explicit Vite
+  mock surface with a fresh disposable Chromium profile. The probe's complete
+  captured log is `/tmp/dm-extension-popup-final.log`.
+- The popup rendered `CURRENT SITE` for `example.com`, trusted CDP clicks
+  changed `Exclude this site` to `Enable on this site` and back, and the
+  persisted `download-manager.settings` excluded-sites list reflected both
+  transitions. `Open Manager` then reached the manager without opening a new
+  tab. The manager showed `All Downloads`, count `14`, and `14` rows.
+- Exact output: `EXTENSION-POPUP-PROBE: PASS {"excluded_site":
+  "example.com", "excluded_then_enabled": true, "manager_heading": "All
+  Downloads\\n14", "manager_rows": 14}`.
+
+- Reran `fixtures/manager_filters_context_chromium_probe.py` with a fresh
+  disposable Chromium profile and captured the complete log at
+  `/tmp/dm-manager-filters-context-final.log`.
+- The real rendered manager reported the expected sets and heading counts:
+  All `14`, Active `3`, Paused `1`, Completed `8`, Failed `2`, and Media `7`.
+  The trusted row-specific menu for `backup-manifest.json` contained `Retry`,
+  `Open containing folder`, `Copy source URL`, `Reattach download`, and
+  `Remove from list`. Removing that row left `13` rows and preserved the
+  selected `Big Buck Bunny (1080p).mkv` row and inspector.
+- Exact output ended with `MANAGER-FILTERS-CONTEXT-PROBE: PASS`; the probe
+  returned `0`. These are mock-adapter UI checks; no native application or
+  external service was touched. The protected Rust sibling remains clean.

@@ -20,8 +20,8 @@ export function siteOf(url: string): string {
   }
 }
 
-export function siteOfDocument(url: string, referrer: string): string {
-  return siteOf(url) || siteOf(referrer);
+export function siteOfDocument(url: string, referrer: string, ancestorOrigin = ''): string {
+  return siteOf(url) || siteOf(referrer) || siteOf(ancestorOrigin);
 }
 
 export function mediaSourceFromValues(

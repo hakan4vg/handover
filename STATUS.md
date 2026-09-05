@@ -2891,3 +2891,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - The expected native-job count is `0` for this contract case: with
   interception disabled, Chromium owns the download and the manager does
   nothing. The existing protected Rust sibling hunk remains untouched.
+
+## 2026-09-05 — MDN `about:srcdoc` audio capture
+
+- The first direct MDN interactive-page run exposed a reachable policy-site
+  defect. The media was in execution context `5`, frame ID
+  `7CC287E809731ACC307CCF9D0A8567D2`, with URL `about:srcdoc`, empty referrer,
+  source `https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3`,
+  `readyState=4`, `paused=false`, visible geometry, and owner iframe geometry
+  `510.1875x369` at `(768.796875,50)`, but `button=false`. The old URL/referrer-only
+  policy derivation could not identify the parent site.
+- MDN documents `about:srcdoc` as the location of `srcdoc` documents, and
+  `Location.ancestorOrigins` exposes ancestor browsing-context origins. Added
+  the smallest third-priority fallback: document URL, then referrer, then the
+  first ancestor origin. Existing document/referrer precedence and exclusion
+  matching remain unchanged.
+- Focused extension tests passed `18/18`; `npx tsc -b`, `npm run
+  build:extension`, and `git diff --check` passed. The fresh-profile rerun used
+  the rebuilt extension and the resident `--commit` path. The worker was
+  present, and the child context remained `5` with frame ID
+  `37AA06C5DC5ECA4DEBB85B858821AF9F`.
+- The injected child button was present at child rectangle
+  `left=213, top=63.609375, width=90.890625, height=28.796875`; the owner was
+  `510.1875x369` at `(768.796875,50)`. The trusted CDP click point was
+  `(1027.2421875,128.0078125)`. The child reported `readyState=4`,
+  `paused=false`, `duration=2.074218`, and `visible=true`.
+- Exactly one native media job was created and committed. The completed output
+  was `39868` bytes with SHA-256
+  `41191d0727073bf848bcc8f0bd851d71a0b0058e901abb1c1b236ad327bda52e`. The
+  browser-side reference for the same source was `39868` bytes with the same
+  SHA-256. The job was `completed`, `provisional=false`, and Chromium Downloads
+  was empty. Exact output ended with
+  `MDN-INTERACTIVE-AUDIO: PASS (... jobs=1, browser_downloads=[])` and
+  `MDN-INTERACTIVE-AUDIO-CHROMIUM-PROBE: PASS`.

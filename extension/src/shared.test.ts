@@ -51,6 +51,8 @@ describe('siteOfDocument', () => {
   it('uses the document URL first and the parent referrer for opaque frames', () => {
     expect(siteOfDocument('https://child.example.test/player', 'https://parent.example.test/page')).toBe('child.example.test');
     expect(siteOfDocument('about:blank', 'https://www.Parent.EXAMPLE.test/page')).toBe('parent.example.test');
+    expect(siteOfDocument('about:srcdoc', '', 'https://www.Parent.EXAMPLE.test/page')).toBe('parent.example.test');
+    expect(siteOfDocument('about:srcdoc', 'https://referrer.example.test/page', 'https://ancestor.example.test/page')).toBe('referrer.example.test');
     expect(siteOfDocument('blob:https://child.example.test/id', 'https://parent.example.test/page')).toBe('parent.example.test');
   });
 });

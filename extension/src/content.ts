@@ -12,8 +12,8 @@ function siteOf(url: string): string {
   }
 }
 
-function siteOfDocument(url: string, referrer: string): string {
-  return siteOf(url) || siteOf(referrer);
+function siteOfDocument(url: string, referrer: string, ancestorOrigin = ''): string {
+  return siteOf(url) || siteOf(referrer) || siteOf(ancestorOrigin);
 }
 
 function isHttp(url: string): boolean {
@@ -124,7 +124,7 @@ async function refreshPolicy(): Promise<void> {
 
 function active(): boolean {
   if (!policy?.showMediaButtons) return false;
-  const site = siteOfDocument(window.location.href, document.referrer);
+  const site = siteOfDocument(window.location.href, document.referrer, window.location.ancestorOrigins?.item(0) ?? '');
   return !!site && !policy.excludedSites.includes(site);
 }
 

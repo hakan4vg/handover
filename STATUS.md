@@ -2996,5 +2996,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   notification_type=completed, cards=1, buttons=['Open', 'Show in folder'], source_requests=1)`.
 - The first retry hit the known intermittent Inspector connection refusal
   before any job; the fresh retry passed. This verifies in-app notification
-  state and action rendering. OS-level toast delivery was not independently
-  asserted. The protected Rust sibling remains untouched.
+  state and action rendering. OS-level toast was not independently asserted.
+  The protected Rust sibling remains untouched.
+
+## 2026-09-05 — Failure notification surface
+
+- Added `fixtures/failure_notification_probe.py`. It used a safe local missing
+  URL, the built extension/native host, a fresh Chromium profile and native-app
+  HOME, and the normal native `--capture` forwarding path. The resulting native
+  job was exactly one failed provisional job:
+  `provisional-c75206c2-974a-4150-bbcf-2a75c6d8b8f4`, with error
+  `Source returned 404 Not Found`.
+- After bringing the main window back and opening
+  `tauri://localhost/?view=notifications`, the UI rendered exactly one failure
+  card. Its text contained `Download failed` and
+  `failure.bin · Source returned 404 Not Found`; its exact actions were
+  `View details` and `Open Manager`.
+- No managed destination file was created and the local missing URL saw zero
+  successful source requests. Exact output ended with
+  `FAILURE-NOTIFICATION-PROBE: PASS (job=provisional-c75206c2-974a-4150-bbcf-2a75c6d8b8f4,
+  state=failed, cards=1, buttons=['View details', 'Open Manager'], source_requests=0,
+  managed_files=0)`. A non-fatal local 404-handler `BrokenPipeError` was printed
+  when the native client closed after the error response; the probe exited `0`.
+  OS-level toast delivery remains unasserted. The protected Rust sibling remains
+  untouched.

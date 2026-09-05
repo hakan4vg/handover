@@ -3148,3 +3148,16 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   opener. Windows Explorer behavior remains a separate platform check; the
   installed notification plugin's OS-toast action API remains unasserted. The
   protected Rust sibling remains untouched.
+
+## 2026-09-05 — Shaka public-player boundary
+
+- Added `fixtures/public_shaka_chromium_probe.py` to inspect the official
+  Shaka Player demo at `https://shaka-project.github.io/shaka-player/demo/`.
+- The real page rendered its `PLAY` labels in `document.body.innerText`, but
+  the Inspector found no actionable `button` or `[role=button]` node, and
+  traversing open shadow roots still found no visible target. The bounded
+  diagnostic ended with `buttons=[]`; this is a public demo/custom-shadow
+  boundary, not evidence that the extension failed to inject.
+- No trusted demo click, media capture, native job, managed output, or browser
+  download was produced. The candidate is retained as a diagnostic artifact;
+  no product change is justified by this unreachable public control.

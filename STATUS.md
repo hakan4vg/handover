@@ -3618,3 +3618,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   output_bytes=4690721, output_sha256=60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de,
   traffic=2, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`.
+
+## 2026-09-05 — DASH-IF trusted quality-menu selection and native capture
+
+- Added `fixtures/public_dash_quality_chromium_probe.py` against the official
+  DASH-IF reference player at
+  `https://reference.dashif.org/dash.js/latest/samples/dash-if-reference-player/index.html`.
+  The fixture used a fresh Chromium profile and the public static MPD
+  `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps_shortened.mpd`.
+- Chromium reached a playable blob/MSE player with `duration=30`,
+  `readyState=4`, and `paused=false`. A trusted CDP mouse click discovered the
+  visible button with `title="Quality"`. The rendered menu exposed ten
+  non-Auto video entries plus one audio entry. A second trusted click selected
+  `254 kbps (320x180)`, and the menu's selected state confirmed
+  `254 kbps (320x180)`.
+- The product Download button was then activated through trusted Chromium
+  input. The native database contained one media job. Resident `--commit`
+  forwarded that job and exited `0`; the final state was `completed` with
+  `provisional=false`.
+- The browser-context reference fetched the first video and audio
+  representations from the MPD: video `9,755,337` bytes with SHA-256
+  `44ddc05092974595726f81181796611d257ac55927244b36d8b60129bf8a839f`, and
+  audio `267,561` bytes with SHA-256
+  `26195401fbff20512d36a9b08c9fd8e9c45b62fe0ad8e9a212a7b6ea24be9273`.
+  The completed native MP4 was `15,894,760` bytes with SHA-256
+  `365d01c1ebad60049d8e17a20fa081a4c64fdc8fc21dbd110356b31afd053eed`.
+  `ffprobe` reported H.264 video and AAC audio with duration `32.085333`.
+- Browser ownership remained intact after capture: trusted right-click and
+  Ctrl-click on a browser-owned link were both not prevented. Chromium
+  Downloads was empty and the database contained exactly one job.
+- The exact terminal result ended with
+  `DASH-QUALITY: {"control": {"button": true, "title": "Quality", "x": 726.015625, "y": 669.5234375}, "items": ["254 kbps (320x180)", "507 kbps (320x180)", "760 kbps (480x270)", "1013 kbps (640x360)", "1255 kbps (640x360)", "1884 kbps (768x432)", "3134 kbps (1024x576)", "4953 kbps (1280x720)", "9915 kbps (1920x1080)", "14932 kbps (3840x2160)", "67 kbps"], "selected": ["254 kbps (320x180)", "Auto"], "target": "254 kbps (320x180)"}` and
+  `PUBLIC-DASH-CHROMIUM-PROBE: PASS`.
+- The extension diagnostic also returned the native policy with
+  `interceptDownloads=true`. No product code changed; the protected Rust
+  sibling remains untouched.

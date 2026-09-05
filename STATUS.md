@@ -3046,3 +3046,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   source_requests=1, native_jobs=0)`. This proves excluded sites bypass both
   native capture and extension fallback. The protected Rust sibling remains
   untouched.
+
+## 2026-09-05 — Public media buttons disabled
+
+- Added `fixtures/public_paciello_media_off_probe.py` to exercise the real
+  Paciello public audio page with a fresh Chromium profile and the built
+  extension. The probe first updates policy through the extension worker to
+  `showMediaButtons=false`, then uses one trusted native-control click to
+  activate the page's audio element. The trusted click is needed because
+  Chromium blocks script-only autoplay; it does not invoke Download Manager.
+- The corrected probe passed after fixing its harness-only assertion: it had
+  assigned `app_db` but still referenced the removed `db_files` variable. The
+  final check targets only the application database path, not Chromium's NSS
+  `key4.db`/`cert9.db` files.
+- Exact result:
+  `showMediaButtons=false`, source
+  `https://thepaciellogroup.github.io/AT-browser-tests/audio/jeffbob.mp3`,
+  `readyState=4`, `paused=false`, `button=false`, `browser_downloads=0`, and
+  `native_jobs=0`. The application database did not exist.
+- Exact output ended with
+  `PACIello-MEDIA-OFF-CHROMIUM-PROBE: PASS (page=https://thepaciellogroup.github.io/AT-browser-tests/acc-name-test/audio.html,
+  source=https://thepaciellogroup.github.io/AT-browser-tests/audio/jeffbob.mp3,
+  readyState=4, paused=False, button=False, browser_downloads=0, native_jobs=0)`.
+  This closes the media-button-off control behavior without changing product
+  code. The protected Rust sibling remains untouched.

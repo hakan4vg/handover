@@ -3417,3 +3417,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   traffic=3, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — Able Player dynamic video creation
+
+- Added `fixtures/public_ableplayer_dynamic_chromium_probe.py` against the
+  official dynamic-player demo at
+  `https://ableplayer.github.io/ableplayer/demos/external6.html`. The page
+  initially had no media element. A trusted CDP click on `#addVideo` created
+  the page's duplicate-ID wrapper plus `video#video1`; the generated source
+  was `https://ableplayer.github.io/ableplayer/media/wwa.mp4`.
+- The generated video was `640x480`, `readyState=4`, and the player-bound
+  Download button was present after activation. Chromium made three range
+  requests for the MP4.
+- The native database contained one media job. Resident `--commit` exited `0`.
+  Final job state was `completed` with `provisional=false`. The managed output
+  and browser-context reference were both `5,613,210` bytes with matching
+  SHA-256
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/external6.html,
+  traffic=3, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

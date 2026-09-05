@@ -3738,3 +3738,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `CUSTOM-PLAYER-CONTROL: {"after": {"button": true, "currentTime": 0, "paused": false, "readyState": 4, "text": "Pause"}, "before": {"button": true, "paused": true, "readyState": 4, "text": "Play", "video": true, "x": 262.5, "y": 630.96875}, "captions": {"label": "Captions on", "mode": "showing"}, "captionsClick": {"selector": "#captions", "x": 753.53125, "y": 624.46875}, "transcript": {"open": true, "status": "Open"}, "transcriptClick": {"selector": "#summary", "x": 632.5, "y": 676.46875}, "trustedClick": true}` and
   `CUSTOM-PLAYER-HTML5-CHROMIUM-PROBE: PASS`. No product code changed; the
   protected Rust sibling remains untouched.
+
+## 2026-09-05 — MDN styled-player mute-control boundary
+
+- Added `fixtures/public_mdn_styled_player_chromium_probe.py` for the live MDN
+  styled player
+  `https://iandevlin.github.io/mdn/video-player-styled/`. The page exposes one
+  top-level `<video>` (`readyState=4`, duration `70.542222`) and an external
+  custom control bar with `#playpause`, `#stop`, `#mute`, volume, and fullscreen
+  buttons. The player uses three fallback sources and the MP4 source was
+  `http://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4`.
+- Fresh Chromium reached the paused media surface and the trusted `#playpause`
+  path started playback; the Download Manager button appeared. The next trusted
+  click targeted a visible, enabled 40x40 `BUTTON` at `x=1006,y=523.671875`;
+  `document.elementFromPoint` returned `id="mute"`, and a capture listener saw
+  `{"trusted":true,"target":"mute"}`.
+- Despite that delivered trusted event, the official page listener left
+  `video.muted=false`, label `Mute/Unmute`, and `data-state=mute` after 15
+  seconds. The same page's programmatic `#mute.click()` immediately produced
+  `{"muted":true,"dataState":"unmute","label":"Mute/Unmute"}`. The
+  extension has no listener that interferes with this button: its only
+  capture-phase click interception requires an anchor with `download`.
+- Result: `MDN-STYLED-HTML5-CHROMIUM-PROBE: FAIL` at the external page-control
+  assertion. This is a retained external browser/page trusted-input boundary,
+  not a Download Manager capture failure; no native job or PASS is claimed.
+  The probe's compile passed. The retained disposable profile was used only for
+  diagnosis and is cleaned after this run.

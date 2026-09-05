@@ -3258,6 +3258,30 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `MDN-WEBM-CHROMIUM-PROBE: PASS`. This closes a finite WebM top-level player
   path without product changes. The protected Rust sibling remains untouched.
 
+## 2026-09-05 — HTML5Demo Ogg player boundary
+
+- Added `fixtures/public_html5demo_ogg_chromium_probe.py` against the live
+  page `https://html5demo.yo.fr/demo/video.php`, whose fetched HTML exposes
+  three top-level videos; the first is
+  `https://html5demo.yo.fr/demo/media/windowsill.ogv` with `video/ogg`.
+- The stale copied `#mwe_player_0` selector was replaced with a source-based
+  selector for the page's actual Ogg `<video>`, and the helper scrolls that
+  element into view before a trusted CDP click. The runtime DOM confirmed the
+  Ogg element has `readyState=4`, `paused=false`, duration `20`, and geometry
+  `213x53`.
+- The corrected real Chromium probe remained blocked at the product-control
+  boundary: after the full wait, `#dm-media-download-button` was absent. The
+  page's Ogg is decoded and playing, but no native job was created, so there
+  was no valid commit, native output, or browser-reference comparison to
+  claim. Exact probe exit was `1` with
+  `HTML5 demo Ogg player did not become playable/injected ... button=False`.
+- The extension source's actual visibility rule is `width >= 120` and
+  `height >= 40`; this element meets it. The page nevertheless did not expose
+  a reachable Download control in this fresh profile. This is recorded as a
+  page/extension reachability boundary, not as an Ogg decode failure or a
+  product fix. No product code was changed; the protected Rust sibling remains
+  untouched.
+
 ## 2026-09-05 — W3C recycled-player source switch
 
 - Added `fixtures/public_w3c_source_switch_chromium_probe.py` against the

@@ -3480,3 +3480,17 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   bytes=67108864, source_requests=1)` and
   `CLOSE-TO-TRAY-PROBE: PASS`. No product code changed; the protected Rust
   sibling remains untouched.
+
+## 2026-09-05 — independent simultaneous Add Download windows
+
+- Ran `fixtures/multiple_add_windows_probe.py` against a fresh resident and
+  three rapid native capture forwards for `one.bin`, `two.bin`, and `three.bin`.
+- The real application opened three Add Download windows and created three
+  distinct jobs while keeping exactly one resident application process.
+  Each source server counter was exactly one request:
+  `{'one.bin': 1, 'three.bin': 1, 'two.bin': 1}`.
+- The run ended with
+  `MULTIPLE-ADD-WINDOWS: PASS (windows=3, jobs=3, processes=1,
+  source_requests={'one.bin': 1, 'three.bin': 1, 'two.bin': 1})` and
+  `MULTIPLE-ADD-WINDOWS-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

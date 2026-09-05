@@ -3370,3 +3370,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   browser_downloads=[])` and
   `MEDIAELEMENT-DASH-CHROMIUM-PROBE: PASS`. No product code changed; the
   protected Rust sibling remains untouched.
+
+## 2026-09-05 — Able Player accessibility-player capture
+
+- Added `fixtures/public_ableplayer_chromium_probe.py` against the official
+  Able Player demo at
+  `https://ableplayer.github.io/ableplayer/demos/video1.html`. Its live DOM
+  contains one top-level `#video1` with Able Player's custom accessibility
+  controls and `video/mp4` source
+  `https://ableplayer.github.io/ableplayer/media/wwa.mp4`.
+- Runtime Chromium evidence was `readyState=4`, `paused=false`, duration
+  `52.406826`; the extension Download button was present. Chromium made three
+  range requests for the MP4.
+- The native database contained one media job. Resident `--commit` exited `0`.
+  Final job state was `completed` with `provisional=false`. The managed output
+  was `5,613,210` bytes, matching the browser-context reference size.
+  Both native and browser SHA-256 values were
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (traffic=3, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

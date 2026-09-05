@@ -4175,3 +4175,34 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Exact output ended with `MANAGER-INLINE-CONTROLS: PASS`; the probe returned
   `0`. These are mock-adapter UI checks; no native application or external
   service was touched. The protected Rust sibling remains clean.
+
+## 2026-09-05 — Real GitHub release asset download through the real page
+
+- Added `fixtures/public_github_release_chromium_probe.py`. It navigates the
+  real Chromium/native setup to the actual flask 3.1.3 release page
+  `https://github.com/pallets/flask/releases/tag/3.1.3` and trusted-clicks the
+  real "Source code (zip)" asset link
+  (`https://github.com/pallets/flask/archive/refs/tags/3.1.3.zip`). The asset
+  is a plain link (no `download` attribute) that redirects to codeload with
+  `Content-Disposition: attachment; filename=flask-3.1.3.zip`.
+- Chromium created one browser download (`id=1`, `state=complete`,
+  `error=null`, `filename=…/flask-3.1.3.zip`, `857854` bytes, SHA-256
+  `4c8bfa9d33ac64436875f3f7d213b4fd3bbd855e0a4c4e4afaf7acc51f6b64ab`).
+- The observe-only native fallback created exactly one provisional job whose
+  name was already the header-resolved `flask-3.1.3.zip` — the
+  `onDeterminingFilename` change proves correct through a real public page.
+  The source was the codeload final URL.
+- Resident `--commit` exited `0`; the job completed with `provisional=false`.
+  Native output matched the browser exactly: `857854` bytes and the same
+  SHA-256 `4c8bfa9d33ac64436875f3f7d213b4fd3bbd855e0a4c4e4afaf7acc51f6b64ab`.
+  The database contained exactly one job.
+- Exact output ended with
+  `GITHUB-RELEASE: PASS (page=https://github.com/pallets/flask/releases/tag/3.1.3,
+  name=flask-3.1.3.zip, browser_bytes=857854,
+  sha256=4c8bfa9d33ac64436875f3f7d213b4fd3bbd855e0a4c4e4afaf7acc51f6b64ab,
+  native_bytes=857854,
+  native_sha256=4c8bfa9d33ac64436875f3f7d213b4fd3bbd855e0a4c4e4afaf7acc51f6b64ab,
+  jobs=1)` and `GITHUB-RELEASE-PROBE: PASS`; the complete log is
+  `/tmp/dm-github-release.log`.
+- No product source changed; the protected `src-tauri/src/main.rs` sibling
+  remains clean.

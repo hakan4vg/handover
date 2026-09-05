@@ -3518,3 +3518,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   traffic=7, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — Able Player external-control initiation
+
+- Added `fixtures/public_ableplayer_external_chromium_probe.py` against the
+  official external-controls demo at
+  `https://ableplayer.github.io/ableplayer/demos/external4.html`. The page's
+  separate `#play` control was discovered at runtime and activated with a
+  trusted Chromium click. Its `#status-play` changed to `true`.
+- The underlying `video#video1` reported `readyState=4`, `paused=false`,
+  duration `52.406826`, and the product Download button was present. Chromium
+  observed two range requests for
+  `https://ableplayer.github.io/ableplayer/media/wwa.mp4`.
+- The native database contained one media job. Resident `--commit` exited `0`.
+  Final job state was `completed` with `provisional=false`. The managed output
+  and browser-context reference were both `5,613,210` bytes with matching
+  SHA-256
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/external4.html,
+  traffic=2, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

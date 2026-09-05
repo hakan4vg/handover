@@ -4206,3 +4206,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `/tmp/dm-github-release.log`.
 - No product source changed; the protected `src-tauri/src/main.rs` sibling
   remains clean.
+
+## 2026-09-05 — Real Wikimedia Commons media page capture
+
+- Added `fixtures/public_commons_media_chromium_probe.py` against the real
+  Commons page `https://commons.wikimedia.org/wiki/File:Example.ogg`. The page
+  uses MediaWiki's TimedMediaHandler player: a `disabled` placeholder `<video>`
+  with a `poster` and `preload="none"`, plus an `a.mw-tmh-play` overlay.
+- A trusted click on that overlay (`title="Play audio"`) loaded a real playing
+  `<audio>` (source
+  `https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg?utm_source=...&utm_campaign=index&utm_content=original`,
+  `readyState=4`, `paused=false`, duration `6.104036`). The native `<audio>`
+  box is `0x0`, yet the product Download button was present at
+  `x=823.9453125, y=589.8984375` — the zero-box wrapper geometry path.
+- The extension correctly ignored the `disabled` placeholder `<video>` and
+  picked the real playing audio. Trusted button activation created exactly one
+  native media job for the Ogg URL; the job completed with `provisional=false`.
+- Because this is a whole-object progressive media capture (not a manifest),
+  the native output is byte-identical to the raw source. The independent
+  browser-context reference recorded `104793` bytes and SHA-256
+  `f57b56d8aae4c847cf01224fb45293610d801cfdac43d932b5eeab1cd318182a`; the
+  managed native output matched both. Chromium Downloads was empty and the
+  database contained exactly one job.
+- Exact output ended with
+  `COMMONS-MEDIA: PASS (page=https://commons.wikimedia.org/wiki/File:Example.ogg,
+  output_bytes=104793,
+  sha256=f57b56d8aae4c847cf01224fb45293610d801cfdac43d932b5eeab1cd318182a,
+  jobs=1, browser_downloads=[])` and `COMMONS-MEDIA-PROBE: PASS`; the complete
+  log is `/tmp/dm-commons.log`.
+- Recorded observation only, no product change: the media capture message names
+  every non-manifest capture after the page title plus `.mp4`, so the Ogg
+  provisional was named `File:Example.ogg - Wikimedia Commons.mp4` until commit
+  renamed it. No product source changed; the protected Rust sibling remains
+  clean.

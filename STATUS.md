@@ -4239,3 +4239,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   provisional was named `File:Example.ogg - Wikimedia Commons.mp4` until commit
   renamed it. No product source changed; the protected Rust sibling remains
   clean.
+
+## 2026-09-06 — Real same-origin download attribute page
+
+- Added `fixtures/public_jcisaacs_download_attr_chromium_probe.py` against the
+  real public page
+  `https://jcisaacs.com/TEST/HTML5-Test/HTML5%20Download%20Attribute%20Demo.html`.
+  The target is a real top-document anchor, not an injected test element or an
+  iframe: `href="samp/htmldoc.html"` resolves to
+  `https://jcisaacs.com/TEST/HTML5-Test/samp/htmldoc.html` and carries the
+  filename attribute `download="sample-file.html"`.
+- A clean fresh Chromium profile trusted-clicked that anchor and recorded the
+  browser-owned `sample-file.html`: `681` bytes, SHA-256
+  `529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7`.
+- A second fresh profile ran the resident binary and unpacked extension. The
+  extension's document-capture path created exactly one ordinary native job
+  with the attribute filename `sample-file.html`; resident `--commit` exited
+  `0`, and the job completed with `provisional=false`.
+- Native output was byte/hash-identical to the clean browser download: `681`
+  bytes and SHA-256
+  `529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7`.
+  The database contained exactly one job and the extension profile's
+  Chromium Downloads directory was empty.
+- Exact output ended with
+  `JCISAACS-DOWNLOAD-ATTR: PASS (page=https://jcisaacs.com/TEST/HTML5-Test/HTML5%20Download%20Attribute%20Demo.html,
+  source=https://jcisaacs.com/TEST/HTML5-Test/samp/htmldoc.html,
+  filename=sample-file.html, browser_bytes=681,
+  browser_sha256=529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7,
+  native_bytes=681,
+  native_sha256=529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7,
+  jobs=1, browser_downloads=[])` and
+  `JCISAACS-DOWNLOAD-ATTR-PROBE: PASS`; the complete log is
+  `/tmp/dm-jcisaacs-download-attr.log`.
+- No product source changed; the protected Rust sibling remains clean.

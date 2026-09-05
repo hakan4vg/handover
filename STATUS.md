@@ -3440,3 +3440,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   traffic=3, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — retained public iframe candidate boundaries
+
+- Ran `fixtures/public_iframe_paciello_audio_chromium_probe.py` with fresh
+  real Chromium/native-host state. It exited `1` before native capture:
+  `Iframe Tester Paciello audio player did not become playable/injected`.
+  The only exposed page execution context was origin
+  `https://iframe.verekia.com`, with frame URL
+  `https://iframe.verekia.com/?allow=accelerometer;%20autoplay;%20clipboard-write;%20encrypted-media;%20fullscreen;%20gyroscope;%20picture-in-picture;%20web-share&w=1280&h=720&url=https://thepaciellogroup.github.io/AT-browser-tests/acc-name-test/audio.html`.
+  No player context or Download button was observable.
+- Ran `fixtures/public_mdn_iframe_audio_chromium_probe.py` with fresh real
+  Chromium/native-host state. It exited `1` before native capture:
+  `MDN iframe audio player did not become playable/injected`.
+  Chromium exposed the MDN top-level frame and a second MDN-origin context,
+  but no playable child media context or Download button was observable.
+- Ran `fixtures/public_sa11y_soundcloud_iframe_chromium_probe.py` with fresh
+  real Chromium/native-host state. It exited `1` before native capture:
+  `Sa11y SoundCloud iframe player did not become playable/injected`.
+  The only exposed page context was origin `https://panzi.github.io`, frame
+  URL `https://panzi.github.io/embedplayer/`; no player context or Download
+  button was observable.
+- These are retained external iframe/frame-boundary results. No native job,
+  product defect, or policy change was inferred. The three candidate probes
+  are now durable artifacts for the audit. The protected Rust sibling remains
+  untouched.

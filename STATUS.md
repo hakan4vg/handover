@@ -2760,3 +2760,93 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   concrete public-page layout/injection limitation, not evidence of a completed
   browser/native capture, so no size/hash/job PASS is claimed.
 - The protected Rust `wait_for_transfer_idle` sibling hunk remains untouched.
+
+## 2026-09-05 — MDN iframe audio probe (no child frame exposed)
+
+- Ran the existing fresh-profile probe unchanged:
+  `timeout 360s python3 fixtures/public_mdn_iframe_audio_chromium_probe.py`.
+- The real native app started and the extension worker was present at
+  `chrome-extension://mogdhelapdlmkfgeeaogeehnlclhcnkn/background.js`. The probe
+  recorded the known Inspector limitation: `Target.getTargets` returned
+  `-32601`, so it used the resident `--commit` CLI path.
+- The MDN page was
+  `https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/audio`.
+  `Page.getFrameTree` exposed only the top document
+  `https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/audio`.
+  Two default execution contexts had origin `https://developer.mozilla.org`,
+  but no child frame, child media element, or injected Download button was
+  exposed. The candidate wait ended with `last=None`, `error=None`, no trusted
+  click, no native job, and the process exited `1`.
+- This is a concrete MDN/browser frame-layout or page-content blocker. It does
+  not establish native completion, browser/native size/hash equality, or empty
+  browser Downloads. No product policy change or candidate fixture rewrite was
+  made for this failure.
+
+## 2026-09-05 — Iframe Tester/Paciello audio probe (wrapper boundary)
+
+- Ran the existing fresh-profile probe unchanged:
+  `timeout 360s python3 fixtures/public_iframe_paciello_audio_chromium_probe.py`.
+- The real native app started and the extension worker was present at
+  `chrome-extension://mogdhelapdlmkfgeeaogeehnlclhcnkn/background.js`. The probe
+  recorded the known Inspector limitation: `Target.getTargets` returned
+  `-32601`, so it used the resident `--commit` CLI path.
+- The only frame exposed by `Page.getFrameTree` was the top-level
+  `iframe.verekia.com` wrapper, with URL
+  `https://iframe.verekia.com/?allow=accelerometer;%20autoplay;%20clipboard-write;%20encrypted-media;%20fullscreen;%20gyroscope;%20picture-in-picture;%20web-share&w=1280&h=720&url=https://thepaciellogroup.github.io/AT-browser-tests/acc-name-test/audio.html`.
+  One default execution context had origin `https://iframe.verekia.com`; no
+  Paciello child frame, child media element, injected Download button, trusted
+  click, or native job was exposed. The candidate wait ended with `last=None`,
+  `error=None`, and the process exited `1`.
+- This is a concrete public wrapper/frame-boundary blocker. It does not
+  establish native completion, browser/native size/hash equality, or empty
+  browser Downloads. No product policy change or candidate fixture rewrite was
+  made for this failure.
+
+## 2026-09-05 — Sa11y SoundCloud iframe probe (embed-player boundary)
+
+- Ran the existing fresh-profile probe unchanged:
+  `timeout 360s python3 fixtures/public_sa11y_soundcloud_iframe_chromium_probe.py`.
+- The real native app started and the extension worker was present at
+  `chrome-extension://mogdhelapdlmkfgeeaogeehnlclhcnkn/background.js`. The probe
+  recorded the known Inspector limitation: `Target.getTargets` returned
+  `-32601`, so it used the resident `--commit` CLI path.
+- The only frame exposed by `Page.getFrameTree` was the top-level
+  `https://panzi.github.io/embedplayer/` document. One default execution
+  context had origin `https://panzi.github.io`; no SoundCloud child frame,
+  child media element, injected Download button, trusted click, or native job
+  was exposed. The candidate wait ended with `last=None`, `error=None`, and the
+  process exited `1`.
+- This is a concrete public embed-player/frame-boundary blocker. It does not
+  establish native completion, browser/native size/hash equality, or empty
+  browser Downloads. No product policy change or candidate fixture rewrite was
+  made for this failure.
+
+## 2026-09-05 — Prove native-failure browser download fallback
+
+- Added `fixtures/browser_fallback_chromium_probe.py` for SPEC §5.1.1. The
+  probe uses a fresh Chromium profile and HOME, deliberately does not register
+  the native messaging host, and serves a safe 64 KiB local fixture. This
+  isolates the browser-restoration path from native acquisition.
+- The real extension worker was present at
+  `chrome-extension://mogdhelapdlmkfgeeaogeehnlclhcnkn/background.js`. Its
+  diagnostic returned `Specified native messaging host not found.`. A trusted
+  CDP left-click targeted a visible explicit `<a download>` with filename
+  `browser-fallback.bin`.
+- The content script consumed the first click, the worker's native attempt
+  failed, and `chrome.downloads.download({saveAs:false})` restored the intended
+  browser transaction. Chromium created exactly one completed download (id
+  `1`) at the isolated HOME Downloads directory, with `bytesReceived=65536`,
+  `error=null`, and one local server request. The downloaded bytes matched the
+  fixture: size `65536`, SHA-256
+  `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a`.
+- No native application database or native binary process was created, so the
+  expected native-job count for this failure-mode acceptance is `0`; one
+  browser download is the intended result. The exact probe output ended with
+  `BROWSER-FALLBACK: PASS (browser_bytes=65536,
+  sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  downloads=1, source_requests=1, native_jobs=0, native_processes=0)` and
+  `BROWSER-FALLBACK-CHROMIUM-PROBE: PASS`.
+- The one-download/one-request assertion also verifies that the synthetic
+  fallback anchor did not recursively re-enter ordinary interception. No
+  product code was changed; the existing fallback unit tests remain the
+  relevant code-path regression.

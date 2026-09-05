@@ -4302,3 +4302,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `GITHUB-RAW-BUTTON-PROBE: PASS`; the complete log is
   `/tmp/dm-github-raw-button.log`.
 - No product source changed; the protected Rust sibling remains clean.
+
+## 2026-09-06 — Real bare download attribute (URL-basename naming)
+
+- Added `fixtures/public_jcisaacs_download_attr_bare_chromium_probe.py` against
+  the same real public page
+  `https://jcisaacs.com/TEST/HTML5-Test/HTML5%20Download%20Attribute%20Demo.html`.
+  The target is the page's real **bare** download anchor: `download` present
+  with no value (`getAttribute('download') === ''`), same-origin
+  `href="samp/htmldoc.html"` resolving to
+  `https://jcisaacs.com/TEST/HTML5-Test/samp/htmldoc.html`.
+- A clean fresh Chromium profile trusted-clicked that anchor and recorded the
+  browser-owned `htmldoc.html` (named from the URL basename): `681` bytes,
+  SHA-256 `529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7`.
+- A second fresh profile ran the resident binary and unpacked extension. The
+  extension's document-capture path derived the name from the URL basename
+  (`cleanFilename('')` is undefined, so `basenameFromUrl` produced
+  `htmldoc.html`) and created exactly one ordinary native job with that name;
+  resident `--commit` exited `0`, and the job completed with
+  `provisional=false`.
+- Native output was byte/hash-identical to the clean browser download: `681`
+  bytes and SHA-256
+  `529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7`.
+  The database contained exactly one job and the extension profile's
+  Chromium Downloads directory was empty.
+- Exact output ended with
+  `JCISAACS-BARE-DOWNLOAD-ATTR: PASS (page=https://jcisaacs.com/TEST/HTML5-Test/HTML5%20Download%20Attribute%20Demo.html,
+  source=https://jcisaacs.com/TEST/HTML5-Test/samp/htmldoc.html,
+  filename=htmldoc.html, browser_bytes=681,
+  browser_sha256=529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7,
+  native_bytes=681,
+  native_sha256=529724dd54dd4966554ed18e61bad2efd48cfad35996351f7fc2150f848b8bb7,
+  jobs=1, browser_downloads=[])` and
+  `JCISAACS-BARE-DOWNLOAD-ATTR-PROBE: PASS`; the complete log is
+  `/tmp/dm-jcisaacs-bare.log`.
+- No product source changed; the protected Rust sibling remains clean.

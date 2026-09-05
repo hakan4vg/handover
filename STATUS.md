@@ -3570,3 +3570,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   output_bytes=4690721, output_sha256=60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de,
   traffic=2, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`.
+
+## 2026-09-05 — Able Player playlist audio source selection
+
+- Added `fixtures/public_ableplayer_playlist_audio_chromium_probe.py` for the
+  official playlist page
+  `https://ableplayer.github.io/ableplayer/demos/playlist1-audio.html`. The
+  probe trusted-clicked the second generated playlist item, `PHP 7.0 Alpha`,
+  and verified that `audio#audio1` switched to
+  `https://ableplayer.github.io/ableplayer/media/php70alpha.mp3`.
+- The selected audio reached `readyState=4`, `paused=false`, duration
+  `278.256286`; its rendered Able wrapper was `640x260`, and the product
+  Download button was present. The page made two initial `paulallen.mp3`
+  requests, but the single native job source was only the selected
+  `php70alpha.mp3` URL.
+- Resident `--commit` exited `0`. Final job state was `completed` with
+  `provisional=false`. The managed output and browser-context reference were
+  both `3,895,621` bytes with matching SHA-256
+  `e89bbffc3889ee44f63de9960b715ddab12301c008fe9fe988053814181d0a4b`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/playlist1-audio.html,
+  source=https://ableplayer.github.io/ableplayer/media/php70alpha.mp3,
+  output_bytes=3895621, output_sha256=e89bbffc3889ee44f63de9960b715ddab12301c008fe9fe988053814181d0a4b,
+  traffic=3, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`.

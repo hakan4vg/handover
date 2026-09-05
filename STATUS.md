@@ -3392,3 +3392,28 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `ABLEPLAYER-CHROMIUM: PASS (traffic=3, jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — Able Player transcript initiation
+
+- Added `fixtures/public_ableplayer_transcript_chromium_probe.py` against the
+  official transcript demo at
+  `https://ableplayer.github.io/ableplayer/demos/video3.html`. The probe used
+  the page's generated `Show transcript` control (`aria="Show transcript"`,
+  title `Show transcript`) and then the generated
+  `.able-transcript-seekpoint` `Intro` cue (`data-start=0`, `data-end=37`).
+  Both were activated by trusted Chromium CDP mouse clicks.
+- After the transcript cue click, the real video reported `readyState=4`,
+  `paused=false`, duration `52.406826`, and the Download button was present.
+  Chromium made three range requests for
+  `https://ableplayer.github.io/ableplayer/media/wwa.mp4`.
+- The native database contained one media job. Resident `--commit` exited `0`.
+  Final job state was `completed` with `provisional=false`. The managed output
+  and browser-context reference were both `5,613,210` bytes with matching
+  SHA-256
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `ABLEPLAYER-CHROMIUM: PASS (page=https://ableplayer.github.io/ableplayer/demos/video3.html,
+  traffic=3, jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

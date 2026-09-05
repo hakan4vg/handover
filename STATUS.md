@@ -4372,3 +4372,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   jobs=1, browser_downloads=[])` and `TRANSISTOR-PODCAST-PROBE: PASS`; the
   complete log is `/tmp/dm-transistor.log`.
 - No product source changed; the protected Rust sibling remains clean.
+
+## 2026-09-06 — Real production video page (Streamable) media capture
+
+- Added `fixtures/public_streamable_video_chromium_probe.py` against a real
+  production host — Streamable's public watch page
+  `https://streamable.com/o6xqa3` (video hosted and distributed by
+  Streamable). This is a live production video page, not a library/demo page.
+  The media ships in the top document: a native `<video>` whose `src` is the
+  server-issued signed CDN URL
+  (`https://cdn-cf-east.streamable.com/video/mp4/o6xqa3.mp4?Expires=...&Key-Pair-Id=...&Signature=...`) —
+  the SPEC §6.3 signed, opaque, query-heavy URL case on a real host.
+- Headless verification first (fresh disposable profile): the video loads
+  (`readyState=4`, duration `92.05`) and a trusted click on the player's real
+  play control (`div.svp-button-play`, `aria-label="Play (k)"`) starts
+  playback (`paused=false`, current time advancing). The earlier long-lived
+  browser session's "An error occurred" banner and `networkState=3` did not
+  reproduce in the fresh profile, so the page-player state was environmental,
+  not a product path.
+- In the probe run the trusted play click produced exactly one native media
+  job (`media=true`) for that signed URL. Resident `--commit` exited `0`; the
+  job completed with `provisional=false`.
+- For whole-object progressive media the native output is byte-identical to
+  the raw source. The independent reference fetched the exact signed element
+  source and recorded `82,608,844` bytes with SHA-256
+  `71397e09c2d6c7ab9b54cfb6903db132bab1666a601cf885042b63e391726877`; the
+  managed native output matched both. Chromium Downloads was empty and the
+  database contained exactly one job.
+- Exact output ended with
+  `STREAMABLE-VIDEO: PASS (page=https://streamable.com/o6xqa3,
+  source=https://cdn-cf-east.streamable.com/video/mp4/o6xqa3.mp4?Expires=…,
+  output_bytes=82608844,
+  sha256=71397e09c2d6c7ab9b54cfb6903db132bab1666a601cf885042b63e391726877,
+  jobs=1, browser_downloads=[])` and `STREAMABLE-VIDEO-PROBE: PASS`; the
+  complete log is `/tmp/dm-streamable.log`.
+- No product source changed; the protected Rust sibling remains clean.

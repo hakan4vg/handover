@@ -3653,3 +3653,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - The extension diagnostic also returned the native policy with
   `interceptDownloads=true`. No product code changed; the protected Rust
   sibling remains untouched.
+
+## 2026-09-05 — WET audio player with Archive redirect and zero native box
+
+- Added `fixtures/public_wet_audio_chromium_probe.py` against the current Web
+  Experience Toolkit audio-only demo:
+  `https://wet-boew.github.io/wet-boew/demos/multimedia/multimedia-audio-en.html`.
+  The page exposes one top-level HTML5 `<audio>` with MP3 and OGG sources. The
+  selected MP3 source was
+  `https://www.archive.org/download/RideOfTheValkyries/ride_of_the_valkyries_2.mp3`.
+- Fresh real Chromium reported `readyState=4`, `paused=false`, duration
+  `246.386938`, and three browser requests across the Archive redirect. The
+  native audio element's own rectangle was `0x0`, but the extension's real
+  player-bound Download button was visible and activated by trusted CDP input.
+  This exercises the wrapper-geometry path proven by the earlier zero-box audio
+  fix on a different public player implementation.
+- The first run reached native capture and resident commit but its browser-side
+  reference fetch failed with the exact CDP error `TypeError: Failed to fetch`.
+  This was a fixture CORS boundary: the player could consume the Archive media,
+  while a cross-origin page fetch could not read it. The probe was changed only
+  to navigate to the exact source, wait for the redirect-resolved media origin,
+  and fetch `location.href` from that same origin.
+- The corrected fresh-profile rerun created exactly one native media job.
+  Resident `--commit` forwarded it and exited `0`; final state was `completed`
+  with `provisional=false`. The browser-context reference resolved to
+  `https://dn711106.ca.archive.org/0/items/RideOfTheValkyries/ride_of_the_valkyries_2.mp3`
+  and recorded `3,942,417` bytes with SHA-256
+  `d712ccb817a8a205292283eec45d814f3d3805a68ecfde1d4c7e59792fd8fc3d`.
+  The native output matched exactly. Chromium Downloads was empty and the
+  database contained one job.
+- Exact output ended with
+  `WET-AUDIO-CHROMIUM: PASS (page=https://wet-boew.github.io/wet-boew/demos/multimedia/multimedia-audio-en.html, source=https://www.archive.org/download/RideOfTheValkyries/ride_of_the_valkyries_2.mp3, output_bytes=3942417, output_sha256=d712ccb817a8a205292283eec45d814f3d3805a68ecfde1d4c7e59792fd8fc3d, traffic=3, jobs=1, browser_downloads=[])` and
+  `WET-AUDIO-CHROMIUM-PROBE: PASS`. No product code changed; the protected
+  Rust sibling remains untouched.

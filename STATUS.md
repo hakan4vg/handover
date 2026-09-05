@@ -3257,3 +3257,34 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   traffic=1, jobs=1, browser_downloads=[])` and
   `MDN-WEBM-CHROMIUM-PROBE: PASS`. This closes a finite WebM top-level player
   path without product changes. The protected Rust sibling remains untouched.
+
+## 2026-09-05 — W3C recycled-player source switch
+
+- Added `fixtures/public_w3c_source_switch_chromium_probe.py` against the
+  official W3C HTML5 Video Events page at
+  `https://www.w3.org/2010/05/video/mediaevents.html`.
+- The probe first clicked the page's trusted `Test movie` control. The control
+  reused the existing top-level `<video>`, changed its child source to the
+  alternate `http://media.w3.org/2010/05/video/movie_300.mp4`, and called
+  `load()`. Chromium automatically upgraded the media request to HTTPS and
+  reported three range requests. The player then reported `readyState=4`,
+  `paused=false`, duration `300.141134`, and the injected Download button.
+- Exactly one native media job was created from the switched source. Resident
+  `--commit` returned exit `0`; the job completed with `provisional=false`.
+- The first run exposed two probe assumptions, both corrected before the PASS:
+  the page keeps MP4 before its WebM fallback, and its media server does not
+  allow CORS from the W3C page. The final probe asserts the observed MP4
+  source and navigates the same Chromium target to the media server origin for
+  a same-origin byte reference.
+- The browser reference recorded `2757913` bytes and SHA-256
+  `80c548058688a577ce9ca501cf9807311b95cc526cc82d292ec7e138e42257de`.
+  The managed native output matched both values. Chromium Downloads was empty.
+- Exact output ended with
+  `W3C-SOURCE-SWITCH-CHROMIUM: PASS (page=https://www.w3.org/2010/05/video/mediaevents.html,
+  source=http://media.w3.org/2010/05/video/movie_300.mp4,
+  output_bytes=2757913,
+  output_sha256=80c548058688a577ce9ca501cf9807311b95cc526cc82d292ec7e138e42257de,
+  traffic=3, jobs=1, browser_downloads=[])` and
+  `W3C-SOURCE-SWITCH-CHROMIUM-PROBE: PASS`. This closes a reachable recycled
+  player/source-update path without product changes. The protected Rust sibling
+  remains untouched.

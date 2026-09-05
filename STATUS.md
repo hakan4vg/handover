@@ -4272,3 +4272,33 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `JCISAACS-DOWNLOAD-ATTR-PROBE: PASS`; the complete log is
   `/tmp/dm-jcisaacs-download-attr.log`.
 - No product source changed; the protected Rust sibling remains clean.
+
+## 2026-09-06 — Real GitHub raw-button download (blob boundary)
+
+- Added `fixtures/public_github_raw_button_chromium_probe.py` against the real
+  GitHub blob page `https://github.com/pallets/flask/blob/main/README.md`. The
+  target is the real JS control `[data-testid=download-raw-button]` ("Download
+  raw file") in the file header; no injected element, no iframe.
+- A clean fresh Chromium profile trusted-clicked that button and recorded the
+  browser-owned `README.md`: `1639` bytes, SHA-256
+  `1f2de14735b1ee9d3a342fa7c5d5e87b95727276c0a56c8a9d77221f37880602`.
+- A second fresh profile ran the resident binary and unpacked extension, and
+  trusted-clicked the identical button. `chrome.downloads.search` from the
+  extension worker proved the download's `url` and `finalUrl` are both
+  `blob:https://github.com/<uuid>` — GitHub's button fetches the raw file and
+  initiates a client-side `blob:` download (`mime=text/markdown`,
+  `state=complete`, `error=null`, `fileSize=1639`, filename `README.md`).
+- The ordinary-download fallback is HTTP(S)-only by contract (`isHttp` in
+  `shared.ts`), so the extension leaves the blob transaction browser-owned.
+  The resident database stayed empty (`native_jobs=0`) while the complete
+  browser download (identical `1639` bytes) persisted — the correct boundary
+  for client-generated blob downloads, now proven on a real production page
+  rather than a fixture.
+- Exact output ended with
+  `GITHUB-RAW-BUTTON: PASS (page=https://github.com/pallets/flask/blob/main/README.md,
+  source=blob:https://github.com/…, filename=README.md, browser_bytes=1639,
+  browser_sha256=1f2de14735b1ee9d3a342fa7c5d5e87b95727276c0a56c8a9d77221f37880602,
+  native_jobs=0, browser_downloads=1)` and
+  `GITHUB-RAW-BUTTON-PROBE: PASS`; the complete log is
+  `/tmp/dm-github-raw-button.log`.
+- No product source changed; the protected Rust sibling remains clean.

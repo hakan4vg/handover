@@ -3822,3 +3822,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   interception policy: the browser copy remains intact while the resident app
   receives one observe-only capture. The protected Rust sibling remains
   untouched.
+
+## 2026-09-05 — Explicit Save-As gesture remains browser-owned
+
+- Added `fixtures/save_as_ownership_chromium_probe.py` for SPEC §§5.2 and
+  19.2. The fresh Chromium profile registered a disposable native host, built a
+  visible explicit `<a download>` on a local page, and sent a trusted right
+  click (`button=2`) to represent Save Link As. The probe's own listener then
+  prevented the headless context menu from opening, but recorded the event
+  before doing so.
+- Chromium delivered `isTrusted=true`, `button=2`, and
+  `defaultPrevented=false` to the page listener. The extension's capture-phase
+  ordinary-download handler did not intercept it: the fake host received only
+  `get-policy` messages and zero `capture-acquisition` messages.
+- Chromium's Downloads API returned an empty list, no application database was
+  created, and no native job existed. Exact output ended with
+  `SAVE-AS-OWNERSHIP-CHROMIUM: PASS (trusted_contextmenu=true,
+  default_prevented=false, native_captures=0, browser_downloads=0,
+  native_jobs=0)` and
+  `SAVE-AS-OWNERSHIP-CHROMIUM-PROBE: PASS`.
+- This proves the reachable Save-Link-As gesture boundary. The probe does not
+  claim that headless Chromium selected an operating-system context-menu item;
+  the menu itself is deliberately suppressed after the event is observed. The
+  protected Rust sibling remains untouched.

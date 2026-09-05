@@ -183,18 +183,23 @@ chrome.webRequest.onHeadersReceived.addListener(
 // INTERIM fallback (SPEC §5.1.1): observe-only. Forwards intent so the
 // resident app opens an Add Download window, but never cancels the browser
 // download — destroying a one-use/tokenized transaction to pretend takeover
-// succeeded is worse than a duplicate. Replaced by the pre-browser M0 proof.
-chrome.downloads.onCreated.addListener((item) => {
-  if (!policy.interceptDownloads) return;
-  if (consumeBrowserFallback(item) || item.byExtensionId === chrome.runtime.id) return;
-  if (!item.url || !isHttp(item.url)) return;
+// succeeded is worse than a duplicate. `onCreated` exposes only a tentative
+// URL basename for redirected downloads; `onDeterminingFilename` supplies the
+// header-resolved name while still allowing the browser transaction to proceed.
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  if (!policy.interceptDownloads || consumeBrowserFallback(item) || item.byExtensionId === chrome.runtime.id || !item.url || !isHttp(item.url)) {
+    suggest();
+    return;
+  }
   void sendNative({
     type: 'capture-acquisition',
     payload: {
       source: item.finalUrl || item.url,
-      name: item.filename?.split('/').pop()?.split('\\').pop(),
+      name: cleanFilename(item.filename),
+      pageUrl: item.referrer,
     },
-  });
+  }).finally(() => suggest());
+  return true;
 });
 
 chrome.runtime.onMessage.addListener((message, sender, reply) => {

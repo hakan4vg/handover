@@ -133,6 +133,8 @@ def main() -> int:
         native_job = wait_job_for_source(db)
         print("ORDINARY-FALLBACK-JOB:", json.dumps({"id": native_job["id"], "source": native_job["source"], "state": native_job["state"], "name": native_job["name"]}, sort_keys=True), flush=True)
         browser_record, browser_path = wait_browser_download(chrome_port, profile)
+        browser_name = Path(browser_record["filename"]).name
+        assert native_job["name"] == browser_name, {"native_name": native_job["name"], "browser_name": browser_name, "browser_record": browser_record}
         browser_size = browser_path.stat().st_size
         browser_hash = support.sha256(str(browser_path))
         print("BROWSER-DOWNLOAD:", json.dumps({"id": browser_record.get("id"), "state": browser_record.get("state"), "error": browser_record.get("error"), "url": browser_record.get("url"), "finalUrl": browser_record.get("finalUrl"), "filename": browser_record.get("filename"), "bytesReceived": browser_record.get("bytesReceived"), "size": browser_size, "sha256": browser_hash}, sort_keys=True), flush=True)

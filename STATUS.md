@@ -3997,6 +3997,42 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Verification after the repair passed `npm run build:all`, `npx tsc -b`,
   Vitest `38/38`, Rust `58/58`, fixture compilation, and `git diff --check`.
 
+## 2026-09-05 — Redirected browser downloads retain the final filename
+
+- The existing `fixtures/ordinary_download_chromium_probe.py` was tightened to
+  compare the browser's final filename with the native provisional job name.
+  The red real-Chromium baseline reproduced the reachable mismatch: browser
+  `Hello-World-master.zip` versus native `master`, even though the source
+  redirected from GitHub to codeload.
+- Chrome's documented downloads lifecycle exposes a tentative basename at
+  `onCreated`, then resolves the header/MIME filename during
+  `onDeterminingFilename`. The extension's observe-only native forward now runs
+  at that later event and always calls `suggest()`. Extension-initiated browser
+  fallback downloads are still consumed by the existing marker and skipped.
+- The corrected fresh-profile run recorded native name
+  `Hello-World-master.zip`, browser filename
+  `Hello-World-master.zip`, browser/native `351` bytes, and identical SHA-256
+  `acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233`.
+  Chromium finished one browser item and the resident finished one native job;
+  no duplicate was created.
+- Exact output ended with
+  `ORDINARY-DOWNLOAD: PASS (browser_bytes=351,
+  sha256=acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233,
+  native_bytes=351,
+  native_sha256=acd2fd3563d8de4b46dae1edeb96607b3d105a0a3be894e90aa5472353a93233,
+  browser_state=complete, jobs=1)` and
+  `ORDINARY-DOWNLOAD-PROBE: PASS`; the complete log is
+  `/tmp/dm-ordinary-filename-green.log`.
+- Neighboring real-browser regressions also passed: explicit-anchor native
+  capture; native-failure browser fallback with one download/one request and
+  zero native jobs; form POST fallback with browser POST/native GET and matching
+  bytes; and integration-off page-owned download with zero native jobs. Logs:
+  `/tmp/dm-reg-explicit-anchor.log`, `/tmp/dm-reg-native-fallback.log`,
+  `/tmp/dm-reg-form.log`, and `/tmp/dm-reg-integration-off.log`.
+- Full gates passed after the change: `npm run build:all`, `npx tsc -b`, Vitest
+  `7` files/`38` tests, Rust `58/58`, fixture compilation, and `git diff --check`.
+  The protected `src-tauri/src/main.rs` sibling remains clean.
+
 ## 2026-09-05 — Extension popup and manager handoff pass
 
 - Ran `fixtures/extension_popup_chromium_probe.py` against the explicit Vite

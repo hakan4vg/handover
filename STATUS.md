@@ -3886,3 +3886,22 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `Input` domain (`-32601`), and synthetic select events were reset by React.
   Theme and accent are real button interactions and were verified end-to-end.
   No product source changed; the protected Rust sibling remains untouched.
+
+## 2026-09-05 — Captured Add Download child target remains inspector-blocked
+
+- Added `fixtures/child_window_inspector_probe.py` for a bounded protocol attempt
+  against the real captured Add Download window. A disposable resident app,
+  native capture, Xvfb display, and one visible `Add Download` X11 window were
+  created successfully (`windows=1`).
+- The WebKit inspector root responded, but `/json`, `/json/list`, and
+  `/json/version` all returned HTTP 404. Candidate WebPage sockets did not expose
+  a usable child target: socket `1/1` emitted no target event and
+  `Target.getTargets` returned `-32601` (`'Target.getTargets' was not found`);
+  socket `1/3` was only `about:blank`; sockets `1/2`, `1/4`, `1/5`, and `1/6`
+  emitted unusable non-UTF-8 frames. No child Download click was claimed.
+- Two fresh retries stopped earlier at the known inspector startup races
+  (`[Errno 111] Connection refused` and no page-target event). The successful
+  endpoint run is the retained blocker evidence. This is an instrumentation
+  limit, not a product failure; the existing resident `--commit` path remains
+  the verified fallback for child-window lifecycle tests. No product source
+  changed; the protected Rust sibling remains untouched.

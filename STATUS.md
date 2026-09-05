@@ -3867,3 +3867,22 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   The next run exposed a fixture-only label mismatch (`Start Download`), which
   was corrected and then passed. No product source changed; the protected Rust
   sibling remains untouched.
+
+## 2026-09-05 — Appearance settings persist through a real UI restart
+
+- Added `fixtures/settings_ui_persistence_probe.py` for the still-uncovered
+  user-facing persistence path. A fresh disposable HOME/Xvfb booted the real
+  resident binary, and the main WebKit inspector clicked the Settings and
+  Appearance controls rather than invoking `update_settings` directly.
+- The rendered UI changed from `theme=system, accent=#0878ed` to
+  `theme=dark, accent=#d3138c`; the native SQLite settings row held both values
+  immediately. After terminating and restarting only that disposable app, the
+  Appearance surface restored both values, with `sqlite_match=true` and
+  `restart=true`.
+- Exact output ended with
+  `SETTINGS-UI-PERSISTENCE: PASS (theme=dark, accent=#d3138c,
+  sqlite_match=true, restart=true)` and `SETTINGS-UI-PROBE: PASS`.
+- The probe intentionally leaves App density unclaimed: WebKit Inspector has no
+  `Input` domain (`-32601`), and synthetic select events were reset by React.
+  Theme and accent are real button interactions and were verified end-to-end.
+  No product source changed; the protected Rust sibling remains untouched.

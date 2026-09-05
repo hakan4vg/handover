@@ -3070,3 +3070,31 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   readyState=4, paused=False, button=False, browser_downloads=0, native_jobs=0)`.
   This closes the media-button-off control behavior without changing product
   code. The protected Rust sibling remains untouched.
+
+## 2026-09-05 — Public media button keyboard activation
+
+- Added `fixtures/public_paciello_keyboard_chromium_probe.py` by reusing the
+  real Paciello public audio setup and changing only the initiation stimulus.
+  The fresh Chromium profile focused the injected native `<button>` and sent
+  trusted CDP Space key input. An earlier Enter-only sequence generated no
+  activation in this headless Chromium build; it produced no native job and
+  was not treated as product evidence. The passing probe uses Space, the
+  standard native-button activation path observed by Chromium here.
+- The focused button reported `aria-label=Download this media` and text
+  `Download`. The trusted keyboard activation created exactly one media job:
+  `provisional-58447b95-59f9-4b73-a5ac-599e5f66dedd`, source
+  `https://thepaciellogroup.github.io/AT-browser-tests/audio/jeffbob.mp3`.
+- Resident `--commit` returned exit `0`; the job completed with
+  `provisional=false`. Browser-context fetch recorded `4104320` bytes and
+  SHA-256 `a60b3d66d9bb9cacbe697b7bfc18ce31dd53d1fadec33e5d8f71bb780e6f551a`.
+  The managed native output matched both values, and Chromium Downloads was
+  empty.
+- Exact output ended with
+  `KEYBOARD-AUDIO-CHROMIUM: PASS (page=https://thepaciellogroup.github.io/AT-browser-tests/acc-name-test/audio.html,
+  source=https://thepaciellogroup.github.io/AT-browser-tests/audio/jeffbob.mp3,
+  output_bytes=4104320,
+  output_sha256=a60b3d66d9bb9cacbe697b7bfc18ce31dd53d1fadec33e5d8f71bb780e6f551a,
+  traffic=1, jobs=1, browser_downloads=[])` and
+  `KEYBOARD-AUDIO-CHROMIUM-PROBE: PASS`. This adds a real public keyboard
+  initiation path without changing product code. The protected Rust sibling
+  remains untouched.

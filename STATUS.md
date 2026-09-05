@@ -3338,3 +3338,35 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   traffic=5, jobs=1, browser_downloads=[])` and
   `MEDIAELEMENT-CHROMIUM-PROBE: PASS`. No product code changed; the protected
   Rust sibling remains untouched.
+
+## 2026-09-05 — MediaElement HLS boundary and DASH capture
+
+- The official MediaElement source selector exposes an HLS option, but its
+  exact live playlist
+  `https://bitdash-a.akamaihd.net/content/MI201109210084_1/m3u8s/f08e80da-bf1d-4e3d-8899-f0f6155f6efa.m3u8`
+  returned HTTP `403` with `content-type: text/html` and `486` bytes. This is
+  an external CDN boundary; no product defect was inferred and no HLS probe
+  was claimed.
+- Added `fixtures/public_mediaelement_dash_chromium_probe.py` for the
+  canonical MediaElement page `https://www.mediaelementjs.com/`. The page's
+  real `#player1-sources` change handler selected `M(PEG)-DASH` and resolved
+  the protocol-relative option to
+  `https://www.bok.net/dash/tears_of_steel/cleartext/stream.mpd`.
+- Browser CDP observed the MPD, video/audio initialization segments, and
+  `.m4f` media segments from `www.bok.net`. Runtime player evidence was
+  `readyState=4`, `paused=false`, duration `734`, with the product Download
+  button present. The native job source was the MPD; the database contained
+  one media job.
+- Resident `--commit` exited `0`. Final job state was `completed` with
+  `provisional=false`. The managed output was `59,936,285` bytes with SHA-256
+  `f1e5f73a9ae02e8eee29c16c55c86ae2a9336d8e94d3f6a6ba06353d5a796b12`.
+  `ffprobe` reported AAC audio plus H.264 video at `512x214`, duration
+  `734.166667`. Browser-context fetch of the selected MPD was `1,913` bytes
+  with SHA-256
+  `408a09285a7b2fda93b835998c1273902a1e03e0ed827eacedccf542b787c620`.
+  Chromium Downloads was empty.
+- The final output ended with
+  `MEDIAELEMENT-DASH-CHROMIUM: PASS (traffic=10, jobs=1,
+  browser_downloads=[])` and
+  `MEDIAELEMENT-DASH-CHROMIUM-PROBE: PASS`. No product code changed; the
+  protected Rust sibling remains untouched.

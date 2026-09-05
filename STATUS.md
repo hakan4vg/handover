@@ -4096,3 +4096,58 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   it. That is a separate naming-polish item, not a selection or data defect.
 - No product source changed; the protected `src-tauri/src/main.rs` sibling
   remains clean.
+
+## 2026-09-05 — Custom-element players: open shadow-root media discovery
+
+- Added `fixtures/public_muxvideo_chromium_probe.py` against the Media Chrome
+  `<mux-video>` example at
+  `https://media-chrome.mux.dev/examples/vanilla/media-elements/mux-video.html`.
+  The page exposes zero light-DOM `video`/`audio`; the media is a `<mux-video>`
+  custom element whose real `<video>` lives inside its open shadow root, and
+  the HLS VOD master streams from `stream.mux.com`.
+- The red fresh-profile baseline proved a real generic gap: after a trusted
+  click on `media-play-button`, the shadow video was playing
+  (`readyState=4`, `paused=false`, duration `653.875`, blob source,
+  `640x360`) but `lightMedia=0` and `#dm-media-download-button` was absent.
+  The extension only scanned light DOM, so web-component players were
+  invisible.
+- Fixes in `extension/src/content.ts`:
+  - `collectMedia()` scans light DOM every tick and pierces open shadow roots
+    at most once per second, caching the full result so throttled ticks cannot
+    drop shadow media and flicker the button; closed shadow roots stay
+    invisible.
+  - `pick()` now calls `collectMedia()` once and reuses the list for the hover
+    and best-area passes (the previous two calls let the throttled second call
+    return only light DOM).
+- Fix in `extension/src/media-candidates.ts`: the first fresh run exposed a
+  second reachable selection defect. The newest-observed-manifest rule picked
+  the later-fetched **subtitles playlist** (`subtitles.m3u8`) instead of the
+  media rendition; the native job then failed in FFmpeg on webvtt-in-mp4.
+  Selection now prefers the media manifest over subtitle/caption playlists
+  (`isSubtitlePlaylist()` naming check, generic, not site-specific) and falls
+  back to a subtitle playlist only when it is the only manifest evidence.
+- Three focused unit tests added (41/41 Vitest total): subtitle-name
+  recognition, media-manifest-over-subtitle preference, subtitle-only fallback.
+- The corrected fresh-profile run: button present on the shadow video
+  (`button=true`, `light_media=0`), trusted activation created exactly one
+  native media job for the 720p `rendition.m3u8` (not subtitles). Resident
+  `--commit` exited `0`; the job completed with `provisional=false`.
+- Independent byte reference: the probe fetched the exact same rendition
+  playlist (map + every segment) and ran the identical
+  `ffmpeg -c copy` finalize. Native output and reference both were
+  `172,487,989` bytes with SHA-256
+  `9d20a196f4ceb8ecbf9691398a6f6ff0016fd8c2a77f09df0e1fd768f362f063`.
+  Chromium Downloads was empty and the database contained exactly one job.
+- Exact output ended with
+  `MUXVIDEO-CHROMIUM: PASS (page=https://media-chrome.mux.dev/examples/vanilla/media-elements/mux-video.html,
+  output_bytes=172487989,
+  sha256=9d20a196f4ceb8ecbf9691398a6f6ff0016fd8c2a77f09df0e1fd768f362f063,
+  jobs=1, browser_downloads=[], shadow_media=true, light_media=0)` and
+  `MUXVIDEO-CHROMIUM-PROBE: PASS`; the complete log is
+  `/tmp/dm-muxvideo-green.log`; the red baseline is `/tmp/dm-muxvideo-red.log`.
+- Regression gates passed: `npm run build:all`, `npx tsc -b`, Vitest
+  `7` files/`41` tests, Rust `58/58`, fixture compilation, and
+  `git diff --check`. The light-DOM public WebM probe re-passed after the
+  content-script change (`MDN-WEBM-CHROMIUM-PROBE: PASS`, 330,618 bytes,
+  SHA-256 `074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e`).
+  The protected `src-tauri/src/main.rs` sibling remains clean.

@@ -36,6 +36,19 @@ export function roleFor(url: string, contentType = ''): MediaRole {
   return 'unknown';
 }
 
+// Subtitle/caption playlists are manifests too, but they are not the media the
+// user is watching. Providers commonly name them subtitles/captions, so the
+// generic selection prefers a media manifest over a subtitle one and falls back
+// to subtitles only when nothing else exists.
+export function isSubtitlePlaylist(url: string): boolean {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    return /(^|[/_-])(subtitles?|captions?)([/_.-]|$)/.test(path) || /\.(?:vtt|ttml)(?:[?#]|$)/i.test(url);
+  } catch {
+    return false;
+  }
+}
+
 export function choosePlayerEvidence(players: MediaPlayerEvidence[], tabId: number, frameId: number, now = Date.now(), documentId?: string): MediaPlayerEvidence | undefined {
   const fresh = players.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId) && now - item.at <= 15_000);
   return [...fresh].sort((left, right) => {
@@ -48,7 +61,11 @@ export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number
   const scoped = candidates.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId));
   const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
     const newest = [...pool].sort((left, right) => right.at - left.at);
-    const manifest = newest.find((item) => item.role === 'manifest');
+    const manifests = newest.filter((item) => item.role === 'manifest');
+    // Prefer the media manifest over subtitle/caption playlists: captions are
+    // not the resource the user is watching. Fall back to a subtitle playlist
+    // only when it is the only manifest evidence.
+    const manifest = manifests.find((item) => !isSubtitlePlaylist(item.url)) ?? manifests[0];
     // Once segmented traffic is present, an unknown MP4 may be only an MSE
     // initialization fragment. Never promote it to a complete download.
     if (!manifest && pool.some((item) => item.role === 'segment')) return undefined;

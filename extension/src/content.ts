@@ -192,6 +192,36 @@ function usable(el: HTMLMediaElement): boolean {
   return !el.hasAttribute('disabled') && !!sourceFor(el);
 }
 
+// Media inside web-component players (Media Chrome / mux-video and similar)
+// lives in open shadow roots; document.querySelectorAll('video, audio') cannot
+// see it. Scan light DOM every tick, and pierce open shadow roots at most once
+// per second to bound cost on heavy pages. The last full result is cached so a
+// throttled tick does not drop shadow media and flicker the button. Closed
+// shadow roots stay invisible.
+let lastShadowScan = 0;
+let mediaCache: (HTMLVideoElement | HTMLAudioElement)[] | null = null;
+function collectMedia(): (HTMLVideoElement | HTMLAudioElement)[] {
+  const light = Array.from(document.querySelectorAll('video, audio')) as (HTMLVideoElement | HTMLAudioElement)[];
+  if (!active()) {
+    mediaCache = null;
+    return light;
+  }
+  if (performance.now() - lastShadowScan < 1000) return mediaCache ?? light;
+  lastShadowScan = performance.now();
+  const found = light.slice();
+  const scan = (root: ParentNode): void => {
+    root.querySelectorAll('*').forEach((el) => {
+      const shadow = (el as HTMLElement).shadowRoot;
+      if (!shadow) return;
+      shadow.querySelectorAll('video, audio').forEach((media) => found.push(media as HTMLVideoElement | HTMLAudioElement));
+      scan(shadow);
+    });
+  };
+  scan(document);
+  mediaCache = found;
+  return found;
+}
+
 function reportPlayer(el: HTMLMediaElement, force = false): void {
   if (!active()) return;
   const now = Date.now();
@@ -228,14 +258,14 @@ function pick(): HTMLVideoElement | HTMLAudioElement | null {
   // is over the button. Without this the control vanishes from under the
   // cursor and can never be clicked.
   if (current?.isConnected && button?.isConnected && button.matches(':hover')) return current;
-  const hovered = document.querySelectorAll('video, audio');
-  for (const el of hovered) {
-    const media = el as HTMLVideoElement | HTMLAudioElement;
-    if (media.matches(':hover') && visible(media) && usable(media)) return media;
+  const media = collectMedia();
+  for (const el of media) {
+    const item = el as HTMLVideoElement | HTMLAudioElement;
+    if (item.matches(':hover') && visible(item) && usable(item)) return item;
   }
   let best: HTMLVideoElement | HTMLAudioElement | null = null;
   let bestArea = 0;
-  document.querySelectorAll('video, audio').forEach((el) => {
+  media.forEach((el) => {
     const media = el as HTMLVideoElement | HTMLAudioElement;
     if (media.paused || media.ended || !visible(media) || !usable(media)) return;
     const rect = anchorRect(media);
@@ -301,8 +331,8 @@ function track(): void {
   // MutationObserver; any non-idempotent write here (e.g. rewriting
   // document.title every tick) re-triggers the observer into a
   // self-perpetuating loop that starves the page's main thread. Proven live.
-  const media = document.querySelectorAll('video, audio');
-  media.forEach((el) => observePlayer(el as HTMLMediaElement));
+  const media = collectMedia();
+  media.forEach((el) => observePlayer(el as HTMLVideoElement | HTMLAudioElement));
   const next = active() ? pick() : null;
   if (next !== current) {
     const previous = current;

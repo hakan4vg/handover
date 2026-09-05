@@ -4,6 +4,7 @@ import {
   chooseMediaCandidate,
   chooseMediaSelection,
   choosePlayerEvidence,
+  isSubtitlePlaylist,
   roleFor,
   type MediaCandidate,
   type MediaPlayerEvidence,
@@ -117,6 +118,28 @@ describe('media candidate selection', () => {
       { url: 'https://cdn.test/vod/old.m3u8', tabId: 4, frameId: 0, at: 10, role: 'manifest', playerKey: 'player-a' },
     ];
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/selected.m3u8');
+  });
+
+  it('recognizes subtitle and caption playlist names', () => {
+    expect(isSubtitlePlaylist('https://cdn.test/subtitles.m3u8')).toBe(true);
+    expect(isSubtitlePlaylist('https://cdn.test/cc/captions.m3u8')).toBe(true);
+    expect(isSubtitlePlaylist('https://cdn.test/vod/rendition.m3u8')).toBe(false);
+    expect(isSubtitlePlaylist('https://cdn.test/vod/index.m3u8')).toBe(false);
+  });
+
+  it('prefers the media manifest over a newer subtitle playlist', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/rendition.m3u8', tabId: 4, frameId: 0, at: 10, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/subtitles/subtitles.m3u8', tabId: 4, frameId: 0, at: 30, role: 'manifest', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/rendition.m3u8');
+  });
+
+  it('falls back to the subtitle playlist when it is the only manifest', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/subtitles.m3u8', tabId: 4, frameId: 0, at: 30, role: 'manifest', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/subtitles.m3u8');
   });
 
   it('returns recent browser segment hints with the selected manifest', () => {

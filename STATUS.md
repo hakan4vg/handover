@@ -3715,5 +3715,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   fresh-profile Chromium/native rerun passed without product changes. Exact
   output ended with
   `CUSTOM-PLAYER-HTML5-CHROMIUM: PASS (page=https://chrisnajman.github.io/custom-video-player/, source=https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4, output_bytes=15256787, output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451, traffic=1, jobs=1, browser_downloads=[])` and
+  `CUSTOM-PLAYER-HTML5-CHROMIUM: PASS (page=https://chrisnajman.github.io/custom-video-player/, source=https://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4, output_bytes=15256787, output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451, traffic=1, jobs=1, browser_downloads=[])` and
+  `CUSTOM-PLAYER-HTML5-CHROMIUM-PROBE: PASS`. No product code changed; the
+  protected Rust sibling remains untouched.
+
+## 2026-09-05 — Custom Video Player captions and transcript controls
+
+- Re-ran `fixtures/public_custom_video_player_chromium_probe.py` after adding
+  trusted interaction coverage for the page's own accessibility controls. The
+  fresh profile again loaded the paused top-level video at `readyState=4`,
+  duration `70.542222`, and the same MP4 source.
+- A trusted click on `#playpause` changed `paused=true`, `text="Play"` to
+  `paused=false`, `text="Pause"`. Trusted clicks then enabled captions with
+  `textTracks[0].mode="showing"` and label `"Captions on"`, and opened the
+  transcript with `details.open=true`.
+- The product Download button was activated after those page interactions.
+  Exactly one native media job was created; resident `--commit` exited `0`; the
+  final state was `completed` with `provisional=false`. Native and
+  browser-context output were both `15,256,787` bytes with SHA-256
+  `8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451`.
+  Chromium Downloads was empty.
+- Exact output included
+  `CUSTOM-PLAYER-CONTROL: {"after": {"button": true, "currentTime": 0, "paused": false, "readyState": 4, "text": "Pause"}, "before": {"button": true, "paused": true, "readyState": 4, "text": "Play", "video": true, "x": 262.5, "y": 630.96875}, "captions": {"label": "Captions on", "mode": "showing"}, "captionsClick": {"selector": "#captions", "x": 753.53125, "y": 624.46875}, "transcript": {"open": true, "status": "Open"}, "transcriptClick": {"selector": "#summary", "x": 632.5, "y": 676.46875}, "trustedClick": true}` and
   `CUSTOM-PLAYER-HTML5-CHROMIUM-PROBE: PASS`. No product code changed; the
   protected Rust sibling remains untouched.

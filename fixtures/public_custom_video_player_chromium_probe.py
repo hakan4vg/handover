@@ -119,6 +119,18 @@ def wait_player(client: adaptive.EventCDP, timeout: float = 90.0) -> dict:
     raise RuntimeError(f"custom video player did not become playable/injected: last={last}; raw={last_raw}; error={last_error}; diagnostic={diagnostic}")
 
 
+def trusted_click(client: adaptive.EventCDP, selector: str) -> dict:
+    raw = client.evaluate(
+        "JSON.stringify((()=>{const b=document.querySelector(" + json.dumps(selector) + ");"
+        "if(!b)throw Error('control missing: '+" + json.dumps(selector) + ");"
+        "const r=b.getBoundingClientRect();return {selector:" + json.dumps(selector) + ",x:r.left+r.width/2,y:r.top+r.height/2};})())"
+    )
+    point = json.loads(raw)
+    client.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": point["x"], "y": point["y"], "button": "left", "clickCount": 1, "modifiers": 0})
+    client.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": point["x"], "y": point["y"], "button": "left", "clickCount": 1, "modifiers": 0})
+    return point
+
+
 def activate_custom_player(client: adaptive.EventCDP) -> dict:
     raw = client.evaluate(
         "JSON.stringify((()=>{"
@@ -141,7 +153,27 @@ def activate_custom_player(client: adaptive.EventCDP) -> dict:
         )
         last = json.loads(raw)
         if last.get("readyState", 0) >= 2 and not last.get("paused") and last.get("button"):
-            return {"before": before, "after": last, "trustedClick": True}
+            captions_point = trusted_click(client, "#captions")
+            captions_deadline = time.time() + 15
+            captions = None
+            while time.time() < captions_deadline:
+                captions = json.loads(client.evaluate("JSON.stringify({mode:document.querySelector('#video')?.textTracks?.[0]?.mode||'missing',label:document.querySelector('#captions-text')?.textContent?.trim()||''})"))
+                if captions.get("mode") == "showing":
+                    break
+                time.sleep(0.25)
+            if not captions or captions.get("mode") != "showing":
+                raise RuntimeError(f"captions control did not enable track: {captions}")
+            transcript_point = trusted_click(client, "#summary")
+            transcript = None
+            transcript_deadline = time.time() + 15
+            while time.time() < transcript_deadline:
+                transcript = json.loads(client.evaluate("JSON.stringify({open:!!document.querySelector('#transcript')?.open,status:document.querySelector('#summary-status')?.textContent?.trim()||''})"))
+                if transcript.get("open"):
+                    break
+                time.sleep(0.25)
+            if not transcript or not transcript.get("open"):
+                raise RuntimeError(f"transcript control did not open: {transcript}")
+            return {"before": before, "after": last, "trustedClick": True, "captionsClick": captions_point, "captions": captions, "transcriptClick": transcript_point, "transcript": transcript}
         time.sleep(0.5)
     raise RuntimeError(f"custom play/pause click did not start/inject player: {last}")
 

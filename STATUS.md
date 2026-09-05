@@ -3098,3 +3098,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `KEYBOARD-AUDIO-CHROMIUM-PROBE: PASS`. This adds a real public keyboard
   initiation path without changing product code. The protected Rust sibling
   remains untouched.
+
+## 2026-09-05 — Public Plyr player initiation
+
+- Added `fixtures/public_plyr_chromium_probe.py` against the official Plyr
+  demo page `https://plyr.io/`. The page exposed two video elements; the
+  extension selected the visible, playing `800x450` player rather than the
+  hidden `0x0` placeholder. Its source was the finite direct MP4
+  `https://cdn.plyr.io/static/demo/View_From_A_Blue_Moon_Trailer-576p.mp4`.
+- The player reported `readyState=4`, `paused=false`, duration `183.125333`,
+  and the injected Download control was visible. CDP recorded five browser
+  range requests to the selected source. The trusted button activation created
+  exactly one native media job.
+- Resident `--commit` returned exit `0`; the job completed with
+  `provisional=false`. Browser-context fetch recorded `49900386` bytes and
+  SHA-256 `2f4bd69d9bfc928a399493eaec2ba0e5a6a4f7e326d6e74e0d1d415f63be86f8`.
+  The managed native output matched both values, and Chromium Downloads was
+  empty.
+- Exact output ended with
+  `PLYR-CHROMIUM: PASS (page=https://plyr.io/,
+  source=https://cdn.plyr.io/static/demo/View_From_A_Blue_Moon_Trailer-576p.mp4,
+  output_bytes=49900386,
+  output_sha256=2f4bd69d9bfc928a399493eaec2ba0e5a6a4f7e326d6e74e0d1d415f63be86f8,
+  traffic=5, jobs=1, browser_downloads=[])` and
+  `PLYR-CHROMIUM-PROBE: PASS`. This adds a distinct public custom-player path
+  without site-specific resolver code or product changes. The protected Rust
+  sibling remains untouched.

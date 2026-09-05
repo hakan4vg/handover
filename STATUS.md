@@ -3905,3 +3905,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   limit, not a product failure; the existing resident `--commit` path remains
   the verified fallback for child-window lifecycle tests. No product source
   changed; the protected Rust sibling remains untouched.
+
+## 2026-09-05 — Public MDN progressive WebM capture
+
+- Ran `fixtures/public_mdn_webm_chromium_probe.py` with a fresh disposable
+  Chromium profile, the unpacked extension, a disposable native-host manifest,
+  and the real resident binary. The page was the safe MDN simple-video example:
+  `https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/simple-video.html`.
+- Chromium reported one visible top-level video, source
+  `https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/rabbit320.webm`,
+  `readyState=4`, `paused=false`, duration `7.8`, and a visible 320x240 player.
+  The Download button was at `x=270.4453125, y=104.2734375`, inside that player;
+  the trusted CDP click created one media job for the exact current source.
+- The native job began `downloading`, then the real resident `--commit` CLI
+  forwarded it with exit `0`. The final job was `completed` and
+  `provisional=false`. The output was `330618` bytes. A browser-context fetch
+  of the exact source was also `330618` bytes, with matching SHA-256
+  `074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e`.
+- Exactly one media request was observed, Chromium Downloads remained empty,
+  and the probe ended with `MDN-WEBM-CHROMIUM-PROBE: PASS`.
+- No product source changed. The dead uncommitted `wait_for_transfer_idle`
+  duplicate was removed separately; `src-tauri/src/main.rs` is now clean.

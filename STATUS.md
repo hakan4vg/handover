@@ -2950,3 +2950,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   jobs=1, source_requests=2, browser_downloads=[])` and
   `EXPLICIT-ANCHOR-CHROMIUM-PROBE: PASS`. The protected Rust sibling remains
   untouched.
+
+## 2026-09-05 — Add Download confirmation surface
+
+- Added `fixtures/add_window_chromium_probe.py` to verify the user-visible
+  confirmation surface on a real Chromium/native capture. It used a fresh
+  Chromium profile and native-app HOME, the built extension, the registered
+  native host, and the safe local 64 KiB fixture.
+- A trusted CDP click on the explicit `<a download>` created exactly one
+  provisional native job. Before commit, `xwininfo -root -tree` observed exactly
+  one visible `Add Download` window: `410x560+435+170`, title `Add Download`.
+- The Inspector endpoint returns `404` and its `Target.getTargets` method is
+  unsupported (`-32601`), so this probe uses the already-established resident
+  `--commit` CLI control after proving the window is mapped. It does not claim a
+  child-window Commit-button click.
+- The CLI commit returned exit `0`. The completed managed output was `65536`
+  bytes with SHA-256
+  `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a`. The
+  browser-side reference matched size and hash. The job was completed and
+  non-provisional; Chromium Downloads was empty. The source server saw two
+  requests: native acquisition and browser reference fetch.
+- Exact output ended with
+  `ADD-WINDOW-CHROMIUM: PASS (... output_bytes=65536,
+  output_sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  jobs=1, source_requests=2, browser_downloads=[], ui_matches=1)` and
+  `ADD-WINDOW-CHROMIUM-PROBE: PASS`. No XTEST automation was used and the
+  protected Rust sibling remains untouched.

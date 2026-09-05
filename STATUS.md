@@ -4151,3 +4151,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   content-script change (`MDN-WEBM-CHROMIUM-PROBE: PASS`, 330,618 bytes,
   SHA-256 `074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e`).
   The protected `src-tauri/src/main.rs` sibling remains clean.
+
+## 2026-09-05 — Manager inline controls and bulk actions
+
+- Added `fixtures/manager_inline_controls_chromium_probe.py` for the SPEC
+  §10.2 inline row controls, §10.3 bulk actions, sorting, and the Add URL
+  overlay. It drives the explicit `npm run dev` mock adapter in a fresh
+  Chromium profile with trusted CDP input; the complete log is
+  `/tmp/dm-manager-inline-controls.log`.
+- Inline row controls: a trusted click on the active
+  `ubuntu-24.04-desktop-amd64.iso` row's `Pause` action changed it to
+  `Paused`/`Resume`; `Resume` returned it to `Downloading`/`Pause`. A trusted
+  `Retry` on the failed `old-archive.tar.xz` changed `Failed` to `Connecting`.
+- Bulk actions: `Pause All` paused the active rows and switched the toolbar to
+  `Resume All`; `Resume All` restored them and switched the toolbar back to
+  `Pause All`.
+- Sorting: `Sort → Name` produced a DOM order equal to the browser's
+  `localeCompare` order over all 14 rows (first `backup-manifest.json`);
+  `Sort → File size` placed the largest job first
+  (`ubuntu-24.04-desktop-amd64.iso`).
+- Add URL: the toolbar `Add URL` opened the `Add Download` overlay (Cancel
+  present); `Cancel` closed it.
+- Exact output ended with `MANAGER-INLINE-CONTROLS: PASS`; the probe returned
+  `0`. These are mock-adapter UI checks; no native application or external
+  service was touched. The protected Rust sibling remains clean.

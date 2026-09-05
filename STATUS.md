@@ -3947,3 +3947,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Trusted browser-owned context-click and Ctrl-click remained unprevented.
   The exact run ended with `PUBLIC-HLS-CHROMIUM-PROBE: PASS`.
 - No product source changed; `src-tauri/src/main.rs` remains clean.
+
+## 2026-09-05 — Public live HLS is rejected cleanly
+
+- Added `fixtures/public_live_rejection_chromium_probe.py` and ran it with a
+  fresh disposable Chromium profile, the unpacked extension, a disposable
+  native-host manifest, and the real resident binary. The safe public page was
+  the hls.js demo with iReplay's continuously generated Blender channel:
+  `https://ireplay.tv/test/blender.m3u8`.
+- The live master returned HTTP 200 with content type
+  `application/vnd.apple.mpegurl`, no `#EXT-X-ENDLIST`, and four `_live.m3u8`
+  variants. Chromium loaded a playing blob/MSE video at `readyState=4`; its
+  current `HTMLMediaElement.duration` was a finite DVR-window value (`1535`),
+  so the manifest's sliding-window evidence—not duration infinity—was used to
+  identify the live source.
+- The player-bound Download button was visible inside the current 1012x569.25
+  player (`attached=true`, button center `x=1080.9453125, y=439.7578125`). A
+  trusted CDP click created one media job for the observed live variant
+  `https://ireplay.tv/test/rate_3_28.m3u8`.
+- The resident acquisition rejected the source before any commit with the
+  generic core error `Live media is not supported; a finite VOD playlist is
+  required`. The job ended `state=failed`; there was one job, no output, and
+  Chromium Downloads was empty. The exact run ended with
+  `PUBLIC-LIVE-REJECTION-CHROMIUM-PROBE: PASS`.
+- No product source changed; `src-tauri/src/main.rs` remains clean.

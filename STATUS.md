@@ -3926,3 +3926,24 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   and the probe ended with `MDN-WEBM-CHROMIUM-PROBE: PASS`.
 - No product source changed. The dead uncommitted `wait_for_transfer_idle`
   duplicate was removed separately; `src-tauri/src/main.rs` is now clean.
+
+## 2026-09-05 — Public hls.js segmented VOD capture
+
+- Ran `fixtures/public_hls_chromium_probe.py` with a fresh disposable Chromium
+  profile, the unpacked extension, a disposable native-host manifest, and the
+  real resident binary. The safe public page was the hls.js demo, using the
+  finite VOD manifest
+  `https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8`.
+- Chromium reported a playing blob/MSE video with `duration=634.6`,
+  `readyState=4`, and a visible 1012x572.828 player. The product button was
+  visible inside it at `x=1080.9453125, y=649.7578125`; the trusted click
+  created one media job for the observed manifest rather than the blob URL.
+- The browser reference independently fetched and concatenated 64 manifest
+  segments: `71878228` bytes, SHA-256
+  `6e830be99296a8452aa3294f25ca64193bee2b58bf4d559a7cc5ffbb1cda0a42`.
+  Resident `--commit` exited `0`; the final native job was `completed` and
+  `provisional=false`, with the same byte count and hash. Chromium Downloads
+  was empty.
+- Trusted browser-owned context-click and Ctrl-click remained unprevented.
+  The exact run ended with `PUBLIC-HLS-CHROMIUM-PROBE: PASS`.
+- No product source changed; `src-tauri/src/main.rs` remains clean.

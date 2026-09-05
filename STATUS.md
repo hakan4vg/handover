@@ -3845,3 +3845,25 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   claim that headless Chromium selected an operating-system context-menu item;
   the menu itself is deliberately suppressed after the event is observed. The
   protected Rust sibling remains untouched.
+
+## 2026-09-05 — Manual Add URL commits through the real UI
+
+- Added `fixtures/manual_add_ui_probe.py` to close the manual Add URL acceptance
+  in SPEC §§10.6 and 19.3. A fresh disposable HOME/Xvfb booted the compiled
+  resident binary; the main WebKit inspector drove the rendered Add URL overlay,
+  not a direct Tauri command.
+- The overlay initially rendered `Start Download` disabled. After entering the
+  local HTTP fixture URL and `manual-ui.bin`, the button became enabled. The
+  server request count stayed `0` until that actual button was activated.
+- The UI-created job was `provisional=true` and reached `finalizing` after one
+  source request. The probe set the Save-to field through the same captured
+  overlay and activated its real `Download` button. The resident job then ended
+  `state=completed`, `provisional=false`, with `262144` bytes at the requested
+  destination. The output matched the fixture payload byte-for-byte and had
+  SHA-256 `ac6533c30d2d4fcc01be82be68bd63a592d37c49fe769b05aebfb4504fa146b3`.
+- Exact output ended with `MANUAL-ADD-UI-PROBE: PASS` and one source request.
+  The first attempt stopped before UI action on the known intermittent
+  `WebKit inspector did not become ready: [Errno 111] Connection refused`.
+  The next run exposed a fixture-only label mismatch (`Start Download`), which
+  was corrected and then passed. No product source changed; the protected Rust
+  sibling remains untouched.

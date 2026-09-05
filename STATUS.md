@@ -3124,3 +3124,27 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `PLYR-CHROMIUM-PROBE: PASS`. This adds a distinct public custom-player path
   without site-specific resolver code or product changes. The protected Rust
   sibling remains untouched.
+
+## 2026-09-05 — Completion notification actions execute
+
+- Added `fixtures/notification_actions_probe.py` on top of the real completion
+  notification flow. It launched the real binary under Xvfb, captured and
+  committed the safe local `65536`-byte fixture, navigated the real Tauri UI to
+  `?view=notifications`, and clicked both rendered action buttons.
+- The surface rendered one completion card with exactly `Open` and
+  `Show in folder`. A disposable `xdg-open` recorder then observed the exact
+  arguments in order: the managed file path, followed by its parent folder.
+  No real desktop opener was launched.
+- The managed output was `65536` bytes with SHA-256
+  `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a`, and
+  the source server saw exactly one request. Exact output ended with
+  `NOTIFICATION-ACTIONS-PROBE: PASS (job=provisional-7b14c8f0-8dc2-49c6-bd81-39f637a994e5,
+  output_bytes=65536,
+  output_sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  buttons=['Open', 'Show in folder'],
+  open_calls=['[DISPOSABLE-PATH]/Managed/notification-surface.bin',
+  '[DISPOSABLE-PATH]/Managed'], source_requests=1)`.
+- This closes the in-app completion action wiring on Linux's equivalent shell
+  opener. Windows Explorer behavior remains a separate platform check; the
+  installed notification plugin's OS-toast action API remains unasserted. The
+  protected Rust sibling remains untouched.

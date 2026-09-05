@@ -3161,3 +3161,26 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - No trusted demo click, media capture, native job, managed output, or browser
   download was produced. The candidate is retained as a diagnostic artifact;
   no product change is justified by this unreachable public control.
+
+## 2026-09-05 — Form POST browser initiation
+
+- Added `fixtures/form_download_chromium_probe.py` with a local, safe
+  `POST /download` form returning `Content-Disposition: attachment` and a
+  deterministic `65536`-byte payload. The real Chromium probe clicked the
+  visible submit button with CDP mouse input; it did not synthesize the form
+  submission in page JavaScript.
+- Chromium recorded one ordinary browser download from `POST /download` with
+  a 17-byte form body. The extension's browser-download fallback created one
+  native provisional job for the same URL; the native replay used `GET
+  /download` and completed successfully.
+- Browser and native outputs were both `65536` bytes with SHA-256
+  `7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2`.
+  Chromium's record was `state=complete`, `error=null`; the native job was
+  `state=completed`, `provisional=false`; Chromium produced no second record.
+  Exact output included `FORM-SERVER-METHODS: [{"body_bytes": 17,
+  "method": "POST", "path": "/download"}, {"body_bytes": 0,
+  "method": "GET", "path": "/download"}]` and
+  `FORM-DOWNLOAD-PROBE: PASS`.
+- This proves the browser remains intact for a form-originated attachment
+  while the native fallback replays a safe GET. It does not claim to preserve
+  arbitrary POST bodies for native replay; no product change was needed.

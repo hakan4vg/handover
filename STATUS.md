@@ -4407,3 +4407,36 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   jobs=1, browser_downloads=[])` and `STREAMABLE-VIDEO-PROBE: PASS`; the
   complete log is `/tmp/dm-streamable.log`.
 - No product source changed; the protected Rust sibling remains clean.
+
+## 2026-09-06 — Production segmented VOD (blob/MSE) environment-block record
+
+The remaining distinct horizontal pattern — segmented VOD resolved through
+the extension's media-traffic ring on a production page — was attempted
+against two real production hosts. Both refuse at the transport or file level
+in this environment; the evidence is recorded here with no product source
+change and no site resolver exception:
+
+- **PeerTube** (peertube.tv): watch pages mount their hls.js/video.js player,
+  but the media fails before playback. The "Sliding from a waterfall in Tahiti
+  #shorts" clip fails with `HLS.js error: mediaError - fatal: true -
+  manifestIncompatibleCodecsError`, and the 40s "Lille Norge" clip's direct
+  web-video (`https://media.tube.tchncs.de/videos/…-480.mp4`) reports
+  `[object MediaError]` at `readyState=0` — PeerTube's WebM-class web-video
+  files are not decodable by this headless Chromium build.
+- **Al Jazeera** (aljazeera.com video newsfeed,
+  `https://www.aljazeera.com/video/newsfeed/2026/9/5/09-05-sv-india-building-collapse-mp4`):
+  the page and its "Play video" control work, but a trusted click mounts five
+  `<video>` elements whose `src` attributes are all plain-HTTP
+  (`http://ajmn-aje-vod.akamaized.net/media/v1/pmp4/static/clear/…/main.mp4`)
+  inside an HTTPS document. Chromium's mixed-content policy kills each one:
+  `networkState=3` (NO_SOURCE) and `[object MediaError]` on every element —
+  no decodable media can ever exist, so the generic media button has nothing
+  to attach to. Server-side probing of those `http://` URLs is additionally
+  blocked by the VPS terminal security policy (plain-HTTP fetch scan), so the
+  block is recorded from the in-browser evidence alone.
+- Conclusion: production MSE/blob segmented capture is environment-blocked
+  on the hosts reachable from this box without an HTTPS-served manifest
+  player. This is an instrumentation/environment block, not a demonstrated
+  product defect; the generic blob resolution path itself remains proven by
+  the mux-video probe (`5536ffd`).
+- No product source changed; the protected Rust sibling remains clean.

@@ -4337,3 +4337,38 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `JCISAACS-BARE-DOWNLOAD-ATTR-PROBE: PASS`; the complete log is
   `/tmp/dm-jcisaacs-bare.log`.
 - No product source changed; the protected Rust sibling remains clean.
+
+## 2026-09-06 — Real production podcast page (Transistor) media capture
+
+- Added `fixtures/public_transistor_podcast_chromium_probe.py` against a real
+  production host — Transistor's public episode share page
+  `https://share.transistor.fm/s/e70577fd` ("Forward Thinking Founders"
+  episode 197, published via Transistor, Inc.). This is a live production
+  player page, not a library/demo page. The page ships the episode's audio in
+  the top document: a native `<audio>` with
+  `src=https://media.transistor.fm/e70577fd/6bc50f3d.mp3?src=player` and
+  `preload="none"`.
+- A trusted CDP click on the player's real control
+  (`button.play-button[aria-label="Play/Pause"]`) started playback:
+  `paused=false`, `readyState=1`, duration `1776.177756` (29:36). The native
+  `<audio>` element box is `0x0`, and the generic Download button appeared at
+  `x=1059.9453125, y=128.5859375` — the playing-zero-box wrapper geometry
+  path applied outside a demo page.
+- Trusted button activation created exactly one native media job
+  (`media=true`) for
+  `https://media.transistor.fm/e70577fd/6bc50f3d.mp3?src=player`. Resident
+  `--commit` exited `0`; the job completed with `provisional=false`.
+- For whole-object progressive media the native output is byte-identical to
+  the raw source. The independent reference fetched the same element source
+  (following its `302` to the CDN) and recorded `28,465,955` bytes with
+  SHA-256 `4d587525133b8fa812b3cc5150cb12a15c2783421d06b41c5e58edc047325b1a`;
+  the managed native output matched both. Chromium Downloads was empty and the
+  database contained exactly one job.
+- Exact output ended with
+  `TRANSISTOR-PODCAST: PASS (page=https://share.transistor.fm/s/e70577fd,
+  source=https://media.transistor.fm/e70577fd/6bc50f3d.mp3?src=player,
+  output_bytes=28465955,
+  sha256=4d587525133b8fa812b3cc5150cb12a15c2783421d06b41c5e58edc047325b1a,
+  jobs=1, browser_downloads=[])` and `TRANSISTOR-PODCAST-PROBE: PASS`; the
+  complete log is `/tmp/dm-transistor.log`.
+- No product source changed; the protected Rust sibling remains clean.

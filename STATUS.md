@@ -3465,3 +3465,18 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   product defect, or policy change was inferred. The three candidate probes
   are now durable artifacts for the audit. The protected Rust sibling remains
   untouched.
+
+## 2026-09-05 — close-to-tray transfer continuity
+
+- Ran `fixtures/close_to_tray_probe.py` against a fresh resident application,
+  a real 64 MiB slow transfer, and one forwarded capture. The main window was
+  closed through the live WebKit window API while the transfer was active.
+- X11 reported `Map State: IsUnMapped`; the Tauri visibility result was `{}`
+  from the installed inspector endpoint. The resident remained alive with
+  exactly one application process.
+- The transfer reached `finalizing` at `67,108,864` bytes and the fixture
+  server saw exactly one source request. The final output ended with
+  `CLOSE-TO-TRAY: PASS (main_visible={}, processes=1, state=finalizing,
+  bytes=67108864, source_requests=1)` and
+  `CLOSE-TO-TRAY-PROBE: PASS`. No product code changed; the protected Rust
+  sibling remains untouched.

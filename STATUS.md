@@ -2924,3 +2924,29 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   was empty. Exact output ended with
   `MDN-INTERACTIVE-AUDIO: PASS (... jobs=1, browser_downloads=[])` and
   `MDN-INTERACTIVE-AUDIO-CHROMIUM-PROBE: PASS`.
+
+## 2026-09-05 — Explicit `<a download>` native interception
+
+- Added `fixtures/explicit_anchor_chromium_probe.py` for the successful branch
+  paired with the native-failure fallback proof. It used the built extension,
+  a fresh Chromium profile, a fresh native-app HOME, the registered native host,
+  and a safe local 64 KiB fixture.
+- The first attempt stopped before the click because the probe treated the
+  known service-worker CDP diagnostic (`runtimeType=undefined`, while the
+  worker target was present) as native-host failure. That was a probe bug, not
+  product evidence; the gate was removed without changing production code.
+- The corrected run performed a trusted CDP left-click on an explicit
+  `<a download>` with source `http://127.0.0.1:[DISPOSABLE-PORT]/browser-fallback.bin`
+  and filename `browser-fallback.bin`. It created exactly one native job with
+  `media=false`, then the resident `--commit` path returned exit `0`.
+- The completed managed output was `65536` bytes with SHA-256
+  `d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a`. The
+  browser-side reference was `65536` bytes with the same SHA-256. The source
+  server saw two requests: one native acquisition and one explicit browser
+  reference fetch. Chromium Downloads remained empty.
+- Exact output ended with
+  `EXPLICIT-ANCHOR-CHROMIUM: PASS (... output_bytes=65536,
+  output_sha256=d0fb80b239a23260482afa5bc8360bcabe5604b5f50a93078c6e5c99a0b0e53a,
+  jobs=1, source_requests=2, browser_downloads=[])` and
+  `EXPLICIT-ANCHOR-CHROMIUM-PROBE: PASS`. The protected Rust sibling remains
+  untouched.

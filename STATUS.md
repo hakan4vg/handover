@@ -4797,3 +4797,23 @@ change and no site resolver exception:
   for the same CDN bytes; exactly 1 job; Chromium Downloads empty:
   `PLYR-PROBE: PASS`.
 - No product source changed in this slice.
+
+## 2026-09-06 — Public Video.js player: blob MSE -> Mux VOD -> muxed MP4
+
+- New `fixtures/public_videojs_button_chromium_probe.py`: real videojs.org
+  hero player (Video.js + VHS, `<video>` fed via blob MSE), trusted play
+  click, trusted click on the real `#dm-media-download-button`, commit
+  through the real provisional-to-completed flow. The captured source is a
+  signed Mux `rendition.m3u8` (fMP4, EXT-X-MAP + segments).
+- First run failed honestly on the PROBE side: the reference fetched only
+  the ~3.4 KB manifest while the resident correctly downloaded 869,306
+  bytes of media. Fixed by resolving the manifest (MAP + segment URLs),
+  fetching all fragments, and muxing the reference with the resident's
+  exact ffmpeg `-c copy` invocation.
+- Evidence (`/tmp/dm-videojs-green.log`, `probe_rc=0`): reference
+  `fragments=10 bytes=21005303 sha256=da4d8ec2…`; job row `media=true
+  kind=video`; output byte/hash-identical; exactly 1 job; Chromium
+  Downloads empty: `VIDEOJS-PROBE: PASS`. (Mux serves renditions per run —
+  fragment count differs between runs; equality is per-run manifest vs
+  output.)
+- No product source changed in this slice.

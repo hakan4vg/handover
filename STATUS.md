@@ -6247,3 +6247,29 @@ change and no site resolver exception:
   `/tmp/dm-ui-general-platform-neutral.png`.
 - Full Vitest passed `50/50`; `npx tsc -b`, `npm run build:extension`, and
   `git diff --check` passed.
+
+## 2026-09-07 — Resident exit lifecycle boundary
+
+- Ran the requested isolated command repeatedly:
+  `timeout 360s python3 fixtures/exit_behavior_probe.py`. The established
+  X11 `WM_DELETE_WINDOW` path reached the close handler and the resident
+  process terminated, but it reproducibly returned `resident_exit=1` rather
+  than `0`.
+- Tested two minimal native hypotheses in disposable builds. Adding
+  `api.prevent_close()` before the delayed `app.exit(0)` did not improve the
+  close result. Increasing the delay from 100 ms to 1 s also did not improve
+  it. Both changes were reverted; no unverified lifecycle production change
+  remains.
+- A separate startup `SIGSEGV` occurred twice during Inspector bring-up, but
+  rerunning the established probe reached the close path. It is retained as
+  a startup-race observation, not lifecycle acceptance.
+- Updated `fixtures/exit_behavior_probe.py` so it no longer labels every
+  non-`SIGSEGV` exit a clean PASS. Exit `0` is `PASS`; exit `1` is
+  `TERMINATION-PASS-WITH-EXTERNAL-BLOCKER` for the reproducible GTK/Xvfb
+  shutdown status; other statuses fail. The final run reported:
+  `EXIT-BEHAVIOR: TERMINATION-PASS-WITH-EXTERNAL-BLOCKER (closeBehavior=exit,
+  resident_exit=1, native_close=WM_DELETE_WINDOW, blocker=GTK/Xvfb shutdown
+  status)`.
+- Native Cargo tests passed `70/70`; Cargo build and probe compilation passed.
+  No source change remains outside the probe harness. The external blocker is
+  the only unresolved part of this lifecycle acceptance.

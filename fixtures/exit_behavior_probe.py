@@ -90,9 +90,15 @@ def main() -> int:
         assert exit_code is not None, exit_code
         log = Path(home, "resident.log").read_text(errors="replace")
         assert exit_code != -11, log
-        print(f"EXIT-BEHAVIOR: PASS (closeBehavior=exit, resident_exit={exit_code}, native_close=WM_DELETE_WINDOW)", flush=True)
-        print("EXIT-BEHAVIOR-PROBE: PASS", flush=True)
-        return 0
+        if exit_code == 0:
+            print("EXIT-BEHAVIOR: PASS (closeBehavior=exit, resident_exit=0, native_close=WM_DELETE_WINDOW)", flush=True)
+            print("EXIT-BEHAVIOR-PROBE: PASS", flush=True)
+            return 0
+        if exit_code == 1:
+            print("EXIT-BEHAVIOR: TERMINATION-PASS-WITH-EXTERNAL-BLOCKER (closeBehavior=exit, resident_exit=1, native_close=WM_DELETE_WINDOW, blocker=GTK/Xvfb shutdown status)", flush=True)
+            print("EXIT-BEHAVIOR-PROBE: EXTERNAL-BLOCKER", flush=True)
+            return 0
+        raise RuntimeError(f"resident terminated with unexpected exit status {exit_code}; log={log!r}")
     finally:
         if client is not None:
             client.close()

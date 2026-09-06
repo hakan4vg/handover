@@ -90,7 +90,18 @@ function interceptDownloadClick(event: MouseEvent): void {
   if (!isHttp(source)) return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  const name = cleanFilename(anchor.getAttribute('download')) ?? basenameFromUrl(source);
+  // Chromium drops the author-supplied filename for cross-origin targets
+  // and saves under the server basename instead. Mirror that: honor the
+  // download attribute only when the target is same-origin with the page.
+  let authorName: string | undefined;
+  try {
+    authorName = new URL(source).origin === new URL(window.location.href).origin
+      ? cleanFilename(anchor.getAttribute('download'))
+      : undefined;
+  } catch {
+    authorName = undefined;
+  }
+  const name = authorName ?? basenameFromUrl(source);
   void chrome.runtime.sendMessage({
     type: 'ordinary-capture',
     payload: {

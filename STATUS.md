@@ -4486,3 +4486,37 @@ change and no site resolver exception:
   log is `/tmp/dm-direct-mp4.log` (`probe_rc=0`).
 - No product source changed; the protected `src-tauri/src/main.rs` sibling
   remains clean.
+
+## 2026-09-06 — Cross-origin download attribute follows Chromium (server basename)
+
+- Real defect in `extension/src/content.ts` (`interceptDownloadClick`): the
+  author-supplied `download` attribute value was honored for every
+  HTTP(S) target. Chromium itself drops that value for cross-origin
+  targets and saves under the server basename instead (verified via web
+  search: WHATWG/html#2562 discussion, Chromium issue 714373, MDN
+  `download` attribute cross-origin behavior). The native job therefore
+  diverged from the browser's name on every cross-origin attributed link.
+- Minimal fix: honor the attribute only when
+  `new URL(source).origin === new URL(window.location.href).origin`;
+  otherwise fall back to `basenameFromUrl(source)`. Same-origin valued and
+  bare attributes are untouched (the jcisaacs probes below re-prove them).
+- New `fixtures/xorigin_download_attr_chromium_probe.py`: page on
+  `127.0.0.1`, file on `localhost` (different host = different origin),
+  anchor carries `download="author-supplied-name.bin"` for
+  `/file/range.bin`. It asserts the native job is NOT the author name,
+  commits, and checks byte/hash equality with an independent fetch.
+- Red baseline (fix stashed, extension rebuilt): native job named
+  `author-supplied-name.bin`, probe FAIL, `probe_rc=1`
+  (`/tmp/dm-xorigin-attr-red.log`).
+- Green run: `XORIGIN-ATTR: PASS (author=author-supplied-name.bin,
+  native_name=range.bin, output_bytes=8388608,
+  output_sha256=70204857af3fc5eaeec3102843f9a0b58a2b8c4d8336a127db9c2aedef5c29bb,
+  jobs=1, browser_downloads=[])` and `XORIGIN-ATTR-PROBE: PASS`;
+  complete log `/tmp/dm-xorigin-attr.log` (`probe_rc=0`).
+- Neighboring regressions with the fix: jcisaacs valued
+  (`JCISAACS-DOWNLOAD-ATTR-PROBE: PASS`) and bare
+  (`JCISAACS-BARE-DOWNLOAD-ATTR-PROBE: PASS`) real-public probes.
+- Full gates: `npm run build:all`, `npx tsc -b`, Vitest `7` files/`41`
+  tests, Rust `58/58`, fixture compilation, `git diff --check`
+  (`/tmp/dm-xorigin-gates.log`). The protected `src-tauri/src/main.rs`
+  sibling remains clean.

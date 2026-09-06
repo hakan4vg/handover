@@ -5171,3 +5171,37 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and
   `PUBLIC-MEDIA-CHROME-CHROMIUM-PROBE: PASS`.
 - No product source change was justified by these results.
+
+## 2026-09-06 — Internet Archive nested-shadow track-player capture
+
+- Added `fixtures/public_internet_archive_chromium_probe.py` for a distinct
+  public-site/player initiation pattern: the Internet Archive public-domain
+  item page `https://archive.org/details/HumpbackWhalesSongsSoundsVocalizations`.
+  Its real player is nested through `ia-music-theater` and `play-av` open
+  shadow roots into a JW-controlled `<video>`; this is not the already-proven
+  Media Chrome light-DOM player or the hls.js selector path.
+- A fresh Chromium profile trusted-clicked the real player track button for
+  track 2, `Humpback_whale_song_3`, then used the real player control to start
+  playback. Chromium reported the selected source
+  `https://archive.org/download/HumpbackWhalesSongsSoundsVocalizations/Humpback_whale_song_3_64kb.mp3`,
+  `readyState=3`, `paused=false`, and duration `31.215964`. The generic
+  extension button appeared over the nested-shadow media and a trusted click
+  created exactly one media job for that selected source.
+- Resident `--commit` exited `0`; the sole managed job completed with
+  `provisional=false`. The independent browser-context fetch of the exact
+  captured source measured `250,693` bytes and SHA-256
+  `c9e971c425fa831c438253dda8ec9232f697b57b647dbccea35939a040a7e70a`.
+  Native output matched the reference exactly, and Chromium Downloads stayed
+  empty.
+- Exact retained green output is `/tmp/dm-public-internet-archive-retry.log`:
+  `INTERNET-ARCHIVE: PASS (page=https://archive.org/details/HumpbackWhalesSongsSoundsVocalizations,
+  source=https://archive.org/download/HumpbackWhalesSongsSoundsVocalizations/Humpback_whale_song_3_64kb.mp3,
+  output_bytes=250693,
+  output_sha256=c9e971c425fa831c438253dda8ec9232f697b57b647dbccea35939a040a7e70a,
+  jobs=1, browser_downloads=[])` and
+  `INTERNET-ARCHIVE-CHROMIUM-PROBE: PASS`.
+- The first run reached the same real chain and created the selected job, but
+  the probe wrapped an async browser reference in `JSON.stringify`, serializing
+  the unresolved Promise as `{}`. That probe-only error is retained at
+  `/tmp/dm-public-internet-archive.log`; the helper was corrected and the
+  fresh-profile retry above passed. No product source change was justified.

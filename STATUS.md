@@ -5248,3 +5248,43 @@ change and no site resolver exception:
   capture were timing-sensitive. The final probe fixes use no product change:
   bounded player-mount waiting, visible consent geometry, and CDP
   Network-response-body readback. No product defect was established.
+
+## 2026-09-06 — PeerTube ranged fMP4 HLS capture
+
+- Added `fixtures/public_peertube_chromium_probe.py` for a distinct public
+  watch-page/player family: the PeerTube page
+  `https://peertube.tv/w/sQDpFLkMpWcm33kjTKHPYy`. Its real player exposed a
+  blob-backed `<video>` fed by a finite fMP4 HLS media playlist. This path is
+  distinct from the earlier TED `media-controller` path and the other closed
+  public-player probes.
+- A fresh Chromium profile reached the real player, used trusted pause/play
+  gestures, and clicked the injected Download Manager button. Chromium
+  reported `readyState=4`, `paused=false`, duration `1325.833331` seconds;
+  the button event recorded `isTrusted=true`. The extension/native path made
+  exactly one provisional media job for the captured PeerTube HLS source.
+- The browser-context CDP Network readback observed the exact finite manifest:
+  HTTP `206`, MIME `application/vnd.apple.mpegurl`, `36,262` bytes, SHA-256
+  `ec219ce1e1c739106e7e83f54d279625ab9707c6310fefc4c9791ccb23517724`.
+- PeerTube stores the initialization map and all media fragments as byte
+  ranges in one shared `.mp4` resource. The probe's independent reference
+  now preserves those ranges, issues bounded `Range` requests, validates each
+  `206` response length, concatenates the `332` ordered pieces, and remuxes
+  with the same `ffmpeg -map 0 -c copy` path as the resident. This corrected a
+  probe-only reference mismatch; no product source change was justified.
+- Resident `--commit` exited `0`; the sole managed job completed with
+  `provisional=false`. The resident output and independent reference matched
+  exactly at `339,829,878` bytes, SHA-256
+  `6887e86862d2e33b7a5d62c7f00cafb64ee70eb92cf9f021c4d60482f4a13fee`.
+  Chromium Downloads stayed empty.
+- Exact retained green output is `/tmp/dm-public-peertube-retry6.log`:
+  `PEERTUBE: PASS (output_bytes=339829878,
+  output_sha256=6887e86862d2e33b7a5d62c7f00cafb64ee70eb92cf9f021c4d60482f4a13fee,
+  browser_source_bytes=36262,
+  browser_source_sha256=ec219ce1e1c739106e7e83f54d279625ab9707c6310fefc4c9791ccb23517724,
+  jobs=1, browser_downloads=[])` and
+  `PUBLIC-PEERTUBE-CHROMIUM-PROBE: PASS`.
+- One intermediate fresh run completed all `332/332` resident fragments but
+  its final remux hit `/tmp` exhaustion (`No space left on device`, FFmpeg exit
+  `228`). The disposable prior probe roots were moved off the tmpfs; the next
+  fresh-profile run above passed with the same external source and no product
+  change.

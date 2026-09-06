@@ -3764,6 +3764,11 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   not a Download Manager capture failure; no native job or PASS is claimed.
 - The probe's compile passed. The retained disposable profile was used only for
   diagnosis and is cleaned after this run.
+- A fresh rerun on 2026-09-06 reproduced the same concrete boundary in
+  `/tmp/dm-public-mdn-styled.log`: the page was reachable, the extension button
+  was injected, and the trusted mute event was observed, but `video.muted`
+  remained false until a programmatic click. No native capture assertion ran;
+  this remains an external page-control blocker, not a product defect.
 
 ## 2026-09-05 — Native failure restores one browser download without recursion
 
@@ -3882,10 +3887,16 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - Exact output ended with
   `SETTINGS-UI-PERSISTENCE: PASS (theme=dark, accent=#d3138c,
   sqlite_match=true, restart=true)` and `SETTINGS-UI-PROBE: PASS`.
-- The probe intentionally leaves App density unclaimed: WebKit Inspector has no
-  `Input` domain (`-32601`), and synthetic select events were reset by React.
-  Theme and accent are real button interactions and were verified end-to-end.
-  No product source changed; the protected Rust sibling remains untouched.
+- The original probe intentionally left App density unclaimed because WebKit
+  Inspector has no `Input` domain (`-32601`). The extended probe now uses the
+  native HTML `select.value` setter plus a bubbled `change` event: the first
+  real UI phase changed density from `comfortable` to `compact` and SQLite
+  immediately saved `density=compact`. The second disposable boot hit the known
+  Inspector startup race (`[Errno 111] Connection refused`) before restored
+  density could be inspected; a fresh retry hit the same race before the first
+  UI phase. Evidence: `/tmp/dm-settings-ui-density.log` and
+  `/tmp/dm-settings-ui-density-retry.log`. Restart restoration remains
+  unclaimed, and no product source changed.
 
 ## 2026-09-05 — Captured Add Download child target remains inspector-blocked
 

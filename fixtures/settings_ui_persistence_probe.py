@@ -18,6 +18,20 @@ import segmented_restart_probe as support
 BIN = str(Path(__file__).resolve().parents[1] / "src-tauri" / "target" / "debug" / "download-manager")
 THEME = "dark"
 ACCENT = "#d3138c"
+DENSITY = "compact"
+
+
+def select_density(client, value: str) -> dict:
+    raw = client.evaluate(
+        "JSON.stringify((()=>{const select=document.querySelector('.settings-content select');"
+        "if(!select)return {error:'density select missing'};"
+        "const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value')?.set;"
+        "if(!setter)return {error:'HTMLSelectElement value setter missing'};"
+        f"setter.call(select,{json.dumps(value)});"
+        "select.dispatchEvent(new Event('change',{bubbles:true}));"
+        "return {value:select.value,density:document.querySelector('.desktop-shell')?.dataset.density||''};})())"
+    )
+    return json.loads(raw)
 
 
 def wait_dom(client, expression: str, predicate, timeout: float = 30.0):
@@ -91,18 +105,21 @@ def main() -> int:
 
         click_text(client, "button.theme-option", "Dark")
         click_text(client, f"button.accent-swatch[aria-label='Use {ACCENT} accent']", "")
+        density_event = select_density(client, DENSITY)
+        print("SETTINGS-UI-DENSITY-EVENT:", json.dumps(density_event, sort_keys=True), flush=True)
         wait_dom(
             client,
             "JSON.stringify((()=>{const shell=document.querySelector('.desktop-shell');return {theme:shell?.dataset.theme||'',density:shell?.dataset.density||'',style:shell?.getAttribute('style')||'',selected:!!document.querySelector('button.accent-swatch.selected[aria-label=\"Use #d3138c accent\"]'),select:document.querySelector('.settings-content select')?.value||''}})())",
-            lambda value: (lambda state: state.get("theme") == THEME and state.get("selected"))(json.loads(value)),
+            lambda value: (lambda state: state.get("theme") == THEME and state.get("selected") and state.get("density") == DENSITY and state.get("select") == DENSITY)(json.loads(value)),
             timeout=30.0,
         )
         saved = support.load_settings(db)
         assert saved.get("theme") == THEME, saved
         assert saved.get("accent") == ACCENT, saved
+        assert saved.get("density") == DENSITY, saved
         changed = rendered_state(client)
         print("SETTINGS-UI-CHANGED:", json.dumps(changed, sort_keys=True), flush=True)
-        print("SETTINGS-DB-SAVED:", json.dumps({"theme": saved.get("theme"), "accent": saved.get("accent")}, sort_keys=True), flush=True)
+        print("SETTINGS-DB-SAVED:", json.dumps({"theme": saved.get("theme"), "accent": saved.get("accent"), "density": saved.get("density")}, sort_keys=True), flush=True)
 
         client.close()
         client = None
@@ -117,14 +134,15 @@ def main() -> int:
         restored = wait_dom(
             client,
             "JSON.stringify((()=>{const shell=document.querySelector('.desktop-shell');return {theme:shell?.dataset.theme||'',density:shell?.dataset.density||'',style:shell?.getAttribute('style')||'',selected:!!document.querySelector('button.accent-swatch.selected[aria-label=\"Use #d3138c accent\"]'),select:document.querySelector('.settings-content select')?.value||''}})())",
-            lambda value: (lambda state: state.get("theme") == THEME and state.get("selected"))(json.loads(value)),
+            lambda value: (lambda state: state.get("theme") == THEME and state.get("selected") and state.get("density") == DENSITY and state.get("select") == DENSITY)(json.loads(value)),
             timeout=30.0,
         )
         persisted = support.load_settings(db)
         assert persisted.get("theme") == THEME, persisted
         assert persisted.get("accent") == ACCENT, persisted
+        assert persisted.get("density") == DENSITY, persisted
         print("SETTINGS-UI-RESTORED:", restored, flush=True)
-        print(f"SETTINGS-UI-PERSISTENCE: PASS (theme={THEME}, accent={ACCENT}, sqlite_match=true, restart=true)", flush=True)
+        print(f"SETTINGS-UI-PERSISTENCE: PASS (theme={THEME}, accent={ACCENT}, density={DENSITY}, sqlite_match=true, restart=true)", flush=True)
         print("SETTINGS-UI-PROBE: PASS", flush=True)
         return 0
     finally:

@@ -131,6 +131,20 @@ class GatedEncryptedHls:
                 path = urlsplit(self.path).path
                 with owner.lock:
                     owner.counts[path] = owner.counts.get(path, 0) + 1
+                if path == "/page/encrypted.html":
+                    page = b"""<!doctype html>
+<html><body><video id='player' controls autoplay playsinline></video>
+<script src='https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js'></script>
+<script>
+const video = document.getElementById('player');
+if (window.Hls && Hls.isSupported()) {
+  const hls = new Hls();
+  hls.loadSource('/hls/encrypted.m3u8');
+  hls.attachMedia(video);
+  hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+} else { video.src = '/hls/encrypted.m3u8'; video.play(); }
+</script></body></html>"""
+                    return self.send_body(200, page, "text/html; charset=utf-8")
                 if path in {"/hls/encrypted.m3u8", "/hls/key.bin", "/hls/init.mp4"} or path.startswith("/hls/v-"):
                     if not self.gated():
                         return self.send_body(403, b"referer required", "text/plain")

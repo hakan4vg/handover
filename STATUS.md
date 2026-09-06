@@ -4955,3 +4955,19 @@ change and no site resolver exception:
   `GATED-ENCRYPTED-HLS-PROBE: PASS`. The key was fetched through the same
   request-context path as the media fragments.
 - No product source changed in this slice.
+
+## 2026-09-06 — Full browser chain for Referer-gated AES-128 HLS
+
+- Added `fixtures/fullchain_encrypted_hls_chromium_probe.py`. A fresh
+  disposable Chromium profile loads the local hls.js page, plays the gated
+  encrypted VOD, and clicks the actual extension media button with a trusted
+  CDP click. The real extension/native-messaging path creates the job; this is
+  not an Inspector-only shortcut.
+- Evidence (`/tmp/dm-fullchain-encrypted-hls.log`, `PROBE_EXIT=0`): hls.js
+  player `playing=true`, `readyState=4`, extension/native diagnostic clean;
+  job `media=true` with the exact page Referer; commit forwarded with exit 0;
+  resident output and independent reference both `32,057` bytes, SHA-256
+  `6b6875bc6d4c6233f362624c1d5e919993e49f0e7530fc007cfb2d6d17167861`;
+  exactly one job and `browser_downloads=[]`. `FULLCHAIN-ENCRYPTED-HLS-PROBE:
+  PASS`.
+- No product source changed in this slice.

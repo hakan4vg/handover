@@ -5738,3 +5738,47 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and
   `VIME-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
   passed. No production source changed.
+
+## 2026-09-06 — Vime official-demo HLS/fMP4 capture
+
+- Added untracked fixture `fixtures/public_vime_hls_chromium_probe.py` for the
+  provider selector on Vime's official demo `https://vimejs.com/demo/`. The
+  probe selects the real `hls` option, waits for `<vm-hls>` to become ready,
+  traverses Vime's shadow-root `vm-playback-control`, and keeps the acceptance
+  checks for one native job, browser-observed HLS, resident completion,
+  independent reconstruction equality, and an empty Chromium Downloads tree.
+- The first bounded run correctly exposed that the copied fixture had not
+  selected HLS and loaded Vime's default progressive `/agent-327/720p.mp4`.
+  The second run selected HLS but clicked before the provider was ready
+  (`readyState=4`, `paused=true`, `currentTime=0`). Waiting for Vime's `ready`
+  state, finite duration, and native `readyState >= 2` fixed that control-boundary
+  failure without weakening the trusted-input assertion.
+- The next real run reached active HLS playback and a trusted injected-button
+  click, but created no native job. Source tracing found the concrete seam:
+  Vime's native element exposes an opaque `blob:` `currentSrc` while its child
+  `<source src>` contains the real HTTP HLS manifest. The duplicated MV3
+  content-script source resolver chose the opaque value first, so the capture
+  could not forward an acquirable source.
+- Added a regression for opaque-current/HTTP-child resolution in
+  `extension/src/shared.test.ts` and applied the same minimal candidate rule to
+  `extension/src/shared.ts` and the intentionally duplicated helper in
+  `extension/src/content.ts`. The red baseline failed with the expected
+  `blob:https://page.test/player/id`; the focused test then passed.
+- Final fresh-profile Chromium/native execution is retained at
+  `/tmp/dm-public-vime-hls-retry4.log`. It selected HLS with source
+  `https://files.vidstack.io/agent-327/hls/stream.m3u8`; Vime's real playback
+  control produced active playback (`readyState=4`, `currentTime=0.317532`,
+  `paused=false`), and the injected button event recorded `isTrusted=true`.
+- The database contained exactly one native HLS job for the public manifest.
+  Chromium independently observed the manifest response (`431` bytes,
+  `application/x-mpegurl`, HTTP `206`, SHA-256
+  `9728f3b427132e4af15271d78404381dc92047ac89752bbad58612d515b32d43`). The
+  independent finite-HLS reconstruction saw 5 variants, selected the 1080p
+  child playlist, and assembled 58 fragments with no byte ranges.
+- Resident `--commit` exited `0`; the final job was `state=completed` and
+  `provisional=false`. Resident output matched the independent fMP4 reference
+  exactly: `113,171,567` bytes, SHA-256
+  `b26bee5d89b99e662dafabf8218c7720066b3c42c8e1caf2f9b54f4bf71d8c89`.
+  Chromium Downloads stayed empty and the database contained one job.
+- Verification gates passed: `VIME-HLS-COMPILE=PASS`, `npm test -- --run`
+  (`8` files, `45` tests), `npm run build:extension`, and `npx tsc -b`.

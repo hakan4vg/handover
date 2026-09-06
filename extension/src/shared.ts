@@ -30,13 +30,17 @@ export function mediaSourceFromValues(
   childSrc: string | null | undefined,
   baseUrl: string,
 ): string {
-  const raw = currentSrc?.trim() || elementSrc?.trim() || childSrc?.trim() || '';
-  if (!raw) return '';
-  try {
-    return new URL(raw, baseUrl).href;
-  } catch {
-    return raw;
-  }
+  const candidates = [currentSrc, elementSrc, childSrc]
+    .map((value) => value?.trim() || '')
+    .filter(Boolean)
+    .map((raw) => {
+      try {
+        return new URL(raw, baseUrl).href;
+      } catch {
+        return raw;
+      }
+    });
+  return candidates.find((candidate) => isHttp(candidate)) || candidates[0] || '';
 }
 
 export function isHttp(url: string): boolean {

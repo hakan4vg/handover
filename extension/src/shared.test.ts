@@ -64,6 +64,11 @@ describe('mediaSourceFromValues', () => {
     expect(mediaSourceFromValues('', 'https://cdn.test/element.mp4', 'child.webm', 'https://page.test/watch')).toBe('https://cdn.test/element.mp4');
   });
 
+  it('falls back to an HTTP child when the browser-selected source is opaque', () => {
+    expect(mediaSourceFromValues('blob:https://page.test/player/id', '', 'https://cdn.test/vod/index.m3u8', 'https://page.test/watch')).toBe('https://cdn.test/vod/index.m3u8');
+    expect(mediaSourceFromValues('blob:https://page.test/player/id', '', '../vod/index.m3u8', 'https://page.test/player/index.html')).toBe('https://page.test/vod/index.m3u8');
+  });
+
   it('resolves a source child relative to the player document', () => {
     expect(mediaSourceFromValues('', '', '../media/clip.webm', 'https://page.test/player/index.html')).toBe('https://page.test/media/clip.webm');
   });

@@ -6297,3 +6297,10 @@ change and no site resolver exception:
   `/tmp/dm-public-mdn-webm-after-audio-name.log`.
 - Full Vitest passed `50/50`; `npx tsc -b`, `npm run build:extension`, and
   `git diff --check` passed. No provider-specific resolver code was added.
+- Re-audited the sibling Able Player dynamic-video flow. It still creates
+  `Player created dynamically | Able Player Demos.mp4` and completed one managed
+  job with four browser range requests. Native output was `5,613,210` bytes and
+  matched SHA-256
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`; Chromium
+  Downloads remained empty. Evidence:
+  `/tmp/dm-public-ableplayer-dynamic-video-after-name.log`.

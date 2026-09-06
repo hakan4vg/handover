@@ -4781,3 +4781,19 @@ change and no site resolver exception:
   reference; exactly 1 job; Chromium Downloads empty:
   `FULLCHAIN-PROBE: PASS`.
 - No product source changed in this slice.
+
+## 2026-09-06 — Public Plyr player: custom controls -> button -> MP4
+
+- New `fixtures/public_plyr_button_chromium_probe.py`: real plyr.io page
+  (Plyr custom controls, no native controls element), trusted play click,
+  trusted click on the real `#dm-media-download-button`, commit through the
+  real provisional-to-completed flow. Reference = the CDN bytes fetched
+  live (cdn.plyr.io 403s Python's bare default UA — diagnosed, probe sends
+  the same HeadlessChrome UA it drives).
+- Evidence (`/tmp/dm-plyr-green.log`, `probe_rc=0`): button unoccluded
+  after playback starts (audit: `hit: dm-media-download-button`); job row
+  `media=true kind=video`; output `49900386` bytes, `sha256=2f4bd69d…` —
+  identical to the live reference AND to the earlier direct-navigation hash
+  for the same CDN bytes; exactly 1 job; Chromium Downloads empty:
+  `PLYR-PROBE: PASS`.
+- No product source changed in this slice.

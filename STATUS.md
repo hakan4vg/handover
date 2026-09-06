@@ -4935,3 +4935,23 @@ change and no site resolver exception:
   `199658ea9995cf15a8cd0cfe2dfea9eec9518c975c347be45140d9b2ce225ad2`; one
   job and `browser_downloads=[]`. `DAILYMOTION-PROBE: PASS`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — Referer-gated AES-128 HLS composition proof
+
+- Added `fixtures/gated_encrypted_hls_referrer_probe.py`, a disposable local
+  fMP4 VOD fixture. Its playlist, AES-128 key, init fragment, and three
+  encrypted media fragments all return `403` without the captured page
+  Referer. The encrypted transport uses the existing generic fMP4 bytes and
+  sequence-derived RFC 8216 IVs; it is not a site resolver.
+- Red phase against the resident binary: no page context produced
+  `state=failed`, `Source returned 403 Forbidden`.
+- Green phase passed `pageUrl` through the real Inspector command path. The
+  resident replayed the Referer for the playlist, key, init, and fragment
+  requests, decrypted the segments, and finalized the media.
+- Evidence (`/tmp/dm-gated-encrypted-hls-rerun.log`, `PROBE_EXIT=0`):
+  `segments.completed=4`; resident output and independent plaintext reference
+  both `32,057` bytes, SHA-256
+  `6b6875bc6d4c6233f362624c1d5e919993e49f0e7530fc007cfb2d6d17167861`;
+  `GATED-ENCRYPTED-HLS-PROBE: PASS`. The key was fetched through the same
+  request-context path as the media fragments.
+- No product source changed in this slice.

@@ -5531,6 +5531,14 @@ change and no site resolver exception:
   The independent 30-second `curl` fetch timed out, and `web_extract` returned
   an empty/blocked response for the exact source. No production source changed;
   the candidate is not green.
+- Fresh re-run on 2026-09-07 (`/tmp/dm-public-ivid-fresh-20260907.log`,
+  probe exit `1`) reached the host and the real custom Play control. The
+  player-bound Download button then appeared, but the exact Archive source
+  remained `readyState=0`, `duration=null`, and no media error was exposed;
+  there was no native job, commit, output, or byte/hash comparison. A corrected
+  direct fetch of the exact source timed out after `60` seconds with zero
+  response headers and zero bytes. This independently reconfirms an upstream
+  source/bootstrap blocker; no product code changed.
 
 ## 2026-09-06 — ImageKit Video Player playlist capture
 

@@ -6213,3 +6213,17 @@ change and no site resolver exception:
   with `provisional=false, state=completed`, and left Chromium Downloads empty.
   Evidence: `/tmp/dm-public-w3c-source-switch-final.log`.
 - No production change was needed for this generic source-switch boundary.
+
+## 2026-09-07 — Generic public WebM media
+
+- Fresh Chromium ran the MDN top-level HTML5 WebM player. The real media
+  element reached `readyState=4`, played for `7.8` seconds, and received the
+  player-bound Download control.
+- The extension selected the browser's current WebM source
+  `https://mdn.github.io/learning-area/html/multimedia-and-embedding/video-and-audio-content/rabbit320.webm`.
+  The resident output was `330,618` bytes and matched the independent browser
+  reference SHA-256
+  `074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e`.
+- The completed run had exactly one media job and zero Chromium Downloads.
+  Evidence: `/tmp/dm-public-mdn-webm-final.log`.
+- No production change was needed for this generic WebM boundary.

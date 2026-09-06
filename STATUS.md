@@ -5940,3 +5940,31 @@ change and no site resolver exception:
   `DROP-ORIGINAL-CHROMIUM-PROBE: PASS`; independent readback is retained at
   `/tmp/dm-public-drop-player-original-chromium-u_96afd8/`. No production source
   change was justified by this path.
+
+## 2026-09-06 — ReactPlayer HLS shadow-DOM negative boundary
+
+- Ran a fresh Chromium diagnostic against the official ReactPlayer demo
+  `https://cookpete.github.io/react-player/`. The real `HLS (m3u8)` control
+  selected the documented public Mux master
+  `https://stream.mux.com/VcmKA6aqzIzlg3MayLJDnbF55kX00mds028Z65QxvBYaA.m3u8`
+  with trusted CDP mouse input.
+- The page's network path was reachable: `42` redacted Mux records were
+  observed (`14` requests, `14` HTTP-200 responses, `14` finishes), including
+  the master playlist, one signed rendition playlist, and finite `.ts`
+  fragments. There were zero `Network.loadingFailed` records. Signed query
+  values and opaque CDN path values are redacted in the retained log.
+- The demo's own state reached `duration=1:00`, `loaded=1.000`, and the
+  `HLS-VIDEO` custom element exposed a shadow-root `<video>` with the blob
+  `currentSrc` and the HTTP child `<source>`. The normal light-DOM media scan
+  saw zero `<video>`/`<audio>` nodes, so the extension injected no
+  `dm-media-download-button` and created no native job. The extension/native
+  handshake itself was healthy (`get-policy` returned `ok=true`).
+- This is a bounded negative result for the current generic integration:
+  ReactPlayer's shadow-DOM HLS path is externally playable but not usable by
+  the current Download Manager initiation path. No shadow-DOM-specific
+  production patch was made, no acceptance fixture was added, and no managed
+  output/reference equality can be claimed. The earlier demo MP4 item also
+  remained an external media-error-4 baseline, not a product defect.
+- Exact retained diagnostic is `/tmp/dm-reactplayer-hls-diag.log`, ending with
+  `REACTPLAYER-HLS-DIAGNOSTIC: BLOCKED`. The next audit slice must use another
+  reachable initiation pattern rather than patching around this demo.

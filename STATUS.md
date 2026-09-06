@@ -2799,8 +2799,14 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `error=None`, and the process exited `1`.
 - This is a concrete public wrapper/frame-boundary blocker. It does not
   establish native completion, browser/native size/hash equality, or empty
-  browser Downloads. No product policy change or candidate fixture rewrite was
-  made for this failure.
+  browser Downloads. No product policy change or candidate fixture rewrite
+  was made for this failure.
+- Fresh re-run on 2026-09-07 (`/tmp/dm-public-iframe-paciello-audio-fresh-20260907.log`,
+  probe exit `1`) reproduced the boundary. `Page.getFrameTree` exposed only the
+  top-level `iframe.verekia.com` wrapper, with one default context at
+  `https://iframe.verekia.com`; the expected Paciello child URL was absent.
+  The wait ended with `last=None`, `error=None`, no trusted click, no native job,
+  and no browser/native comparison. No product code changed.
 
 ## 2026-09-05 — Sa11y SoundCloud iframe probe (embed-player boundary)
 

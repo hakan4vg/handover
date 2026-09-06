@@ -5573,3 +5573,24 @@ change and no site resolver exception:
   output_sha256=87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38,
   jobs=1, browser_downloads=[])` and
   `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No production source changed.
+
+## 2026-09-06 — VisionPlayer AV1 progressive capture
+
+- Added `fixtures/public_visionplayer_chromium_probe.py` against the official
+  VisionPlayer trailer page `https://visionplayer.io/`. The page uses a custom
+  overlay/controller player and a finite direct AV1 MP4 source.
+- Fresh Chromium loaded the source at `readyState=4`, duration `111.199002`,
+  and active playback followed a trusted CDP click on VisionPlayer's real large
+  overlay Play control. The player-bound Download control then appeared.
+- The extension/native path created exactly one provisional media job for
+  `https://visionplayer.io/media/trailer/streams/visionplayer-trailer.en.720.av1.mp4`.
+  Resident `--commit` exited `0`; the job completed with `provisional=false`.
+  An independent fetch matched the resident output exactly at `35,552,069`
+  bytes, SHA-256
+  `782148a7387da302fa0858805d51fde0d1765087f5b93f926696a4d319f858bb`.
+  Chromium Downloads stayed empty.
+- Exact retained green output is `/tmp/dm-public-visionplayer.log`:
+  `VISIONPLAYER: PASS (output_bytes=35552069,
+  output_sha256=782148a7387da302fa0858805d51fde0d1765087f5b93f926696a4d319f858bb,
+  jobs=1, browser_downloads=[])` and
+  `VISIONPLAYER-CHROMIUM-PROBE: PASS`. No production source changed.

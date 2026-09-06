@@ -5032,3 +5032,17 @@ change and no site resolver exception:
   clean resident exit code `1` without SIGSEGV. Evidence:
   `/tmp/dm-exit-behavior-current.log`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — Three rapid captures and independent Add Download windows
+
+- The first attempt hit the known disposable WebKit Inspector startup race
+  (`[Errno 111] Connection refused`) before the app became observable; it made
+  no product assertion and left no process. The retained first log is
+  `/tmp/dm-multiple-add-windows-current.log`.
+- A fresh retry passed
+  (`/tmp/dm-multiple-add-windows-retry.log`, `PROBE_EXIT=0`): three rapid
+  native capture forwards created three independent jobs and three visible Add
+  Download windows, while exactly one resident process remained alive. Each of
+  `one.bin`, `two.bin`, and `three.bin` was requested exactly once.
+  `MULTIPLE-ADD-WINDOWS-PROBE: PASS`.
+- No product source changed in this verification slice.

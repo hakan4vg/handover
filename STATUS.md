@@ -5452,3 +5452,29 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and `BRIGHTCOVE-CHROMIUM-PROBE: PASS`.
 - Python compilation and `git diff --check` passed. This slice changed no
   production source.
+
+## 2026-09-06 — Cloudinary Video Player DASH VP9 capture
+
+- Added `fixtures/public_cloudinary_dash_chromium_probe.py` against
+  Cloudinary's public adaptive-streaming page
+  `https://cloudinary.github.io/cloudinary-video-player/adaptive-streaming.html`.
+  This is a distinct Cloudinary/Video.js player family. The probe targeted the
+  page's real DASH VP9 player, issued a trusted click on its visible video, and
+  observed blob-backed playback with `readyState=4`, `paused=false`, and
+  duration `15.21500015258789` seconds before clicking the injected Download
+  Manager control.
+- The browser/native path resolved the MSE session to a finite Cloudinary
+  `.mp4dv` representation. The database contained exactly one `media=true`
+  video job; resident `--commit` exited `0` and the job completed with
+  `provisional=false`. The independent reference fetched the captured object
+  directly, without using the managed output.
+- Resident output and independent reference matched exactly at `490,593`
+  bytes, SHA-256
+  `620c251fb3230a01b037b54a27c750578af738fbcbd2d81e0bf53e5256e9a48f`.
+  Chromium Downloads stayed empty and the database contained one job.
+- Exact retained green output is `/tmp/dm-public-cloudinary-dash.log`:
+  `CLOUDINARY: PASS (output_bytes=490593,
+  output_sha256=620c251fb3230a01b037b54a27c750578af738fbcbd2d81e0bf53e5256e9a48f,
+  jobs=1, browser_downloads=[])` and `CLOUDINARY-PROBE: PASS`.
+- Python compilation and `git diff --check` passed. This slice changed no
+  production source.

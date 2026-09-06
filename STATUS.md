@@ -6100,3 +6100,26 @@ change and no site resolver exception:
   `50/50`, Rust `70/70`, `cargo check`, `cargo build`, `npm run build:extension`,
   `npx tsc -b`, Python compilation, and `git diff --check`. Broader v1 gaps
   remain open; this closes the real multivariant-master active-rendition slice.
+
+## 2026-09-06 — POST replay and lifecycle probes verified
+
+- Corrected the stale description in `fixtures/postonly_replay_chromium_probe.py`:
+  the current bounded urlencoded-form path observes the POST body and native
+  replay sends it as POST; it no longer claims the native fallback is GET-only.
+- Fresh Chromium POST-only proof passed. The visible form submission produced
+  one browser download of `65,536` bytes with SHA-256
+  `3473fca710f006025d284d4e32ad4fc453a1c522c36bfcde4cb19da38220d8a7`.
+  The resident job completed with the same bytes/hash, exactly one managed job,
+  and the fixture asserted every server request body was `fixture=post-only`.
+  Evidence: `/tmp/dm-postonly-replay-baseline.log`.
+- Fresh two-process single-instance proof passed: the second `--capture`
+  process exited `0`, the original resident stayed alive, process count stayed
+  at one, only one job was created, and the server saw one request. Evidence:
+  `/tmp/dm-single-instance-final.log`.
+- Fresh close-to-tray proof passed: the manager window became unmapped while
+  the resident stayed alive as one process; the 64 MiB output reached
+  `finalizing` with one server request. Evidence:
+  `/tmp/dm-close-to-tray-final.log`.
+- These probes changed no production code. Remaining lifecycle gaps include
+  reopening from the tray, explicit exit behavior, and broader trusted
+  context-menu/Ctrl-click coverage outside the accepted paths.

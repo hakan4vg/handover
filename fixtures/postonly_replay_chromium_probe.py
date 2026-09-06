@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Real Chromium proof: POST-body replay for form-originated downloads.
+"""Real Chromium proof: bounded POST-body replay for form downloads.
 
-SPEC §5.1 lists method/body as capturable context "when safely
-reproducible". Today the native fallback replays a bare GET, so any
-endpoint that requires the form POST fails natively. This probe serves a
-POST-only attachment (GET answers 405) and asserts SUCCESS (completed job,
-byte/hash equality with the browser's own POST download, one browser
-download, one job). Against a resident without POST replay it FAILs —
-that red run earns the section.
+SPEC §5.1 lists method/body as capturable context "when safely reproducible".
+The extension observes urlencoded form bodies within the documented size and
+lifetime bounds, and the native job replays that body as POST. This probe serves
+a POST-only attachment (GET answers 405) and asserts byte/hash equality with the
+browser's own POST download, one browser download, and one managed job.
 """
 from __future__ import annotations
 

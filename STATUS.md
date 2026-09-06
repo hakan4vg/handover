@@ -4520,3 +4520,29 @@ change and no site resolver exception:
   tests, Rust `58/58`, fixture compilation, `git diff --check`
   (`/tmp/dm-xorigin-gates.log`). The protected `src-tauri/src/main.rs`
   sibling remains clean.
+
+## 2026-09-06 — Cold browser capture starts the app without opening the manager
+
+- Covers the SPEC §19.1 / M2 launch-from-extension path, previously
+  unproven: with no resident process, a browser capture must start the app,
+  create the provisional acquisition, show the standalone Add Download
+  window, and not open the manager. The chain is Chrome spawning
+  `BIN --native-host` on demand, which spawns detached `BIN --capture`,
+  whose setup hides main and starts the provisional (`main.rs` setup +
+  single-instance callback both verified by reading the source first).
+- New `fixtures/cold_launch_capture_chromium_probe.py`: fresh HOME with the
+  resident deliberately never started (environ-scanned `app_pids=[]`
+  before the click), fixture-server page plus a same-origin valued
+  `download` anchor, trusted CDP click. It polls for a new app process
+  (environ contains the disposable HOME root), one provisional ordinary
+  job, empty Chromium Downloads — then samples X11 visibility
+  (`xdotool search --onlyvisible`) 3x1s.
+- First-run evidence (`/tmp/dm-cold-launch.log`, `probe_rc=0`):
+  `COLD-LAUNCH-JOB` provisional `cold-launch.bin` for the file (same-origin
+  attribute honored, consistent with the cross-origin fix above);
+  `COLD-LAUNCH-APP: pids=[3604097]`; `COLD-LAUNCH-WINDOWS:
+  [{add:1,main:0} x3]`; `COLD-LAUNCH: PASS (...,
+  add_window_visible=true, manager_visible=false, jobs=1,
+  browser_downloads=[])` and `COLD-LAUNCH-PROBE: PASS`.
+- No product source changed; the protected `src-tauri/src/main.rs` sibling
+  remains clean.

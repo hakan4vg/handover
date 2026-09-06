@@ -14,13 +14,25 @@ const SETTINGS_KEY = 'download-manager.settings';
 const now = () => new Date();
 const isoNow = () => now().toISOString();
 const timeLabel = (date = now()) => date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+const mockPlatform = typeof navigator === 'undefined' ? '' : `${navigator.userAgent} ${navigator.platform}`.toLowerCase();
+const isWindowsMock = mockPlatform.includes('windows');
+const mockDefaultFolder = isWindowsMock ? 'C:\\Users\\mroth\\Downloads' : '~/Downloads';
+const mockTempFolder = isWindowsMock ? 'C:\\Users\\mroth\\AppData\\Local\\DM\\Temp' : '~/.cache/download-manager/tmp';
+
+function platformPath(value: string) {
+  if (isWindowsMock) return value;
+  return value
+    .replace('C:\\Users\\mroth\\Downloads', mockDefaultFolder)
+    .replace('C:\\Users\\mroth\\AppData\\Local\\DM\\Temp', mockTempFolder)
+    .replaceAll('\\', '/');
+}
 
 const defaults: AppSettings = {
   startAtSignIn: true,
   showManagerAtSignIn: true,
   closeBehavior: 'tray',
-  defaultFolder: 'C:\\Users\\mroth\\Downloads',
-  tempFolder: 'C:\\Users\\mroth\\AppData\\Local\\DM\\Temp',
+  defaultFolder: mockDefaultFolder,
+  tempFolder: mockTempFolder,
   collisionBehavior: 'rename',
   interceptDownloads: true,
   showMediaButtons: true,
@@ -147,7 +159,11 @@ function initialJobs(): DownloadJob[] {
     make({ id: 'job-12', name: 'open-source-icons.zip', source: 'https://assets.example.com/open-source-icons.zip', domain: 'assets.example.com', kind: 'archive', state: 'completed', progress: 100, downloaded: 188 * 1024 ** 2, total: 188 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\open-source-icons.zip`, tempPath: `${temp}\\job-12.part`, resumable: true, completed: 'Yesterday, 10:11 AM', created: 'Yesterday, 10:07 AM', events: [event('Download completed', 'success')] }),
     make({ id: 'job-13', name: 'product-tour.mp4', source: 'https://media.example.org/product-tour.mp4', domain: 'media.example.org', kind: 'video', state: 'completed', progress: 100, downloaded: 632 * 1024 ** 2, total: 632 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, mediaDetails: '1080p · H.264 + AAC', destination: `${base}\\product-tour.mp4`, tempPath: `${temp}\\job-13.part`, resumable: true, completed: 'Monday, 2:30 PM', created: 'Monday, 2:20 PM', events: [event('Download completed', 'success')] }),
     make({ id: 'job-14', name: 'backup-manifest.json', source: 'https://backup.example.net/manifest.json', domain: 'backup.example.net', kind: 'document', state: 'failed', progress: 38, downloaded: 12 * 1024 ** 2, total: 31 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\backup-manifest.json`, tempPath: `${temp}\\job-14.part`, resumable: false, error: 'The remote server returned 503', created: 'Monday, 9:03 AM', events: [event('Server returned 503', 'error')] }),
-  ];
+  ].map((job) => ({
+    ...job,
+    destination: platformPath(job.destination),
+    tempPath: platformPath(job.tempPath),
+  }));
 }
 
 function cloneSnapshot(snapshot: AppSnapshot): AppSnapshot {
@@ -272,8 +288,8 @@ class MockAdapter implements DownloadAdapter {
       mode: media ? 'segments' : 'single-stream',
       media,
       mediaDetails: media ? 'Detecting current media…' : undefined,
-      destination: `${this.snapshot.settings.defaultFolder}\\${name}`,
-      tempPath: `${this.snapshot.settings.tempFolder}\\${id}.part`,
+      destination: platformPath(`${this.snapshot.settings.defaultFolder}\\${name}`),
+      tempPath: platformPath(`${this.snapshot.settings.tempFolder}\\${id}.part`),
       resumable: false,
       created: 'Just now',
       provisional: true,

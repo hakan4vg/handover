@@ -6155,3 +6155,22 @@ change and no site resolver exception:
   screenshot: `/tmp/dm-ui-settings-network.png`.
 - Full Vitest passed `50/50`; `npm run build:extension`, `npx tsc -b`, and
   `git diff --check` passed.
+
+## 2026-09-07 — Linux-safe mock paths
+
+- Fresh Chromium used a new profile and CDP port `9228`; no prior localStorage
+  was retained. The mock Add URL dialog showed `~/Downloads`.
+- Settings → Downloads showed `~/Downloads` and
+  `~/.cache/download-manager/tmp`.
+- A seeded job's Overview showed
+  `~/Downloads/ubuntu-24.04-desktop-amd64.iso`; its Files tab showed
+  `~/.cache/download-manager/tmp/job-1.part`. The earlier intermediate probe
+  caught and fixed a remaining Windows backslash in the seeded destination.
+- `src/adapters.ts` now selects Windows sample paths only on Windows, uses
+  Linux/macOS-safe mock defaults elsewhere, and normalizes seeded/provisional
+  mock paths without changing native Rust defaults.
+- Evidence screenshots: `/tmp/dm-ui-path-add-fixed.png`,
+  `/tmp/dm-ui-path-settings-fixed.png`, and
+  `/tmp/dm-ui-path-seeded-files-fixed.png`.
+- Full Vitest passed `50/50`; `npx tsc -b`, `npm run build:extension`, and
+  `git diff --check` passed.

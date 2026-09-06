@@ -5348,3 +5348,40 @@ change and no site resolver exception:
   output_sha256=c07e72aa615ef37162af92d340cf1bdc9c0b312655d23c3ef3e579873bafe260,
   jobs=1, browser_downloads=[])` and `NFB-PROBE: PASS`.
   No product source change was justified.
+
+## 2026-09-06 — Gcore JavaScript Player Spring VOD HLS capture
+
+- Added `fixtures/public_gcore_chromium_probe.py` for the official Gcore player
+  demo `https://g-core.github.io/gcore-videoplayer-js/example/player.html`.
+  This covers a distinct custom-player initiation path with a real page-level
+  VOD tab selector, external player controls, blob playback, and a finite HLS
+  rendition. The probe selected the page's real `Blender, Spring` VOD tab.
+- A fresh Chromium profile reached the page and the extension/native diagnostic
+  passed. A trusted click on the Spring tab produced blob playback with
+  `readyState=4`, `paused=false`, duration `464.083` seconds, and no media
+  error. Trusted Pause and Play clicks then produced the playing state used for
+  capture. The injected Download Manager button reported `isTrusted=true`,
+  `pointer-events=auto`, and `elementFromPoint` resolved to the button.
+- The extension/native path created exactly one provisional media job. The
+  captured source was the finite `index-s0q3570v1-v1-a1.m3u8` rendition; query
+  parameters are redacted from durable evidence. Browser CDP readback observed
+  HTTP `206`, MIME `application/vnd.apple.mpegurl`, 3,682 bytes, SHA-256
+  `f427266194568ea871f000cd4bb6a17160e163b94c9bb6999044338f83e6a6d8`.
+- The independent all-stream HLS reference resolved `79` finite fragments and
+  used the resident's `ffmpeg -map 0 -c copy` mux path. Resident `--commit`
+  exited `0`; the sole job completed with `provisional=false`. Resident output
+  and reference matched exactly at `111,477,259` bytes, SHA-256
+  `b0ad16fcaa29b6cec57ec481faaac0e770600de8d57dbe2c223a0f869a288145`.
+  Chromium Downloads stayed empty.
+- Exact retained green output is `/tmp/dm-public-gcore-retry2.log`:
+  `GCORE: PASS (output_bytes=111477259,
+  output_sha256=b0ad16fcaa29b6cec57ec481faaac0e770600de8d57dbe2c223a0f869a288145,
+  browser_source_bytes=3682,
+  browser_source_sha256=f427266194568ea871f000cd4bb6a17160e163b94c9bb6999044338f83e6a6d8,
+  jobs=1, browser_downloads=[])` and
+  `PUBLIC-GCORE-CHROMIUM-PROBE: PASS`.
+- The first probe attempt exposed a fixture-only selector error: the helper
+  referenced an undefined browser-side `source_id` while selecting the Spring
+  tab. The page itself was healthy and auto-playing Sintel. The helper was
+  corrected to compare `dataset` values against JSON-encoded strings; the
+  fresh-profile retry above then passed. No product change was justified.

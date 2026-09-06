@@ -5095,6 +5095,37 @@ change and no site resolver exception:
   one completed managed job. The resident output and browser-context reference
   both measured `39,868` bytes and SHA-256
   `41191d0727073bf848bcc8f0bd851d71a0b0058e901abb1c1b236ad327bda52e`.
-  Chromium Downloads remained empty. Evidence:
+- Chromium Downloads remained empty. Evidence:
   `/tmp/dm-public-mdn-interactive-audio.log`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — Public hls.js runtime stream-selector capture
+
+- Added `fixtures/public_hls_selection_chromium_probe.py` for a distinct
+  initiation path on the official hls.js demo
+  `https://hlsjs.video-dev.org/demo/`. Unlike the earlier hls.js proof, the
+  fresh Chromium profile opened the page without a `src` query parameter and
+  selected the page's live `bigBuckBunny480p` stream option through
+  `#streamSelect`.
+- The page then produced a real playing blob/MSE video
+  (`readyState=4`, duration `634.6`) and the extension's player-bound Download
+  button. The native job source was the exact selected finite manifest
+  `https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8`,
+  not the blob URL.
+- Resident `--commit` exited `0`; the sole managed job ended
+  `state=completed, provisional=false`. The independent browser-context
+  reference fetched and concatenated all `64` manifest segments: `71,878,228`
+  bytes, SHA-256
+  `6e830be99296a8452aa3294f25ca64193bee2b58bf4d559a7cc5ffbb1cda0a42`.
+  Native output matched the reference exactly. Chromium Downloads was empty.
+- Exact retained output is `/tmp/dm-public-hls-selection-green.log`:
+  `PUBLIC-HLS-SELECTION-CHROMIUM: PASS (page=https://hlsjs.video-dev.org/demo/,
+  selected_source=https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8,
+  segments=64, output_bytes=71878228,
+  output_sha256=6e830be99296a8452aa3294f25ca64193bee2b58bf4d559a7cc5ffbb1cda0a42,
+  jobs=1, browser_downloads=[])` and
+  `PUBLIC-HLS-SELECTION-CHROMIUM-PROBE: PASS`.
+- The first two attempts exposed only probe assumptions: the page reports
+  `selected=null` while options are loading, and its option value is the
+  registry key `bigBuckBunny480p` rather than the manifest URL. Both were
+  corrected in the fixture; no product code changed.

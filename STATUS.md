@@ -6227,3 +6227,12 @@ change and no site resolver exception:
 - The completed run had exactly one media job and zero Chromium Downloads.
   Evidence: `/tmp/dm-public-mdn-webm-final.log`.
 - No production change was needed for this generic WebM boundary.
+
+## 2026-09-07 — Context-menu ownership re-audit
+
+- Re-ran the existing Save-Link-As boundary after the modified-click
+  suppression change. Chromium delivered a trusted right-click with
+  `defaultPrevented=false`; the fake native host received only policy requests,
+  with zero `capture-acquisition` messages, zero browser downloads, and zero
+  native jobs.
+- Evidence: `/tmp/dm-save-as-ownership-after-ctrl-fix.log`.

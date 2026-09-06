@@ -6421,3 +6421,15 @@ change and no site resolver exception:
   probe used the live native settings surface and database; no production
   source change was needed. Evidence: `/tmp/dm-settings-ui-persistence-current.log`.
 - Native verification on the same tree passed Rust `70/70` and `cargo build`.
+
+## 2026-09-07 — Minimum supported window smoke
+
+- The native configuration sets `minWidth=780` and `minHeight=560`. A fresh
+  Chromium re-audit forced exactly that `780x560` CSS viewport after the narrow
+  containment fix.
+- The document and body both reported `780x560` client and scroll dimensions;
+  `.manager-body` was `496px` with `minHeight=0px`, and the status footer ended
+  at `551px`. The screenshot showed the one-column workspace and its internal
+  download-list scrollbar without an outer page scrollbar:
+  `/tmp/dm-ui-responsive-min.log` and `/tmp/dm-ui-responsive-min.png`.
+- No additional production change was needed.

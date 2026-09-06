@@ -5288,3 +5288,39 @@ change and no site resolver exception:
   `228`). The disposable prior probe roots were moved off the tmpfs; the next
   fresh-profile run above passed with the same external source and no product
   change.
+
+## 2026-09-06 — Bitmovin Cloudflare challenge boundary and NASA+ Video.js HLS capture
+
+- The next distinct candidate was Bitmovin's official Test Your Stream page
+  (`https://bitmovin.com/demos/stream-test/`). Its browser-inspection backend
+  exposed a real player and Play control, but the actual fresh Chromium profile
+  used by the native probe received a Cloudflare challenge instead of the page:
+  the live CDP target reported `title="Just a moment..."`, `videos=[]`,
+  `buttons=[]`, `#player=null`, and no media resources. Evidence is retained in
+  `/tmp/dm-public-bitmovin-cdp.log`; the bounded probe is
+  `/tmp/dm-public-bitmovin-retry2.log`. The disposable Bitmovin fixture was
+  quarantined and no product or challenge-bypass change was made.
+
+- Added `fixtures/public_nasa_plus_chromium_probe.py` for NASA+'s real
+  production page `https://plus.nasa.gov/video/astro-smile/`. This is a distinct
+  page-level initiation path: a trusted click on `Open Video Player` opens the
+  modal, the page's Video.js/VHS player starts from its finite HLS source, and
+  the injected Download Manager button is then activated through trusted
+  Chromium input. The video element is blob-backed, while the captured native
+  job preserves NASA+'s replayable HLS manifest source.
+- The first NASA+ reference was intentionally rejected: its `-map 0:0`
+  reference omitted the AAC stream from the TS playlist, producing
+  `176,649,660` bytes while the resident correctly produced
+  `191,251,672` bytes. A live fragment probe confirmed the playlist contains
+  H.264 video plus AAC audio. The reference was corrected to the resident's
+  all-stream `ffmpeg -map 0 -c copy` semantics. A following run hit only
+  disposable `/tmp` exhaustion; the probe root was moved to `/var/tmp` without
+  changing the application path.
+- Final fresh-profile evidence is `/tmp/dm-public-nasa-plus-retry3.log`:
+  `NASA_PLUS-OPEN-CLICK` and a playing blob video (`t=2.933113`) preceded one
+  native media job for NASA's finite HLS source. The independent reference
+  resolved `132` fragments. Resident output and reference matched exactly at
+  `977,853,824` bytes, SHA-256
+  `9d7f816d8d7b297d6cbf87971d63e789ac702fad48f47ef5e258330cad883fc9`.
+  The log ends with `NASA_PLUS: PASS (... jobs=1, browser_downloads=[])` and
+  `NASA_PLUS-PROBE: PASS`. No product source changed in this slice.

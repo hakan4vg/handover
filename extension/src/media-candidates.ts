@@ -1,4 +1,5 @@
 export type MediaRole = 'unknown' | 'manifest' | 'segment';
+export type MediaKind = 'unknown' | 'audio' | 'video';
 
 export interface MediaCandidate {
   url: string;
@@ -6,6 +7,7 @@ export interface MediaCandidate {
   frameId: number;
   at: number;
   role: MediaRole;
+  kind?: MediaKind;
   documentId?: string;
   // one player is the active/hovered/playing target. It is deliberately
   // optional: a manifest can load before the page reports player state.
@@ -49,6 +51,46 @@ export function isSubtitlePlaylist(url: string): boolean {
   }
 }
 
+export function mediaKindFor(url: string, contentType = ''): MediaKind {
+  const mime = contentType.toLowerCase().split(';', 1)[0].trim();
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('video/')) return 'video';
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    if (/(^|[/_-])audio([/_.-]|$)/.test(path) || /\.(?:m4a|aac|mp3|oga|ogg|opus|flac)(?:$|[?#])/.test(path)) return 'audio';
+    if (/(^|[/_-])video([/_.-]|$)/.test(path) || /\.(?:webm|m4v|ogv)(?:$|[?#])/.test(path)) return 'video';
+  } catch {
+    // Keep extensionless or malformed URLs untyped. The response MIME type,
+    // when Chromium exposes it, is the authoritative generic classification.
+  }
+  return 'unknown';
+}
+
+export function isLikelyRepresentation(url: string): boolean {
+  try {
+    return /\.(?:mp4|webm|m4a|m4v|mov|ogv)(?:$|[?#])/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function activeRepresentationHints(candidates: MediaCandidate[]): string[] {
+  const representations = candidates.filter((item) => item.role === 'unknown' && isLikelyRepresentation(item.url));
+  if (!representations.length) return [];
+  const newestByKind = new Map<Exclude<MediaKind, 'unknown'>, MediaCandidate>();
+  for (const item of representations) {
+    const kind = item.kind && item.kind !== 'unknown' ? item.kind : mediaKindFor(item.url);
+    if (kind !== 'unknown' && !newestByKind.has(kind)) newestByKind.set(kind, item);
+  }
+  // If Chromium did not expose a MIME type and the URL is extensionless, keep
+  // one bounded hint instead of allowing every stale representation to reach
+  // native parsing. A typed response always wins over this fallback.
+  if (!newestByKind.size) return representations.slice(0, 1).map((item) => item.url);
+  return [...newestByKind.values()]
+    .sort((left, right) => right.at - left.at)
+    .map((item) => item.url);
+}
+
 export function choosePlayerEvidence(players: MediaPlayerEvidence[], tabId: number, frameId: number, now = Date.now(), documentId?: string): MediaPlayerEvidence | undefined {
   const fresh = players.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId) && now - item.at <= 15_000);
   return [...fresh].sort((left, right) => {
@@ -71,9 +113,14 @@ export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number
     if (!manifest && pool.some((item) => item.role === 'segment')) return undefined;
     const source = manifest?.url ?? newest.find((item) => item.role !== 'segment')?.url;
     if (!source) return undefined;
+    const selectedSegments = (() => {
+      const fragments = newest.filter((item) => item.role === 'segment').slice(0, 8).map((item) => item.url);
+      if (fragments.length) return fragments;
+      return activeRepresentationHints(newest).slice(0, 8);
+    })();
     return {
       source,
-      selectedSegments: newest.filter((item) => item.role === 'segment').slice(0, 8).map((item) => item.url),
+      selectedSegments,
     };
   };
   if (!playerKey) return chooseFromPool(scoped);

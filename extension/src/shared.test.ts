@@ -5,6 +5,7 @@ import {
   chooseMediaSelection,
   choosePlayerEvidence,
   isSubtitlePlaylist,
+  mediaKindFor,
   roleFor,
   type MediaCandidate,
   type MediaPlayerEvidence,
@@ -98,6 +99,12 @@ describe('media candidate selection', () => {
     expect(roleFor('https://cdn.test/vod/file.bin', 'application/octet-stream')).toBe('unknown');
   });
 
+  it('classifies representation tracks from response MIME before URL guesses', () => {
+    expect(mediaKindFor('https://cdn.test/vod/representation.mp4', 'audio/mp4; codecs=mp4a.40.2')).toBe('audio');
+    expect(mediaKindFor('https://cdn.test/vod/representation.mp4', 'video/mp4; codecs=avc1.64001f')).toBe('video');
+    expect(mediaKindFor('https://cdn.test/vod/audio_en_2c_128k_aac.mp4')).toBe('audio');
+  });
+
   it('keeps two players in one frame on their own manifest candidates', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/a/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
@@ -157,6 +164,31 @@ describe('media candidate selection', () => {
     expect(selection).toEqual({
       source: 'https://cdn.test/vod/manifest.mpd',
       selectedSegments: ['https://cdn.test/vod/new-1.m4s', 'https://cdn.test/vod/old-1.m4s'],
+    });
+  });
+
+  it('returns observed SegmentBase representation files with the selected manifest', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/video_576p.webm', tabId: 4, frameId: 0, at: 2, role: 'unknown', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/audio_en.mp4', tabId: 4, frameId: 0, at: 3, role: 'unknown', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaSelection(candidates, 4, 0, 'player-a')).toEqual({
+      source: 'https://cdn.test/vod/manifest.mpd',
+      selectedSegments: ['https://cdn.test/vod/audio_en.mp4', 'https://cdn.test/vod/video_576p.webm'],
+    });
+  });
+
+  it('keeps only the newest active representation for each media kind', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/video_480p.webm', tabId: 4, frameId: 0, at: 2, role: 'unknown', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/audio_en.m4a', tabId: 4, frameId: 0, at: 3, role: 'unknown', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/video_576p.webm', tabId: 4, frameId: 0, at: 4, role: 'unknown', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaSelection(candidates, 4, 0, 'player-a')).toEqual({
+      source: 'https://cdn.test/vod/manifest.mpd',
+      selectedSegments: ['https://cdn.test/vod/video_576p.webm', 'https://cdn.test/vod/audio_en.m4a'],
     });
   });
 

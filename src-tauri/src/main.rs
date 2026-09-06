@@ -1597,6 +1597,32 @@ fn segment_identity(tracks: &[media::MediaTrack]) -> String {
     format!("{hash:016x}")
 }
 
+async fn resource_length(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Result<u64, String> {
+    let response = acquisition_request(client, app, id, url).header(reqwest::header::RANGE, "bytes=0-0").send().await.map_err(|error| format!("Could not probe DASH resource length: {error}"))?;
+    let status = response.status();
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT { return Err(format!("DASH resource length probe returned HTTP {status}")); }
+    if let Some(value) = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|value| value.to_str().ok()) {
+        if let Some(total) = value.rsplit('/').next().and_then(|value| value.parse::<u64>().ok()) { return Ok(total); }
+    }
+    response.content_length().ok_or_else(|| "DASH resource length probe returned no total size".into())
+}
+
+async fn materialize_dash_segment_bases(client: &reqwest::Client, app: &AppHandle, id: &str, mut tracks: Vec<media::MediaTrack>, retries: u32, generation: u64) -> Result<Vec<media::MediaTrack>, String> {
+    for track in &mut tracks {
+        let Some(base) = track.segment_base.clone() else { continue; };
+        let total_length = resource_length(client, app, id, &base.url).await?;
+        let index = media::Segment { url: base.url.clone(), range: Some(base.index_range), key: None };
+        let index_data = fragment_bytes(client, app, id, &index.url, index.range, retries, generation).await?;
+        let initialization_data = if let Some(range) = base.initialization_range {
+            let initialization = media::Segment { url: base.url.clone(), range: Some(range), key: None };
+            fragment_bytes(client, app, id, &initialization.url, initialization.range, retries, generation).await?
+        } else { Vec::new() };
+        track.segments = media::expand_dash_segment_base(&base, &index_data, total_length, &initialization_data)?;
+        track.segment_base = None;
+    }
+    Ok(tracks)
+}
+
 async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, _mime: Option<String>, selected_segments: Vec<String>, generation: u64) -> Result<(), String> {
     if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
     let client = http_client();
@@ -1629,10 +1655,12 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
                 if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
                 source = variant;
             }
-            tracks.push(media::MediaTrack { kind, segments: media::parse_hls(&source, &body)? });
+            tracks.push(media::MediaTrack { kind, segments: media::parse_hls(&source, &body)?, segment_base: None });
         }
         tracks
-    } else if is_hls { vec![media::MediaTrack { kind: "video".into(), segments: media::parse_hls(&manifest_source, &manifest_body)? }] } else { media::parse_dash_tracks_for_segments(&manifest_source, &manifest_body, &selected_segments)? };
+    } else if is_hls { vec![media::MediaTrack { kind: "video".into(), segments: media::parse_hls(&manifest_source, &manifest_body)?, segment_base: None }] } else { media::parse_dash_tracks_for_segments(&manifest_source, &manifest_body, &selected_segments)? };
+    let range_retry_count = app.state::<CoreState>().snapshot.lock().map(|snapshot| if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }).unwrap_or(0);
+    let tracks = materialize_dash_segment_bases(&client, &app, &id, tracks, range_retry_count, generation).await?;
     // Name the acquisition after its container, not the manifest: suggesting
     // "vod.m3u8" for MPEG-TS bytes guarantees a doomed FFmpeg remux later.
     // HLS without an EXT-X-MAP carries MPEG-TS; everything else assembles to MP4.

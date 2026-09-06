@@ -1,5 +1,5 @@
 import { DEFAULT_POLICY, NATIVE_HOST, isHttp, type BrowserPolicy } from './shared';
-import { chooseMediaSelection, choosePlayerEvidence, roleFor, type MediaCandidate, type MediaPlayerEvidence } from './media-candidates';
+import { chooseMediaSelection, choosePlayerEvidence, mediaKindFor, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 
@@ -153,17 +153,18 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   }
 }
 
-function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey = activePlayerKey(tabId, frameId, documentId)): void {
+function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey = activePlayerKey(tabId, frameId, documentId), kind: MediaKind = mediaKindFor(url)): void {
   if (!isHttp(url)) return;
   pruneMedia();
   const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
   if (existing) {
     if (role === 'manifest' || existing.role === 'unknown') existing.role = role;
     if (playerKey && !existing.playerKey) existing.playerKey = playerKey;
+    if (kind !== 'unknown' || !existing.kind) existing.kind = kind;
     existing.at = Date.now();
     return;
   }
-  recentMedia.push({ url, tabId, frameId, at: Date.now(), role, documentId, playerKey });
+  recentMedia.push({ url, tabId, frameId, at: Date.now(), role, kind, documentId, playerKey });
 }
 
 // Observe (never block) response traffic that feeds media elements.
@@ -180,9 +181,11 @@ chrome.webRequest.onResponseStarted.addListener(
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return undefined;
+    const type = details.type;
+    if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return undefined;
     const contentType = details.responseHeaders?.find((header) => header.name.toLowerCase() === 'content-type')?.value ?? '';
     const role = roleFor(details.url, contentType);
-    if (role === 'manifest') rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId);
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, activePlayerKey(details.tabId, details.frameId, details.documentId), mediaKindFor(details.url, contentType));
     return undefined;
   },
   { urls: ['<all_urls>'] },

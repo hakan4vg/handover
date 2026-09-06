@@ -5782,3 +5782,44 @@ change and no site resolver exception:
   Chromium Downloads stayed empty and the database contained one job.
 - Verification gates passed: `VIME-HLS-COMPILE=PASS`, `npm test -- --run`
   (`8` files, `45` tests), `npm run build:extension`, and `npx tsc -b`.
+
+## 2026-09-06 — Shaka Angel One DASH SegmentBase capture and active-variant ownership
+
+- Added `fixtures/public_shaka_dash_chromium_probe.py` for the official Shaka
+  demo `https://shaka-project.github.io/shaka-player/demo/` and its static Angel
+  One MPD `https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd`.
+  The MPD was retained at `/tmp/shaka-angel-one.mpd` (11,431 bytes; SHA-256
+  `e885a9db550ffc499709fb2ad501131f72c5b3abdcd3cb03a2c497c2b5d9d5e8`).
+- The first real run exposed a reachable ownership defect: the browser job
+  payload retained stale and active video representation URLs together, and the
+  native parser selected the first matching URL. The post-capture event drain
+  had a different order from the payload, so output could be 480p even while a
+  later browser observation identified 576p. The independent reference was
+  deliberately not changed to follow that order.
+- Fixed the generic extension path to record response MIME ownership, classify
+  audio/video candidates, and retain only the newest observed representation for
+  each media kind when a manifest-backed player exposes whole representation
+  files. Fragment lists keep their existing bounded behavior. Added regression
+  coverage for MIME classification and stale-quality exclusion.
+- Completed native static DASH `SegmentBase` support. The parser preserves the
+  selected representation URL and initialization/index ranges; the resident
+  probes resource length, reads the exact ranges, parses MP4 `sidx` references or
+  WebM Cues, downloads ordered ranged fragments, and muxes the separate current
+  audio/video tracks without re-encoding.
+- Fresh active-variant proof is retained at
+  `/tmp/dm-public-shaka-dash-active-selection2.log` with Chromium artifacts at
+  `/tmp/dm-public-dash-chromium-h_3d8vr_`. Shaka's documented active variant
+  exposed original representation IDs `video=10` and `audio=13`; the browser
+  observed exactly `video_576p_768k_vp9.webm` and
+  `audio_en_2c_128k_aac.mp4`. The managed `selectedSegments` payload contained
+  only those two active URLs. Their SegmentBase ranges were video init `0-313`,
+  index `314-557`, and audio init `0-785`, index `786-1009`.
+- The independent reference and native output were both `6,468,783` bytes with
+  SHA-256 `137b305a8482dbd8d2e4eeb8657b3ddf92a4b7814409a525d7fa9f03073df230`.
+  `ffprobe` reports VP9 video `720x576`, AAC audio at `48,000 Hz`, and duration
+  `60.032000` seconds. The database has exactly one job, `completed` with
+  `provisional=false`, and two media tracks. Browser ownership remained
+  unhandled for trusted context-menu and Ctrl-click events; Chromium Downloads
+  was empty. The probe ends with `PUBLIC-DASH-CHROMIUM-PROBE: PASS`.
+- Full verification passed after the fix: npm `48` tests, `npm run build:all`,
+  `npx tsc -b`, Rust `66` tests, Python compilation, and `git diff --check`.

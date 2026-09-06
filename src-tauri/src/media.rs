@@ -46,10 +46,19 @@ pub fn decrypt_aes128_segment(ciphertext: &[u8], key_bytes: &[u8; 16], iv: [u8; 
     Ok(decrypted.to_vec())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DashSegmentBase {
+    pub url: String,
+    pub initialization_range: Option<(u64, u64)>,
+    pub index_range: (u64, u64),
+    pub container: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct MediaTrack {
     pub kind: String,
     pub segments: Vec<Segment>,
+    pub segment_base: Option<DashSegmentBase>,
 }
 
 pub fn is_manifest_source(source: &str, mime: Option<&str>) -> bool {
@@ -173,6 +182,14 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
                 } else if name.as_slice() == b"representation" {
                     if let Some(track) = current_track.as_mut() {
                         let representation_id = attribute(&element, b"id").unwrap_or_default();
+                        let mime_type = attribute(&element, b"mimeType");
+                        track.segment_base_candidates.push(DashSegmentBaseCandidate {
+                            base_url: None,
+                            initialization_range: None,
+                            index_range: None,
+                            container: dash_container_from(mime_type.as_deref(), ""),
+                        });
+                        track.active_representation = Some(track.segment_base_candidates.len() - 1);
                         track.representation_ids.push(representation_id.clone());
                         if !track.selected_representation {
                             track.selected_representation = true;
@@ -185,6 +202,18 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
                 }
                 if let Some(track) = current_track.as_mut() {
                     if name.as_slice() == b"baseurl" { track.base_text_depth = Some(stack.len() + 1); }
+                    if name.as_slice() == b"segmentbase" {
+                        track.segment_base = true;
+                        if let Some(index) = track.active_representation {
+                            track.active_segment_base = Some(index);
+                            track.segment_base_candidates[index].index_range = dash_range(&element, b"indexRange")?;
+                        }
+                    }
+                    if name.as_slice() == b"initialization" {
+                        if let Some(index) = track.active_segment_base {
+                            track.segment_base_candidates[index].initialization_range = dash_range(&element, b"range")?;
+                        }
+                    }
                     if name.as_slice() == b"segmenttemplate" && track.template.is_none() { track.template = Some(DashTemplate::from_element(&element)); }
                     if name.as_slice() == b"s" && (track.representation_open || !track.selected_representation) { if let Some(template) = track.template.as_mut() { template.timeline.push(DashTimeline::from_element(&element)); } }
                     if (name.as_slice() == b"initialization" || name.as_slice() == b"segmenturl")
@@ -214,6 +243,14 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
                 if name.as_slice() == b"representation" {
                     if let Some(track) = current_track.as_mut() {
                         let representation_id = attribute(&element, b"id").unwrap_or_default();
+                        let mime_type = attribute(&element, b"mimeType");
+                        track.segment_base_candidates.push(DashSegmentBaseCandidate {
+                            base_url: None,
+                            initialization_range: None,
+                            index_range: None,
+                            container: dash_container_from(mime_type.as_deref(), ""),
+                        });
+                        track.active_representation = Some(track.segment_base_candidates.len() - 1);
                         track.representation_ids.push(representation_id.clone());
                         if !track.selected_representation {
                             track.selected_representation = true;
@@ -224,6 +261,18 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
                     }
                 }
                 if let Some(track) = current_track.as_mut() {
+                    if name.as_slice() == b"segmentbase" {
+                        track.segment_base = true;
+                        if let Some(index) = track.active_representation {
+                            track.active_segment_base = Some(index);
+                            track.segment_base_candidates[index].index_range = dash_range(&element, b"indexRange")?;
+                        }
+                    }
+                    if name.as_slice() == b"initialization" {
+                        if let Some(index) = track.active_segment_base {
+                            track.segment_base_candidates[index].initialization_range = dash_range(&element, b"range")?;
+                        }
+                    }
                     if name.as_slice() == b"segmenttemplate" && track.template.is_none() { track.template = Some(DashTemplate::from_element(&element)); }
                     if (name.as_slice() == b"initialization" || name.as_slice() == b"segmenturl")
                         && (track.representation_open || !track.selected_representation)
@@ -248,7 +297,7 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
             Ok(Event::Text(text)) => {
                 if let Ok(value) = text.decode() {
                     if let Some(track) = current_track.as_mut() {
-                        if track.base_text_depth == Some(stack.len()) { if let Some(url) = resolve(source, value.trim()) { track.base_urls.push(url); } }
+                        if track.base_text_depth == Some(stack.len()) { if let Some(url) = resolve(source, value.trim()) { track.base_urls.push(url.clone()); if let Some(index) = track.active_representation { track.segment_base_candidates[index].base_url = Some(url.clone()); track.segment_base_candidates[index].container = dash_container_from(None, &url); } } }
                     } else if global_base_text_depth == Some(stack.len()) { if let Some(url) = resolve(source, value.trim()) { global_base_urls.push(url); } }
                 }
             }
@@ -256,7 +305,11 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
                 let name = element.name().as_ref().to_ascii_lowercase();
                 if let Some(track) = current_track.as_mut() {
                     if name.as_slice() == b"baseurl" { track.base_text_depth = None; }
-                    if name.as_slice() == b"representation" && track.representation_open { track.representation_open = false; }
+                    if name.as_slice() == b"representation" {
+                        if track.representation_open { track.representation_open = false; }
+                        track.active_representation = None;
+                        track.active_segment_base = None;
+                    }
                     if name.as_slice() == b"adaptationset" {
                         let finished = current_track.take().and_then(|track| track.finish(source, global_base_urls.first().map(String::as_str), presentation_duration, selected_segments));
                         if let Some(track) = finished { tracks.push(track); }
@@ -274,6 +327,13 @@ pub fn parse_dash_tracks_for_segments(source: &str, body: &str, selected_segment
     Ok(tracks)
 }
 
+struct DashSegmentBaseCandidate {
+    base_url: Option<String>,
+    initialization_range: Option<(u64, u64)>,
+    index_range: Option<(u64, u64)>,
+    container: String,
+}
+
 struct DashTrackBuilder {
     kind: String,
     base_urls: Vec<String>,
@@ -285,12 +345,36 @@ struct DashTrackBuilder {
     selected_representation: bool,
     representation_open: bool,
     base_text_depth: Option<usize>,
+    segment_base: bool,
+    segment_base_candidates: Vec<DashSegmentBaseCandidate>,
+    active_representation: Option<usize>,
+    active_segment_base: Option<usize>,
 }
 
 impl DashTrackBuilder {
-    fn new(kind: Option<String>) -> Self { Self { kind: kind.as_deref().and_then(track_kind).unwrap_or_default(), base_urls: Vec::new(), segment_refs: Vec::new(), template: None, representation_id: String::new(), bandwidth: String::new(), representation_ids: Vec::new(), selected_representation: false, representation_open: false, base_text_depth: None } }
+    fn new(kind: Option<String>) -> Self { Self { kind: kind.as_deref().and_then(track_kind).unwrap_or_default(), base_urls: Vec::new(), segment_refs: Vec::new(), template: None, representation_id: String::new(), bandwidth: String::new(), representation_ids: Vec::new(), selected_representation: false, representation_open: false, base_text_depth: None, segment_base: false, segment_base_candidates: Vec::new(), active_representation: None, active_segment_base: None } }
 
     fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>, selected_segments: &[String]) -> Option<MediaTrack> {
+        if self.segment_base {
+            let candidate = if selected_segments.is_empty() {
+                self.segment_base_candidates.first()?
+            } else {
+                selected_segments.iter().find_map(|selected| self.segment_base_candidates.iter().find(|candidate| candidate.base_url.as_ref().is_some_and(|base| base == selected)))?
+            };
+            let base = candidate.base_url.clone().or_else(|| inherited_base.map(str::to_owned)).or_else(|| self.base_urls.first().cloned())?;
+            let index_range = candidate.index_range?;
+            if self.kind.is_empty() { return None; }
+            return Some(MediaTrack {
+                kind: self.kind,
+                segments: Vec::new(),
+                segment_base: Some(DashSegmentBase {
+                    url: base.clone(),
+                    initialization_range: candidate.initialization_range,
+                    index_range,
+                    container: if candidate.container.is_empty() { dash_container_from(None, &base) } else { candidate.container.clone() },
+                }),
+            });
+        }
         let base = self.base_urls.first().map(String::as_str).or(inherited_base).unwrap_or(source);
         let representation_ids = if self.representation_ids.is_empty() { vec![self.representation_id.clone()] } else { self.representation_ids.clone() };
         let mut segments = self.segment_refs.iter().filter_map(|(value, range)| resolve(base, value).map(|url| Segment { url, range: *range, key: None })).collect::<Vec<_>>();
@@ -308,8 +392,14 @@ impl DashTrackBuilder {
             segments = expand_dash_template(template, base, chosen_id, &self.bandwidth, presentation_duration).ok()?;
         }
         if segments.is_empty() { return None; }
-        Some(MediaTrack { kind: self.kind, segments })
+        Some(MediaTrack { kind: self.kind, segments, segment_base: None })
     }
+}
+
+fn dash_container_from(mime: Option<&str>, url: &str) -> String {
+    let mime = mime.unwrap_or_default().to_ascii_lowercase();
+    let url = url.to_ascii_lowercase();
+    if mime.contains("webm") || url.contains(".webm") { "webm".into() } else { "mp4".into() }
 }
 
 fn track_kind(value: &str) -> Option<String> {
@@ -494,6 +584,138 @@ fn dash_range(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Result
     Ok(Some((start, length)))
 }
 
+pub fn expand_dash_segment_base(base: &DashSegmentBase, index_data: &[u8], total_length: u64, initialization_data: &[u8]) -> Result<Vec<Segment>, String> {
+    let mut segments = Vec::new();
+    if let Some(range) = base.initialization_range {
+        segments.push(Segment { url: base.url.clone(), range: Some(range), key: None });
+    }
+    let index_range = base.index_range;
+    segments.push(Segment { url: base.url.clone(), range: Some(index_range), key: None });
+    if base.container == "webm" {
+        let segment_offset = ebml_segment_data_offset(initialization_data)?;
+        let cue_offsets = ebml_cue_cluster_offsets(index_data)?;
+        for (index, relative) in cue_offsets.iter().enumerate() {
+            let start = segment_offset.checked_add(*relative).ok_or_else(|| "The WebM Cue offset overflowed".to_string())?;
+            let end = cue_offsets.get(index + 1).and_then(|next| segment_offset.checked_add(*next)).unwrap_or(total_length);
+            if start >= end || end > total_length { return Err("The WebM Cue range exceeds the representation".into()); }
+            segments.push(Segment { url: base.url.clone(), range: Some((start, end - start)), key: None });
+        }
+    } else {
+        segments.extend(parse_mp4_sidx(base, index_data, total_length)?);
+    }
+    if segments.len() < 2 { return Err("The SegmentBase index did not contain media segments".into()); }
+    Ok(segments)
+}
+
+fn parse_mp4_sidx(base: &DashSegmentBase, index_data: &[u8], total_length: u64) -> Result<Vec<Segment>, String> {
+    if index_data.len() < 32 || &index_data[4..8] != b"sidx" { return Err("The MP4 SegmentBase index is not an sidx box".into()); }
+    let size = u32::from_be_bytes(index_data[0..4].try_into().unwrap()) as usize;
+    if size < 32 || size > index_data.len() { return Err("The MP4 sidx box is truncated".into()); }
+    let version = index_data[8];
+    let (first_offset, count_offset, mut cursor) = if version == 0 {
+        (u32::from_be_bytes(index_data[24..28].try_into().unwrap()) as u64, 30usize, 32usize)
+    } else if version == 1 {
+        if index_data.len() < 40 { return Err("The MP4 sidx version-1 box is truncated".into()); }
+        (u64::from_be_bytes(index_data[28..36].try_into().unwrap()), 38usize, 40usize)
+    } else {
+        return Err("The MP4 sidx version is unsupported".into());
+    };
+    let count = u16::from_be_bytes(index_data[count_offset..count_offset + 2].try_into().unwrap()) as usize;
+    let mut segments = Vec::with_capacity(count);
+    let mut start = base.index_range.0.checked_add(size as u64).and_then(|value| value.checked_add(first_offset)).ok_or_else(|| "The MP4 sidx offset overflowed".to_string())?;
+    for _ in 0..count {
+        if cursor + 12 > size { return Err("The MP4 sidx references are truncated".into()); }
+        let reference = u32::from_be_bytes(index_data[cursor..cursor + 4].try_into().unwrap());
+        cursor += 4;
+        if reference & 0x8000_0000 != 0 { return Err("Hierarchical MP4 SegmentBase indexes are unsupported".into()); }
+        let length = u64::from(reference & 0x7fff_ffff);
+        cursor += 8;
+        if length == 0 || start.checked_add(length).is_none_or(|end| end > total_length) { return Err("The MP4 sidx reference exceeds the representation".into()); }
+        segments.push(Segment { url: base.url.clone(), range: Some((start, length)), key: None });
+        start += length;
+    }
+    Ok(segments)
+}
+
+fn ebml_segment_data_offset(initialization_data: &[u8]) -> Result<u64, String> {
+    let mut cursor = 0usize;
+    while cursor < initialization_data.len() {
+        let (id, id_width) = ebml_id(initialization_data, cursor)?;
+        let (size, size_width) = ebml_vint(initialization_data, cursor + id_width)?;
+        let data_start = cursor + id_width + size_width;
+        if id == 0x1853_8067 { return Ok(data_start as u64); }
+        let Some(size) = size else { break; };
+        let Some(next) = data_start.checked_add(size as usize) else { break; };
+        if next > initialization_data.len() { break; }
+        cursor = next;
+    }
+    Err("The WebM initialization range does not contain a Segment element".into())
+}
+
+fn ebml_cue_cluster_offsets(index_data: &[u8]) -> Result<Vec<u64>, String> {
+    let mut offsets = Vec::new();
+    for (id, data_start, data_end) in ebml_children(index_data, 0, index_data.len())? {
+        if id != 0x1c53_bb6b { continue; }
+        for (cue_id, cue_start, cue_end) in ebml_children(index_data, data_start, data_end)? {
+            if cue_id != 0xbb { continue; }
+            for (positions_id, positions_start, positions_end) in ebml_children(index_data, cue_start, cue_end)? {
+                if positions_id != 0xb7 { continue; }
+                for (offset_id, offset_start, offset_end) in ebml_children(index_data, positions_start, positions_end)? {
+                    if offset_id == 0xf1 { offsets.push(ebml_uint(index_data, offset_start, offset_end)?); }
+                }
+            }
+        }
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    if offsets.is_empty() { return Err("The WebM SegmentBase index did not contain Cue cluster positions".into()); }
+    Ok(offsets)
+}
+
+fn ebml_children(data: &[u8], mut cursor: usize, end: usize) -> Result<Vec<(u64, usize, usize)>, String> {
+    let mut elements = Vec::new();
+    while cursor < end {
+        let (id, id_width) = ebml_id(data, cursor)?;
+        cursor += id_width;
+        let (size, size_width) = ebml_vint(data, cursor)?;
+        cursor += size_width;
+        let data_start = cursor;
+        let data_end = match size {
+            Some(size) => data_start.checked_add(size as usize).ok_or_else(|| "The EBML element size overflowed".to_string())?,
+            None => end,
+        };
+        if data_end > end { return Err("The EBML element is truncated".into()); }
+        elements.push((id, data_start, data_end));
+        cursor = data_end;
+    }
+    Ok(elements)
+}
+
+fn ebml_id(data: &[u8], cursor: usize) -> Result<(u64, usize), String> {
+    let first = *data.get(cursor).ok_or_else(|| "The EBML element ID is truncated".to_string())?;
+    let width = if first & 0x80 != 0 { 1 } else if first & 0x40 != 0 { 2 } else if first & 0x20 != 0 { 3 } else if first & 0x10 != 0 { 4 } else { return Err("The EBML element ID is invalid".into()); };
+    if cursor + width > data.len() { return Err("The EBML element ID is truncated".into()); }
+    let mut value = 0u64;
+    for byte in &data[cursor..cursor + width] { value = (value << 8) | u64::from(*byte); }
+    Ok((value, width))
+}
+
+fn ebml_vint(data: &[u8], cursor: usize) -> Result<(Option<u64>, usize), String> {
+    let first = *data.get(cursor).ok_or_else(|| "The EBML variable integer is truncated".to_string())?;
+    let width = if first & 0x80 != 0 { 1 } else if first & 0x40 != 0 { 2 } else if first & 0x20 != 0 { 3 } else if first & 0x10 != 0 { 4 } else if first & 0x08 != 0 { 5 } else if first & 0x04 != 0 { 6 } else if first & 0x02 != 0 { 7 } else if first & 0x01 != 0 { 8 } else { return Err("The EBML variable integer is invalid".into()); };
+    if cursor + width > data.len() { return Err("The EBML variable integer is truncated".into()); }
+    let marker = 1u64 << (8 - width);
+    let mut value = u64::from(first & (marker as u8 - 1));
+    for byte in &data[cursor + 1..cursor + width] { value = (value << 8) | u64::from(*byte); }
+    Ok((if value == marker - 1 { None } else { Some(value) }, width))
+}
+
+fn ebml_uint(data: &[u8], start: usize, end: usize) -> Result<u64, String> {
+    if start >= end || end - start > 8 { return Err("The EBML unsigned integer is invalid".into()); }
+    let mut value = 0u64;
+    for byte in &data[start..end] { value = (value << 8) | u64::from(*byte); }
+    Ok(value)
+}
 fn attribute(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     element.attributes().flatten().find(|attribute| attribute.key.as_ref().eq_ignore_ascii_case(key)).and_then(|attribute| attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|value| value.into_owned()))
 }
@@ -579,6 +801,29 @@ mod tests {
         assert_eq!(tracks[0].segments[0].url, "https://cdn.example.test/vod/high-init.m4s");
         assert_eq!(tracks[0].segments[1].url, "https://cdn.example.test/vod/high-1.m4s");
         assert_eq!(tracks[0].segments[2].url, "https://cdn.example.test/vod/high-2.m4s");
+    }
+
+    #[test]
+    fn selects_static_dash_segment_base_representations_from_browser_segments() {
+        let body = "<MPD type=\"static\" mediaPresentationDuration=\"PT60S\"><Period><AdaptationSet contentType=\"audio\"><Representation id=\"es\"><BaseURL>https://cdn.example.test/audio_es.mp4</BaseURL><SegmentBase indexRange=\"10-20\"><Initialization range=\"0-9\"/></SegmentBase></Representation><Representation id=\"en\"><BaseURL>https://cdn.example.test/audio_en.mp4</BaseURL><SegmentBase indexRange=\"10-20\"><Initialization range=\"0-9\"/></SegmentBase></Representation></AdaptationSet><AdaptationSet contentType=\"video\"><Representation id=\"h264\"><BaseURL>https://cdn.example.test/video_240p.mp4</BaseURL><SegmentBase indexRange=\"10-20\"><Initialization range=\"0-9\"/></SegmentBase></Representation><Representation id=\"vp9\"><BaseURL>https://cdn.example.test/video_576p.webm</BaseURL><SegmentBase indexRange=\"10-20\"><Initialization range=\"0-9\"/></SegmentBase></Representation></AdaptationSet></Period></MPD>";
+        let selected = [
+            "https://cdn.example.test/audio_en.mp4".into(),
+            "https://cdn.example.test/video_576p.webm".into(),
+        ];
+        let tracks = parse_dash_tracks_for_segments("https://cdn.example.test/manifest.mpd", body, &selected).expect("SegmentBase tracks");
+        assert_eq!(tracks.iter().map(|track| track.kind.as_str()).collect::<Vec<_>>(), ["audio", "video"]);
+        assert_eq!(tracks[0].segments.len(), 0);
+        assert_eq!(tracks[1].segments.len(), 0);
+        let audio_base = tracks[0].segment_base.as_ref().expect("audio SegmentBase");
+        assert_eq!(audio_base.url, "https://cdn.example.test/audio_en.mp4");
+        assert_eq!(audio_base.initialization_range, Some((0, 10)));
+        assert_eq!(audio_base.index_range, (10, 11));
+        assert_eq!(audio_base.container, "mp4");
+        let video_base = tracks[1].segment_base.as_ref().expect("video SegmentBase");
+        assert_eq!(video_base.url, "https://cdn.example.test/video_576p.webm");
+        assert_eq!(video_base.initialization_range, Some((0, 10)));
+        assert_eq!(video_base.index_range, (10, 11));
+        assert_eq!(video_base.container, "webm");
     }
 
     #[test]

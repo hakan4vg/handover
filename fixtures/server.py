@@ -186,6 +186,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_bytes(b"referer required", 403)
             size, seed, _ = FILES["ref-gated.bin"]
             return self._serve_file("ref-gated.bin", seed, size, True)
+        if path == "/file/origin-gated.bin":
+            # Strict origin gate (SPEC §16): 403 unless the Referer is exactly
+            # the embedding page's origin with no path or query. The probe
+            # serves the page from 127.0.0.1 and this file is fetched cross-
+            # origin (localhost), so only a stripped page-origin Referer
+            # passes — a full page URL must fail.
+            referer = self.headers.get("Referer", "")
+            expected = f"http://127.0.0.1:{self.server.server_address[1]}"
+            if referer != expected:
+                return self._send_bytes(b"origin referer required", 403)
+            size, seed, _ = FILES["ref-gated.bin"]
+            return self._serve_file("ref-gated.bin", seed, size, True)
         if path == "/one-use/mint":
             with ONE_USE_LOCK:
                 ONE_USE_COUNTER[0] += 1

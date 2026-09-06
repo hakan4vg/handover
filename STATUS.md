@@ -4656,6 +4656,22 @@ change and no site resolver exception:
   `build:all`, `tsc -b`, Vitest `8`/`44`, Rust `61`/`61`, fixture compile,
   `diff --check` (`/tmp/dm-postonly-gates.log`).
 
+## 2026-09-06 — Cross-origin Referer stripped to page origin, proven live
+
+- The §16 scoping half of the Referer section was unit-only. New fixture
+  route `/file/origin-gated.bin` serves only when the Referer is exactly
+  the embedding page's origin — a full page URL must 403.
+- New `fixtures/xorigin_referrer_scope_chromium_probe.py`: page on
+  `127.0.0.1`, file on `localhost` (cross-origin), anchor carrying a
+  cross-origin `download` author name. It proves the gate discriminates
+  in-probe (`bare=403 full-url=403 origin=200`, `1048576` bytes,
+  `077ce9d8…`) and then captures through the real extension path.
+- First-run evidence (`/tmp/dm-xorigin-scope.log`, `probe_rc=0`): native job
+  named `origin-gated.bin` (author name ignored — the earlier fix composes),
+  `completed`, byte/hash-identical output, empty browser Downloads:
+  `XORIGIN-SCOPE-PROBE: PASS`.
+- No product source changed in this slice.
+
 ## 2026-09-06 — Add window shows live provisional metadata (SPEC §19.2)
 
 - Adjacent proof in the same test file: the captured Add window must show

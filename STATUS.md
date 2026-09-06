@@ -6403,3 +6403,21 @@ change and no site resolver exception:
   `npm run build:extension`, the fresh responsive Chromium probe, and
   `git diff --check` all passed. No native or extension production behavior
   changed.
+
+## 2026-09-07 — Appearance settings persist across restart
+
+- Ran `timeout 240s python3 fixtures/settings_ui_persistence_probe.py` against
+  the rebuilt native application with a fresh isolated HOME and Xvfb display.
+  The live settings UI changed from `theme=system`,
+  `accent=#0878ed`, `density=comfortable` to
+  `theme=dark`, `accent=#d3138c`, `density=compact`.
+- The native SQLite settings row immediately contained all three changed
+  values. After terminating and starting a second resident process against the
+  same HOME, the rendered Appearance page restored the same theme, accent, and
+  density. The probe ended with
+  `SETTINGS-UI-PERSISTENCE: PASS (theme=dark, accent=#d3138c,
+  density=compact, sqlite_match=true, restart=true)` and exit `0`.
+- This closes the earlier unclaimed density/restart restoration note. The
+  probe used the live native settings surface and database; no production
+  source change was needed. Evidence: `/tmp/dm-settings-ui-persistence-current.log`.
+- Native verification on the same tree passed Rust `70/70` and `cargo build`.

@@ -136,7 +136,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] referrer: Option<String>, #[serde(default)] post_body: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2477,7 +2477,7 @@ fn main() {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, referer_value, source_compatible, tray_status_text};
+    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, referer_value, source_compatible, tray_status_text, ProvisionalInput};
     use serde_json::json;
 
     #[test]
@@ -2637,6 +2637,17 @@ mod capture_tests {
         let big = "x".repeat(64 * 1024 + 1);
         let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/purchase", "postBody": big } })).expect("oversized body tolerated");
         assert_eq!(input.post_body, None);
+    }
+
+    #[test]
+    fn provisional_input_accepts_page_url_alias() {
+        // The Tauri command path deserializes this struct directly, so it
+        // must accept the extension's pageUrl key (the gated-media E2E
+        // caught it being silently dropped there).
+        let input: ProvisionalInput = serde_json::from_value(json!({ "source": "http://127.0.0.1:9/hls/gated.m3u8", "pageUrl": "http://127.0.0.1:9/page/video.html" })).expect("pageUrl alias");
+        assert_eq!(input.referrer.as_deref(), Some("http://127.0.0.1:9/page/video.html"));
+        let input: ProvisionalInput = serde_json::from_value(json!({ "source": "http://127.0.0.1:9/hls/gated.m3u8" })).expect("missing referrer tolerated");
+        assert_eq!(input.referrer, None);
     }
 
     #[test]

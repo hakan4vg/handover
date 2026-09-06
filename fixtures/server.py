@@ -102,6 +102,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
+    def _referer_host_ok(self) -> bool:
+        # Hotlink-style check shared by the gated fixtures: the Referer must
+        # parse and its host must match this server's host.
+        referer = self.headers.get("Referer", "")
+        host = (self.headers.get("Host", "") or "").split(":")[0].lower()
+        try:
+            ref_host = urlparse(referer).hostname or ""
+        except Exception:
+            ref_host = ""
+        return bool(ref_host) and ref_host.lower() == host
+
     def _serve_file(self, name: str, seed: int, total: int, ranged: bool, extra=None):
         headers = dict(extra or {})
         range_header = self.headers.get("Range")
@@ -176,13 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/file/ref-gated.bin":
             # Hotlink-style gate: 403 unless the Referer parses and its host
             # matches this server's host (SPEC §5.1 request-context replay).
-            referer = self.headers.get("Referer", "")
-            host = (self.headers.get("Host", "") or "").split(":")[0].lower()
-            try:
-                ref_host = urlparse(referer).hostname or ""
-            except Exception:
-                ref_host = ""
-            if not ref_host or ref_host.lower() != host:
+            if not self._referer_host_ok():
                 return self._send_bytes(b"referer required", 403)
             size, seed, _ = FILES["ref-gated.bin"]
             return self._serve_file("ref-gated.bin", seed, size, True)
@@ -252,6 +257,25 @@ class Handler(BaseHTTPRequestHandler):
                 lines += ["#EXTINF:1.0,", f"slow{i}.bin"]
             lines.append("#EXT-X-ENDLIST")
             return self._send_bytes(("\n".join(lines) + "\n").encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/hls/gated.m3u8":
+            # Hotlink-gated VOD: manifest and every segment 403 without a
+            # same-host Referer. Proves Referer replay composes with the
+            # segmented media pipeline (SPEC §5.1 + §16).
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXT-X-MEDIA-SEQUENCE:0"]
+            for i in range(SEG_TS_COUNT):
+                lines += ["#EXTINF:2.0,", f"gseg{i}.ts"]
+            lines.append("#EXT-X-ENDLIST")
+            return self._send_bytes(("\n".join(lines) + "\n").encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
+        m = re.match(r"^/hls/(gseg(\d+)\.ts)$", path)
+        if m:
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            idx = int(m.group(2))
+            if idx >= SEG_TS_COUNT:
+                return self._send_bytes(b"missing fixture", 404)
+            return self._send_bytes(file_data(f"gseg{idx}", 0x90 + idx, 188 * 16), 200, {"Content-Type": "video/mp2t"})
         if path == "/hls/live.m3u8":
             body = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n"
             return self._send_bytes(body.encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})

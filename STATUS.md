@@ -4700,3 +4700,34 @@ change and no site resolver exception:
   `8388608` bytes identical) — `/tmp/dm-postcore-limiter.log`. The segmented
   path shares the edited `acquire_once` arm and is unaffected.
 - No product source changed in this slice.
+
+## 2026-09-06 — Referer replay composes with segmented media (SPEC §5.1/§16)
+
+- New fixture: `/hls/gated.m3u8` (6-segment VOD) plus `gseg` segments, both
+  403 without a same-host Referer, sharing a `_referer_host_ok` helper with
+  the ref-gated route (also fixes a stray Pyright possibly-unbound note by
+  dropping a try/except `urlparse` cannot trip).
+- New `fixtures/gated_media_referrer_probe.py`: two phases through the real
+  binary's Inspector `create_provisional`/`commit_provisional`, reference =
+  ordered segment concatenation.
+- Phase A (red): no page context → `failed`, `Source returned 403
+  Forbidden`. Phase B first failed for a REAL product reason: the Inspector
+  command path deserializes `ProvisionalInput` directly, so the extension's
+  `pageUrl` key was silently dropped (`referrer: None` on the job row) while
+  the native-messaging path maps it manually. Fix: one serde
+  `alias = "pageUrl"` on `ProvisionalInput.referrer` (the `postBody` alias
+  was redundant under `rename_all = "camelCase"` and left out) plus a unit
+  test; first attempt put the alias on the `DownloadJob` DB struct by
+  mistake, caught by re-reading before commit.
+- Green evidence (`/tmp/dm-gated-media.log`, `probe_rc=0`): RED failed 403
+  as required; READY `segments.completed=6/6`; output `18048` bytes,
+  `sha256=3e826d2e…` identical to the reference:
+  `GATED-MEDIA-PROBE: PASS`.
+- Bring-up note: three consecutive WebKit SIGSEGVs (`poll=-11`) at app
+  start mid-sequence; the same binary passes manual launch and the
+  established `hls_fmp4` probe on the same box, and the gated probe goes
+  green on rerun — transient Xvfb/WebKit startup flake, no product
+  involvement.
+- Gates: `build:all`, `tsc -b` clean, Vitest `8`/`44`, Rust `62`/`62`
+  (was `61`), fixture compile, `diff --check`
+  (`/tmp/dm-gated-gates.log`).

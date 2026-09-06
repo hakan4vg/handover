@@ -5941,7 +5941,7 @@ change and no site resolver exception:
   `/tmp/dm-public-drop-player-original-chromium-u_96afd8/`. No production source
   change was justified by this path.
 
-## 2026-09-06 — ReactPlayer HLS shadow-DOM negative boundary
+## 2026-09-06 — ReactPlayer HLS diagnostic boundary (superseded)
 
 - Ran a fresh Chromium diagnostic against the official ReactPlayer demo
   `https://cookpete.github.io/react-player/`. The real `HLS (m3u8)` control
@@ -5953,18 +5953,52 @@ change and no site resolver exception:
   the master playlist, one signed rendition playlist, and finite `.ts`
   fragments. There were zero `Network.loadingFailed` records. Signed query
   values and opaque CDN path values are redacted in the retained log.
-- The demo's own state reached `duration=1:00`, `loaded=1.000`, and the
-  `HLS-VIDEO` custom element exposed a shadow-root `<video>` with the blob
-  `currentSrc` and the HTTP child `<source>`. The normal light-DOM media scan
-  saw zero `<video>`/`<audio>` nodes, so the extension injected no
-  `dm-media-download-button` and created no native job. The extension/native
-  handshake itself was healthy (`get-policy` returned `ok=true`).
-- This is a bounded negative result for the current generic integration:
-  ReactPlayer's shadow-DOM HLS path is externally playable but not usable by
-  the current Download Manager initiation path. No shadow-DOM-specific
-  production patch was made, no acceptance fixture was added, and no managed
-  output/reference equality can be claimed. The earlier demo MP4 item also
-  remained an external media-error-4 baseline, not a product defect.
-- Exact retained diagnostic is `/tmp/dm-reactplayer-hls-diag.log`, ending with
-  `REACTPLAYER-HLS-DIAGNOSTIC: BLOCKED`. The next audit slice must use another
-  reachable initiation pattern rather than patching around this demo.
+- The first diagnostic searched only light-DOM `<video>`/`<audio>` nodes. It
+  therefore reported zero media and no Download button even though the page
+  had mounted an open-shadow `HLS-VIDEO` element. That was an instrumentation
+  defect, not a product result.
+- A corrected diagnostic scanned the open shadow root, found one playing blob
+  video (`readyState=4`, duration `60`), and found the injected button and
+  native provisional job. The positive acceptance below supersedes this
+  negative boundary; no shadow-specific production patch was needed.
+- The earlier demo MP4 item remains an external media-error-4 baseline, not a
+  product defect. Exact retained diagnostic output is
+  `/tmp/dm-reactplayer-hls-diag.log`; its initial negative branch is historical
+  evidence only.
+
+## 2026-09-06 — ReactPlayer HLS shadow-DOM acceptance
+
+- Added `fixtures/public_reactplayer_hls_chromium_probe.py` against
+  `https://cookpete.github.io/react-player/`. The fixture clicks the page's real
+  `HLS (m3u8)` control, scans the open shadow-root `HLS-VIDEO` media, and uses
+  the generic extension/native path. It contains no site-specific resolver.
+- Fresh Chromium evidence reached one shadow video with `readyState=4`,
+  `paused=false`, duration `60.000361`, and `blob:` current source. The
+  extension/native diagnostic returned `ok=true`; the real injected Download
+  button was clicked through trusted input. One native provisional job was
+  created from the public HLS master and committed with resident `--commit`
+  exit `0`.
+- Chromium observed one rendition manifest and twelve finite media segments.
+  The browser-context reference fetched the observed rendition's map and
+  ordered segments, transferred those bytes into the disposable run, and
+  remuxed them with the same local `ffmpeg -map 0 -c copy` finalizer used by
+  the product. Raw browser bytes were `16,912,480`; the independent finalized
+  reference was `16,510,043` bytes with SHA-256
+  `434de625f61910c5758899d73a9e3e875282757330b5df3e753b2b41c276a9f7`.
+- Native output matched the independent finalized reference exactly:
+  `16,510,043` bytes and the same SHA-256. The job ended
+  `state=completed`, `provisional=false`, with exactly one database job.
+  FFprobe reports H.264 `1280x720`, AAC `44,100 Hz`, and duration
+  `59.999954` seconds.
+- Trusted context-menu and Ctrl-click ownership stayed browser-owned
+  (`isTrusted=true`, `defaultPrevented=false`). Chromium Downloads stayed
+  empty. Signed rendition query/path values are `[REDACTED]` in retained
+  output; the public master URL is the only source identifier retained.
+- Focused checks passed: fixture Python compilation, `git diff --check`,
+  credential-pattern scan with zero matches, and `npm test -- --run`
+  (`8` files, `48` tests). Exact acceptance output is
+  `/tmp/dm-public-reactplayer-hls-final.log` ending with
+  `PUBLIC-REACTPLAYER-HLS-CHROMIUM-PROBE: PASS`.
+- No production source change was justified. This closes one real
+  shadow-DOM/custom-player HLS initiation pattern; it does not close the
+  remaining ordinary one-use takeover product decision or unrelated v1 gaps.

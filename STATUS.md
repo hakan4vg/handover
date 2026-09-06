@@ -6378,3 +6378,28 @@ change and no site resolver exception:
   or site-specific resolver change was needed.
 - Verification: the fresh Chromium probe exited `0`, Python compilation and
   `git diff --check` passed.
+
+## 2026-09-07 — Narrow viewport containment regression
+
+- A fresh Chromium baseline at a forced `900x600` CSS viewport exposed a
+  responsive regression left by the earlier desktop containment fix. The
+  `@media (max-width: 1080px)` rule restored `min-height: 580px` on
+  `.manager-body`, making the document `644px` high for a `600px` viewport;
+  the status footer began at `601px` and the compositor showed an outer page
+  scrollbar. Red evidence: `/tmp/dm-ui-responsive-red.log` and
+  `/tmp/dm-ui-responsive-red.png`.
+- Changed only that responsive override to `min-height: 0`, matching the base
+  `.manager-body` rule. Added
+  `fixtures/responsive_viewport_chromium_probe.py`, which forces the same
+  viewport through CDP and checks both horizontal and vertical document/body
+  containment plus footer placement.
+- The fixed fresh run reported document and body `900x600` with equal client
+  and scroll dimensions, manager height `536px` with `minHeight=0px`, and the
+  footer ending at `591px`. The compositor screenshot shows no outer scrollbar;
+  the download list and inspector retain their intended internal scroll areas:
+  `/tmp/dm-ui-responsive-chromium.log` and
+  `/tmp/dm-ui-responsive-chromium.png`.
+- Verification: `npm test -- --run` passed `50/50`, `npx tsc -b`,
+  `npm run build:extension`, the fresh responsive Chromium probe, and
+  `git diff --check` all passed. No native or extension production behavior
+  changed.

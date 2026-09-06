@@ -70,6 +70,10 @@ struct DownloadJob {
     /// request by referer_value). Serde default keeps old DBs loadable.
     #[serde(default)]
     referrer: Option<String>,
+    /// Observed urlencoded form body replayed as the request body (SPEC §5.1
+    /// method/body). Capped at parse; serde default keeps old DBs loadable.
+    #[serde(default)]
+    post_body: Option<String>,
     events: Vec<JobEvent>,
 }
 
@@ -132,7 +136,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] referrer: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] referrer: Option<String>, #[serde(default)] post_body: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -744,18 +748,33 @@ fn referer_value(referrer: &str, url: &str) -> Option<String> {
     Some(page.origin().ascii_serialization())
 }
 
-fn job_referrer(app: &AppHandle, id: &str) -> Option<String> {
+fn job_context(app: &AppHandle, id: &str) -> (Option<String>, Option<String>) {
     app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
-        snapshot.jobs.iter().find(|item| item.id == id).and_then(|job| job.referrer.clone())
-    })
+        snapshot.jobs.iter().find(|item| item.id == id).map(|job| (job.referrer.clone(), job.post_body.clone()))
+    }).unwrap_or((None, None))
 }
 
-fn get_with_referrer(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> reqwest::RequestBuilder {
+fn acquisition_request(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> reqwest::RequestBuilder {
+    let (referrer, _) = job_context(app, id);
     let request = client.get(url);
-    match job_referrer(app, id).as_deref().and_then(|referrer| referer_value(referrer, url)) {
+    match referrer.as_deref().and_then(|value| referer_value(value, url)) {
         Some(value) => request.header(reqwest::header::REFERER, value),
         None => request,
     }
+}
+
+// POST replay for form-originated captures (SPEC §5.1 method/body). Used
+// only after a plain GET is refused with 405: unconditional POST replay
+// would re-submit forms whose endpoints already answer GET. Same Referer
+// scoping as GET requests.
+fn post_replay_request(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Option<reqwest::RequestBuilder> {
+    let (referrer, post_body) = job_context(app, id);
+    let body = post_body?;
+    let request = client.post(url).body(body).header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    Some(match referrer.as_deref().and_then(|value| referer_value(value, url)) {
+        Some(value) => request.header(reqwest::header::REFERER, value),
+        None => request,
+    })
 }
 
 fn retryable_status(status: reqwest::StatusCode) -> bool {
@@ -1180,7 +1199,7 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
             sleep(Duration::from_millis(100)).await;
             if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
         }
-        let mut request = get_with_referrer(client, app, id, source);
+        let mut request = acquisition_request(client, app, id, source);
         if let Some((start, length)) = byte_range {
             let Some(end) = start.checked_add(length).and_then(|value| value.checked_sub(1)) else {
                 return Err("The HLS byte range exceeds the addressable resource size".into());
@@ -1283,7 +1302,7 @@ async fn range_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source
     let mut last_error = String::from("range request failed");
     let total_len = end.saturating_sub(start).saturating_add(1);
     for _ in 0..attempts {
-        match get_with_referrer(client, app, id, source).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send().await {
+        match acquisition_request(client, app, id, source).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send().await {
             Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
                 let valid_range = content_range(&response).map(|(actual_start, actual_end, actual_total)| actual_start == start && actual_end == end && actual_total == expected.length).unwrap_or(false);
                 if !valid_range { last_error = "The server returned an invalid byte range".into(); continue; }
@@ -1444,7 +1463,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             emit_snapshot(&app, &state);
             sleep(Duration::from_secs(3)).await;
             let stream_client = http_client();
-            let response = match get_with_referrer(&stream_client, &app, &id, &source).send().await {
+            let response = match acquisition_request(&stream_client, &app, &id, &source).send().await {
                 Ok(response) if response.status().is_success() => response,
                 Ok(response) => return Err(format!("{initial_error}; one-stream fallback failed: source returned {}", response.status())),
                 Err(stream_error) => return Err(format!("{initial_error}; one-stream fallback failed: {stream_error}")),
@@ -1553,7 +1572,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         if !is_hls { break; }
         if let Some(sources) = media::hls_variant_tracks(&manifest_source, &manifest_body) { hls_track_sources = Some(sources); break; }
         let Some(variant) = (if is_hls { media::hls_variant(&manifest_source, &manifest_body) } else { None }) else { break };
-        let response = get_with_referrer(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+        let response = acquisition_request(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
         manifest_body = response.text().await.map_err(|error| error.to_string())?;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         manifest_source = variant;
@@ -1564,12 +1583,12 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let mut tracks = Vec::with_capacity(sources.len());
         for (kind, track_source) in sources {
             let mut source = track_source;
-            let response = get_with_referrer(&client, &app, &id, &source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+            let response = acquisition_request(&client, &app, &id, &source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
             let mut body = response.text().await.map_err(|error| error.to_string())?;
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
             for _ in 0..4 {
                 let Some(variant) = media::hls_variant(&source, &body) else { break; };
-                let response = get_with_referrer(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+                let response = acquisition_request(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
                 body = response.text().await.map_err(|error| error.to_string())?;
                 if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
                 source = variant;
@@ -1739,10 +1758,20 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     let state = app.state::<CoreState>();
     let client = http_client();
     let selected_segments = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.selected_segments.clone())).unwrap_or_default();
-    let mut response = match get_with_referrer(&client, &app, &id, &source).header(reqwest::header::RANGE, "bytes=0-0").send().await {
+    let mut response = match acquisition_request(&client, &app, &id, &source).header(reqwest::header::RANGE, "bytes=0-0").send().await {
         Ok(response) if response.status().is_success() => response,
-        _ => match get_with_referrer(&client, &app, &id, &source).send().await {
+        _ => match acquisition_request(&client, &app, &id, &source).send().await {
             Ok(response) if response.status().is_success() => response,
+            Ok(_response) if _response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {
+                match post_replay_request(&client, &app, &id, &source) {
+                    Some(replay) => match replay.send().await {
+                        Ok(posted) if posted.status().is_success() => posted,
+                        Ok(posted) => { let retryable = retryable_status(posted.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", posted.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
+                        Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+                    },
+                    None => { let retryable = retryable_status(_response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", _response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
+                }
+            }
             Ok(response) => { let retryable = retryable_status(response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
             Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         }
@@ -1750,7 +1779,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     if !transfer_can_continue(&app, &id, generation) { return false; }
     let valid_probe = response.status() != reqwest::StatusCode::PARTIAL_CONTENT || content_range(&response).map(|(start, end, total)| start == 0 && end == 0 && total > 0).unwrap_or(false);
     if !valid_probe {
-        response = match get_with_referrer(&client, &app, &id, &source).send().await {
+        response = match acquisition_request(&client, &app, &id, &source).send().await {
             Ok(response) if response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT => response,
             Ok(_response) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("The source returned an invalid partial response".into()); job.eta = None; job.events.insert(0, job_event("Source returned an invalid partial response", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
             Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
@@ -1761,7 +1790,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     if media::is_manifest_source(&source, response_mime.as_deref()) {
         if !transfer_can_continue(&app, &id, generation) { return false; }
         let body = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            match get_with_referrer(&client, &app, &id, &source).send().await {
+            match acquisition_request(&client, &app, &id, &source).send().await {
                 Ok(full) if full.status().is_success() => full.text().await.map_err(|error| error.to_string()),
                 Ok(full) => Err(format!("Manifest source returned {}", full.status())),
                 Err(error) => Err(error.to_string()),
@@ -2025,7 +2054,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     }
     let id = format!("provisional-{}", Uuid::new_v4());
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, referrer: input.referrer, events: vec![job_event("Provisional acquisition created", None)] };
+    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, referrer: input.referrer, post_body: input.post_body, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
@@ -2248,7 +2277,11 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
     // `pageUrl`; the downloads-API fallback sends the item referrer).
     // Accept explicit `referrer` first, then `pageUrl`; keep only HTTP(S).
     let referrer = payload.get("referrer").or_else(|| payload.get("pageUrl")).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).and_then(|value| reqwest::Url::parse(value).ok()).filter(|parsed| matches!(parsed.scheme(), "http" | "https")).map(|parsed| parsed.to_string());
-    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments, referrer })
+    // POST replay (SPEC §5.1 method/body): keep a small urlencoded body only.
+    // Multipart, raw, empty, and oversized bodies fall back to a safe GET.
+    const POST_BODY_MAX: usize = 64 * 1024;
+    let post_body = payload.get("postBody").and_then(Value::as_str).filter(|value| !value.is_empty() && value.len() <= POST_BODY_MAX).map(str::to_string);
+    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments, referrer, post_body })
 }
 
 fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {
@@ -2591,6 +2624,19 @@ mod capture_tests {
         assert_eq!(input.referrer, None);
         let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin" } })).expect("missing referrer tolerated");
         assert_eq!(input.referrer, None);
+    }
+
+    #[test]
+    fn capture_post_body_keeps_small_bodies_only() {
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/purchase", "postBody": "fixture=post-only" } })).expect("post body kept");
+        assert_eq!(input.post_body.as_deref(), Some("fixture=post-only"));
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/purchase" } })).expect("missing body tolerated");
+        assert_eq!(input.post_body, None);
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/purchase", "postBody": "" } })).expect("empty body tolerated");
+        assert_eq!(input.post_body, None);
+        let big = "x".repeat(64 * 1024 + 1);
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/purchase", "postBody": big } })).expect("oversized body tolerated");
+        assert_eq!(input.post_body, None);
     }
 
     #[test]

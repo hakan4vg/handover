@@ -181,6 +181,64 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders'],
 );
 
+// POST-body observation for form-originated downloads (SPEC §5.1: method/
+// body when safely reproducible). Bounded one-shot ring: urlencoded form
+// bodies up to 64 KiB, 60 s TTL, consumed on first matching capture.
+// Multipart/file uploads, raw bodies, and larger forms are left out — the
+// native side replays a safe GET for those, exactly as before. Observe-only:
+// no blocking, no modification.
+const FORM_BODY_MAX = 64 * 1024;
+const FORM_BODY_TTL_MS = 60_000;
+const recentFormBodies: Array<{ url: string; body: string; at: number }> = [];
+
+function pruneFormBodies(now = Date.now()): void {
+  while (recentFormBodies.length && now - recentFormBodies[0].at > FORM_BODY_TTL_MS) recentFormBodies.shift();
+  while (recentFormBodies.length > 64) recentFormBodies.shift();
+}
+
+function formBodyFromDetails(details: chrome.webRequest.OnBeforeRequestDetails): string | undefined {
+  const formData = details.requestBody?.formData;
+  if (!formData) return undefined;
+  const params = new URLSearchParams();
+  for (const [key, values] of Object.entries(formData)) {
+    for (const value of values) {
+      if (typeof value !== 'string') return undefined;
+      params.append(key, value);
+    }
+  }
+  const text = params.toString();
+  return text.length > 0 && text.length <= FORM_BODY_MAX ? text : undefined;
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details): undefined => {
+    if (details.tabId < 0 || details.method !== 'POST') return undefined;
+    const body = formBodyFromDetails(details);
+    if (body === undefined) return undefined;
+    pruneFormBodies();
+    const url = details.url.split('#')[0];
+    const existing = recentFormBodies.find((item) => item.url === url);
+    if (existing) {
+      existing.body = body;
+      existing.at = Date.now();
+      return undefined;
+    }
+    recentFormBodies.push({ url, body, at: Date.now() });
+    return undefined;
+  },
+  { urls: ['<all_urls>'] },
+  ['requestBody'],
+);
+
+function takeFormBody(url: string): string | undefined {
+  pruneFormBodies();
+  const now = Date.now();
+  const index = recentFormBodies.findIndex((item) => item.url === url);
+  if (index < 0) return undefined;
+  const [found] = recentFormBodies.splice(index, 1);
+  return now - found.at <= FORM_BODY_TTL_MS ? found.body : undefined;
+}
+
 // INTERIM fallback (SPEC §5.1.1): observe-only. Forwards intent so the
 // resident app opens an Add Download window, but never cancels the browser
 // download — destroying a one-use/tokenized transaction to pretend takeover
@@ -199,6 +257,9 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       name: cleanFilename(item.filename),
       pageUrl: item.referrer,
       referrer: item.referrer,
+      // One-shot POST replay: a form body observed for this URL rides along;
+      // absent (or already consumed) means the native side replays a safe GET.
+      postBody: takeFormBody(item.finalUrl || item.url),
     },
   }).finally(() => suggest());
   return true;

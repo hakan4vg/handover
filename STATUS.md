@@ -4616,6 +4616,46 @@ change and no site resolver exception:
   Vitest `8`/`44`, Rust `60`/`60`, fixture compile, `diff --check`
   (`/tmp/dm-referrer-gates.log`).
 
+## 2026-09-06 — Form POST-body replay for POST-only endpoints (SPEC §5.1)
+
+- Gap, proven red first: the native fallback replayed a bare GET, so any
+  endpoint requiring the form POST failed. New probe
+  `fixtures/postonly_replay_chromium_probe.py` serves a POST-only
+  attachment (GET answers 405; only the exact `fixture=post-only` body
+  succeeds) and asserts SUCCESS with byte/hash equality against the
+  browser's own POST download.
+- Red run (`/tmp/dm-postonly-red.log`, `probe_rc=1`): browser POST completed
+  `65536` bytes (`3473fca7…`); native GET got
+  `Source returned 405 Method Not Allowed`, job `failed`.
+- Course correction caught by the neighbor probe: the first implementation
+  replayed POST unconditionally, and the existing form GET probe failed with
+  methods `[POST, POST]` — a re-submission for endpoints where GET already
+  answers. Narrowed to GET-first with POST only after a 405 refusal when an
+  observed body exists. Unconditional replay would re-submit every form.
+- Implementation, generic (no site rules):
+  - Extension (`background.ts`): observe-only `webRequest.onBeforeRequest`
+    `requestBody` ring — urlencoded form bodies ≤64 KiB, 60 s TTL, one-shot
+    consume by URL. Multipart/raw/oversized forms are left out and stay safe
+    GET. No new permissions, no blocking. The fallback capture attaches
+    `postBody`; pre-browser anchor and media paths are untouched (GET).
+  - Resident (`main.rs`): `ProvisionalInput`/`DownloadJob.post_body`
+    (serde-defaulted, capped, empty dropped) and a 405-gated POST replay in
+    `acquire_once` reusing the Referer scoping. All other fetch sites stay
+    GET exactly as before.
+- Green run (`/tmp/dm-postonly-green.log`, `probe_rc=0`):
+  `POSTONLY-REPLAY: PASS (output_bytes=65536,
+  output_sha256=3473fca710f006025d284d4e32ad4fc453a1c522c36bfcde4cb19da38220d8a7,
+  jobs=1, browser_downloads=1)` and `POSTONLY-REPLAY-PROBE: PASS`. The
+  browser copy stays intact throughout (least-destructive rule holds).
+- Neighbors on the rebuilt tree: form GET probe PASS with methods back to
+  `[POST, GET]` (no re-submission); explicit-anchor PASS on rerun
+  (`source_requests=2`) after one flaky `3` (raw per-connection counter,
+  transparent Chromium retry against the toy server — rerun green, no
+  product involvement); direct-MP4 PASS earlier on this tree.
+- Unit test for body parse caps; suite Rust `61/61` (was `60`). Full gates
+  `build:all`, `tsc -b`, Vitest `8`/`44`, Rust `61`/`61`, fixture compile,
+  `diff --check` (`/tmp/dm-postonly-gates.log`).
+
 ## 2026-09-06 — Add window shows live provisional metadata (SPEC §19.2)
 
 - Adjacent proof in the same test file: the captured Add window must show

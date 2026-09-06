@@ -6433,3 +6433,17 @@ change and no site resolver exception:
   download-list scrollbar without an outer page scrollbar:
   `/tmp/dm-ui-responsive-min.log` and `/tmp/dm-ui-responsive-min.png`.
 - No additional production change was needed.
+
+## 2026-09-07 — General startup settings effects
+
+- Ran `timeout 240s python3 fixtures/startup_settings_probe.py` against the
+  rebuilt native app with a fresh isolated HOME and Xvfb display. With
+  `startAtSignIn=false`, the disposable Linux autostart desktop file was absent.
+  With it true, the file was present and contained the `--startup` argument.
+- A real process restart with `--startup` and `showManagerAtSignIn=false`
+  produced no visible `Download Manager` main window. Setting it true and
+  restarting again produced exactly one visible main window. The probe ended
+  with `STARTUP-SETTINGS-PROBE: PASS` and exit `0`.
+- This closes the previously unverified live effects of both General sign-in
+  toggles. No production source change was needed. Evidence:
+  `/tmp/dm-startup-settings-current.log`.

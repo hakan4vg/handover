@@ -5031,6 +5031,10 @@ change and no site resolver exception:
   the real Settings value, sent a real `WM_DELETE_WINDOW`, and observed a
   clean resident exit code `1` without SIGSEGV. Evidence:
   `/tmp/dm-exit-behavior-current.log`.
+- `fixtures/single_instance_probe.py` passed with a second resident invocation:
+  the forwarder exited `0`, the original resident stayed alive as the only
+  process, and one 32,768-byte job finalized after one source request.
+  Evidence: `/tmp/dm-single-instance-current.log`.
 - No product source changed in this verification slice.
 
 ## 2026-09-06 — Three rapid captures and independent Add Download windows

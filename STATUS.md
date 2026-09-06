@@ -4896,3 +4896,25 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])`; `ODYSEE-PROBE: PASS` — first-try green.
 - No product source changed in this slice (progressive-MP4 path already
   green); Rust/frontend suites untouched.
+
+## 2026-09-06 — Public Kaltura player: blob MSE -> HLS VOD -> muxed MP4
+
+- New `fixtures/public_kaltura_button_chromium_probe.py`: Kaltura VPaaS
+  player on its live docs page (`https://developer.kaltura.com/player/` — a
+  new player family for this loop). The demo `<video>` is fed via blob MSE;
+  the probe autoplays past the play click when already playing, clicks the
+  real `#dm-media-download-button` (audit proved it hit and unoccluded),
+  and commits through the real provisional-to-completed flow. The captured
+  source is a signed Kaltura HLS VOD manifest
+  (`cfvod.kaltura.com/.../entryId/1_23yaxsca/.../index.m3u8`, 16 fMP4
+  fragments); the probe reference adapts (manifest resolve + MAP +
+  fragments muxed with the resident's exact `-map 0 -c copy`, else direct
+  bytes; DASH raises an honest no-reference error).
+- Evidence (`/tmp/dm-kaltura.log`, `PROBE_EXIT=0`): job `media=true
+  kind=video`; `KALTURA-REFERENCE: manifest fragments=16 bytes=36605194
+  sha256=d075ecbc14d2cfc011443e6a64b03a1446a0ec7bb5751d318afd733f1c625f75`;
+  `KALTURA: PASS (output_bytes=36605194,
+  output_sha256=d075ecbc14d2cfc011443e6a64b03a1446a0ec7bb5751d318afd733f1c625f75,
+  jobs=1, browser_downloads=[])`; `KALTURA-PROBE: PASS` — first-try green.
+- No product source changed in this slice (clear-HLS path already green);
+  Rust/frontend suites untouched.

@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Real Chromium + VidPly public accessibility-player media proof.
+"""Real Chromium + VidPly progressive MP4 proof.
 
-The VidPly project's main demo uses top-level HTML5 ``<video>`` elements with
-multiple ``<source>`` and WebVTT track children, plus its own custom controls.
-It uses a fresh Chromium profile, the real unpacked extension/native host, a
-resident real binary, and the fixture records browser network evidence without
-persisting query values, clicks the product's player-bound Download button,
-commits through the resident single-instance CLI, and compares the native
-result with browser-side bytes.
+VidPly's official demo uses a custom accessible controller surface around
+an MP4 source. This probe clicks the first real VidPly Play control with
+trusted Chromium input, captures one native media job, commits it through the
+resident process, and compares the result to an independent fetch of the exact
+source.
 """
 from __future__ import annotations
 
@@ -19,8 +17,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -31,176 +30,106 @@ import segmented_restart_probe as support
 
 BIN = public.BIN
 EXTENSION = public.EXTENSION
-VIDEO_PAGE = "https://matthiaspeltzer.github.io/vidply/demo/demo.html"
-PAGE = VIDEO_PAGE
+PAGE = "https://matthiaspeltzer.github.io/vidply/demo/demo.html"
+TARGET = "#deadline-video"
+SOURCE_HOST = "matthiaspeltzer.github.io"
+SOURCE_PATH = "/vidply/demo/media/deadline.mp4"
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def redacted_url(url: str) -> str:
-    """Keep host/path and query keys, never signed query values."""
     parts = urlsplit(url)
-    keys = sorted({key for key, _ in parse_qsl(parts.query, keep_blank_values=True)})
-    query = "&".join(f"{key}=[REDACTED]" for key in keys)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def click(client: adaptive.EventCDP, point: dict) -> None:
+    for event_type in ("mousePressed", "mouseReleased"):
+        client.call(
+            "Input.dispatchMouseEvent",
+            {
+                "type": event_type,
+                "x": point["x"],
+                "y": point["y"],
+                "button": "left",
+                "clickCount": 1,
+                "modifiers": 0,
+            },
+        )
 
 
-def browser_reference(client: adaptive.EventCDP, url: str) -> dict:
+def player_state(client: adaptive.EventCDP) -> dict:
     raw = client.evaluate(
-        "(async()=>{"
-        f"const u={json.dumps(url)};const r=await fetch(u,{{cache:'no-store'}});"
-        "if(!r.ok)return JSON.stringify({error:'HTTP '+r.status});"
-        "const b=new Uint8Array(await r.arrayBuffer());"
-        "const d=new Uint8Array(await crypto.subtle.digest('SHA-256',b));"
-        "return JSON.stringify({size:b.length,hash:Array.from(d).map(x=>x.toString(16).padStart(2,'0')).join('')});"
-        "})()"
+        "JSON.stringify((()=>{"
+        f"const v=document.querySelector({json.dumps(TARGET)});"
+        "const r=v?.getBoundingClientRect();"
+        "const play=document.querySelector('#deadline-video + .vidply-controls .vidply-play-pause[aria-label=\\\"Play\\\"],.vidply-video-wrapper:has(#deadline-video) .vidply-play-pause[aria-label=\\\"Play\\\"]');const pr=play?.getBoundingClientRect();"
+        "const button=document.querySelector('#dm-media-download-button');const br=button?.getBoundingClientRect();"
+        "return {target:!!v,source:v?(v.currentSrc||v.src||''):'',readyState:v?.readyState||0,paused:v?.paused??true,duration:v?.duration??0,videoRect:r?{top:r.top,left:r.left,right:r.right,bottom:r.bottom,width:r.width,height:r.height}:null,playPoint:pr?{x:pr.left+pr.width/2,y:pr.top+pr.height/2,width:pr.width,height:pr.height}:null,button:!!button,buttonPoint:br?{x:br.left+br.width/2,y:br.top+br.height/2,width:br.width,height:br.height}:null,buttonPointerEvents:button?getComputedStyle(button).pointerEvents:null,tracks:v?[...v.querySelectorAll('track')].length:0};})())"
     )
-    result = json.loads(raw)
-    if result.get("error"):
-        raise RuntimeError(f"browser reference fetch failed for {redacted_url(url)}: {result['error']}")
-    return result
+    return json.loads(raw)
 
 
-def jobs(db: str) -> list[dict]:
-    return public.jobs(db)
-
-
-def wait_media_job(db: str, timeout: float = 90.0) -> dict:
-    deadline = time.time() + timeout
-    last: list[dict] = []
-    while time.time() < deadline:
-        last = [job for job in jobs(db) if job.get("media") is True]
-        if last:
-            return last[-1]
-        time.sleep(0.2)
-    raise RuntimeError(f"VidPly player capture created no native media job: {last}")
-
-
-def wait_player(client: adaptive.EventCDP, timeout: float = 90.0) -> dict:
+def wait_ready(client: adaptive.EventCDP, timeout: float = 90.0) -> dict:
     deadline = time.time() + timeout
     last = None
-    last_raw = None
-    last_error = None
     while time.time() < deadline:
         try:
-            raw = client.evaluate(
-                "JSON.stringify((()=>{"
-                "const media=Array.from(document.querySelectorAll('audio,video'));"
-                "const visible=item=>{const box=item.getBoundingClientRect();return box.width>=120&&box.height>=40&&box.bottom>0&&box.right>0&&box.top<innerHeight&&box.left<innerWidth};"
-                "const sourceOf=item=>item.currentSrc||item.src||item.querySelector('source[src]')?.getAttribute('src')||'';"
-                "const v=media.find(item=>sourceOf(item)&&visible(item))||media.find(item=>sourceOf(item))||media[0];"
-                "if(v){v.muted=true;void v.play();}"
-                "const r=v?.getBoundingClientRect();"
-                "return {title:document.title,videoCount:media.length,videos:media.map(item=>({src:sourceOf(item),readyState:item.readyState,paused:item.paused,ended:item.ended,rect:(()=>{const box=item.getBoundingClientRect();return {top:box.top,left:box.left,right:box.right,bottom:box.bottom,width:box.width,height:box.height}})()})),"
-                "src:v?sourceOf(v):'',readyState:v?.readyState||0,paused:v?.paused??true,"
-                "ended:v?.ended??false,duration:v?.duration??0,error:v?.error?.message||null,"
-                "button:!!document.querySelector('#dm-media-download-button'),"
-                "rect:r?{top:r.top,left:r.left,right:r.right,bottom:r.bottom,width:r.width,height:r.height}:null,"
-                "body:document.body?.innerText?.slice(0,400)||''};})())"
+            client.evaluate(
+                f"(()=>{{const v=document.querySelector({json.dumps(TARGET)});v?.scrollIntoView({{block:'center',inline:'center'}});return v?.currentSrc||v?.src||'';}})()"
             )
-            last_raw = repr(raw)
-            last = json.loads(raw)
-            if last.get("videoCount", 0) and last.get("readyState", 0) >= 2 and not last.get("paused") and last.get("button"):
+            last = player_state(client)
+            source = urlsplit(last.get("source", ""))
+            if (
+                last.get("target")
+                and source.netloc.lower() == SOURCE_HOST
+                and source.path == SOURCE_PATH
+                and last.get("readyState", 0) >= 2
+                and last.get("playPoint")
+            ):
                 return last
-        except Exception as error:
-            last_error = repr(error)
+        except Exception:
+            pass
         time.sleep(0.5)
-    diagnostic = None
-    try:
-        diagnostic = client.evaluate("JSON.stringify({href:location.href,title:document.title,readyState:document.readyState,body:document.body?.innerText?.slice(0,800)||'',videos:document.querySelectorAll('audio,video').length,videoHtml:Array.from(document.querySelectorAll('audio,video')).map(v=>v.outerHTML.slice(0,1200)),sources:Array.from(document.querySelectorAll('audio source,video source')).map(s=>({attr:s.getAttribute('src'),prop:s.src,type:s.getAttribute('type')})),iframes:Array.from(document.querySelectorAll('iframe')).map(frame=>frame.src).slice(0,8)})")
-    except Exception as error:
-        diagnostic = repr(error)
-    raise RuntimeError(f"Mozilla HTML5 player did not become playable/injected: last={last}; raw={last_raw}; error={last_error}; diagnostic={diagnostic}")
+    raise RuntimeError(f"VidPly media did not become ready: {last}")
 
 
-def activate_player(client: adaptive.EventCDP) -> None:
-    deadline = time.time() + 30
-    point = None
-    raw = 'null'
-    while time.time() < deadline:
-        raw = client.evaluate(
-            "JSON.stringify((()=>{"
-            "const media=Array.from(document.querySelectorAll('audio,video'));"
-            "const visible=item=>{const box=item.getBoundingClientRect();return box.width>=120&&box.height>=40&&box.bottom>0&&box.right>0&&box.top<innerHeight&&box.left<innerWidth};"
-            "const v=media.filter(visible).sort((a,b)=>b.getBoundingClientRect().width*b.getBoundingClientRect().height-a.getBoundingClientRect().width*a.getBoundingClientRect().height)[0];"
-            "const r=v?.getBoundingClientRect();"
-            "return r?{x:r.left+r.width/2,y:r.top+r.height/2}:null;})())"
-        )
-        point = json.loads(raw)
-        if point:
-            break
-        time.sleep(0.5)
-    if not point:
-        raise RuntimeError(f"Mozilla HTML5 player surface missing: {raw}")
-    client.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": point["x"], "y": point["y"], "button": "left", "clickCount": 1, "modifiers": 0})
-    client.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": point["x"], "y": point["y"], "button": "left", "clickCount": 1, "modifiers": 0})
-    deadline = time.time() + 25
-    while time.time() < deadline:
-        raw = client.evaluate(
-            "JSON.stringify((()=>{"
-            "const v=document.querySelector('#mwe_player_0');"
-            "const source=v?.currentSrc||v?.src||v?.querySelector('source[src]')?.getAttribute('src')||'';"
-            "if(v&&source){v.muted=true;void v.play();}"
-            "return {source,disabled:v?.hasAttribute('disabled')??true,readyState:v?.readyState||0};})())"
-        )
-        state = json.loads(raw)
-        if state.get("source") and not state.get("disabled"):
-            return
-        time.sleep(0.5)
-    raise RuntimeError(f"Mozilla HTML5 player did not instantiate after surface click: {raw}")
-
-
-def collect_media_events(client: adaptive.EventCDP) -> list[dict]:
-    records: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for event in client.take_events():
-        if event.get("method") != "Network.requestWillBeSent":
-            continue
-        params = event.get("params", {})
-        request = params.get("request", {})
-        url = request.get("url", "")
-        host = urlsplit(url).netloc.lower()
-        if "matthiaspeltzer.github.io" not in host:
-            continue
-        if not urlsplit(url).path.lower().endswith((".mp4", ".webm", ".ogg", ".mp3", ".wav")):
-            continue
-        key = (url, str(params.get("requestId")))
-        if key in seen:
-            continue
-        seen.add(key)
-        records.append({
-            "url": redacted_url(url),
-            "host": host,
-            "type": request.get("method"),
-            "range": next((value for key, value in request.get("headers", {}).items() if str(key).lower() == "range"), None),
-            "requestId": params.get("requestId"),
-        })
-    return records
-
-
-def wait_for_traffic(client: adaptive.EventCDP, timeout: float = 20.0) -> list[dict]:
+def wait_playing(client: adaptive.EventCDP, timeout: float = 60.0) -> dict:
     deadline = time.time() + timeout
-    records: list[dict] = []
+    last = None
     while time.time() < deadline:
-        records.extend(collect_media_events(client))
-        if records:
-            return records
+        try:
+            last = player_state(client)
+            button = last.get("buttonPoint") or {}
+            if (
+                last.get("readyState", 0) >= 2
+                and not last.get("paused")
+                and last.get("button")
+                and last.get("buttonPointerEvents") == "auto"
+                and button.get("y", -1) > 0
+                and button.get("y", -1) < 1000
+            ):
+                return last
+        except Exception:
+            pass
         time.sleep(0.5)
-    return records
+    raise RuntimeError(f"VidPly media did not become playing/injected: {last}")
 
 
-def button_point(client: adaptive.EventCDP) -> dict:
-    return json.loads(client.evaluate(
-        "JSON.stringify((()=>{const b=document.querySelector('#dm-media-download-button');"
-        "if(!b)throw Error('Download button missing');const r=b.getBoundingClientRect();"
-        "return {x:r.left+r.width/2,y:r.top+r.height/2,text:b.textContent};})())"
-    ))
+def independent_reference(url: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/149 Safari/537.36",
+            "Referer": PAGE,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=180) as response:
+        if response.status != 200:
+            raise RuntimeError(f"independent reference HTTP {response.status}")
+        return response.read()
 
 
 def main() -> int:
@@ -208,7 +137,7 @@ def main() -> int:
     home = root / "home"
     profile = root / "profile"
     downloads = profile / "Default" / "Downloads"
-    managed_dir = root / "Managed"
+    managed = root / "Managed" / "vidply-deadline.mp4"
     home.mkdir(parents=True)
     public.write_native_manifest(str(home), str(profile))
     inspector_port = support.free_port()
@@ -217,7 +146,9 @@ def main() -> int:
     support.DISPLAY = display
     app_log_path = root / "app.log"
     app_log = app_log_path.open("wb")
-    app = subprocess.Popen([BIN], env=public.browser_env(str(home), inspector_port), stdout=app_log, stderr=subprocess.STDOUT)
+    app = subprocess.Popen(
+        [BIN], env=public.browser_env(str(home), inspector_port), stdout=app_log, stderr=subprocess.STDOUT
+    )
     chrome = None
     client = None
     try:
@@ -229,70 +160,97 @@ def main() -> int:
                 "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*",
                 f"--remote-debugging-port={chrome_port}", f"--user-data-dir={profile}",
                 f"--load-extension={EXTENSION}", f"--disable-extensions-except={EXTENSION}",
-                "--window-size=1280,900", "--autoplay-policy=no-user-gesture-required", "about:blank",
+                "--window-size=1280,1000", "--autoplay-policy=no-user-gesture-required", "about:blank",
             ],
             env=public.browser_env(str(home), inspector_port), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         public.wait_chrome(chrome_port)
-        diagnostic = public.extension_diagnostic(chrome_port)
-        print("EXTENSION-DIAGNOSTIC:", json.dumps(diagnostic, sort_keys=True), flush=True)
+        print("EXTENSION-DIAGNOSTIC:", json.dumps(public.extension_diagnostic(chrome_port), sort_keys=True), flush=True)
         client = adaptive.connect_event_chrome(chrome_port)
         client.call("Page.navigate", {"url": PAGE})
-        player = wait_player(client)
+        deadline = time.time() + 60
+        loaded = None
+        while time.time() < deadline:
+            try:
+                loaded = json.loads(client.evaluate("JSON.stringify({href:location.href,state:document.readyState})"))
+                if loaded.get("href") == PAGE and loaded.get("state") == "complete":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(f"VidPly page did not load: {loaded}")
+
+        player = wait_ready(client)
+        print("VIDPLY-PLAYER-READY:", json.dumps(player, sort_keys=True), flush=True)
+        click(client, player["playPoint"])
+        print("VIDPLY-PLAY-CLICK: trusted CDP input issued", flush=True)
+        player = wait_playing(client)
         print("VIDPLY-PLAYER:", json.dumps(player, sort_keys=True), flush=True)
-        initial_traffic = wait_for_traffic(client)
-        print("VIDPLY-TRAFFIC:", json.dumps(initial_traffic[:12], sort_keys=True), flush=True)
-        point = button_point(client)
-        print("VIDPLY-BUTTON:", json.dumps(point, sort_keys=True), flush=True)
-        client.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": point["x"], "y": point["y"], "button": "left", "clickCount": 1, "modifiers": 0})
-        client.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": point["x"], "y": point["y"], "button": "left", "clickCount": 1, "modifiers": 0})
+        source = player["source"]
+        source_parts = urlsplit(source)
+        if source_parts.netloc.lower() != SOURCE_HOST or source_parts.path != SOURCE_PATH:
+            raise RuntimeError(f"VidPly selected unexpected source: {source}")
+
+        click(client, player["buttonPoint"])
+        print("VIDPLY-DOWNLOAD-CLICK: trusted CDP input issued", flush=True)
         db = public.db_path(str(home))
-        job = wait_media_job(db)
-        suffix = Path(urlsplit(job["source"]).path).suffix or ".media"
-        media_name = "vidply-deadline" + suffix
-        managed = managed_dir / media_name
-        print("VIDPLY-NATIVE-JOB:", json.dumps({"id": job["id"], "source": redacted_url(job["source"]), "media": job.get("media"), "state": job.get("state"), "name": job.get("name"), "selected_segments": [redacted_url(url) for url in job.get("selected_segments", [])]}, sort_keys=True), flush=True)
-        traffic = initial_traffic + collect_media_events(client)
-        print("VIDPLY-SELECTED-TRAFFIC:", json.dumps(traffic[:24], sort_keys=True), flush=True)
-        public.commit_via_cli(str(home), inspector_port, job["id"], media_name, str(managed))
-        done = public.wait_completed(db, job["id"], timeout=240)
-        native_size = managed.stat().st_size
-        native_hash = sha256(managed)
-        browser_reference_result = None
-        if job.get("source", "").startswith(("http://", "https://")):
-            browser_reference_result = browser_reference(client, job["source"])
-            print("BROWSER-VIDPLY-REFERENCE:", json.dumps({"url": redacted_url(job["source"]), **browser_reference_result}, sort_keys=True), flush=True)
-            if native_size != int(browser_reference_result["size"]) or native_hash != browser_reference_result["hash"]:
-                raise RuntimeError(f"native output differs from browser source: native={native_size}/{native_hash} browser={browser_reference_result}")
+        job = public.wait_job(db, source, timeout=90)
+        print("VIDPLY-NATIVE-JOB:", json.dumps({"id": job["id"], "source": redacted_url(job["source"]), "media": job.get("media"), "state": job.get("state"), "provisional": job.get("provisional"), "name": job.get("name")}, sort_keys=True), flush=True)
+        if job.get("media") is not True or job.get("source") != source:
+            raise RuntimeError(f"wrong VidPly native job: {job}")
+        if len(public.jobs(db)) != 1:
+            raise RuntimeError(f"unexpected extra VidPly job: {public.jobs(db)}")
+
+        reference = independent_reference(source)
+        print("VIDPLY-INDEPENDENT-REFERENCE:", json.dumps({"url": redacted_url(source), "bytes": len(reference), "sha256": sha256_bytes(reference)}, sort_keys=True), flush=True)
+        public.commit_via_cli(str(home), inspector_port, job["id"], "vidply-deadline.mp4", str(managed))
+        done = public.wait_completed(db, job["id"], timeout=300)
+        output = managed.read_bytes()
+        output_hash = sha256_bytes(output)
+        reference_hash = sha256_bytes(reference)
+        if len(output) != len(reference) or output_hash != reference_hash:
+            raise RuntimeError(f"resident media differs from independent reference: output={len(output)}/{output_hash} reference={len(reference)}/{reference_hash}")
         browser_files = [str(path.relative_to(profile)) for path in downloads.rglob("*")] if downloads.exists() else []
         assert done.get("state") == "completed" and done.get("provisional") is False, done
-        assert len(jobs(db)) == 1, jobs(db)
+        print("VIDPLY-NATIVE-RESULT:", json.dumps({"state": done.get("state"), "provisional": done.get("provisional"), "bytes": len(output), "sha256": output_hash}, sort_keys=True), flush=True)
+        assert len(public.jobs(db)) == 1, public.jobs(db)
         assert not browser_files, browser_files
-        print("VIDPLY-NATIVE-RESULT:", json.dumps({"state": done["state"], "provisional": done.get("provisional"), "bytes": native_size, "sha256": native_hash, "browser_downloads": browser_files}, sort_keys=True), flush=True)
-        print(f"VIDPLY-CHROMIUM: PASS (page={PAGE}, source={redacted_url(job['source'])}, output_bytes={native_size}, output_sha256={native_hash}, traffic={len(traffic)}, jobs=1, browser_downloads={browser_files})", flush=True)
+        print(f"VIDPLY: PASS (page={PAGE}, source={redacted_url(source)}, output_bytes={len(output)}, output_sha256={output_hash}, jobs=1, browser_downloads={browser_files})", flush=True)
         print("VIDPLY-CHROMIUM-PROBE: PASS", flush=True)
         return 0
     except Exception:
         if app_log_path.exists():
-            print(f"APP-LOG: {app_log_path.read_text(encoding='utf-8', errors='replace')}", flush=True)
+            print(f"APP-LOG: {app_log_path.read_text(encoding='utf-8', errors='replace')[-3000:]}", flush=True)
         raise
     finally:
         if client is not None:
-            try: client.sock.close()
-            except Exception: pass
+            try:
+                client.sock.close()
+            except Exception:
+                pass
         if chrome is not None and chrome.poll() is None:
             chrome.terminate()
-            try: chrome.wait(timeout=10)
-            except subprocess.TimeoutExpired: chrome.kill(); chrome.wait(timeout=10)
+            try:
+                chrome.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                chrome.kill()
+                chrome.wait(timeout=10)
         if app.poll() is None:
             app.terminate()
-            try: app.wait(timeout=10)
-            except subprocess.TimeoutExpired: app.kill(); app.wait(timeout=10)
+            try:
+                app.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                app.kill()
+                app.wait(timeout=10)
         app_log.close()
         if xvfb.poll() is None:
             xvfb.terminate()
-            try: xvfb.wait(timeout=5)
-            except subprocess.TimeoutExpired: xvfb.kill(); xvfb.wait(timeout=5)
+            try:
+                xvfb.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                xvfb.kill()
+                xvfb.wait(timeout=5)
         if os.environ.get("DM_KEEP_VIDPLY") != "1":
             shutil.rmtree(root, ignore_errors=True)
 

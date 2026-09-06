@@ -5654,3 +5654,30 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and
   `PUBLIC-FLOWPLAYER-CHROMIUM-PROBE: PASS`. Python compilation and
   `git diff --check` passed. No production source changed.
+
+## 2026-09-06 — VidPly accessible progressive MP4 capture
+
+- Added `fixtures/public_vidply_chromium_probe.py` against VidPly's official
+  demo `https://matthiaspeltzer.github.io/vidply/demo/demo.html`. The probe
+  selects the first real `#deadline-video` player and its
+  `https://matthiaspeltzer.github.io/vidply/demo/media/deadline.mp4` source.
+- Fresh Chromium reached `readyState=4`, duration `76.81161`, and exposed 12
+  text tracks. A trusted CDP click on the real `.vidply-play-pause` control
+  started active playback. The injected player-bound Download Manager button
+  was visible and clickable.
+- The extension/native path created exactly one media job. The independent
+  direct fetch returned `12,769,545` bytes with SHA-256
+  `249d6ec925db1ed34b66f66882030a25800138da8d9ed6af89987e0ff612d74f`.
+  Resident `--commit` exited `0`; the final job result was
+  `state=completed` and `provisional=false`. Resident output matched the
+  independent reference exactly. Chromium Downloads stayed empty and the
+  database contained one job.
+- Exact retained green output is `/tmp/dm-public-vidply-final.log`:
+  `VIDPLY-NATIVE-RESULT: {"bytes":12769545,"provisional":false,
+  "sha256":"249d6ec925db1ed34b66f66882030a25800138da8d9ed6af89987e0ff612d74",
+  "state":"completed"}`, followed by
+  `VIDPLY: PASS (output_bytes=12769545,
+  output_sha256=249d6ec925db1ed34b66f66882030a25800138da8d9ed6af89987e0ff612d74,
+  jobs=1, browser_downloads=[])` and
+  `VIDPLY-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
+  passed. No production source changed.

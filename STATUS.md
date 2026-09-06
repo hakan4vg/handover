@@ -5852,3 +5852,24 @@ change and no site resolver exception:
   `PUBLIC-GCORE-PLAYER-LAB-CHROMIUM-PROBE: PASS`; independent readback is
   retained at `/var/tmp/dm-public-gcore-lab-chromium-6hvm9nzt/`. No production
   source change was justified by this path.
+
+## 2026-09-06 — ArtPlayer editor progressive capture
+
+- Added `fixtures/public_artplayer_chromium_probe.py` against the official
+  ArtPlayer editor `https://artplayer.org/`. The editor's default code created
+  a real visible ArtPlayer control surface and the public progressive source
+  `https://artplayer.org/assets/sample/video.mp4`.
+- Fresh Chromium reached `readyState=4`, active playback, duration `90.045011`,
+  and one visible video. The injected Download Manager button was unoccluded;
+  its trusted event recorded `isTrusted=true`, `defaultPrevented=false`, and
+  target `dm-media-download-button`.
+- The native job selected the replayable ArtPlayer source. Resident `--commit`
+  exited `0`; the job became `completed` with `provisional=false`.
+- The independent browser reference measured `2,304,837` bytes with SHA-256
+  `73a1c47b4e2da63ce67c1cf8fe7fd3332b6f6dbb08b9f0939c8dfecfc21fdb57`.
+  Native output matched exactly. `ffprobe` reports H.264 `480x360`, AAC
+  `44,100 Hz`, and duration `90.045011`. Chromium Downloads stayed empty.
+- Exact retained output is `/tmp/dm-public-artplayer-final.log` with
+  `ARTPLAYER: PASS (...)` and `ARTPLAYER-CHROMIUM-PROBE: PASS`; independent
+  readback is retained at `/tmp/dm-public-artplayer-chromium-q2vn9mti/`.
+  No production source change was justified by this path.

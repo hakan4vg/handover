@@ -5710,3 +5710,31 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and
   `VIDSTACK-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
   passed. No production source changed.
+
+## 2026-09-06 — Vime shadow-control progressive MP4 capture
+
+- Added `fixtures/public_vime_chromium_probe.py` against Vime's official demo
+  `https://vimejs.com/demo/`. The probe targets Vime's shadow-root
+  `vm-player`/`vm-default-ui` stack, the real `vm-playback-control` control,
+  and its public native video source
+  `https://files.vidstack.io/agent-327/720p.mp4`.
+- Fresh Chromium reached `readyState=4`, duration `231.6`, and exposed one
+  subtitle track. A trusted CDP click on the actual Vime playback control
+  started active playback. The injected player-bound Download Manager button
+  was visible and clickable through the Vime shadow boundary.
+- The extension/native path created exactly one media job. The independent
+  direct fetch returned `43,094,196` bytes with SHA-256
+  `0715b3f6743218d802b2137cd258315f9464debc4c7e14059bfce89c7c321753`.
+  Resident `--commit` exited `0`; the final job result was
+  `state=completed` and `provisional=false`. Resident output matched the
+  independent reference exactly. Chromium Downloads stayed empty and the
+  database contained one job.
+- Exact retained green output is `/tmp/dm-public-vime.log`:
+  `VIME-NATIVE-RESULT: {"bytes":43094196,"provisional":false,
+  "sha256":"0715b3f6743218d802b2137cd258315f9464debc4c7e14059bfce89c7c321753",
+  "state":"completed"}`, followed by
+  `VIME: PASS (output_bytes=43094196,
+  output_sha256=0715b3f6743218d802b2137cd258315f9464debc4c7e14059bfce89c7c321753,
+  jobs=1, browser_downloads=[])` and
+  `VIME-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
+  passed. No production source changed.

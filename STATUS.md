@@ -5129,3 +5129,45 @@ change and no site resolver exception:
   `selected=null` while options are loading, and its option value is the
   registry key `bigBuckBunny480p` rather than the manifest URL. Both were
   corrected in the fixture; no product code changed.
+
+## 2026-09-06 — Public player continuation: Media Chrome pass and external boundaries
+
+- The official hls.js demo's `MP3 VOD demo` and `MPEG Audio Only demo` were
+  checked as adjacent selector paths. Chromium loaded the MP3 manifest
+  `https://playertest.longtailvideo.com/adaptive/vod-with-mp3/manifest.m3u8`
+  and a TS segment, then reported
+  `MediaSource.addSourceBuffer: Can't play type` / `bufferAddCodecError`;
+  the player stayed `readyState=0`. The MPEG option loaded
+  `https://pl.streamingvideoprovider.com/mp3-playlist/playlist.m3u8` but also
+  stayed `readyState=0, paused=true` with no finite playback. These are public
+  player codec/environment boundaries; no product change was made.
+- The W3Schools Try-it result was reachable and its exact `#iframeResult`
+  contained playing `https://www.w3schools.com/html/horse.ogg`
+  (`readyState=4`, duration `1.515102`), but the fresh-profile extension
+  handshake returned `extensionId=null, runtimeType=undefined` and the result
+  iframe had no `#dm-media-download-button`, even after the page's Run control
+  was activated. The retained diagnostics are
+  `/tmp/dm-public-w3schools-audio-run-retry.log` and
+  `/tmp/dm-public-w3schools-audio-standard-cdp.log`. This remains an
+  extension/bootstrap or about:blank-frame boundary, not a claimed product
+  defect; the disposable probe was not committed.
+- Added `fixtures/public_media_chrome_chromium_probe.py` for the direct
+  official Media Chrome homepage `https://www.media-chrome.org/`. The real
+  page uses Media Chrome shadow controls around a light-DOM `<video>`. A fresh
+  Chromium profile reached `readyState=4`, duration `32.419667`, and clicked
+  the injected player-bound Download button through trusted CDP input.
+- The native job captured the exact current progressive source
+  `https://stream.mux.com/ddBx5002F02xe7ftFvTFkYBxEdQ2inQ2o029CMqu9A4IcY/high.mp4`.
+  Resident `--commit` exited `0`; one job completed with `provisional=false`.
+  The independent browser-context reference and native output both measured
+  `9,271,282` bytes and SHA-256
+  `d777a2a3d2fc6eb5e5b12c031767a033da0d56380d66e7edfb769ca92d057b44`.
+  Chromium Downloads was empty.
+- Exact retained output is `/tmp/dm-public-media-chrome.log`:
+  `PUBLIC-MEDIA-CHROME-CHROMIUM: PASS (page=https://www.media-chrome.org/,
+  source=https://stream.mux.com/ddBx5002F02xe7ftFvTFkYBxEdQ2inQ2o029CMqu9A4IcY/high.mp4,
+  output_bytes=9271282,
+  output_sha256=d777a2a3d2fc6eb5e5b12c031767a033da0d56380d66e7edfb769ca92d057b44,
+  jobs=1, browser_downloads=[])` and
+  `PUBLIC-MEDIA-CHROME-CHROMIUM-PROBE: PASS`.
+- No product source change was justified by these results.

@@ -4872,3 +4872,27 @@ change and no site resolver exception:
   explicit IV + SAMPLE-AES rejection, openssl-anchored CBC/PKCS#7 decrypt
   roundtrip + misalignment/tamper rejection. Rust 65/65, Vitest 8/44,
   `tsc` clean.
+
+## 2026-09-06 — Public Odysee host: watch page button -> progressive MP4
+
+- New `fixtures/public_odysee_button_chromium_probe.py`: real production
+  video host (Odysee, LBRY-based — a new family for this loop, not a
+  library/demo page). The probe discovers a real watch page at runtime from
+  Discover (state-media channels excluded from selection), starts playback
+  with a trusted play click, clicks the real `#dm-media-download-button`
+  (audit proved it hit and unoccluded), and commits through the real
+  provisional-to-completed flow. The captured source is a plain progressive
+  MP4 on `player.odycdn.com/v6/streams/.../*.mp4`.
+- Environment notes, not product defects: `demo.jwplayer.com` fails TLS
+  from this box (curl exit 35), so JW Player is unreachable here and was
+  not pursued; Odysee Discover's first card was a channel page (no video),
+  so the probe filters for watch URLs (`/@channel/video`).
+- Evidence (`/tmp/dm-odysee.log`, `PROBE_EXIT=0`): page
+  `https://odysee.com/@ControNews.org:4/algoritmo-all-go-rhythm:d`; job
+  `media=true kind=video`; `ODYSEE-REFERENCE: bytes=30994343
+  sha256=76dc5d5dfac071400ecfe87f4ab665348f714ee3f1b70a83d518cf4739a0c7ba`;
+  `ODYSEE: PASS (output_bytes=30994343,
+  output_sha256=76dc5d5dfac071400ecfe87f4ab665348f714ee3f1b70a83d518cf4739a0c7ba,
+  jobs=1, browser_downloads=[])`; `ODYSEE-PROBE: PASS` — first-try green.
+- No product source changed in this slice (progressive-MP4 path already
+  green); Rust/frontend suites untouched.

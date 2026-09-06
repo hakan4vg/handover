@@ -4817,3 +4817,18 @@ change and no site resolver exception:
   fragment count differs between runs; equality is per-run manifest vs
   output.)
 - No product source changed in this slice.
+
+## 2026-09-06 — Vimeo/DRM boundary (honest v1 limit, no acceptance)
+
+- Real Vimeo embed `https://player.vimeo.com/video/76979871`: player
+  playable, `dm-media-download-button` present and unoccluded, trusted
+  button click captured a real media job (`media=true`, source ending in
+  `/drm/cenc/.../playlist.mpd`). Fetching that MPD live proves the boundary:
+  `ContentProtection cenc` with Widevine UUID
+  `edef8ba9-79d6-4ace-a3c8-27dcd51d21ed` and `cenc:pssh` present — the
+  segments are CENC-encrypted and the resident has no CDM, so no playable
+  output is producible. Chasing this would mean hoster-specific DRM
+  handling, against the v1 contract.
+- Recorded as an honest v1 boundary (like the Reddit login wall):
+  DRM/CENC-gated sources stay unsupported. The failing experiment probe was
+  removed rather than committed; no acceptance claimed.

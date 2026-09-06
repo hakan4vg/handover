@@ -6327,3 +6327,26 @@ change and no site resolver exception:
   `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`; Chromium
   Downloads remained empty. Evidence:
   `/tmp/dm-public-ableplayer-dynamic-video-after-name.log`.
+
+## 2026-09-07 — Public interception-off download remains browser-owned
+
+- Added and ran `fixtures/public_integration_off_chromium_probe.py` with a
+  fresh Chromium profile, isolated HOME, the unpacked extension, and the real
+  native binary available but unused. The extension policy reply was
+  `interceptDownloads=false`, `showMediaButtons=true`, `excludedSites=[]`.
+- A trusted page anchor initiated the public GitHub CLI checksum asset
+  `https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_checksums.txt`.
+  Chromium recorded exactly one complete download of `1,971` bytes with
+  `error=null` and `byExtensionId=null`; the signed release-assets redirect is
+  recorded with its query values redacted. SHA-256 was
+  `6b5916dffcfa6f593b1db7890f2ddc485318e99fa263acf73aa28ebb877b53cd`.
+- The browser-owned file was the only matching download. The app database was
+  absent, no native process was present, and native job count was `0`. This
+  closes the public real-browser §5.3 / §19.2 off-toggle evidence gap without
+  claiming native takeover when interception is disabled.
+- The first run exposed only a fixture-path assertion error: Chromium correctly
+  saved under the isolated HOME's `Downloads/`, not the profile's default
+  subdirectory. The fixture was corrected and the fresh rerun passed:
+  `/tmp/dm-public-integration-off-fixed-20260907.log`.
+- Verification: the corrected probe exited `0`, Python compilation passed, and
+  `git diff --check` passed. No production code changed.

@@ -4516,6 +4516,13 @@ change and no site resolver exception:
 - Neighboring regressions with the fix: jcisaacs valued
   (`JCISAACS-DOWNLOAD-ATTR-PROBE: PASS`) and bare
   (`JCISAACS-BARE-DOWNLOAD-ATTR-PROBE: PASS`) real-public probes.
+- Post-fix sweep of the ordinary-capture family sharing the touched
+  `content.ts` intercept path, all fresh-profile PASS after `16af69f`:
+  `EXPLICIT-ANCHOR-CHROMIUM-PROBE: PASS`,
+  `FORM-DOWNLOAD-PROBE: PASS`,
+  `BROWSER-NATIVE-FAILURE-FALLBACK-CHROMIUM-PROBE: PASS`,
+  `INTEGRATION-OFF-CHROMIUM-PROBE: PASS`. Logs
+  `/tmp/dm-sweep-<fixture>.log`, all `rc=0`.
 - Full gates: `npm run build:all`, `npx tsc -b`, Vitest `7` files/`41`
   tests, Rust `58/58`, fixture compilation, `git diff --check`
   (`/tmp/dm-xorigin-gates.log`). The protected `src-tauri/src/main.rs`

@@ -425,7 +425,7 @@ function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => v
   return <button className="radio" onClick={onClick}><span className={checked ? 'checked' : ''} />{label}</button>;
 }
 
-function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void; onCancel: (id: string) => void; onClose: () => void }) {
+export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void; onCancel: (id: string) => void; onClose: () => void }) {
   const [source, setSource] = useState(job?.source ?? '');
   const [name, setName] = useState(job?.name ?? '');
   const [nameTouched, setNameTouched] = useState(false);

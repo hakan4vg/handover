@@ -4542,7 +4542,27 @@ change and no site resolver exception:
   attribute honored, consistent with the cross-origin fix above);
   `COLD-LAUNCH-APP: pids=[3604097]`; `COLD-LAUNCH-WINDOWS:
   [{add:1,main:0} x3]`; `COLD-LAUNCH: PASS (...,
-  add_window_visible=true, manager_visible=false, jobs=1,
-  browser_downloads=[])` and `COLD-LAUNCH-PROBE: PASS`.
-- No product source changed; the protected `src-tauri/src/main.rs` sibling
-  remains clean.
+ add_window_visible=true, manager_visible=false, jobs=1,
+ browser_downloads=[])` and `COLD-LAUNCH-PROBE: PASS`.
+ - No product source changed; the protected `src-tauri/src/main.rs` sibling
+ remains clean.
+
+ ## 2026-09-06 — Add-window Download button wiring proof (SPEC §19.2)
+
+ - Gap: every E2E probe commits through the resident `--commit` CLI, which
+   reaches the same `commit_provisional` backend as the Add window's
+   Download button — but no evidence showed the real button invokes it with
+   the captured job's id, shown name, and destination. The WebKit inspector
+   cannot dispatch input (`Input` `-32601`, already recorded), so the real
+   button is not headlessly clickable; the proportionate proof is a
+   component test over the exact submit path.
+ - Change (`src/App.tsx`, one word): export `AddDownloadWindow` for tests.
+   New `src/add-window-commit.test.tsx` (jsdom, already installed): renders
+   the captured-mode window with a provisional job, clicks the real
+   `Download` button, and asserts `onCommit` fires once with
+   `(job.id, job.name, job.destination, maxConnections, null)`; a second
+   test routes `Cancel` to the captured job id, never another row.
+ - First run: `8` files/`43` tests pass (was `7`/`41`). Full gates after the
+   change: `npx tsc -b`, Vitest `8`/`43`, Rust `58/58`, `git diff --check`
+   (`/tmp/dm-addbtn-gates.log`). The protected `src-tauri/src/main.rs`
+   sibling remains clean.

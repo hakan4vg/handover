@@ -383,6 +383,48 @@ class Handler(BaseHTTPRequestHandler):
                 "src='/media/real.mp4'></video></body></html>"
             )
             return self._send_bytes(body.encode(), 200, {"Content-Type": "text/html"})
+        if path == "/page/gated-hls.html":
+            # Real hls.js player (CDN) driving the hotlink-gated VOD. Same-
+            # host playback carries a same-host Referer, so the page itself
+            # plays; the full-chain probe clicks the extension media button
+            # and the resident must replay the capture context for the same
+            # gated segments. The fMP4 variant carries real media bytes: a
+            # genuine demuxer rejects the synthetic .ts fixture bytes.
+            body = (
+                "<!doctype html><html><body style='margin:40px;background:#222'>"
+                "<video id='v' width='640' height='360' controls autoplay muted></video>"
+                "<script src='https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js'></script>"
+                "<script>"
+                "var video=document.getElementById('v');"
+                "if(window.Hls&&Hls.isSupported()){var hls=new Hls();hls.loadSource('/hls/gated-fmp4.m3u8');hls.attachMedia(video);}"
+                "else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src='/hls/gated-fmp4.m3u8';}"
+                "</script></body></html>"
+            )
+            return self._send_bytes(body.encode(), 200, {"Content-Type": "text/html"})
+        if path == "/hls/gated-fmp4.m3u8":
+            # fMP4 HLS variant of the gated VOD with real media bytes, so a
+            # genuine player can actually play it (same gate as gated.m3u8).
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXT-X-MEDIA-SEQUENCE:0", '#EXT-X-MAP:URI="ginit.mp4"']
+            for i in range(DASH_V_SEGS):
+                lines += ["#EXTINF:4.0,", f"g{i}.m4s"]
+            lines.append("#EXT-X-ENDLIST")
+            return self._send_bytes(("\n".join(lines) + "\n").encode(), 200, {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/hls/ginit.mp4":
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            data = media_file("v-init.mp4")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
+        m = re.match(r"^/hls/g(\d+)\.m4s$", path)
+        if m:
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            idx = int(m.group(1))
+            if idx >= DASH_V_SEGS:
+                return self._send_bytes(b"missing fixture", 404)
+            data = media_file(f"v-{idx}.m4s")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
         if path == "/media/real.mp4":
             # Real playable fixture (ffmpeg testsrc). No Range support needed;
             # the browser streams it progressively for playback tests.

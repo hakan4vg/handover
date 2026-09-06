@@ -4750,3 +4750,34 @@ change and no site resolver exception:
 - Request context now has E2E evidence on every transfer family:
   whole-object, segmented HLS, DASH, cross-origin scoping, POST replay.
 - No product source changed in this slice.
+
+## 2026-09-06 — Cookies: decided boundary, not a pending question
+
+- Cookies stay OUT of v1. Rationale, now final: forwarding cookies needs
+  the `cookies` host permission (new data-access surface on every site),
+  a same-party scoping rule per request, and a §16 privacy review — three
+  decisions that belong to the owner, not to an autonomous slice. The
+  Referer/POST/body work covers the hotlink/form class without them; login-
+  walled sources (Reddit login wall, proven) stay honestly unsupported.
+- This closes the parked "cookie question": it is a recorded v1 boundary,
+  not an open item. Revisit only on explicit owner direction.
+
+## 2026-09-06 — Full-chain IDM loop: button -> gated media -> commit
+
+- New fixture page `/page/gated-hls.html`: real hls.js 1.5.13 (CDN) plays
+  the gated VOD so the page itself exercises the gate like any hotlinked
+  embed. First attempt used the synthetic `.ts` playlist and a real demuxer
+  correctly refused it (in-page diag: manifest 200, MSE attached, segments
+  never appended) — added a gated fMP4 variant (`gated-fmp4.m3u8`,
+  `ginit.mp4`, `gN.m4s`) serving the real media bytes; resident EXT-X-MAP
+  handling already covered that shape.
+- New `fixtures/fullchain_gated_media_chromium_probe.py`: fresh disposable
+  profile, real unpacked extension, real native-messaging path, trusted CDP
+  click on `#dm-media-download-button`, commit through the real
+  provisional-to-completed flow.
+- Evidence (`/tmp/dm-fullchain.log`, `probe_rc=0`): player `playing`,
+  `readyState 4`; job row `media=true` with `referrer` = the page URL;
+  output `32057` bytes, `sha256=6b6875bc…` identical to the ffmpeg
+  reference; exactly 1 job; Chromium Downloads empty:
+  `FULLCHAIN-PROBE: PASS`.
+- No product source changed in this slice.

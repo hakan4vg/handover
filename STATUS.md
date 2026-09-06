@@ -6350,3 +6350,31 @@ change and no site resolver exception:
   `/tmp/dm-public-integration-off-fixed-20260907.log`.
 - Verification: the corrected probe exited `0`, Python compilation passed, and
   `git diff --check` passed. No production code changed.
+
+## 2026-09-07 — Public button-triggered ordinary download
+
+- Added `fixtures/public_button_download_chromium_probe.py` for a different
+  ordinary initiation shape. Fresh Chromium loaded the public W3Schools page
+  with the persisted extension policy explicitly reporting
+  `interceptDownloads=true`, `showMediaButtons=true`, and no exclusions. A
+  trusted CDP click targeted a visible page `<button>`; its handler created an
+  anchor without a `download` attribute and started the public GitHub CLI
+  archive URL
+  `https://github.com/cli/cli/archive/refs/tags/v2.100.0.tar.gz`.
+- The observe-only browser fallback created one native provisional job for the
+  redirected codeload source and preserved Chromium's own copy. The browser
+  recorded exactly one complete item with `byExtensionId=null`, `15,067,137`
+  bytes, and no error. The native job was committed through the resident
+  `--commit` path and completed with the same filename and bytes.
+- Browser, native, and an independent post-run public fetch all matched at
+  SHA-256
+  `39d5123f08a553a6fa69e46de86c22d04d97a217e03d0e6584b66d0fea50f1fe`.
+  The final evidence reported `browser_records=1`, `native_jobs=1`,
+  `button_initiation=true`, and `explicit_anchor_download=false`. This proves
+  the public button path and confirms there was no unintended second browser
+  download; the expected observe-only fallback has one browser copy plus one
+  managed native copy.
+- Evidence: `/tmp/dm-public-button-download-fresh-20260907.log`. No production
+  or site-specific resolver change was needed.
+- Verification: the fresh Chromium probe exited `0`, Python compilation and
+  `git diff --check` passed.

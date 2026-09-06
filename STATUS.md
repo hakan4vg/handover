@@ -5873,3 +5873,34 @@ change and no site resolver exception:
   `ARTPLAYER: PASS (...)` and `ARTPLAYER-CHROMIUM-PROBE: PASS`; independent
   readback is retained at `/tmp/dm-public-artplayer-chromium-q2vn9mti/`.
   No production source change was justified by this path.
+
+## 2026-09-06 — DPlayer official-page progressive capture
+
+- Added `fixtures/public_dplayer_chromium_probe.py` against the official DPlayer
+  page `https://dplayer.diygod.dev/`. This is a distinct custom-player path:
+  DPlayer's real `<video>` starts from an API URL and the browser follows it to
+  a signed `ovcdn-acc.dogevideo.com` MP4 object. Query values and signed
+  redirect values are redacted in the fixture and retained log.
+- The first request-level diagnostic caught a fixture-only serialization error;
+  the fresh rerun then passed. Chromium reached `readyState=4`,
+  `paused=false`, duration `260.179002`, and no media error. The captured
+  network evidence showed the DPlayer API request, HTTP `302` redirect, and
+  the CDN response as `video/mp4`, HTTP `206`, full content range
+  `bytes 0-18125695/18125696`.
+- The real injected button was hit through trusted Chromium input. The
+  capture-phase event recorded `isTrusted=true`, `defaultPrevented=false`, and
+  target `dm-media-download-button`. The native job source was the exact
+  browser-observed DPlayer API URL.
+- Resident `--commit` exited `0`; the only job became `completed` with
+  `provisional=false`. An independent browser-context fetch of the captured
+  source returned HTTP `200` and measured `18,125,696` bytes with SHA-256
+  `ec2eeff713f2707f37085772a6a6ed206f1d4fd8180f679bb7387dfeb3fce00`.
+  Native output matched exactly. `ffprobe` reports H.264 `964x540`, AAC
+  `44,100 Hz`, and duration `260.179002`.
+- Trusted context-menu and Ctrl-click ownership remained unprevented. Chromium
+  Downloads stayed empty and the database contained exactly one completed job.
+  Exact retained output is `/tmp/dm-public-dplayer-final.log` with
+  `DPLAYER-CHROMIUM: PASS (...)` and `DPLAYER-CHROMIUM-PROBE: PASS`;
+  independent readback is retained at
+  `/tmp/dm-public-dplayer-chromium-_yueuxeq/`. No production source change was
+  justified by this path.

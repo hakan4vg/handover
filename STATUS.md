@@ -3281,6 +3281,15 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   page/extension reachability boundary, not as an Ogg decode failure or a
   product fix. No product code was changed; the protected Rust sibling remains
   untouched.
+- Fresh re-run on 2026-09-07 (`/tmp/dm-public-html5demo-ogg-fresh-20260907.log`,
+  probe exit `1`) reproduced the same state: all three page videos reported
+  `readyState=4`, `paused=false`, and the selected Ogg player reported duration
+  `20` with `button=false`. The loader diagnostic
+  (`/tmp/dm-public-html5demo-ogg-response.log`) saw the actual browser document
+  response as HTTP `200`, `text/html`, with no CSP header, and no final-frame
+  redirect; Chromium created no extension content-script context for that public
+  navigation. This rules out an Ogg decode or native acquisition failure but
+  does not establish a generalized product defect, so no product code changed.
 
 ## 2026-09-05 — W3C recycled-player source switch
 

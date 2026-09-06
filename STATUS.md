@@ -5594,3 +5594,33 @@ change and no site resolver exception:
   output_sha256=782148a7387da302fa0858805d51fde0d1765087f5b93f926696a4d319f858bb,
   jobs=1, browser_downloads=[])` and
   `VISIONPLAYER-CHROMIUM-PROBE: PASS`. No production source changed.
+
+## 2026-09-06 — player.html direct-hash progressive capture
+
+- Added `fixtures/public_player_html_chromium_probe.py` for the official
+  player.html page
+  `https://pseudosavant.github.io/player.html/player.html`. The probe uses the
+  documented `#url=` launcher with the public WebM
+  `https://pseudosavant.github.io/player.html/videos/big-buck-bunny.webm`.
+  It targets the main `video.player`; the page also creates a separate paused
+  thumbnail video, which is excluded from player and job selection.
+- The first bounded run exposed a fixture-only JavaScript syntax error in the
+  diagnostic `allVideos` object (`Unexpected token ';'`). The probe now reports
+  CDP evaluation errors instead of swallowing them, and the single punctuation
+  correction was verified by a fresh rerun. No production source changed.
+- Fresh Chromium loaded the hash launcher, reached `readyState=4`, duration
+  `32.48`, and active playback. A trusted CDP click paused the real player and
+  a second trusted click resumed it. The player-bound Download control was
+  present and clickable.
+- The extension/native path created exactly one provisional media job for the
+  WebM source. Resident `--commit` exited `0`; the job completed with
+  `provisional=false`. The independent reference fetched `2,165,175` bytes
+  separately. Resident output matched it exactly with SHA-256
+  `519ce67113629c8556337602c28e7dd1286bed58d60936da5dde5215f6427d74`.
+  Chromium Downloads stayed empty and the database contained one job.
+- Exact retained green output is `/tmp/dm-public-player-html-retry1.log`:
+  `PLAYER-HTML: PASS (output_bytes=2165175,
+  output_sha256=519ce67113629c8556337602c28e7dd1286bed58d60936da5dde5215f6427d74,
+  jobs=1, browser_downloads=[])` and
+  `PLAYER-HTML-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
+  passed.

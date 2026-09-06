@@ -6002,3 +6002,54 @@ change and no site resolver exception:
 - No production source change was justified. This closes one real
   shadow-DOM/custom-player HLS initiation pattern; it does not close the
   remaining ordinary one-use takeover product decision or unrelated v1 gaps.
+
+## 2026-09-06 — Ordinary redirect ownership boundary (§5.1.1)
+
+- Added `fixtures/ordinary_redirect_chromium_probe.py`. It uses fresh
+  Chromium profiles, the built extension, the real resident binary, native
+  messaging, and trusted CDP mouse input against the public GitHub release URL
+  `https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_checksums.txt`.
+  GitHub redirects this URL to a signed `release-assets.githubusercontent.com`
+  object at runtime; all signed query values are `[REDACTED]` in retained
+  evidence. No site-specific resolver or browser-process hook is used.
+- The plain-link case had no `download` attribute and exercised the current
+  observe-only `downloads.onDeterminingFilename` fallback. Chromium recorded
+  one completed browser download (`1,971` bytes, SHA-256
+  `6b5916dffcfa6f593b1db7890f2ddc485318e99fa263acf73aa28ebb877b53cd`). The
+  resident created exactly one provisional job, was committed with `--commit`,
+  and produced the same `1,971` bytes and hash. The observable product
+  consumer count was `2`: one browser download record plus one native job.
+  This is public redirect evidence that the fallback duplicates a reusable
+  transaction; it is not a claim that a reusable redirect is one-shot-safe.
+- The explicit `<a download="gh_2.100.0_checksums.txt">` case used the same
+  public redirect through the generic content-script pre-browser path. The
+  trusted click created exactly one native job, Chromium recorded zero matching
+  downloads, and the resident output matched an independent post-run public
+  validation fetch: `1,971` bytes with the same SHA-256. The observable product
+  consumer count was `1`.
+- A separate disposable one-use timing probe used a local mint-once endpoint
+  only to isolate the race; it is not public coverage and is not a resolver.
+  A plain link produced source status sequence `[200, 410, 410]`: the browser
+  received the one valid `64 KiB` response and completed its browser record;
+  the native job then failed with `Source returned 410 Gone`. The two native
+  `410` responses are the ordinary acquisition range probe followed by its
+  full GET. The run retained exactly one browser record and one native job,
+  with no state in the repository.
+- Decision: keep the observe-only fallback. Do not add cancel+erase takeover;
+  the real one-use run proves that destroying the browser transaction is not a
+  safe generic repair. The product can claim generic pre-browser ownership for
+  explicit download-attributed actions, and must honestly preserve the browser
+  download for browser-generated/plain-link cases where MV3 exposes no safe
+  pre-browser action. No production source change was justified.
+- This matches the current Chrome API boundary: `downloads.onCreated` fires
+  when a download begins, while `downloads.onDeterminingFilename` holds the
+  transaction only until filename listeners call `suggest`; Chrome's current
+  `webRequest` documentation says blocking handlers in MV3 are policy-only.
+  Sources: `https://developer.chrome.com/docs/extensions/reference/api/downloads`
+  and `https://developer.chrome.com/docs/extensions/reference/api/webRequest`.
+- Verification: `python3 -m py_compile
+  fixtures/ordinary_redirect_chromium_probe.py`, the fresh public two-case run,
+  and the disposable one-use timing run all passed. Public output is retained
+  at `/tmp/dm-ordinary-redirect-public.log`; timing output is retained at
+  `/tmp/dm-ordinary-one-use-timing.log`. No credentials or signed query values
+  are retained. Broader v1 gaps remain open.

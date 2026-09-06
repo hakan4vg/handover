@@ -5349,7 +5349,39 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and `NFB-PROBE: PASS`.
   No product source change was justified.
 
-## 2026-09-06 — Gcore JavaScript Player Spring VOD HLS capture
+## 2026-09-06 — Wistia Aurora custom-player HLS capture
+
+- Added `fixtures/public_wistia_chromium_probe.py` against the official Wistia
+  demo route `https://wistia.com/demo?wchannelid=rs59uqxakj&wmediaid=rbsg3da4jd`.
+  The route renders the selected product video as the open-shadow
+  `<wistia-player media-id="9mz11isa6g">` element. Its real Play Video control
+  started a blob-backed video with `readyState=4`, `currentTime=0.133334`, and
+  `duration=78.667`; the injected Download Manager control was found inside the
+  open shadow tree and clicked with trusted CDP mouse input.
+- The first disposable run stopped before player readiness because the probe
+  incorrectly treated the page query `wmediaid` as the rendered custom-element
+  media ID. The retained failure `/tmp/dm-public-wistia.log` shows the page had
+  already exposed the real blob video and player controls; the probe-only
+  assertion was corrected to the rendered ID.
+- Retry 3 reached the full browser -> extension -> native path and completed
+  `220/220` resident HLS segments, but its reference helper compared the native
+  output with the 19,828-byte manifest text. That invalid reference was rejected
+  and retained in `/tmp/dm-public-wistia-retry3.log`; no product change was made.
+- The corrected probe independently fetched the finite Wistia VOD playlist
+  `https://embed-cloudfront.wistia.com/deliveries/e23d45799c14736f4b2111c6be7922a993124278.m3u8`,
+  reconstructed all 220 MPEG-TS fragments concurrently, and remuxed all streams
+  with FFmpeg `-map 0`. Retry 4 recorded one provisional job, resident commit
+  exit `0`, and exact resident/reference equality:
+  `82,491,823` bytes, SHA-256
+  `99557485bb84cd39e251203981bb529453e1581224d54ab0cb7f23c76b6c8f79`.
+- Retained output `/tmp/dm-public-wistia-retry4.log` ends with:
+  `WISTIA: PASS (page=https://wistia.com/demo?wchannelid=rs59uqxakj&wmediaid=rbsg3da4jd,
+  source=https://embed-cloudfront.wistia.com/deliveries/e23d45799c14736f4b2111c6be7922a993124278.m3u8,
+  output_bytes=82491823,
+  output_sha256=99557485bb84cd39e251203981bb529453e1581224d54ab0cb7f23c76b6c8f79,
+  jobs=1, browser_downloads=[])` and `WISTIA-CHROMIUM-PROBE: PASS`.
+- Python compilation and `git diff --check` passed. This slice changed no
+  production source.
 
 - Added `fixtures/public_gcore_chromium_probe.py` for the official Gcore player
   demo `https://g-core.github.io/gcore-videoplayer-js/example/player.html`.

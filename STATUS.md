@@ -3998,7 +3998,7 @@ Linux autostart (.desktop), no Windows-only types in core logic.
   `PUBLIC-LIVE-REJECTION-CHROMIUM-PROBE: PASS`.
 - No product source changed; `src-tauri/src/main.rs` remains clean.
 
-## 2026-09-05 — Manager stale-context guard fixed; end-to-end evidence pending
+## 2026-09-05 — Manager stale-context guard fixed; end-to-end evidence recorded
 
 - Added `fixtures/manager_filters_context_chromium_probe.py` for SPEC
   §§10.1, 10.5, and 19.6. It runs the explicit `npm run dev` mock adapter in
@@ -4013,11 +4013,10 @@ Linux autostart (.desktop), no Windows-only types in core logic.
 - The minimal fix in `src/App.tsx` derives `contextJob` from the current
   snapshot and renders `JobContextMenu` only while that job exists. No native
   state or action semantics changed.
-- A later fresh-profile command returned exit `0`, but its detailed stdout was
-  not retained. Therefore the filter row sets, heading counts, context-menu
-  labels, row removal, and inspector-selection assertions are not accepted as
-  durable PASS evidence yet. They require a rerun with the complete output
-  captured and read back.
+- A later fresh-profile command returned exit `0` with its complete stdout
+  retained at `/tmp/dm-manager-filters-context-final.log`. The exact filter row
+  sets, heading counts, context-menu labels, row removal, and inspector-selection
+  assertions are recorded in the later `2026-09-05` manager-filters entry below.
 - No native application or external service was touched during the mock probe.
   The protected Rust sibling remains clean.
 - Verification after the repair passed `npm run build:all`, `npx tsc -b`,

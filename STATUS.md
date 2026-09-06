@@ -4566,3 +4566,17 @@ change and no site resolver exception:
    change: `npx tsc -b`, Vitest `8`/`43`, Rust `58/58`, `git diff --check`
    (`/tmp/dm-addbtn-gates.log`). The protected `src-tauri/src/main.rs`
    sibling remains clean.
+
+## 2026-09-06 — Add window shows live provisional metadata (SPEC §19.2)
+
+- Adjacent proof in the same test file: the captured Add window must show
+  real progress, size, and resumability as available. A third test renders
+  the window with a mid-download provisional (`5 MiB` of `10 MiB`,
+  `downloading`, `4` connections, resumable) and asserts the panel reads
+  `5.0 MB / 10.0 MB`, `Downloading`, `4 active`, `Yes`.
+- First version of the new assertion failed on my wrong expectation
+  (`5 MB`, actual format is `5.0 MB` per `formatBytes`); corrected the test,
+  not the product. Suite now `8` files/`44` tests green with `npx tsc -b`
+  and `git diff --check` (`/tmp/dm-addmeta-gates.log`). No product source
+  changed in this slice; the protected `src-tauri/src/main.rs` sibling
+  remains clean.

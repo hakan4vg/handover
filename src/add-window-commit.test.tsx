@@ -96,4 +96,34 @@ describe('AddDownloadWindow captured commit wiring', () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
     expect(onCancel).toHaveBeenCalledWith('provisional-wiring-1');
   });
+
+  it('shows the live provisional progress, size, and resumability', () => {
+    const live = {
+      ...job(),
+      state: 'downloading',
+      downloaded: 5 * 1024 ** 2,
+      total: 10 * 1024 ** 2,
+      connections: 4,
+      resumable: true,
+    } as DownloadJob;
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(
+        <AddDownloadWindow
+          settings={settings()}
+          job={live}
+          onCommit={() => {}}
+          onCancel={() => {}}
+          onClose={() => {}}
+        />,
+      );
+    });
+    const text = host.querySelector('.provisional-panel')?.textContent ?? '';
+    expect(text).toContain('5.0 MB / 10.0 MB');
+    expect(text).toContain('Downloading');
+    expect(text).toContain('4 active');
+    expect(text).toContain('Yes');
+  });
 });

@@ -5059,3 +5059,17 @@ change and no site resolver exception:
   fixture recorded four range requests total. Evidence:
   `/tmp/dm-simultaneous-capture-current.log`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — Full Chromium DASH/MSE capture and two-track mux
+
+- `fixtures/public_dash_chromium_probe.py` passed against the live DASH-IF
+  reference player. DASH.js produced a playable 30-second `blob:` MediaSource,
+  the extension injected its media button, and native capture created one
+  managed job. The browser-selected video and audio references each matched
+  their logged segment size/SHA-256 records.
+- FFmpeg produced a playable two-track MP4 of `2,619,740` bytes with SHA-256
+  `c66a095517273e2cbeb01ba0848a43d5232a36a9969a986484e3f6bdec8fec23` and
+  duration `32.085333` seconds. The probe found one completed job and
+  `browser_downloads=[]`; real context-menu and Ctrl-click ownership remained
+  unprevented. Evidence: `/tmp/dm-public-dash-current.log`.
+- No product source changed in this verification slice.

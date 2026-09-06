@@ -5019,3 +5019,16 @@ change and no site resolver exception:
   one completed job, `trusted_audio_click=true`, and
   `browser_downloads=[]`. `ABLEPLAYER-AUDIO-SELECTION-CHROMIUM-PROBE: PASS`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — Resident close-to-tray and exit behavior
+
+- `fixtures/close_to_tray_probe.py` passed against the current resident with a
+  live 64 MiB transfer. The manager's real Close action left the X11 window
+  `IsUnMapped`, kept exactly one resident process alive, made exactly one
+  source request, and allowed the provisional transfer to reach `finalizing`
+  at `67,108,864` bytes. Evidence: `/tmp/dm-close-to-tray-current.log`.
+- `fixtures/exit_behavior_probe.py` passed with `closeBehavior=exit`. It set
+  the real Settings value, sent a real `WM_DELETE_WINDOW`, and observed a
+  clean resident exit code `1` without SIGSEGV. Evidence:
+  `/tmp/dm-exit-behavior-current.log`.
+- No product source changed in this verification slice.

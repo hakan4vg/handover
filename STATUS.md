@@ -5417,3 +5417,38 @@ change and no site resolver exception:
   tab. The page itself was healthy and auto-playing Sintel. The helper was
   corrected to compare `dataset` values against JSON-encoded strings; the
   fresh-profile retry above then passed. No product change was justified.
+
+## 2026-09-06 — Brightcove Video.js master HLS capture
+
+- Added `fixtures/public_brightcove_chromium_probe.py` against the reachable
+  Brightcove VET page `https://vet.brightcove.com/ve795-Interactivity/`.
+  This is a distinct Video.js/Brightcove initiation path. A fresh Chromium
+  profile reached the real `video-js` player, trusted-clicked `Play Video`,
+  observed blob playback with `readyState=4`, and clicked the injected
+  Download Manager control.
+- The first retained attempt `/tmp/dm-public-brightcove.log` stopped in the
+  disposable reference helper because it required `#EXT-X-ENDLIST` on the
+  captured master playlist. Cache inspection showed the real source shape:
+  a finite master that points to finite fMP4 video and alternate-audio media
+  playlists. The resident parser selects the first video variant and first
+  audio rendition; the reference was changed to follow that exact shape and
+  include each playlist's `#EXT-X-MAP` initialization segment.
+- Retry 1 exposed a second fixture-only race: Brightcove analytics produced a
+  `media=true` database row whose source was not an HLS playlist. The probe now
+  waits for the real `.m3u8` media job rather than selecting the newest media
+  row. No production source change was made.
+- Fresh-profile retry 2 completed the real browser → extension → native →
+  resident path with exactly one HLS media job. The independent reference
+  reconstructed the first video and first audio tracks, including `44` ordered
+  init/media parts, and used FFmpeg `-map 0:0 -map 1:0 -c copy`. Resident
+  `--commit` exited `0`; the job completed with `provisional=false`.
+- Resident output and independent reference matched exactly at `20,063,456`
+  bytes, SHA-256
+  `bc50767489a7f0ad29846a902c47d021ca70ba58190c27d142e227b0673c6158`.
+  Chromium Downloads stayed empty and the database contained one job.
+- Exact retained green output is `/tmp/dm-public-brightcove-retry2.log`:
+  `BRIGHTCOVE: PASS (output_bytes=20063456,
+  output_sha256=bc50767489a7f0ad29846a902c47d021ca70ba58190c27d142e227b0673c6158,
+  jobs=1, browser_downloads=[])` and `BRIGHTCOVE-CHROMIUM-PROBE: PASS`.
+- Python compilation and `git diff --check` passed. This slice changed no
+  production source.

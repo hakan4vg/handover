@@ -145,7 +145,7 @@ button:disabled { cursor: default; opacity: .56; }
 .window-controls button:last-child:hover { color: white; background: #d83b3b; }
 .window-controls span { font-size: 17px; font-weight: 300; line-height: 1; }
 
-.manager-body { display: grid; grid-template-columns: 204px minmax(0, 1fr); height: calc(100vh - 76px); min-height: 620px; overflow: hidden; border: 1px solid var(--border); border-top: 0; border-radius: 0 0 10px 10px; background: var(--surface); box-shadow: 0 3px 18px rgba(34, 48, 65, .06); }
+.manager-body { display: grid; grid-template-columns: 204px minmax(0, 1fr); height: calc(100vh - 76px); min-height: 0; overflow: hidden; border: 1px solid var(--border); border-top: 0; border-radius: 0 0 10px 10px; background: var(--surface); box-shadow: 0 3px 18px rgba(34, 48, 65, .06); }
 .sidebar { min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--surface); }
 .sidebar-nav { padding: 13px 8px 8px; display: flex; flex-direction: column; gap: 3px; }
 .sidebar-spacer { flex: 1; }

@@ -6137,4 +6137,21 @@ change and no site resolver exception:
 - Explicit exit remains unverified. The custom-button probe hit repeated
   WebKit Inspector startup races; the Inspector-free X11 probe did reach the
   native close handler but returned code `1` with a GDK `BadDrawable` error.
-  No production close-handler change was retained from that experiment.
+- No production close-handler change was retained from that experiment.
+
+## 2026-09-07 — Desktop viewport containment correction
+
+- Fresh Chromium at `1180x760` (effective viewport `1180x617`) exposed a real
+  layout defect: `.manager-body` used `height: calc(100vh - 76px)` together
+  with `min-height: 620px`. The shell therefore grew to `696px`, showed an
+  outer page scrollbar, and also kept independent Downloads-list and inspector
+  scrollbars. The Settings item and footer were below the visible viewport.
+- Changed `.manager-body` in `src/styles.css` to `min-height: 0`. The live
+  post-fix DOM reports `document.documentElement.scrollHeight ===
+  clientHeight === 617`; only `.download-list` and `.inspector-scroll` remain
+  scrollable. The desktop screenshot shows the full shell without the outer
+  scrollbar: `/tmp/dm-ui-main-fixed.png`.
+- Fresh Network settings navigation rendered without clipping or overflow;
+  screenshot: `/tmp/dm-ui-settings-network.png`.
+- Full Vitest passed `50/50`; `npm run build:extension`, `npx tsc -b`, and
+  `git diff --check` passed.

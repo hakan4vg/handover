@@ -4918,3 +4918,20 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])`; `KALTURA-PROBE: PASS` — first-try green.
 - No product source changed in this slice (clear-HLS path already green);
   Rust/frontend suites untouched.
+
+## 2026-09-06 — Takeover verification: Dailymotion AES-128 path remains green
+
+- Re-ran `fixtures/public_dailymotion_button_chromium_probe.py` from the
+  current `c6c4ffa` tree after taking over from Muse, using a fresh disposable
+  HOME/profile, real Chromium, the unpacked extension, native messaging, and
+  the resident binary.
+- The job captured a signed Dailymotion VOD playlist (source URL intentionally
+  not retained), resolved `212` AES-128 MPEG-TS fragments, and completed one
+  media job without a Chromium download. The independent reference decrypted
+  each fragment with its RFC 8216 key/IV and muxed with the resident's exact
+  `ffmpeg -map 0 -c copy` path.
+- Evidence (`/tmp/dm-takeover-dailymotion.log`, `PROBE_EXIT=0`): resident and
+  reference both `35,709,183` bytes, SHA-256
+  `199658ea9995cf15a8cd0cfe2dfea9eec9518c975c347be45140d9b2ce225ad2`; one
+  job and `browser_downloads=[]`. `DAILYMOTION-PROBE: PASS`.
+- No product source changed in this verification slice.

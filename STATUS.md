@@ -4832,3 +4832,43 @@ change and no site resolver exception:
 - Recorded as an honest v1 boundary (like the Reddit login wall):
   DRM/CENC-gated sources stay unsupported. The failing experiment probe was
   removed rather than committed; no acceptance claimed.
+
+## 2026-09-06 — Public Dailymotion player: AES-128 HLS -> decrypted muxed MP4
+
+- New `fixtures/public_dailymotion_button_chromium_probe.py`: real
+  dailymotion.com embed (`/embed/video/x7svh5p`, geo player), trusted play
+  state check (click only when not already playing), trusted click on the
+  real `#dm-media-download-button`, commit through the real
+  provisional-to-completed flow. The captured source is a Dailymotion VOD
+  media playlist (`..._mp4_h264_aac.m3u8#cell=cf2`): 212 MPEG-TS segments
+  under a single `EXT-X-KEY:METHOD=AES-128` with explicit IV.
+- Product change (smallest honest RFC 8216 4.4.2.4 path, no DRM widening):
+  `src-tauri/src/media.rs` parses `EXT-X-KEY` (key transitions incl.
+  `METHOD=NONE` clearing, `EXT-X-MEDIA-SEQUENCE` anchoring, explicit or
+  sequence-derived IV; any other METHOD/KEYFORMAT fails honestly),
+  `hls_key_iv` + `decrypt_aes128_segment` (CBC/PKCS#7, block-alignment and
+  padding validated; new deps `aes 0.8`, `cbc 0.1`, `cipher 0.4` with
+  `block-padding`); `src-tauri/src/main.rs` fetches each segment's 16-byte
+  key through the existing acquisition context (`acquisition_request`, so
+  Referer scoping flows) and decrypts before the segment write/mux path.
+  Unsupported modes keep failing honestly; CENC/DRM stays out of scope.
+- Two probe-side defects were fixed with evidence, not product guesses:
+  (a) the reference concatenated raw (still-encrypted) segments so its
+  ffmpeg failed with `Invalid data found when processing input` — fixed by
+  giving the reference the same RFC 8216 key/IV/decrypt path (key fetch +
+  openssl AES-128-CBC per segment); (b) the reference muxed with
+  `-map 0:0` while the resident finalizes with `-map 0 -c copy`, yielding
+  5,155,297 vs 35,709,183 bytes on identical decrypted input — fixed by
+  using the resident's exact map. The resident output hash was stable
+  across both runs (`199658ea...`), proving the resident was right and the
+  reference was narrow.
+- Evidence (`/tmp/dm-dailymotion.log`, `PROBE_EXIT=0`):
+  `DAILYMOTION-REFERENCE: fragments=212 bytes=35709183
+  sha256=199658ea9995cf15a8cd0cfe2dfea9eec9518c975c347be45140d9b2ce225ad2`;
+  `DAILYMOTION: PASS (output_bytes=35709183,
+  output_sha256=199658ea9995cf15a8cd0cfe2dfea9eec9518c975c347be45140d9b2ce225ad2,
+  jobs=1, browser_downloads=[])`; `DAILYMOTION-PROBE: PASS`.
+- Focused unit coverage in `media.rs`: key transitions + sequence IV,
+  explicit IV + SAMPLE-AES rejection, openssl-anchored CBC/PKCS#7 decrypt
+  roundtrip + misalignment/tamper rejection. Rust 65/65, Vitest 8/44,
+  `tsc` clean.

@@ -7,6 +7,43 @@ pub struct Segment {
     pub url: String,
     /// Optional HTTP byte range: (start offset, length).
     pub range: Option<(u64, u64)>,
+    /// HLS full-segment encryption for this segment, if any. Only the open
+    /// `METHOD=AES-128` form is represented; anything else fails parsing
+    /// honestly so encrypted bytes never land in an output silently.
+    pub key: Option<HlsKey>,
+}
+
+/// Open AES-128 segment encryption (RFC 8216 4.4.2.4): fetch `uri` for the
+/// 16-byte key, decrypt CBC with `iv` (explicit, else the media sequence
+/// number as 128-bit big-endian), strip PKCS#7.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlsKey {
+    pub uri: String,
+    pub iv: Option<[u8; 16]>,
+    pub sequence: u64,
+}
+
+/// Effective IV for a segment key: explicit IV when present, otherwise the
+/// media sequence number as a 128-bit big-endian integer (RFC 8216 4.4.2.4).
+pub fn hls_key_iv(key: &HlsKey) -> [u8; 16] {
+    if let Some(iv) = key.iv { return iv; }
+    let mut iv = [0u8; 16];
+    iv[8..].copy_from_slice(&key.sequence.to_be_bytes());
+    iv
+}
+
+/// Decrypt one full-segment AES-128-CBC body and strip PKCS#7. Ciphertext
+/// must be non-empty and block-aligned; anything else is an honest error so
+/// undecryptable bytes never land in an output silently.
+pub fn decrypt_aes128_segment(ciphertext: &[u8], key_bytes: &[u8; 16], iv: [u8; 16]) -> Result<Vec<u8>, String> {
+    use aes::Aes128;
+    use cbc::Decryptor;
+    use cipher::{BlockDecryptMut, KeyIvInit};
+    if ciphertext.is_empty() { return Err("The AES-128 segment is empty".into()); }
+    if ciphertext.len() % 16 != 0 { return Err("The AES-128 segment is not block-aligned".into()); }
+    let mut buf = ciphertext.to_vec();
+    let decrypted = Decryptor::<Aes128>::new(key_bytes.into(), &iv.into()).decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf).map_err(|_| "The AES-128 segment failed PKCS#7 validation".to_string())?;
+    Ok(decrypted.to_vec())
 }
 
 #[derive(Clone, Debug)]
@@ -58,9 +95,22 @@ pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
     let mut segments = Vec::new();
     let mut pending_range = None;
     let mut previous_range: Option<(String, u64)> = None;
+    // RFC 8216 4.4.2.4: EXT-X-KEY applies to subsequent segments until
+    // replaced or cleared; EXT-X-MEDIA-SEQUENCE anchors sequence numbers.
+    let mut base_sequence: u64 = 0;
+    let mut segment_index: u64 = 0;
+    let mut pending_key: Option<HlsKeyTemplate> = None;
     for line in body.lines().map(str::trim) {
         if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
             pending_range = Some(parse_hls_byterange(value)?);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            base_sequence = value.trim().parse::<u64>().map_err(|_| "Invalid HLS media sequence number".to_string())?;
+            continue;
+        }
+        if line.starts_with("#EXT-X-KEY:") {
+            pending_key = parse_hls_key(source, line)?;
             continue;
         }
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -77,13 +127,16 @@ pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
             previous_range = None;
             None
         };
-        segments.push(Segment { url, range });
+        let sequence = base_sequence.saturating_add(segment_index);
+        segment_index = segment_index.saturating_add(1);
+        let key = pending_key.clone().map(|template| HlsKey { uri: template.uri, iv: template.iv, sequence });
+        segments.push(Segment { url, range, key });
     }
     if segments.is_empty() { return Err("The VOD playlist did not contain any media fragments".into()); }
     if let Some(line) = body.lines().map(str::trim).find(|line| line.starts_with("#EXT-X-MAP")) {
         let Some(map) = hls_map_segment(line)? else { return Err("The HLS initialization map is missing its URI".into()); };
         if let Some(url) = resolve(source, &map.0) {
-            segments.insert(0, Segment { url, range: map.1 });
+            segments.insert(0, Segment { url, range: map.1, key: None });
         }
     }
     Ok(segments)
@@ -240,7 +293,7 @@ impl DashTrackBuilder {
     fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>, selected_segments: &[String]) -> Option<MediaTrack> {
         let base = self.base_urls.first().map(String::as_str).or(inherited_base).unwrap_or(source);
         let representation_ids = if self.representation_ids.is_empty() { vec![self.representation_id.clone()] } else { self.representation_ids.clone() };
-        let mut segments = self.segment_refs.iter().filter_map(|(value, range)| resolve(base, value).map(|url| Segment { url, range: *range })).collect::<Vec<_>>();
+        let mut segments = self.segment_refs.iter().filter_map(|(value, range)| resolve(base, value).map(|url| Segment { url, range: *range, key: None })).collect::<Vec<_>>();
         if segments.is_empty() {
             let Some(template) = self.template.as_ref() else { return None; };
             let mut chosen_id = self.representation_id.as_str();
@@ -309,7 +362,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
     let mut segments = Vec::new();
     if let Some(initialization) = template.initialization.as_deref() {
         let value = expand_template(initialization, template.start_number, 0, representation_id, bandwidth);
-        if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None }); }
+        if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None, key: None }); }
     }
     let mut number = template.start_number;
     let mut current_time = 0u64;
@@ -321,7 +374,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
             for offset in 0..repeat.min(100_000) {
                 let time = start.saturating_add(offset.saturating_mul(item.duration));
                 let value = expand_template(media, number, time, representation_id, bandwidth);
-                if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None }); }
+                if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None, key: None }); }
                 number = number.saturating_add(1);
             }
             current_time = start.saturating_add(repeat.saturating_mul(item.duration));
@@ -331,7 +384,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
         for index in 0..count {
             let time = index.saturating_mul(segment_duration);
             let value = expand_template(media, number, time, representation_id, bandwidth);
-            if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None }); }
+            if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None, key: None }); }
             number = number.saturating_add(1);
         }
     }
@@ -371,6 +424,50 @@ fn hls_map_segment(line: &str) -> Result<Option<(String, Option<(u64, u64)>)>, S
     let Some(uri) = hls_attribute(line, "URI") else { return Ok(None); };
     let range = hls_attribute(line, "BYTERANGE").map(|value| parse_hls_byterange(&value).map(|(length, offset)| (offset.unwrap_or(0), length))).transpose()?;
     Ok(Some((uri, range)))
+}
+
+/// Parsed EXT-X-KEY state before sequence anchoring: EXT-X-KEY applies to
+/// subsequent segments, so the per-segment sequence is attached at push time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HlsKeyTemplate {
+    uri: String,
+    iv: Option<[u8; 16]>,
+}
+
+/// Parse an `#EXT-X-KEY:` line. Returns `Ok(None)` for `METHOD=NONE`
+/// (clears encryption); any method other than open `AES-128` is an honest
+/// error so encrypted bytes never land in an output silently.
+fn parse_hls_key(source: &str, line: &str) -> Result<Option<HlsKeyTemplate>, String> {
+    let body = line.strip_prefix("#EXT-X-KEY:").unwrap_or("");
+    let method = hls_attr_bare(body, "METHOD").unwrap_or_default();
+    if method.eq_ignore_ascii_case("NONE") { return Ok(None); }
+    if !method.eq_ignore_ascii_case("AES-128") { return Err(format!("Unsupported HLS encryption method: {method}")); }
+    if let Some(format) = hls_attribute(line, "KEYFORMAT").or_else(|| hls_attr_bare(body, "KEYFORMAT")) {
+        if !format.eq_ignore_ascii_case("identity") { return Err(format!("Unsupported HLS key format: {format}")); }
+    }
+    let Some(uri_value) = hls_attribute(line, "URI") else { return Err("HLS AES-128 key is missing its URI".into()); };
+    let Some(uri) = resolve(source, &uri_value) else { return Err("HLS AES-128 key URI does not resolve".into()); };
+    let iv = hls_attr_bare(body, "IV").as_deref().map(parse_hls_iv).transpose()?;
+    Ok(Some(HlsKeyTemplate { uri, iv }))
+}
+
+/// Bare (unquoted) attribute value: `KEY=value` up to the next comma.
+fn hls_attr_bare(body: &str, key: &str) -> Option<String> {
+    let marker = format!("{key}=");
+    let start = body.find(&marker)? + marker.len();
+    let rest = &body[start..];
+    if rest.starts_with('"') { return hls_attribute(body, key); }
+    Some(rest.split(',').next()?.trim().to_string())
+}
+
+fn parse_hls_iv(value: &str) -> Result<[u8; 16], String> {
+    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) { return Err("Invalid HLS key IV".into()); }
+    let mut iv = [0u8; 16];
+    for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        iv[index] = u8::from_str_radix(std::str::from_utf8(chunk).map_err(|_| "Invalid HLS key IV".to_string())?, 16).map_err(|_| "Invalid HLS key IV".to_string())?;
+    }
+    Ok(iv)
 }
 
 fn hls_attribute(line: &str, key: &str) -> Option<String> {
@@ -489,5 +586,43 @@ mod tests {
         let body = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"audio\"\nvideo/index.m3u8";
         let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body).expect("HLS master");
         assert_eq!(tracks, [("video".into(), "https://cdn.example.test/vod/video/index.m3u8".into()), ("audio".into(), "https://cdn.example.test/vod/audio/index.m3u8".into())]);
+    }
+
+    #[test]
+    fn parses_aes128_key_with_sequence_iv_and_transition() {
+        let body = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:2,\none.ts\n#EXTINF:2,\ntwo.ts\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\nthree.ts\n#EXT-X-ENDLIST";
+        let segments = parse_hls("https://cdn.example.test/vod/index.m3u8", body).expect("aes playlist");
+        assert_eq!(segments.len(), 3);
+        let first = segments[0].key.as_ref().expect("first encrypted");
+        assert_eq!(first.uri, "https://cdn.example.test/vod/key.bin");
+        assert_eq!(first.sequence, 7);
+        assert_eq!(hls_key_iv(first)[8..], 7u64.to_be_bytes());
+        assert_eq!(segments[1].key.as_ref().expect("second encrypted").sequence, 8);
+        assert!(segments[2].key.is_none());
+    }
+
+    #[test]
+    fn parses_aes128_explicit_iv_and_rejects_other_methods() {
+        let body = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x0000000000000000000000000000002a\n#EXTINF:2,\none.ts\n#EXT-X-ENDLIST";
+        let segments = parse_hls("https://cdn.example.test/vod/index.m3u8", body).expect("explicit iv");
+        let key = segments[0].key.as_ref().expect("key");
+        assert_eq!(hls_key_iv(key)[15], 0x2a);
+        assert!(parse_hls("https://cdn.example.test/vod/index.m3u8", "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key.bin\"\n#EXTINF:2,\none.ts\n#EXT-X-ENDLIST").is_err());
+    }
+
+    #[test]
+    fn decrypts_aes128_cbc_pkcs7_roundtrip_and_rejects_misaligned() {
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let plaintext = b"hello aes-128 hls slice";
+        // openssl enc -aes-128-cbc -K 11*16 -iv 22*16 of the plaintext above.
+        let ciphertext: [u8; 32] = [0xdb, 0x65, 0x64, 0x3d, 0x41, 0x77, 0x4f, 0x88, 0xbf, 0xbd, 0x33, 0x07, 0x80, 0x24, 0xb6, 0xc0, 0xb5, 0x18, 0x95, 0x3b, 0x30, 0x6d, 0xf8, 0xb9, 0x2b, 0xd1, 0xf5, 0x9b, 0x94, 0xb7, 0xe7, 0x4d];
+        let decrypted = decrypt_aes128_segment(&ciphertext, &key, iv).expect("known vector");
+        assert_eq!(decrypted, plaintext);
+        assert!(decrypt_aes128_segment(&ciphertext[..15], &key, iv).is_err());
+        let mut tampered = ciphertext;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(decrypt_aes128_segment(&tampered, &key, iv).is_err());
     }
 }

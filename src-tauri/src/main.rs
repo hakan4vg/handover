@@ -1238,6 +1238,14 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
     Err(last_error)
 }
 
+async fn fetch_hls_key_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, uri: &str) -> Result<[u8; 16], String> {
+    let bytes = acquisition_request(client, app, id, uri).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.bytes().await.map_err(|error| error.to_string())?;
+    if bytes.len() != 16 { return Err(format!("The HLS AES-128 key did not contain 16 bytes (got {})", bytes.len())); }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
 async fn acquire_media_segment(
     client: &reqwest::Client,
     app: &AppHandle,
@@ -1256,8 +1264,19 @@ async fn acquire_media_segment(
     connection_cap: usize,
 ) -> Result<(), String> {
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
-    let bytes = fragment_bytes(client, app, id, &fragment.url, fragment.range, retry_count, generation).await?;
+    let raw_bytes = fragment_bytes(client, app, id, &fragment.url, fragment.range, retry_count, generation).await?;
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    // RFC 8216 4.4.2.4: full-segment AES-128 arrives encrypted; fetch the
+    // 16-byte key through the same acquisition context (Referer flows via
+    // acquisition_request) and decrypt CBC/PKCS#7 before writing. Byte-range
+    // segments never carry a key (parser leaves key None), so no partial
+    // decryption path exists.
+    let bytes = if let Some(key) = fragment.key.as_ref() {
+        let key_bytes = fetch_hls_key_bytes(client, app, id, &key.uri).await?;
+        media::decrypt_aes128_segment(&raw_bytes, &key_bytes, media::hls_key_iv(key))?
+    } else {
+        raw_bytes
+    };
     if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
     tokio::fs::write(segment_temp_path, &bytes).await.map_err(|error| error.to_string())?;

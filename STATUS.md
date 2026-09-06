@@ -5324,3 +5324,27 @@ change and no site resolver exception:
   `9d7f816d8d7b297d6cbf87971d63e789ac702fad48f47ef5e258330cad883fc9`.
   The log ends with `NASA_PLUS: PASS (... jobs=1, browser_downloads=[])` and
   `NASA_PLUS-PROBE: PASS`. No product source changed in this slice.
+
+## 2026-09-06 — NFB signed trailer Video.js HLS capture
+
+- Added `fixtures/public_nfb_trailer_chromium_probe.py` for NFB's lawful public
+  Wavemakers trailer embed:
+  `https://www.nfb.ca/film/wavemakers/trailer/wavemakers_trailer/embed/player/`.
+  This is a distinct production-site Video.js/HLS initiation path from NASA+'s
+  page-level modal and from the earlier player families.
+- A fresh Chromium profile reached the direct Video.js embed, issued a trusted
+  play click, and reported a playing blob source at `t=4.496195`. The injected
+  Download Manager button created exactly one provisional native media job.
+  The captured source was NFB's finite signed CloudFront `800Kbps.m3u8` variant;
+  signed query strings are redacted in the retained log and never documented.
+- The independent reference resolved `36` finite HLS fragments and used the
+  resident's all-stream `ffmpeg -map 0 -c copy` path. Resident `--commit`
+  exited `0`; the sole job completed with `provisional=false`. Resident output
+  and the independent reference matched exactly at `12,150,305` bytes, SHA-256
+  `c07e72aa615ef37162af92d340cf1bdc9c0b312655d23c3ef3e579873bafe260`.
+  Chromium Downloads stayed empty.
+- Exact retained green output is `/tmp/dm-public-nfb-trailer.log`:
+  `NFB: PASS (output_bytes=12150305,
+  output_sha256=c07e72aa615ef37162af92d340cf1bdc9c0b312655d23c3ef3e579873bafe260,
+  jobs=1, browser_downloads=[])` and `NFB-PROBE: PASS`.
+  No product source change was justified.

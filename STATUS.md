@@ -5522,3 +5522,27 @@ change and no site resolver exception:
   The independent 30-second `curl` fetch timed out, and `web_extract` returned
   an empty/blocked response for the exact source. No production source changed;
   the candidate is not green.
+
+## 2026-09-06 — ImageKit Video Player playlist capture
+
+- Added `fixtures/public_imagekit_playlist_chromium_probe.py` against the official
+  ImageKit playlist example
+  `https://imagekit-developer.github.io/imagekit-video-player/pages/playlist.html`.
+  The page mounts two real Video.js-backed playlist players; the probe selects
+  only the first `#player_html5_api` instance and leaves the second player
+  paused.
+- Fresh Chromium loaded both finite players at `readyState=4`. A trusted CDP
+  click on the first player's real `Play Video` control produced active playback
+  and the player-bound Download control. The extension/native path created
+  exactly one provisional media job for
+  `https://ik.imagekit.io/ikmedia/docs/video-player/playlist/horses.mp4`.
+- Resident `--commit` exited `0`; the job completed with `provisional=false`.
+  An independent fetch matched the resident output exactly at `1,061,077`
+  bytes, SHA-256
+  `5b7a87ffd96efeebecc60495613983222750e1a330db374543796b88c12461dd`.
+  Chromium Downloads stayed empty and the second player created no job.
+- Exact retained green output is `/tmp/dm-public-imagekit-playlist-retry1.log`:
+  `IMAGEKIT: PASS (output_bytes=1061077,
+  output_sha256=5b7a87ffd96efeebecc60495613983222750e1a330db374543796b88c12461dd,
+  jobs=1, browser_downloads=[])` and
+  `IMAGEKIT-CHROMIUM-PROBE: PASS`. No production source changed.

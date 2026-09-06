@@ -35,6 +35,7 @@ MEDIA_DIR = Path(__file__).resolve().parent / "media"
 SEQUENCE = 7
 SEGMENT_NAMES = ["v-0.m4s", "v-1.m4s", "v-2.m4s"]
 KEY = bytes.fromhex("00112233445566778899aabbccddeeff")
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.0.0 Safari/537.36"
 
 
 def read_jobs(db: str) -> list[dict]:
@@ -97,7 +98,8 @@ def reference_output(root: Path, plaintext: list[bytes]) -> tuple[Path, str]:
 
 
 class GatedEncryptedHls:
-    def __init__(self) -> None:
+    def __init__(self, require_browser_user_agent: bool = False) -> None:
+        self.require_browser_user_agent = require_browser_user_agent
         self.plain = [Path(MEDIA_DIR / name).read_bytes() for name in SEGMENT_NAMES]
         self.encrypted = [encrypt_segment(body, SEQUENCE + index) for index, body in enumerate(self.plain)]
         self.counts: dict[str, int] = {}
@@ -125,7 +127,9 @@ class GatedEncryptedHls:
                     pass
 
             def gated(self) -> bool:
-                return self.headers.get("Referer") == owner.page_url
+                if self.headers.get("Referer") != owner.page_url:
+                    return False
+                return not owner.require_browser_user_agent or self.headers.get("User-Agent", "").startswith("Mozilla/5.0")
 
             def do_GET(self):
                 path = urlsplit(self.path).path
@@ -191,7 +195,7 @@ if (window.Hls && Hls.isSupported()) {
 
 
 def fetch_reference(server: GatedEncryptedHls, root: Path) -> tuple[Path, str]:
-    headers = {"Referer": server.page_url}
+    headers = {"Referer": server.page_url, "User-Agent": BROWSER_UA}
     for path in ["/hls/encrypted.m3u8", "/hls/key.bin", "/hls/init.mp4", *[f"/hls/{name}" for name in SEGMENT_NAMES]]:
         with urlopen(Request(f"http://127.0.0.1:{server.port}{path}", headers=headers), timeout=30) as response:
             if path == "/hls/encrypted.m3u8":

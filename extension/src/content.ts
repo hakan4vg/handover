@@ -108,6 +108,7 @@ function interceptDownloadClick(event: MouseEvent): void {
       source,
       name,
       pageUrl: window.location.href,
+      userAgent: navigator.userAgent,
     },
   }).then((response) => {
     // Background answers ok:false only after its own downloads-API fallback
@@ -373,6 +374,7 @@ async function capture(): Promise<void> {
       payload: {
         source: isHttp(source) ? source : '',
         pageUrl: window.location.href,
+        userAgent: navigator.userAgent,
         media: true,
         playerKey: keyFor(el),
         name: document.title ? `${document.title.slice(0, 80)}.mp4` : undefined,

@@ -81,6 +81,13 @@ function prunePlayers(now = Date.now()): void {
   while (recentPlayers.length > PLAYER_BUFFER_MAX) recentPlayers.shift();
 }
 
+function cleanUserAgent(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const candidate = value.trim();
+  if (!candidate || candidate.length > 512 || /[\r\n]/.test(candidate)) return undefined;
+  return candidate;
+}
+
 function rememberPlayer(payload: Record<string, unknown>, tabId: number, frameId: number, documentId?: string): void {
   const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey.trim() : '';
   if (!playerKey) return;
@@ -125,6 +132,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
       name: cleanFilename(payload.name),
       pageUrl: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
       referrer: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
+      userAgent: cleanUserAgent(payload.userAgent),
     },
   })) as { ok?: boolean };
   if (response?.ok) return { ok: true };
@@ -257,6 +265,8 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       name: cleanFilename(item.filename),
       pageUrl: item.referrer,
       referrer: item.referrer,
+      // The Downloads API exposes no tab/frame identifier, so do not guess a
+      // User-Agent from another document on this fallback path.
       // One-shot POST replay: a form body observed for this URL rides along;
       // absent (or already consumed) means the native side replays a safe GET.
       postBody: takeFormBody(item.finalUrl || item.url),
@@ -305,7 +315,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         return;
       }
       const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined;
-      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments, referrer: pageUrl } }));
+      const userAgent = cleanUserAgent(payload.userAgent);
+      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments, referrer: pageUrl, userAgent } }));
     } else if (type === 'open-manager') {
       reply(await sendNative({ type: 'open-manager' }));
     } else {

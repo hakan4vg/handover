@@ -4971,3 +4971,33 @@ change and no site resolver exception:
   exactly one job and `browser_downloads=[]`. `FULLCHAIN-ENCRYPTED-HLS-PROBE:
   PASS`.
 - No product source changed in this slice.
+
+## 2026-09-06 — Replay the capture-page User-Agent through the media chain
+
+- Added `fixtures/fullchain_user_agent_chromium_probe.py` and extended the
+  disposable encrypted-HLS fixture with an optional browser-UA gate. The gate
+  requires both the existing same-host Referer and a `Mozilla/5.0` User-Agent
+  on the playlist, key, init fragment, and all media fragments.
+- Red phase against the unchanged resident (`/tmp/dm-user-agent-red.log`,
+  `PROBE_EXIT=0`): real Chromium reported
+  `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
+  HeadlessChrome/149.0.0.0 Safari/537.36`, but the captured job had no
+  `userAgent`; the resident's fixed User-Agent was rejected with 403.
+- The extension now forwards the exact capture-page `navigator.userAgent` for
+  ordinary and media captures. The background validates it as a bounded,
+  newline-free value. The native job persists it with a serde default for old
+  databases and applies it to GET, POST fallback, manifest, key, init,
+  fragment, and range requests. Cookies and arbitrary headers remain excluded.
+- Evidence (`/tmp/dm-user-agent-green.log`, `PROBE_EXIT=0`): the job carried
+  the exact Chromium UA, the real extension/native/Rust chain completed the
+  gated encrypted VOD, and the managed output matched the independent
+  reference exactly: `32,057` bytes, SHA-256
+  `6b6875bc6d4c6233f362624c1d5e919993e49f0e7530fc007cfb2d6d17167861`;
+  exactly one job and `browser_downloads=[]`. `UA-PROBE: GREEN PASS`.
+- Neighbor proofs remained green: the ordinary full encrypted-HLS browser
+  chain passed in `/tmp/dm-user-agent-neighbor-encrypted.log`, and the
+  Referer-gated DASH path passed with four fragments and the same exact
+  `32,057`-byte hash in `/tmp/dm-user-agent-neighbor-dash.log`.
+- Regression gates (`/tmp/dm-user-agent-gates.log`) passed: Vitest 8 files /
+  44 tests, Rust 65/65, TypeScript, and diff check. Disposable fixture
+  bytecode and processes were removed after the runs.

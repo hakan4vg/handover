@@ -74,6 +74,11 @@ struct DownloadJob {
     /// method/body). Capped at parse; serde default keeps old DBs loadable.
     #[serde(default)]
     post_body: Option<String>,
+    /// Browser User-Agent observed for this captured request. Only this safe,
+    /// non-credential header is replayed; old jobs continue using the client
+    /// default through serde default.
+    #[serde(default)]
+    user_agent: Option<String>,
     events: Vec<JobEvent>,
 }
 
@@ -136,7 +141,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -748,15 +753,23 @@ fn referer_value(referrer: &str, url: &str) -> Option<String> {
     Some(page.origin().ascii_serialization())
 }
 
-fn job_context(app: &AppHandle, id: &str) -> (Option<String>, Option<String>) {
+fn user_agent_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 512 && !value.contains(['\r', '\n'])).then_some(value)
+}
+
+fn job_context(app: &AppHandle, id: &str) -> (Option<String>, Option<String>, Option<String>) {
     app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
-        snapshot.jobs.iter().find(|item| item.id == id).map(|job| (job.referrer.clone(), job.post_body.clone()))
-    }).unwrap_or((None, None))
+        snapshot.jobs.iter().find(|item| item.id == id).map(|job| (job.referrer.clone(), job.post_body.clone(), job.user_agent.clone()))
+    }).unwrap_or((None, None, None))
 }
 
 fn acquisition_request(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> reqwest::RequestBuilder {
-    let (referrer, _) = job_context(app, id);
-    let request = client.get(url);
+    let (referrer, _, user_agent) = job_context(app, id);
+    let request = match user_agent.as_deref().and_then(user_agent_value) {
+        Some(value) => client.get(url).header(reqwest::header::USER_AGENT, value),
+        None => client.get(url),
+    };
     match referrer.as_deref().and_then(|value| referer_value(value, url)) {
         Some(value) => request.header(reqwest::header::REFERER, value),
         None => request,
@@ -768,9 +781,13 @@ fn acquisition_request(client: &reqwest::Client, app: &AppHandle, id: &str, url:
 // would re-submit forms whose endpoints already answer GET. Same Referer
 // scoping as GET requests.
 fn post_replay_request(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Option<reqwest::RequestBuilder> {
-    let (referrer, post_body) = job_context(app, id);
+    let (referrer, post_body, user_agent) = job_context(app, id);
     let body = post_body?;
     let request = client.post(url).body(body).header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    let request = match user_agent.as_deref().and_then(user_agent_value) {
+        Some(value) => request.header(reqwest::header::USER_AGENT, value),
+        None => request,
+    };
     Some(match referrer.as_deref().and_then(|value| referer_value(value, url)) {
         Some(value) => request.header(reqwest::header::REFERER, value),
         None => request,
@@ -2054,6 +2071,8 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
                 let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == target_id && job.provisional != Some(true) && source_compatible(&job.source, &input.source)) else { return false; };
                 job.source = input.source.clone();
                 job.selected_segments = input.selected_segments.clone();
+                job.referrer = input.referrer.clone();
+                job.user_agent = input.user_agent.as_deref().and_then(user_agent_value).map(str::to_string);
                 job.domain = domain(&input.source);
                 job.state = "connecting".into();
                 job.error = None;
@@ -2073,7 +2092,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     }
     let id = format!("provisional-{}", Uuid::new_v4());
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, referrer: input.referrer, post_body: input.post_body, events: vec![job_event("Provisional acquisition created", None)] };
+    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, referrer: input.referrer, post_body: input.post_body, user_agent: input.user_agent.as_deref().and_then(user_agent_value).map(str::to_string), events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
@@ -2300,7 +2319,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
     // Multipart, raw, empty, and oversized bodies fall back to a safe GET.
     const POST_BODY_MAX: usize = 64 * 1024;
     let post_body = payload.get("postBody").and_then(Value::as_str).filter(|value| !value.is_empty() && value.len() <= POST_BODY_MAX).map(str::to_string);
-    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments, referrer, post_body })
+    let user_agent = payload.get("userAgent").and_then(Value::as_str).and_then(user_agent_value).map(str::to_string);
+    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments, referrer, post_body, user_agent })
 }
 
 fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {

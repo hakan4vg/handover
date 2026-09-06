@@ -5681,3 +5681,32 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and
   `VIDPLY-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
   passed. No production source changed.
+
+## 2026-09-06 — Vidstack custom-element progressive MP4 capture
+
+- Added `fixtures/public_vidstack_chromium_probe.py` against Vidstack's official
+  demo `https://vidstack.io/player/demo/`. The probe targets the real
+  `media-player`/`media-provider` custom-element stack, its native video source
+  `https://files.vidstack.io/sprite-fight/720p.mp4`, and the visible
+  `media-play-button` control.
+- Fresh Chromium initially exposed `readyState=0` while the Vidstack player
+  was still loading. A trusted CDP click on the actual custom-element control
+  started playback; the native video then reached `readyState=4`, duration
+  `629.84`, and exposed two text tracks. The injected player-bound Download
+  Manager button was visible and clickable.
+- The extension/native path created exactly one media job. The independent
+  direct fetch returned `122,571,618` bytes with SHA-256
+  `2bd1b2116f70a2ed61e6d2331370f7fb6774594ea8f847e56739542c4baca9c3`.
+  Resident `--commit` exited `0`; the final job result was
+  `state=completed` and `provisional=false`. Resident output matched the
+  independent reference exactly. Chromium Downloads stayed empty and the
+  database contained one job.
+- Exact retained green output is `/tmp/dm-public-vidstack.log`:
+  `VIDSTACK-NATIVE-RESULT: {"bytes":122571618,"provisional":false,
+  "sha256":"2bd1b2116f70a2ed61e6d2331370f7fb6774594ea8f847e56739542c4baca9c3",
+  "state":"completed"}`, followed by
+  `VIDSTACK: PASS (output_bytes=122571618,
+  output_sha256=2bd1b2116f70a2ed61e6d2331370f7fb6774594ea8f847e56739542c4baca9c3,
+  jobs=1, browser_downloads=[])` and
+  `VIDSTACK-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
+  passed. No production source changed.

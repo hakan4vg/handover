@@ -5624,3 +5624,33 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and
   `PLAYER-HTML-CHROMIUM-PROBE: PASS`. Python compilation and `git diff --check`
   passed.
+
+## 2026-09-06 — Flowplayer standalone HLS capture
+
+- Added `fixtures/public_flowplayer_hls_chromium_probe.py` against Flowplayer's
+  official standalone HLS demo
+  `https://docs.flowplayer.com/demos/hls-plugin/samplecode.html`. The public
+  master playlist exposes four finite VOD variants; the real Flowplayer player
+  mounted a custom-controls `<video>` backed by a blob URL.
+- Fresh Chromium reached `readyState=4`, active playback, `duration=16.873334`,
+  and `currentTime=0.1` after a trusted CDP click on Flowplayer's visible Play
+  control. The player-bound Download Manager button was visible. A capture-phase
+  listener on the actual button recorded `isTrusted=true`.
+- The extension/native path created exactly one media job for the selected
+  `playlist_1080.m3u8` child playlist. The independent browser CDP response
+  contained the finite 191-byte HLS playlist, and the independent reconstruction
+  fetched its two media fragments and remuxed them locally.
+- Resident `--commit` exited `0`; the job completed with `state=completed` and
+  `provisional=false`. Resident output matched the independent reference exactly
+  at `7,615,379` bytes, SHA-256
+  `e6b1fa6addda41ee3a93c8c23106ec66424a8900c9dfbb114b08cf1e13082f00`.
+  Chromium Downloads stayed empty and the database contained one job.
+- Exact retained green output is `/tmp/dm-public-flowplayer-hls-final.log`:
+  `FLOWPLAYER-NATIVE-RESULT: {"bytes":7615379,"provisional":false,
+  "sha256":"e6b1fa6addda41ee3a93c8c23106ec66424a8900c9dfbb114b08cf1e13082f00",
+  "state":"completed"}`, followed by
+  `FLOWPLAYER: PASS (output_bytes=7615379,
+  output_sha256=e6b1fa6addda41ee3a93c8c23106ec66424a8900c9dfbb114b08cf1e13082f00,
+  jobs=1, browser_downloads=[])` and
+  `PUBLIC-FLOWPLAYER-CHROMIUM-PROBE: PASS`. Python compilation and
+  `git diff --check` passed. No production source changed.

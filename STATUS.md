@@ -6199,3 +6199,17 @@ change and no site resolver exception:
   `extension/src/background.ts`. Focused Vitest passed `27/27`,
   `npx tsc -b`, `npm run build:extension`, and the two real Chromium probes
   passed. Broader v1 work remains open.
+
+## 2026-09-07 — Generic public player source switch
+
+- Fresh Chromium ran the uncovered W3C HTML5 Video Events source-switch flow.
+  The page's trusted `Test movie` control reused the same `<video>` element and
+  changed it to `http://media.w3.org/2010/05/video/movie_300.mp4`.
+- The extension followed the switched current source, kept the player-bound
+  Download button attached, and created exactly one media job. Native output
+  was `2,757,913` bytes and matched the independent browser reference hash
+  `80c548058688a577ce9ca501cf9807311b95cc526cc82d292ec7e138e42257de`.
+- The run observed three browser range requests for the switched media, ended
+  with `provisional=false, state=completed`, and left Chromium Downloads empty.
+  Evidence: `/tmp/dm-public-w3c-source-switch-final.log`.
+- No production change was needed for this generic source-switch boundary.

@@ -5001,3 +5001,21 @@ change and no site resolver exception:
 - Regression gates (`/tmp/dm-user-agent-gates.log`) passed: Vitest 8 files /
   44 tests, Rust 65/65, TypeScript, and diff check. Disposable fixture
   bytecode and processes were removed after the runs.
+
+## 2026-09-06 — Able Player audio-player selection
+
+- Ran `fixtures/public_ableplayer_audio_selection_chromium_probe.py` against
+  the official `external5.html` demo. A trusted Chromium click exposed the
+  hidden players, then a second trusted click started the audio player while
+  the video remained a separate candidate.
+- Chromium reported the selected source as
+  `https://ableplayer.github.io/ableplayer/media/smallf.ogg`, with
+  `readyState=4`, `paused=false`, and the extension button anchored to the
+  audio wrapper. The native job selected that exact `.ogg` source.
+- Evidence (`/tmp/dm-ableplayer-audio-selection.log`, `PROBE_EXIT=0`): resident
+  output and an independent browser `fetch(job.source)` reference both
+  measured `4,600,399` bytes and SHA-256
+  `09e3151c902c2fef6f98075a6ee23067ca8e1faca249932dc1ce530f379b2159`;
+  one completed job, `trusted_audio_click=true`, and
+  `browser_downloads=[]`. `ABLEPLAYER-AUDIO-SELECTION-CHROMIUM-PROBE: PASS`.
+- No product source changed in this verification slice.

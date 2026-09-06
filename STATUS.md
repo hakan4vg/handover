@@ -5504,3 +5504,21 @@ change and no site resolver exception:
   output_sha256=bad8caf78fbf9ca292db2f170f99ff6251782947c0bfa8bfd391b4da4a459163,
   jobs=1, browser_downloads=[])` and
   `OPENPLAYERJS-CHROMIUM-PROBE: PASS`. No production source changed.
+
+## 2026-09-06 — IVID progressive-player source boundary
+
+- Added `fixtures/public_ivid_chromium_probe.py` for the official IVID sandbox
+  `https://ividjs.github.io/ivid/`. Fresh Chromium upgraded the real top-level
+  `<i-video>` custom element, exposed its light-DOM `<video class="ivid__video">`
+  and custom Play control, and injected the player-bound Download control.
+- The probe issued trusted CDP input to the actual IVID control. The element
+  transitioned to `paused=false`, but the selected Internet Archive source
+  `https://ia601305.us.archive.org/28/items/arashyekt4_gmail_Cat/Cat.mp4`
+  remained at `readyState=0` with no duration, so no native job or commit proof
+  was claimed. This is an external source/bootstrap boundary, not a product
+  capture result.
+- Retained diagnostics are `/tmp/dm-public-ivid.log`,
+  `/tmp/dm-public-ivid-diagnostic.log`, and `/tmp/dm-public-ivid-retry1.log`.
+  The independent 30-second `curl` fetch timed out, and `web_extract` returned
+  an empty/blocked response for the exact source. No production source changed;
+  the candidate is not green.

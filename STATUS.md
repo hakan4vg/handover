@@ -6273,3 +6273,27 @@ change and no site resolver exception:
 - Native Cargo tests passed `70/70`; Cargo build and probe compilation passed.
   No source change remains outside the probe harness. The external blocker is
   the only unresolved part of this lifecycle acceptance.
+
+## 2026-09-07 — Media filename follows audio/video type
+
+- The real Able Player dynamic-audio flow exposed a generalized naming defect:
+  the current MP3 source `https://ableplayer.github.io/ableplayer/media/smallf.mp3`
+  created a job named `Player created dynamically | Able Player Demos.mp4`.
+  Red evidence: `/tmp/dm-public-ableplayer-dynamic-audio-final.log`.
+- Changed `extension/src/content.ts` so media capture derives a safe filename
+  extension from the element/source MIME type or URL. Known audio types use
+  `.mp3`, `.m4a`, `.ogg`, or `.wav`; known video types use `.mp4`, `.ogv`, or
+  `.webm`; non-URL/unknown sources fall back by element kind.
+- The repaired dynamic-audio flow now creates
+  `Player created dynamically | Able Player Demos.mp3`. Native output remained
+  `4,690,721` bytes with browser-reference SHA-256
+  `60c777096e72ae34ceb250d66f071ba6b612f445aefba8438d12e8536288a2de`, one
+  completed managed job, and empty Chromium Downloads:
+  `/tmp/dm-public-ableplayer-dynamic-audio-fixed.log`.
+- Re-audited the public MDN WebM flow after the shared change. It still creates
+  `Simple video example.webm`, with `330,618` bytes, SHA-256
+  `074b046f0832c1c262a7a3e015b042092fa226b1550b83a7d14cca9025d34e1e`, one
+  completed job, and empty Chromium Downloads:
+  `/tmp/dm-public-mdn-webm-after-audio-name.log`.
+- Full Vitest passed `50/50`; `npx tsc -b`, `npm run build:extension`, and
+  `git diff --check` passed. No provider-specific resolver code was added.

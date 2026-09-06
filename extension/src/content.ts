@@ -388,6 +388,32 @@ function track(): void {
   }
 }
 
+function mediaExtension(media: HTMLMediaElement, source: string): string {
+  const type = media.getAttribute('type') || [...media.querySelectorAll('source')].find(item => item.src === source || item.getAttribute('src') === source)?.getAttribute('type') || '';
+  const typeExtension: Record<string, string> = {
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/ogg': 'ogg',
+    'audio/wav': 'wav',
+    'audio/webm': 'webm',
+    'video/mp4': 'mp4',
+    'video/ogg': 'ogv',
+    'video/webm': 'webm',
+  };
+  if (typeExtension[type.toLowerCase()]) return typeExtension[type.toLowerCase()];
+  try {
+    const extension = new URL(source).pathname.split('/').pop()?.split('.').pop()?.toLowerCase() || '';
+    if (['m4a', 'mp3', 'ogg', 'ogv', 'wav', 'webm', 'mp4'].includes(extension)) return extension;
+  } catch {
+    // Use the media kind fallback below for non-URL sources.
+  }
+  return media instanceof HTMLAudioElement ? 'mp3' : 'mp4';
+}
+
+function captureName(media: HTMLMediaElement, source: string): string | undefined {
+  return document.title ? `${document.title.slice(0, 80)}.${mediaExtension(media, source)}` : undefined;
+}
+
 async function capture(): Promise<void> {
   if (!current) return;
   const el = current as HTMLVideoElement;
@@ -401,7 +427,7 @@ async function capture(): Promise<void> {
         userAgent: navigator.userAgent,
         media: true,
         playerKey: keyFor(el),
-        name: document.title ? `${document.title.slice(0, 80)}.mp4` : undefined,
+        name: captureName(el, source),
       },
     })) as { ok?: boolean; error?: string };
     if (!response?.ok) flashError();

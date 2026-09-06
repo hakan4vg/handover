@@ -6123,3 +6123,18 @@ change and no site resolver exception:
 - These probes changed no production code. Remaining lifecycle gaps include
   reopening from the tray, explicit exit behavior, and broader trusted
   context-menu/Ctrl-click coverage outside the accepted paths.
+
+## 2026-09-06 — Lifecycle evidence correction
+
+- Audit found that the original `close_to_tray_probe.py` clicked Close after
+  the capture callback had already hidden the main window. That earlier result
+  did not prove a visible user close. The fixture now maps the exact X11 window,
+  asserts `Map State: IsViewable`, then clicks the real custom Close button.
+- The corrected visible-close run passed: the window became `IsUnMapped`, the
+  resident stayed alive as one process, the 64 MiB transfer reached
+  `finalizing`, and the local source saw one request. Evidence:
+  `/tmp/dm-close-to-tray-corrected.log`.
+- Explicit exit remains unverified. The custom-button probe hit repeated
+  WebKit Inspector startup races; the Inspector-free X11 probe did reach the
+  native close handler but returned code `1` with a GDK `BadDrawable` error.
+  No production close-handler change was retained from that experiment.

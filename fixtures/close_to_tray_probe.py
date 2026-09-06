@@ -124,6 +124,14 @@ def main() -> int:
         job = wait_job(db, job["id"], lambda current: current.get("state") == "downloading" and current.get("downloaded", 0) > 0, timeout=30)
         assert resident.poll() is None, resident.poll()
 
+        tree = subprocess.run(["xwininfo", "-root", "-tree"], env=app_env(home), capture_output=True, text=True, check=True).stdout
+        match = re.search(r'^\s*(0x[0-9a-f]+) "Download Manager":', tree, re.MULTILINE)
+        assert match, tree
+        subprocess.run(["xdotool", "windowmap", match.group(1)], env=app_env(home), check=True)
+        time.sleep(0.3)
+        manager_info = subprocess.run(["xwininfo", "-id", match.group(1)], env=app_env(home), capture_output=True, text=True, check=True).stdout
+        map_state = next((line.strip() for line in manager_info.splitlines() if line.strip().startswith("Map State:")), "missing")
+        assert map_state == "Map State: IsViewable", manager_info
         close_result = client.evaluate("(document.querySelector('button[aria-label=\\\"Close\\\"]')?.click(), 'clicked')")
         assert close_result == "clicked", close_result
         time.sleep(0.3)

@@ -4484,6 +4484,11 @@ change and no site resolver exception:
   output_sha256=2f4bd69d9bfc928a399493eaec2ba0e5a6a4f7e326d6e74e0d1d415f63be86f8,
   jobs=1, browser_downloads=[])` and `DIRECT-MP4-PROBE: PASS`; the complete
   log is `/tmp/dm-direct-mp4.log` (`probe_rc=0`).
+- Re-ran after the `16af69f` content-script rebuild: identical PASS,
+  `output_bytes=49900386`,
+  `output_sha256=2f4bd69d9bfc928a399493eaec2ba0e5a6a4f7e326d6e74e0d1d415f63be86f8`
+  (`/tmp/dm-direct-mp4-postfix.log`, `probe_rc=0`). The media-button path
+  is unaffected by the anchor-attribute fix.
 - No product source changed; the protected `src-tauri/src/main.rs` sibling
   remains clean.
 

@@ -6174,3 +6174,28 @@ change and no site resolver exception:
   `/tmp/dm-ui-path-seeded-files-fixed.png`.
 - Full Vitest passed `50/50`; `npx tsc -b`, `npm run build:extension`, and
   `git diff --check` passed.
+
+## 2026-09-07 — Modified browser-click ownership boundary
+
+- A fresh Chromium Ctrl-click probe exposed a generic ownership defect. The
+  page received a trusted left click with `ctrlKey=true` and
+  `defaultPrevented=false`, but the fallback `downloads.onDeterminingFilename`
+  path still sent one `capture-acquisition` message to native. The browser
+  record remained present, so the gesture was duplicated rather than owned by
+  one side. Red evidence: `/tmp/dm-ctrl-click-ownership-final.log`.
+- Added a bounded browser-owned-click token. The content script records only
+  modified clicks on explicit `<a download>` links; the background matches the
+  source URL/name for ten seconds and lets the next browser download proceed
+  without native forwarding. No site-specific rule or cancellation was added.
+- The repaired Ctrl-click probe passed with `isTrusted=true`, `ctrlKey=true`,
+  `defaultPrevented=false`, `native_captures=0`, and one browser-owned record.
+  Chromium marked this disposable fixture record `SERVER_BAD_CONTENT`, so this
+  is ownership evidence, not browser-byte acceptance:
+  `/tmp/dm-ctrl-click-ownership-fixed.log`.
+- The existing unmodified explicit-anchor probe still passed after the fix:
+  one native job, one source request pair, `65,536` byte/hash equality, and
+  empty Chromium Downloads. Evidence: `/tmp/dm-explicit-anchor-after-ctrl-fix.log`.
+- Changed files: `extension/src/content.ts` and
+  `extension/src/background.ts`. Focused Vitest passed `27/27`,
+  `npx tsc -b`, `npm run build:extension`, and the two real Chromium probes
+  passed. Broader v1 work remains open.

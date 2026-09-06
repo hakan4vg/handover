@@ -83,6 +83,26 @@ function siteAllowed(): boolean {
   return !!site && !policy.excludedSites.includes(site);
 }
 
+function rememberBrowserOwnedClick(event: MouseEvent): void {
+  if (event.defaultPrevented || event.button !== 0 || !(event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) return;
+  if (!policy?.interceptDownloads || !siteAllowed()) return;
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const anchor = target.closest('a');
+  if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download') || anchor.hasAttribute('data-dm-browser-fallback')) return;
+  const source = anchor.href;
+  if (!isHttp(source)) return;
+  let name: string | undefined;
+  try {
+    name = new URL(source).origin === new URL(window.location.href).origin
+      ? cleanFilename(anchor.getAttribute('download'))
+      : basenameFromUrl(source);
+  } catch {
+    name = basenameFromUrl(source);
+  }
+  void chrome.runtime.sendMessage({ type: 'browser-owned-download', payload: { source, name } });
+}
+
 function interceptDownloadClick(event: MouseEvent): void {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   if (!policy?.interceptDownloads || !siteAllowed()) return;
@@ -403,6 +423,7 @@ void refreshPolicy().then(() => {
   window.setInterval(track, 500);
   window.setInterval(refreshPolicy, 10_000);
   new MutationObserver(track).observe(document.documentElement, { childList: true, subtree: true });
+  document.addEventListener('click', rememberBrowserOwnedClick, true);
   document.addEventListener('click', interceptDownloadClick, true);
   document.addEventListener('mouseenter', track, true);
   document.addEventListener('scroll', track, { capture: true, passive: true });

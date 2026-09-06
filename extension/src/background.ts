@@ -18,8 +18,11 @@ let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 
 type PendingBrowserFallback = { source: string; name?: string; at: number };
 const pendingBrowserFallbacks: PendingBrowserFallback[] = [];
+const pendingBrowserOwnedDownloads: PendingBrowserFallback[] = [];
 const BROWSER_FALLBACK_TTL_MS = 30_000;
+const BROWSER_OWNED_DOWNLOAD_TTL_MS = 10_000;
 const BROWSER_FALLBACK_MAX = 20;
+const BROWSER_OWNED_DOWNLOAD_MAX = 20;
 
 function pruneBrowserFallbacks(now = Date.now()): void {
   while (pendingBrowserFallbacks.length && now - pendingBrowserFallbacks[0].at > BROWSER_FALLBACK_TTL_MS) pendingBrowserFallbacks.shift();
@@ -40,6 +43,26 @@ function consumeBrowserFallback(item: chrome.downloads.DownloadItem): boolean {
   );
   if (index < 0) return false;
   pendingBrowserFallbacks.splice(index, 1);
+  return true;
+}
+
+function rememberBrowserOwnedDownload(source: string, name?: string): void {
+  const now = Date.now();
+  while (pendingBrowserOwnedDownloads.length && now - pendingBrowserOwnedDownloads[0].at > BROWSER_OWNED_DOWNLOAD_TTL_MS) pendingBrowserOwnedDownloads.shift();
+  while (pendingBrowserOwnedDownloads.length >= BROWSER_OWNED_DOWNLOAD_MAX) pendingBrowserOwnedDownloads.shift();
+  pendingBrowserOwnedDownloads.push({ source, name, at: now });
+}
+
+function consumeBrowserOwnedDownload(item: chrome.downloads.DownloadItem): boolean {
+  const now = Date.now();
+  while (pendingBrowserOwnedDownloads.length && now - pendingBrowserOwnedDownloads[0].at > BROWSER_OWNED_DOWNLOAD_TTL_MS) pendingBrowserOwnedDownloads.shift();
+  const name = cleanFilename(item.filename);
+  const index = pendingBrowserOwnedDownloads.findIndex((pending) =>
+    (pending.source === item.url || pending.source === item.finalUrl) &&
+    (!pending.name || !name || pending.name === name),
+  );
+  if (index < 0) return false;
+  pendingBrowserOwnedDownloads.splice(index, 1);
   return true;
 }
 
@@ -257,7 +280,7 @@ function takeFormBody(url: string): string | undefined {
 // URL basename for redirected downloads; `onDeterminingFilename` supplies the
 // header-resolved name while still allowing the browser transaction to proceed.
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  if (!policy.interceptDownloads || consumeBrowserFallback(item) || item.byExtensionId === chrome.runtime.id || !item.url || !isHttp(item.url)) {
+  if (!policy.interceptDownloads || consumeBrowserFallback(item) || consumeBrowserOwnedDownload(item) || item.byExtensionId === chrome.runtime.id || !item.url || !isHttp(item.url)) {
     suggest();
     return;
   }
@@ -297,6 +320,11 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     } else if (type === 'ordinary-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
       reply(await captureOrdinary(payload));
+    } else if (type === 'browser-owned-download') {
+      const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
+      const source = typeof payload.source === 'string' ? payload.source.trim() : '';
+      if (isHttp(source)) rememberBrowserOwnedDownload(source, cleanFilename(payload.name));
+      reply({ ok: isHttp(source) });
     } else if (type === 'media-player-state') {
       const tabId = sender.tab?.id;
       if (tabId !== undefined) rememberPlayer((message as { payload?: Record<string, unknown> }).payload ?? {}, tabId, sender.frameId ?? 0, sender.documentId);

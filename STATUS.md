@@ -5823,3 +5823,32 @@ change and no site resolver exception:
   was empty. The probe ends with `PUBLIC-DASH-CHROMIUM-PROBE: PASS`.
 - Full verification passed after the fix: npm `48` tests, `npm run build:all`,
   `npx tsc -b`, Rust `66` tests, Python compilation, and `git diff --check`.
+
+## 2026-09-06 — Gcore Player Lab public HLS capture
+
+- Added `fixtures/public_gcore_player_lab_chromium_probe.py` for the official
+  Player Lab page `https://g-core.github.io/gcore-videoplayer-js/example/player-lab.html`.
+  This is a distinct page-level initiation path from the existing Gcore VOD
+  selector proof: the probe submits the real URL form, loads the public Sintel
+  HLS preset, exercises the lab's real player controls, and then activates
+  the injected Download Manager button with trusted Chromium input.
+- Fresh Chromium reported a blob-backed playing player at `readyState=4`,
+  duration `888` seconds, and a trusted button event with
+  `isTrusted=true`, `defaultPrevented=false`, and target
+  `dm-media-download-button`. The native job preserved the replayable finite
+  HLS variant; signed query values are redacted in the retained log.
+- Resident `--commit` exited `0`; exactly one media job completed with
+  `provisional=false`. The browser-context CDP response was HTTP `206`,
+  `application/vnd.apple.mpegurl`, `6,928` bytes, SHA-256
+  `b2de34fd84ec38848b4f2becc73bb964bcff95c27535713cc45e830e5dbab685`.
+  The independent reference resolved `150` finite fragments.
+- Native output and independent reference both measured `216,283,085` bytes
+  with SHA-256
+  `637578a8c9baa988b356b12b4e94a858d334c6f25a890e8cf65d3b9e9cc49a81`.
+  `ffprobe` reports H.264 `1586x720`, AAC `44,100 Hz`, and duration
+  `888.083000`. Chromium Downloads stayed empty.
+- Exact retained output is `/tmp/dm-public-gcore-player-lab-red.log` with
+  `GCORE-LAB: PASS (...)` and
+  `PUBLIC-GCORE-PLAYER-LAB-CHROMIUM-PROBE: PASS`; independent readback is
+  retained at `/var/tmp/dm-public-gcore-lab-chromium-6hvm9nzt/`. No production
+  source change was justified by this path.

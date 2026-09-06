@@ -6236,3 +6236,14 @@ change and no site resolver exception:
   with zero `capture-acquisition` messages, zero browser downloads, and zero
   native jobs.
 - Evidence: `/tmp/dm-save-as-ownership-after-ctrl-fix.log`.
+
+## 2026-09-07 — Platform-neutral sign-in settings copy
+
+- Fresh Linux Chromium exposed Windows-only wording in General settings:
+  both sign-in descriptions said “when Windows starts.” Changed `src/App.tsx`
+  to say “when you sign in,” which matches the setting semantics on every host.
+- Fresh route `http://127.0.0.1:4177/?settings=general` now contained no
+  “Windows starts” text and showed both neutral descriptions. Visual evidence:
+  `/tmp/dm-ui-general-platform-neutral.png`.
+- Full Vitest passed `50/50`; `npx tsc -b`, `npm run build:extension`, and
+  `git diff --check` passed.

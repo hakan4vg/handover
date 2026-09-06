@@ -5904,3 +5904,39 @@ change and no site resolver exception:
   independent readback is retained at
   `/tmp/dm-public-dplayer-chromium-_yueuxeq/`. No production source change was
   justified by this path.
+
+## 2026-09-06 — drop-player official progressive fallback
+
+- Added `fixtures/public_drop_player_original_chromium_probe.py` against
+  `https://player.drop.mov/`. The fixture uses the page's real Quality menu and
+  selects its `Original` item; it does not replace the page source. Chromium then
+  leaves the blob-backed HLS source and plays the page-provided
+  `https://assets.drop.mov/samples/video/01/source.mp4`.
+- Fresh Chromium reached `readyState=4`, `paused=false`, duration `29.460000`,
+  and no media error. Network evidence recorded a browser-owned `video/mp4`
+  response, HTTP `206`, with full range `bytes 0-65474249/65474250`; the second
+  range request began at byte `1409024`. The first range's `ERR_ABORTED` was
+  canceled by the page while switching sources, not an unhandled media failure.
+- The real injected Download button was hit through trusted Chromium input. The
+  capture-phase event recorded `isTrusted=true`, `defaultPrevented=false`, and
+  target `dm-media-download-button`. Resident `--commit` exited `0`; the only
+  job became `completed` with `provisional=false`.
+- An independent browser-context fetch returned HTTP `200`, `65,474,250` bytes,
+  `video/mp4`, SHA-256
+  `ec0b221ac4abb9d361ed90e3e02ec84a1a439d7cd706c19da9b06cae369c80f9`.
+  Native output matched exactly. `ffprobe` reports H.264 `3840x2160`, AAC
+  `48,000 Hz`, and duration `29.460000`. Trusted context-menu and Ctrl-click
+  ownership remained unprevented. Chromium Downloads stayed empty and the
+  database contained exactly one completed job.
+- A bounded exploratory HLS check on the same page is not counted as green
+  coverage. The browser observed the master, separate `stream_2.m3u8` 480p video,
+  and `stream_1.m3u8` audio. Clicking after only the first fragments produced a
+  completed but partial `14,720`-byte resident file against a full independent
+  two-track reference of `6,932,130` bytes. Waiting until the adaptive player
+  switched to 1080p removed the injected button at end-of-media. This is a
+  fixture/player-lifecycle limitation, not a justified production fix.
+- Exact retained output is `/tmp/dm-public-drop-player-original-final4.log` with
+  `DROP-ORIGINAL-CHROMIUM: PASS (...)` and
+  `DROP-ORIGINAL-CHROMIUM-PROBE: PASS`; independent readback is retained at
+  `/tmp/dm-public-drop-player-original-chromium-u_96afd8/`. No production source
+  change was justified by this path.

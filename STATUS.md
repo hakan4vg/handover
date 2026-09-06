@@ -5478,3 +5478,29 @@ change and no site resolver exception:
   jobs=1, browser_downloads=[])` and `CLOUDINARY-PROBE: PASS`.
 - Python compilation and `git diff --check` passed. This slice changed no
   production source.
+
+## 2026-09-06 — OpenPlayerJS configurable progressive embed capture
+
+- Added `fixtures/public_openplayerjs_chromium_probe.py` against the official
+  OpenPlayerJS page `https://www.openplayerjs.com/`. The page's configurable
+  `Try it` player is a same-origin `/embed.html` iframe whose default media URL
+  is a direct progressive MP4. The probe selects that child player rather than
+  the unrelated page-level example video.
+- A fresh Chromium profile loaded the configured embed, reached `readyState=4`
+  and active playback after trusted `Input.dispatchMouseEvent` input, and
+  exposed the injected player-bound Download control inside the iframe. The
+  first attempts found and repaired only fixture defects: hidden top-level
+  source selection, a player-control replacement race in optional click
+  instrumentation, and global iframe coordinates below the viewport.
+- The extension/native path created exactly one provisional media job for the
+  configured MP4. Resident `--commit` exited `0`; the job completed with
+  `provisional=false`. The independent reference fetched the captured source
+  separately and matched the resident output exactly at `2,097,084` bytes,
+  SHA-256
+  `bad8caf78fbf9ca292db2f170f99ff6251782947c0bfa8bfd391b4da4a459163`.
+  Chromium Downloads stayed empty.
+- Exact retained green output is `/tmp/dm-public-openplayerjs-final2.log`:
+  `OPENPLAYERJS: PASS (output_bytes=2097084,
+  output_sha256=bad8caf78fbf9ca292db2f170f99ff6251782947c0bfa8bfd391b4da4a459163,
+  jobs=1, browser_downloads=[])` and
+  `OPENPLAYERJS-CHROMIUM-PROBE: PASS`. No production source changed.

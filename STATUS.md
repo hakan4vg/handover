@@ -4579,6 +4579,43 @@ change and no site resolver exception:
    (`/tmp/dm-addbtn-gates.log`). The protected `src-tauri/src/main.rs`
    sibling remains clean.
 
+## 2026-09-06 — Browser-context Referer replay (SPEC §5.1/§3.6/§16)
+
+- Gap, proven red first: the resident fetched every URL bare, so any
+  Referer-gated (hotlink-protected) source failed natively with no path to
+  success. New fixture route `/file/ref-gated.bin` (403 unless the Referer
+  host matches) plus new `fixtures/referrer_replay_chromium_probe.py`, which
+  also proves the gate itself (bare fetch 403s, Referer-bearing fetch serves
+  `1048576` bytes, `077ce9d8e0b8cad7a2813c8e7d7ce7d8153f50df309c31fd7f1649c18e214d14).
+- Red run on the unmodified binary (`/tmp/dm-referrer-red.log`, `probe_rc=1`):
+  capture created the job, native fetch got `Source returned 403 Forbidden`,
+  job `failed`. The section is earned, not assumed.
+- Implementation, minimal and generic (no site rules):
+  - Extension (`background.ts`, 3 payload sites): forwards the capture page
+    as `referrer` — ordinary pre-browser and media captures use `pageUrl`,
+    the downloads-API fallback uses the item referrer. No new permissions;
+    cookies explicitly out of scope (would need the cookies permission plus
+    a §16 review).
+  - Resident (`main.rs`): `ProvisionalInput.referrer` (explicit key, else
+    `pageUrl`, HTTP(S)-validated) → persisted `DownloadJob.referrer`
+    (serde-defaulted, old DBs load). One `get_with_referrer` builder used at
+    all 10 transfer fetch sites (range workers, segment fetcher, manifest
+    chain, whole-object probe/fallbacks); no signature changes, lookup
+    follows the existing snapshot pattern.
+  - Scoping replicates strict-origin-when-cross-origin: full page URL when
+    the request targets the same origin, page origin only otherwise, nothing
+    for invalid values. Paths and query strings never leak cross-origin.
+- Green run (`/tmp/dm-referrer-green.log`, `probe_rc=0`):
+  `REFERRER-REPLAY: PASS (output_bytes=1048576,
+  output_sha256=077ce9d8e0b8cad7a2813c8e7d7ce7d8153f50df309c31fd7f1649c18e214d14,
+  jobs=1, browser_downloads=[])` and `REFERRER-REPLAY-PROBE: PASS`.
+- Unit tests: capture-parse precedence/fallback/tolerance plus five
+  scoping cases. Suite now Rust `60/60` (was `58`).
+- Neighbors on the rebuilt tree: explicit-anchor ordinary capture and
+  direct-MP4 media capture both PASS; full gates `build:all`, `tsc -b`,
+  Vitest `8`/`44`, Rust `60`/`60`, fixture compile, `diff --check`
+  (`/tmp/dm-referrer-gates.log`).
+
 ## 2026-09-06 — Add window shows live provisional metadata (SPEC §19.2)
 
 - Adjacent proof in the same test file: the captured Add window must show

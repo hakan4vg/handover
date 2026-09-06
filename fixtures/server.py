@@ -3,7 +3,7 @@
 
 Stdlib only. Serves the shapes the transfer engine must handle:
   range-capable file / range-ignoring file / slow-drip file
-  redirects (single + chain) / token auth / one-use URL / changed identity
+  redirects (single + chain) / token auth / referer-gated file / one-use URL / changed identity
   finite HLS (TS) / HLS master+variant / live HLS (must be rejected)
   static DASH SegmentList with separate audio+video / SegmentTemplate /
   adaptation-level SegmentList / dynamic DASH (must be rejected) / progressive media
@@ -60,6 +60,7 @@ FILES = {
     "token.bin": (1 * 1024 * 1024, 0x44, True),
     "changed.bin": (256 * 1024, 0x55, True),
     "sample.mp4": (1 * 1024 * 1024, 0x66, True),
+    "ref-gated.bin": (1 * 1024 * 1024, 0x88, True),
 }
 
 ONE_USE = {}  # token -> bytes
@@ -172,6 +173,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_bytes(b"forbidden", 403)
             size, seed, _ = FILES["token.bin"]
             return self._serve_file("token.bin", seed, size, True)
+        if path == "/file/ref-gated.bin":
+            # Hotlink-style gate: 403 unless the Referer parses and its host
+            # matches this server's host (SPEC §5.1 request-context replay).
+            referer = self.headers.get("Referer", "")
+            host = (self.headers.get("Host", "") or "").split(":")[0].lower()
+            try:
+                ref_host = urlparse(referer).hostname or ""
+            except Exception:
+                ref_host = ""
+            if not ref_host or ref_host.lower() != host:
+                return self._send_bytes(b"referer required", 403)
+            size, seed, _ = FILES["ref-gated.bin"]
+            return self._serve_file("ref-gated.bin", seed, size, True)
         if path == "/one-use/mint":
             with ONE_USE_LOCK:
                 ONE_USE_COUNTER[0] += 1

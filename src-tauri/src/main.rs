@@ -66,6 +66,10 @@ struct DownloadJob {
     destination_reservation: Option<String>,
     #[serde(default)]
     selected_segments: Vec<String>,
+    /// Capture-page URL replayed as Referer (SPEC §5.1/§16, scoped per
+    /// request by referer_value). Serde default keeps old DBs loadable.
+    #[serde(default)]
+    referrer: Option<String>,
     events: Vec<JobEvent>,
 }
 
@@ -128,7 +132,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] referrer: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -727,6 +731,33 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30)).user_agent("Download Manager/0.1").build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+// SPEC §5.1 request-context replay under §16 scoping: the capture page is
+// replayed as Referer with a strict-origin-when-cross-origin rule. Same
+// origin as the request target gets the full page URL (hotlink checks);
+// any other origin gets only the page origin, so paths and query strings
+// never leak cross-origin. Non-HTTP(S) or unparsable values yield nothing.
+fn referer_value(referrer: &str, url: &str) -> Option<String> {
+    let page = reqwest::Url::parse(referrer.trim()).ok()?;
+    if !matches!(page.scheme(), "http" | "https") { return None; }
+    let target = reqwest::Url::parse(url).ok()?;
+    if page.origin() == target.origin() { return Some(page.to_string()); }
+    Some(page.origin().ascii_serialization())
+}
+
+fn job_referrer(app: &AppHandle, id: &str) -> Option<String> {
+    app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
+        snapshot.jobs.iter().find(|item| item.id == id).and_then(|job| job.referrer.clone())
+    })
+}
+
+fn get_with_referrer(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match job_referrer(app, id).as_deref().and_then(|referrer| referer_value(referrer, url)) {
+        Some(value) => request.header(reqwest::header::REFERER, value),
+        None => request,
+    }
+}
+
 fn retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT || status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
@@ -1149,7 +1180,7 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
             sleep(Duration::from_millis(100)).await;
             if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
         }
-        let mut request = client.get(source);
+        let mut request = get_with_referrer(client, app, id, source);
         if let Some((start, length)) = byte_range {
             let Some(end) = start.checked_add(length).and_then(|value| value.checked_sub(1)) else {
                 return Err("The HLS byte range exceeds the addressable resource size".into());
@@ -1252,7 +1283,7 @@ async fn range_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source
     let mut last_error = String::from("range request failed");
     let total_len = end.saturating_sub(start).saturating_add(1);
     for _ in 0..attempts {
-        match client.get(source).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send().await {
+        match get_with_referrer(client, app, id, source).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send().await {
             Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
                 let valid_range = content_range(&response).map(|(actual_start, actual_end, actual_total)| actual_start == start && actual_end == end && actual_total == expected.length).unwrap_or(false);
                 if !valid_range { last_error = "The server returned an invalid byte range".into(); continue; }
@@ -1413,7 +1444,7 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
             emit_snapshot(&app, &state);
             sleep(Duration::from_secs(3)).await;
             let stream_client = http_client();
-            let response = match stream_client.get(&source).send().await {
+            let response = match get_with_referrer(&stream_client, &app, &id, &source).send().await {
                 Ok(response) if response.status().is_success() => response,
                 Ok(response) => return Err(format!("{initial_error}; one-stream fallback failed: source returned {}", response.status())),
                 Err(stream_error) => return Err(format!("{initial_error}; one-stream fallback failed: {stream_error}")),
@@ -1522,7 +1553,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         if !is_hls { break; }
         if let Some(sources) = media::hls_variant_tracks(&manifest_source, &manifest_body) { hls_track_sources = Some(sources); break; }
         let Some(variant) = (if is_hls { media::hls_variant(&manifest_source, &manifest_body) } else { None }) else { break };
-        let response = client.get(&variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+        let response = get_with_referrer(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
         manifest_body = response.text().await.map_err(|error| error.to_string())?;
         if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
         manifest_source = variant;
@@ -1533,12 +1564,12 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let mut tracks = Vec::with_capacity(sources.len());
         for (kind, track_source) in sources {
             let mut source = track_source;
-            let response = client.get(&source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+            let response = get_with_referrer(&client, &app, &id, &source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
             let mut body = response.text().await.map_err(|error| error.to_string())?;
             if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
             for _ in 0..4 {
                 let Some(variant) = media::hls_variant(&source, &body) else { break; };
-                let response = client.get(&variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+                let response = get_with_referrer(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
                 body = response.text().await.map_err(|error| error.to_string())?;
                 if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
                 source = variant;
@@ -1708,9 +1739,9 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     let state = app.state::<CoreState>();
     let client = http_client();
     let selected_segments = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.selected_segments.clone())).unwrap_or_default();
-    let mut response = match client.get(&source).header(reqwest::header::RANGE, "bytes=0-0").send().await {
+    let mut response = match get_with_referrer(&client, &app, &id, &source).header(reqwest::header::RANGE, "bytes=0-0").send().await {
         Ok(response) if response.status().is_success() => response,
-        _ => match client.get(&source).send().await {
+        _ => match get_with_referrer(&client, &app, &id, &source).send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => { let retryable = retryable_status(response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
             Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
@@ -1719,7 +1750,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     if !transfer_can_continue(&app, &id, generation) { return false; }
     let valid_probe = response.status() != reqwest::StatusCode::PARTIAL_CONTENT || content_range(&response).map(|(start, end, total)| start == 0 && end == 0 && total > 0).unwrap_or(false);
     if !valid_probe {
-        response = match client.get(&source).send().await {
+        response = match get_with_referrer(&client, &app, &id, &source).send().await {
             Ok(response) if response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT => response,
             Ok(_response) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("The source returned an invalid partial response".into()); job.eta = None; job.events.insert(0, job_event("Source returned an invalid partial response", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
             Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
@@ -1730,7 +1761,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     if media::is_manifest_source(&source, response_mime.as_deref()) {
         if !transfer_can_continue(&app, &id, generation) { return false; }
         let body = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            match client.get(&source).send().await {
+            match get_with_referrer(&client, &app, &id, &source).send().await {
                 Ok(full) if full.status().is_success() => full.text().await.map_err(|error| error.to_string()),
                 Ok(full) => Err(format!("Manifest source returned {}", full.status())),
                 Err(error) => Err(error.to_string()),
@@ -1994,7 +2025,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
     }
     let id = format!("provisional-{}", Uuid::new_v4());
     let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, events: vec![job_event("Provisional acquisition created", None)] };
+    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, referrer: input.referrer, events: vec![job_event("Provisional acquisition created", None)] };
     { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
@@ -2212,7 +2243,12 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
     // Bytes/sec; absent, zero, or non-numeric means no per-job cap.
     let bandwidth_limit = payload.get("bandwidthLimit").and_then(Value::as_u64).filter(|value| *value > 0);
     let selected_segments = payload.get("selectedSegments").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).filter_map(|value| { let parsed = reqwest::Url::parse(value).ok()?; matches!(parsed.scheme(), "http" | "https").then(|| value.to_string()) }).take(8).collect()).unwrap_or_default();
-    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments })
+    // Request-context replay (SPEC §5.1/§16): the extension forwards the
+    // capture page as `referrer` (ordinary-capture and media-capture send
+    // `pageUrl`; the downloads-API fallback sends the item referrer).
+    // Accept explicit `referrer` first, then `pageUrl`; keep only HTTP(S).
+    let referrer = payload.get("referrer").or_else(|| payload.get("pageUrl")).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).and_then(|value| reqwest::Url::parse(value).ok()).filter(|parsed| matches!(parsed.scheme(), "http" | "https")).map(|parsed| parsed.to_string());
+    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments, referrer })
 }
 
 fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {
@@ -2408,7 +2444,7 @@ fn main() {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, source_compatible, tray_status_text};
+    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, referer_value, source_compatible, tray_status_text};
     use serde_json::json;
 
     #[test]
@@ -2543,6 +2579,33 @@ mod capture_tests {
         let input = capture_input_from_args(&args).expect("args capture");
         assert_eq!(input.source, "http://127.0.0.1:8901/range.bin");
         assert_eq!(input.name.as_deref(), Some("range.bin"));
+    }
+
+    #[test]
+    fn capture_referrer_prefers_explicit_key_then_page_url() {
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin", "pageUrl": "http://127.0.0.1:9/page.html" } })).expect("pageUrl fallback");
+        assert_eq!(input.referrer.as_deref(), Some("http://127.0.0.1:9/page.html"));
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin", "pageUrl": "http://127.0.0.1:9/page.html", "referrer": "http://127.0.0.1:9/other.html" } })).expect("explicit key");
+        assert_eq!(input.referrer.as_deref(), Some("http://127.0.0.1:9/other.html"));
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin", "pageUrl": "not a url" } })).expect("bad pageUrl tolerated");
+        assert_eq!(input.referrer, None);
+        let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin" } })).expect("missing referrer tolerated");
+        assert_eq!(input.referrer, None);
+    }
+
+    #[test]
+    fn referer_value_scopes_to_origin() {
+        assert_eq!(
+            referer_value("http://127.0.0.1:9/page/video.html", "http://127.0.0.1:9/file/ref-gated.bin").as_deref(),
+            Some("http://127.0.0.1:9/page/video.html"),
+        );
+        assert_eq!(
+            referer_value("http://127.0.0.1:9/page/video.html?token=secret", "http://cdn.example.test/v.mp4").as_deref(),
+            Some("http://127.0.0.1:9"),
+        );
+        assert_eq!(referer_value("not a url", "http://127.0.0.1:9/f.bin"), None);
+        assert_eq!(referer_value("ftp://127.0.0.1:9/p", "http://127.0.0.1:9/f.bin"), None);
+        assert_eq!(referer_value("", "http://127.0.0.1:9/f.bin"), None);
     }
 
     #[test]

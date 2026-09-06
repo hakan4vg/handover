@@ -124,6 +124,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
       source,
       name: cleanFilename(payload.name),
       pageUrl: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
+      referrer: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
     },
   })) as { ok?: boolean };
   if (response?.ok) return { ok: true };
@@ -197,6 +198,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       source: item.finalUrl || item.url,
       name: cleanFilename(item.filename),
       pageUrl: item.referrer,
+      referrer: item.referrer,
     },
   }).finally(() => suggest());
   return true;
@@ -241,7 +243,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         reply({ ok: false, error: 'no acquirable source for this media' });
         return;
       }
-      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments } }));
+      const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined;
+      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments, referrer: pageUrl } }));
     } else if (type === 'open-manager') {
       reply(await sendNative({ type: 'open-manager' }));
     } else {

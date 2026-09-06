@@ -5073,3 +5073,17 @@ change and no site resolver exception:
   `browser_downloads=[]`; real context-menu and Ctrl-click ownership remained
   unprevented. Evidence: `/tmp/dm-public-dash-current.log`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — MDN interactive audio browser-chain proof
+
+- `fixtures/public_mdn_interactive_audio_chromium_probe.py` passed against the
+  real MDN page `https://interactive-examples.mdn.mozilla.net/pages/tabbed/audio.html`
+  in a fresh Chromium profile. The injected audio button selected the current
+  source `https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3`.
+- The real Chromium → extension → native → Add Download → commit path produced
+  one completed managed job. The resident output and browser-context reference
+  both measured `39,868` bytes and SHA-256
+  `41191d0727073bf848bcc8f0bd851d71a0b0058e901abb1c1b236ad327bda52e`.
+  Chromium Downloads remained empty. Evidence:
+  `/tmp/dm-public-mdn-interactive-audio.log`.
+- No product source changed in this verification slice.

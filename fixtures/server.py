@@ -327,6 +327,34 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/dash/live.mpd":
             body = '<MPD type="dynamic" minimumUpdatePeriod="PT2S"><Period><AdaptationSet><Representation><SegmentTemplate media="s.m4s"/></Representation></AdaptationSet></Period></MPD>'
             return self._send_bytes(body.encode(), 200, {"Content-Type": "application/dash+xml"})
+        if path == "/dash/gated.mpd":
+            # Hotlink-gated DASH (SPEC §5.1 + §16): manifest, init, and every
+            # segment 403 without a same-host Referer. Serves the same real
+            # fMP4 bytes as the open routes under gated names.
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            v = "".join(f'<SegmentURL media="gv-{i}.m4s"/>' for i in range(DASH_V_SEGS))
+            body = (
+                '<MPD type="static" mediaPresentationDuration="PT6S"><Period>'
+                '<AdaptationSet contentType="video"><Representation id="v">'
+                '<BaseURL>/dash/</BaseURL><SegmentList><Initialization sourceURL="gv-init.mp4"/>'
+                f"{v}</SegmentList></Representation></AdaptationSet></Period></MPD>"
+            )
+            return self._send_bytes(body.encode(), 200, {"Content-Type": "application/dash+xml"})
+        if path == "/dash/gv-init.mp4":
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            data = media_file("v-init.mp4")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
+        m = re.match(r"^/dash/gv-(\d+)\.m4s$", path)
+        if m:
+            if not self._referer_host_ok():
+                return self._send_bytes(b"referer required", 403)
+            idx = int(m.group(1))
+            if idx >= DASH_V_SEGS:
+                return self._send_bytes(b"missing fixture", 404)
+            data = media_file(f"v-{idx}.m4s")
+            return self._send_bytes(data if data is not None else b"missing fixture", 200 if data is not None else 500, {"Content-Type": "video/mp4"})
         # Real fragmented-MP4 bytes (see media/): init + per-track fragments.
         # Transport tests use deterministic garbage; finalization tests need
         # media FFmpeg can actually demux, so these routes serve real files.

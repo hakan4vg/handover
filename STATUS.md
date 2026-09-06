@@ -4731,3 +4731,22 @@ change and no site resolver exception:
 - Gates: `build:all`, `tsc -b` clean, Vitest `8`/`44`, Rust `62`/`62`
   (was `61`), fixture compile, `diff --check`
   (`/tmp/dm-gated-gates.log`).
+
+## 2026-09-06 — Referer replay composes with DASH (SPEC §5.1/§16)
+
+- Last transfer family: new fixture `/dash/gated.mpd` (video-only
+  SegmentList, init + 3 segments) serving the same real fMP4 bytes as the
+  open routes under gated names — manifest, init, and segments all 403
+  without a same-host Referer (verified live: bare `403` x3, gated `200`
+  x3, out-of-range `404`, open manifest untouched).
+- New `fixtures/gated_dash_referrer_probe.py`, mirroring the gated-HLS
+  probe: red phase without page context, green phase with `pageUrl`,
+  reference = ffmpeg `-c copy` mux of the fetched track (the resident's
+  exact `mux_media_tracks` invocation).
+- First-run evidence (`/tmp/dm-gated-dash.log`, `probe_rc=0`): RED failed
+  403 as required; READY `segments.completed=4/4` (init counted, as
+  predicted); output `32057` bytes, `sha256=6b6875bc…` identical to the
+  reference: `GATED-DASH-PROBE: PASS`. No bring-up flakes this run.
+- Request context now has E2E evidence on every transfer family:
+  whole-object, segmented HLS, DASH, cross-origin scoping, POST replay.
+- No product source changed in this slice.

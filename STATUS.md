@@ -5546,3 +5546,30 @@ change and no site resolver exception:
   output_sha256=5b7a87ffd96efeebecc60495613983222750e1a330db374543796b88c12461dd,
   jobs=1, browser_downloads=[])` and
   `IMAGEKIT-CHROMIUM-PROBE: PASS`. No production source changed.
+
+## 2026-09-06 — Able Player accessible progressive capture
+
+- Added `fixtures/public_ableplayer_video3_chromium_probe.py` against the
+  official Able Player demo
+  `https://ableplayer.github.io/ableplayer/demos/video3.html`. This is the
+  accessibility-focused custom control path with captions, descriptions,
+  chapters, and a transcript. The pre-existing tracked
+  `fixtures/public_ableplayer_chromium_probe.py` was preserved unchanged.
+- Fresh Chromium selected the page's actual MP4 source
+  `https://ableplayer.github.io/ableplayer/media/wwa.mp4` from the page's
+  source alternatives, reached `readyState=4`, duration `52.406826`, and
+  exposed `14` text tracks. A trusted CDP click on Able Player's real large
+  Play control produced active playback and the player-bound Download control.
+- The extension/native path created exactly one provisional media job.
+  Resident `--commit` exited `0`; the job completed with `provisional=false`.
+  An independent fetch matched the resident output exactly at `5,613,210`
+  bytes, SHA-256
+  `87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38`.
+  Chromium Downloads stayed empty.
+- The first probe run retained the source-selection diagnostic at
+  `/tmp/dm-public-ableplayer-webm.log`; the final green run is
+  `/tmp/dm-public-ableplayer-final.log`:
+  `ABLEPLAYER: PASS (output_bytes=5613210,
+  output_sha256=87716917cfefa444ecc3ae9e4a05a779dbf6621f62ad0c61bc24211283cd6e38,
+  jobs=1, browser_downloads=[])` and
+  `ABLEPLAYER-CHROMIUM-PROBE: PASS`. No production source changed.

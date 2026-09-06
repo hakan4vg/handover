@@ -5050,3 +5050,12 @@ change and no site resolver exception:
   `one.bin`, `two.bin`, and `three.bin` was requested exactly once.
   `MULTIPLE-ADD-WINDOWS-PROBE: PASS`.
 - No product source changed in this verification slice.
+
+## 2026-09-06 — Concurrent capture isolation
+
+- `fixtures/simultaneous_capture_probe.py` passed with two concurrent native
+  captures through one resident. It produced two distinct provisional job IDs,
+  preserved both query-specific source URLs, and completed both jobs while the
+  fixture recorded four range requests total. Evidence:
+  `/tmp/dm-simultaneous-capture-current.log`.
+- No product source changed in this verification slice.

@@ -4440,3 +4440,49 @@ change and no site resolver exception:
   product defect; the generic blob resolution path itself remains proven by
   the mux-video probe (`5536ffd`).
 - No product source changed; the protected Rust sibling remains clean.
+
+## 2026-09-06 — Reddit dynamic-site boundary (login wall, no product change)
+
+- Attempted the SPEC §17.2 dynamic-site case against
+  `https://old.reddit.com/r/funny/comments/9jivgv/she_cut_me_off_so_i_had_a_surprise_for_her/`
+  with a fresh disposable Chromium profile (no resident, page-state only).
+- The box is redirected before any media can exist:
+  `href=https://old.reddit.com/login/?reason=lor2&dest=...`,
+  `state=complete`. No `<video>`/`<audio>` is present to attach a button to,
+  so there is no reachable capture to attempt.
+- This is an external login/bot-wall block, not a product defect. No
+  site-specific resolver was added to force a pass. Evidence:
+  `/tmp/dm-reddit-diag.log` (`public page did not load`, `probe_rc=1`).
+- The §17.2 dynamic-site intent stays covered by the production dynamic
+  players already proven (Streamable watch page, Transistor share page,
+  Mux custom-element player) while the two named hosts remain: Reddit =
+  login-walled here; YouTube embeds already recorded as Error 153.
+- No product source changed; the protected `src-tauri/src/main.rs` sibling
+  remains clean.
+
+## 2026-09-06 — Direct-MP4 navigation (built-in player document)
+
+- Added `fixtures/public_direct_mp4_chromium_probe.py`. It navigates the
+  address bar straight to
+  `https://cdn.plyr.io/static/demo/View_From_A_Blue_Moon_Trailer-576p.mp4`
+  (same already-proven CDN host as the Plyr page probe, but a distinct
+  initiation pattern: top-level media document, browser built-in player, no
+  player page or custom controls).
+- Fresh-profile run: one `<video>` (`readyState=4`, `paused=false`, duration
+  `183.125333`, `1024x576`), product Download button present, trusted click
+  created exactly one native media job for that MP4. Resident `--commit`
+  exited `0`; the job completed with `provisional=false`.
+- Independent browser-context fetch of the same source recorded `49900386`
+  bytes and SHA-256
+  `2f4bd69d9bfc928a399493eaec2ba0e5a6a4f7e326d6e74e0d1d415f63be86f8`; the
+  managed native output matched both. Chromium Downloads was empty and the
+  database contained exactly one job.
+- Exact output ended with
+  `DIRECT-MP4: PASS (page=https://cdn.plyr.io/static/demo/View_From_A_Blue_Moon_Trailer-576p.mp4,
+  source=https://cdn.plyr.io/static/demo/View_From_A_Blue_Moon_Trailer-576p.mp4,
+  output_bytes=49900386,
+  output_sha256=2f4bd69d9bfc928a399493eaec2ba0e5a6a4f7e326d6e74e0d1d415f63be86f8,
+  jobs=1, browser_downloads=[])` and `DIRECT-MP4-PROBE: PASS`; the complete
+  log is `/tmp/dm-direct-mp4.log` (`probe_rc=0`).
+- No product source changed; the protected `src-tauri/src/main.rs` sibling
+  remains clean.

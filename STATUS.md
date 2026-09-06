@@ -4685,3 +4685,18 @@ change and no site resolver exception:
   and `git diff --check` (`/tmp/dm-addmeta-gates.log`). No product source
   changed in this slice; the protected `src-tauri/src/main.rs` sibling
   remains clean.
+
+## 2026-09-06 — Post-core engine matrix re-proven (Referer + POST changes)
+
+- Two transfer-core changes landed since the last engine run (Referer replay
+  at all ten fetch sites, 405-gated POST replay in `acquire_once`), so the
+  deterministic matrix was re-run on the current binary with its documented
+  scaffolding (Xvfb `:99`, `fixtures/server.py --port 8901`, isolated
+  `DM_HOME`; scaffolding started for the run and killed after).
+- `acquire_probe` all green: redirect PASS (`8388608` bytes identical via
+  302), one-use PASS (`65536` bytes, sole consumer), retry-503 PASS (fails
+  honestly after bounded retries) — `/tmp/dm-postcore-acquire-*.log`.
+- `limiter_probe` PASS on the same binary (`0.84 MB/s` in band,
+  `8388608` bytes identical) — `/tmp/dm-postcore-limiter.log`. The segmented
+  path shares the edited `acquire_once` arm and is unaffected.
+- No product source changed in this slice.

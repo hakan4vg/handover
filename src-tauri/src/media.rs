@@ -79,24 +79,78 @@ pub fn hls_variant(source: &str, body: &str) -> Option<String> {
     selected
 }
 
-pub fn hls_variant_tracks(source: &str, body: &str) -> Option<Vec<(String, String)>> {
-    let mut audio = None;
-    let mut pending_variant = false;
-    let mut video = None;
+pub fn hls_variant_tracks(source: &str, body: &str, selected_segments: &[String]) -> Option<Vec<(String, String)>> {
+    let mut audio_options: Vec<(Option<String>, String, bool)> = Vec::new();
+    let mut variants: Vec<(Option<String>, String)> = Vec::new();
+    let mut pending_variant: Option<String> = None;
     for line in body.lines().map(str::trim) {
         if line.starts_with("#EXT-X-MEDIA") && line.to_ascii_uppercase().contains("TYPE=AUDIO") {
-            if let Some(uri) = hls_attribute(line, "URI").and_then(|value| resolve(source, &value)) { audio = Some(uri); }
+            let group = hls_attr_bare(line, "GROUP-ID");
+            let is_default = hls_attr_bare(line, "DEFAULT").is_some_and(|value| value.eq_ignore_ascii_case("YES"));
+            if let Some(uri) = hls_attribute(line, "URI").and_then(|value| resolve(source, &value)) {
+                audio_options.push((group, uri, is_default));
+            }
         } else if line.starts_with("#EXT-X-STREAM-INF") {
-            pending_variant = true;
-        } else if pending_variant && !line.is_empty() && !line.starts_with('#') {
-            video = resolve(source, line);
-            break;
+            pending_variant = Some(line.to_string());
+        } else if pending_variant.is_some() && !line.is_empty() && !line.starts_with('#') {
+            let attributes = pending_variant.take().expect("pending HLS variant");
+            let group = hls_attr_bare(&attributes, "AUDIO");
+            if let Some(uri) = resolve(source, line) {
+                variants.push((group, uri));
+            }
         }
     }
-    let video = video?;
-    let mut tracks = vec![("video".into(), video)];
-    if let Some(audio) = audio { tracks.push(("audio".into(), audio)); }
+    let selected_video = selected_segments
+        .iter()
+        .find_map(|selected| {
+            variants.iter().find(|(_, uri)| {
+                selected_hls_url(uri, std::slice::from_ref(selected))
+            })
+        })
+        .or_else(|| variants.first())?;
+    let mut tracks = vec![("video".into(), selected_video.1.clone())];
+    let selected_audio = selected_segments
+        .iter()
+        .find_map(|selected| {
+            audio_options.iter().find(|(group, uri, _)| {
+                group == &selected_video.0
+                    && selected_hls_url(uri, std::slice::from_ref(selected))
+            })
+        })
+        .or_else(|| audio_options.iter().find(|(group, _, is_default)| group == &selected_video.0 && *is_default))
+        .or_else(|| audio_options.iter().find(|(group, _, _)| group == &selected_video.0))
+        .or_else(|| audio_options.first());
+    if let Some((_, audio, _)) = selected_audio {
+        tracks.push(("audio".into(), audio.clone()));
+    }
     Some(tracks)
+}
+
+fn selected_hls_url(candidate: &str, selected_segments: &[String]) -> bool {
+    let Ok(candidate_url) = Url::parse(candidate) else { return false; };
+    let Some(leaf) = candidate_url.path().rsplit('/').next() else { return false; };
+    let stem = leaf.strip_suffix(".m3u8").unwrap_or(leaf);
+    if stem.is_empty() { return false; }
+    let mut identities = vec![stem];
+    if let Some((_, remainder)) = stem.split_once('-').or_else(|| stem.split_once('_')) {
+        if !remainder.is_empty() { identities.push(remainder); }
+    }
+    selected_segments.iter().any(|selected| {
+        let Ok(selected_url) = Url::parse(selected) else { return false; };
+        if selected_url.scheme() != candidate_url.scheme()
+            || selected_url.host_str() != candidate_url.host_str()
+            || selected_url.port_or_known_default() != candidate_url.port_or_known_default()
+        {
+            return false;
+        }
+        let selected_path = selected_url.path();
+        identities.iter().any(|identity| selected_path.match_indices(identity).any(|(index, _)| {
+            let before = selected_path.as_bytes().get(index.saturating_sub(1)).copied();
+            let after = selected_path.as_bytes().get(index + identity.len()).copied();
+            let boundary = |byte: Option<u8>| byte.is_none_or(|value| matches!(value, b'/' | b'_' | b'-' | b'.'));
+            boundary(before) && boundary(after)
+        }))
+    })
 }
 
 pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
@@ -829,8 +883,55 @@ mod tests {
     #[test]
     fn finds_hls_video_and_alternate_audio_playlists() {
         let body = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"audio\"\nvideo/index.m3u8";
-        let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body).expect("HLS master");
+        let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body, &[]).expect("HLS master");
         assert_eq!(tracks, [("video".into(), "https://cdn.example.test/vod/video/index.m3u8".into()), ("audio".into(), "https://cdn.example.test/vod/audio/index.m3u8".into())]);
+    }
+
+    #[test]
+    fn keeps_pending_hls_variant_across_comments() {
+        let body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n#EXT-X-INDEPENDENT-SEGMENTS\nvideo/index.m3u8";
+        let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body, &[]).expect("commented HLS master");
+        assert_eq!(tracks[0].1, "https://cdn.example.test/vod/video/index.m3u8");
+    }
+
+    #[test]
+    fn chooses_hls_video_and_audio_playlists_from_observed_active_segments() {
+        let body = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio/en.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"French\",DEFAULT=NO,URI=\"audio/fr.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=800000,AUDIO=\"audio\"\nvideo/low.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,AUDIO=\"audio\"\nvideo/high.m3u8";
+        let selected = [
+            "https://cdn.example.test/vod/video/high/seg-01.ts".to_string(),
+            "https://cdn.example.test/vod/audio/en/seg-01.aac".to_string(),
+        ];
+        let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body, &selected).expect("HLS master");
+        assert_eq!(tracks, [("video".into(), "https://cdn.example.test/vod/video/high.m3u8".into()), ("audio".into(), "https://cdn.example.test/vod/audio/en.m3u8".into())]);
+    }
+
+    #[test]
+    fn follows_ordered_manifest_hints_before_master_variant_order() {
+        let body = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"audio/en.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,AUDIO=\"audio\"\nvideo/high.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=900000,AUDIO=\"audio\"\nvideo/active.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=500000,AUDIO=\"audio\"\nvideo/low.m3u8";
+        let selected = [
+            "https://cdn.example.test/vod/video/active.m3u8".to_string(),
+            "https://cdn.example.test/vod/audio/en.m3u8".to_string(),
+            "https://cdn.example.test/vod/video/high.m3u8".to_string(),
+        ];
+        let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body, &selected).expect("ordered HLS master");
+        assert_eq!(tracks, [
+            ("video".into(), "https://cdn.example.test/vod/video/active.m3u8".into()),
+            ("audio".into(), "https://cdn.example.test/vod/audio/en.m3u8".into()),
+        ]);
+    }
+
+    #[test]
+    fn matches_hls_variant_when_segment_filename_embeds_playlist_identity() {
+        let body = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"index-s0q3570v1-a1.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Spanish\",DEFAULT=NO,URI=\"index-s1q3570v1-a2.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=578000,AUDIO=\"audio\"\nindex-s0q3576v1-v1-a1.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1928000,AUDIO=\"audio\"\nindex-s0q3570v1-v1-a1.m3u8";
+        let selected = [
+            "https://cdn.example.test/vod/segment-17-s0q3570v1-v1-a1.ts".to_string(),
+            "https://cdn.example.test/vod/segment-17-s1q3570v1-a2.ts".to_string(),
+        ];
+        let tracks = hls_variant_tracks("https://cdn.example.test/vod/master.m3u8", body, &selected).expect("HLS master");
+        assert_eq!(tracks, [
+            ("video".into(), "https://cdn.example.test/vod/index-s0q3570v1-v1-a1.m3u8".into()),
+            ("audio".into(), "https://cdn.example.test/vod/index-s1q3570v1-a2.m3u8".into()),
+        ]);
     }
 
     #[test]

@@ -6053,3 +6053,50 @@ change and no site resolver exception:
   at `/tmp/dm-ordinary-redirect-public.log`; timing output is retained at
   `/tmp/dm-ordinary-one-use-timing.log`. No credentials or signed query values
   are retained. Broader v1 gaps remain open.
+
+## 2026-09-06 — HLS multivariant master and active audio/video selection
+
+- The unverified HLS experiment is now implemented in the four intended paths:
+  `extension/src/media-candidates.ts`, `extension/src/shared.test.ts`,
+  `src-tauri/src/media.rs`, and `src-tauri/src/main.rs`.
+- Extension selection recognizes generic likely-master names (`master`,
+  `playlist`, `manifest`, and `multivariant`) and keeps recent non-subtitle child
+  manifest URLs ahead of segment hints. Native HLS parsing receives that ordered
+  evidence, chooses the first matching video and grouped audio rendition, and
+  falls back to the manifest's normal order only when no hint matches. Matching
+  covers both directory-style segment names and public filename-embedded
+  identities such as `index-...m3u8` and `segment-...ts`; pending variant state
+  survives intervening HLS comments.
+- Added `fixtures/public_hls_master_selection_chromium_probe.py` against the
+  official hls.js demo with the public multivariant master
+  `https://demo-public.gvideo.io/videos/2675_HCzdHTj79iSt3wiW/master.m3u8`.
+  Fresh Chromium changed hls.js from level `2` to the selected level `1`
+  (`928000` bitrate, `1124x468`). The browser observed the master, a prefetched
+  high rendition, the selected mid rendition, and default English audio. The
+  native job source stayed the master while its ordered `selectedSegments`
+  began with the selected child manifest, then audio/other observed resources.
+- The clean-scratch real run created exactly one managed job and completed the
+  two-track MPEG-TS output. An independent reference fetched the selected video
+  rendition and default audio rendition in playlist order, concatenated their
+  124 + 124 segments, and remuxed them with explicit `-map 0:0 -map 1:0 -c
+  copy`. Both reference and resident output were `91,614,656` bytes with SHA-256
+  `c33db14e961fa6a6ae36c87a6728d23ae7e9ed93605f86e408a4e90231146588`.
+- FFprobe on the exact resident output reports MPEG-TS with two streams:
+  H.264 `1124x468`, duration `730.375000` seconds, and AAC-LC `44,100 Hz`
+  stereo, with container duration `733.936322` seconds. Trusted Ctrl-click and
+  context-menu ownership remained `isTrusted=true` and
+  `defaultPrevented=false`; Chromium Downloads stayed empty.
+- The first durable-fixture retry failed only because a preserved earlier probe
+  root exhausted `/tmp` during FFmpeg muxing. The exact retained tracks were
+  valid and manual mux on `/srv` passed. After removing only the known adaptive
+  HLS disposable roots, the fixture passed; no production scratch behavior was
+  changed.
+- Exact public acceptance output is retained at
+  `/tmp/dm-public-hls-master-selection-final.log`; the preserved ffprobe run is
+  `/tmp/dm-public-hls-master-selection-ffprobe.log`. The independent reference
+  details are printed in both logs and stored under the task-owned
+  `/srv/backup-export/dm-adaptive-hls-gvideo-reference-*` roots.
+- Verification on this worktree passed focused Vitest `27/27`, full Vitest
+  `50/50`, Rust `70/70`, `cargo check`, `cargo build`, `npm run build:extension`,
+  `npx tsc -b`, Python compilation, and `git diff --check`. Broader v1 gaps
+  remain open; this closes the real multivariant-master active-rendition slice.

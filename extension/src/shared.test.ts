@@ -124,6 +124,15 @@ describe('media candidate selection', () => {
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/index.m3u8');
   });
 
+  it('keeps a multivariant master when a newer alternate audio playlist arrives', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/playlist.m3u8', tabId: 4, frameId: 0, at: 10, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/768/chunklist_w1_vo.m3u8', tabId: 4, frameId: 0, at: 20, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/en/chunklist_w1_ao.m3u8', tabId: 4, frameId: 0, at: 30, role: 'manifest', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/playlist.m3u8');
+  });
+
   it('chooses the most recently observed manifest, not the last inserted one', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/vod/selected.m3u8', tabId: 4, frameId: 0, at: 20, role: 'manifest', playerKey: 'player-a' },
@@ -189,6 +198,27 @@ describe('media candidate selection', () => {
     expect(chooseMediaSelection(candidates, 4, 0, 'player-a')).toEqual({
       source: 'https://cdn.test/vod/manifest.mpd',
       selectedSegments: ['https://cdn.test/vod/video_576p.webm', 'https://cdn.test/vod/audio_en.m4a'],
+    });
+  });
+
+  it('puts recent child manifests before segment hints for a likely master', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/master.m3u8', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/high.m3u8', tabId: 4, frameId: 0, at: 10, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/active.m3u8', tabId: 4, frameId: 0, at: 20, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/audio/en.m3u8', tabId: 4, frameId: 0, at: 30, role: 'manifest', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/segment-active.ts', tabId: 4, frameId: 0, at: 40, role: 'segment', playerKey: 'player-a' },
+      { url: 'https://cdn.test/vod/segment-high.ts', tabId: 4, frameId: 0, at: 39, role: 'segment', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaSelection(candidates, 4, 0, 'player-a')).toEqual({
+      source: 'https://cdn.test/vod/master.m3u8',
+      selectedSegments: [
+        'https://cdn.test/vod/audio/en.m3u8',
+        'https://cdn.test/vod/active.m3u8',
+        'https://cdn.test/vod/high.m3u8',
+        'https://cdn.test/vod/segment-active.ts',
+        'https://cdn.test/vod/segment-high.ts',
+      ],
     });
   });
 

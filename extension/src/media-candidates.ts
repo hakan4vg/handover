@@ -51,6 +51,16 @@ export function isSubtitlePlaylist(url: string): boolean {
   }
 }
 
+function isLikelyMasterManifest(url: string): boolean {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    const leaf = path.split('/').pop() ?? '';
+    return /(?:^|[-_.])(master|playlist|manifest|multivariant)(?:[-_.]|$)/.test(leaf);
+  } catch {
+    return false;
+  }
+}
+
 export function mediaKindFor(url: string, contentType = ''): MediaKind {
   const mime = contentType.toLowerCase().split(';', 1)[0].trim();
   if (mime.startsWith('audio/')) return 'audio';
@@ -104,18 +114,23 @@ export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number
   const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
     const newest = [...pool].sort((left, right) => right.at - left.at);
     const manifests = newest.filter((item) => item.role === 'manifest');
-    // Prefer the media manifest over subtitle/caption playlists: captions are
-    // not the resource the user is watching. Fall back to a subtitle playlist
-    // only when it is the only manifest evidence.
-    const manifest = manifests.find((item) => !isSubtitlePlaylist(item.url)) ?? manifests[0];
+    // Prefer a likely multivariant master over newer child playlists. HLS
+    // players request the active video and alternate-audio playlists after the
+    // master; selecting the last response can capture audio-only traffic.
+    const mediaManifests = manifests.filter((item) => !isSubtitlePlaylist(item.url));
+    const manifest = mediaManifests.find((item) => isLikelyMasterManifest(item.url)) ?? mediaManifests[0] ?? manifests[0];
     // Once segmented traffic is present, an unknown MP4 may be only an MSE
     // initialization fragment. Never promote it to a complete download.
     if (!manifest && pool.some((item) => item.role === 'segment')) return undefined;
     const source = manifest?.url ?? newest.find((item) => item.role !== 'segment')?.url;
     if (!source) return undefined;
     const selectedSegments = (() => {
+      const childManifests = mediaManifests
+        .filter((item) => item.url !== manifest?.url)
+        .slice(0, 4)
+        .map((item) => item.url);
       const fragments = newest.filter((item) => item.role === 'segment').slice(0, 8).map((item) => item.url);
-      if (fragments.length) return fragments;
+      if (childManifests.length || fragments.length) return [...childManifests, ...fragments].slice(0, 8);
       return activeRepresentationHints(newest).slice(0, 8);
     })();
     return {

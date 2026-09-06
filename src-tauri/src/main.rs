@@ -1632,7 +1632,7 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
     for _ in 0..4 {
         let is_hls = manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
         if !is_hls { break; }
-        if let Some(sources) = media::hls_variant_tracks(&manifest_source, &manifest_body) { hls_track_sources = Some(sources); break; }
+        if let Some(sources) = media::hls_variant_tracks(&manifest_source, &manifest_body, &selected_segments) { hls_track_sources = Some(sources); break; }
         let Some(variant) = (if is_hls { media::hls_variant(&manifest_source, &manifest_body) } else { None }) else { break };
         let response = acquisition_request(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
         manifest_body = response.text().await.map_err(|error| error.to_string())?;

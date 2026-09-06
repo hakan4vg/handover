@@ -5205,3 +5205,46 @@ change and no site resolver exception:
   the unresolved Promise as `{}`. That probe-only error is retained at
   `/tmp/dm-public-internet-archive.log`; the helper was corrected and the
   fresh-profile retry above passed. No product source change was justified.
+
+## 2026-09-06 — TED media-controller HLS VOD capture
+
+- Added `fixtures/public_ted_chromium_probe.py` for a distinct public-player
+  family: TED's article page
+  `https://www.ted.com/talks/chris_anderson_ted_s_secret_to_great_public_speaking`.
+  The page uses a `media-controller` custom element, a light-DOM `video#video`,
+  and a finite HLS VOD source behind a blob MediaSource. This is not the
+  already-covered Media Chrome direct-MP4, hls.js selector, Kaltura, or
+  Internet Archive initiation path.
+- A fresh Chromium profile reached the real TED player after a trusted CDP
+  play click. Chromium reported `readyState=4`, `paused=false`, duration
+  `466.925` seconds, and a blob-backed `video#video`. The real injected
+  Download button was hit by trusted input; the probe recorded
+  `isTrusted=true`, `pointer-events=auto`, and `elementFromPoint` resolving to
+  `#dm-media-download-button`.
+- The extension/native path created exactly one provisional media job. The
+  captured finite HLS source was TED's `project_masters/4567/index-f14-v1.m3u8`
+  variant; query parameters are intentionally redacted from durable evidence.
+- The browser-context CDP Network readback observed the exact HLS response:
+  HTTP `206`, MIME `application/vnd.apple.mpegurl`, `6,309` bytes, SHA-256
+  `565c4eece889cecd83f507d17bee1ab3641c95577a6cb81339d2ee9d9a00f7b1`.
+  The independent HLS reference resolved `79` finite fragments and used the
+  resident's `ffmpeg -map 0 -c copy` mux path.
+- Resident `--commit` exited `0`. The sole managed job completed with
+  `provisional=false`; resident output and the independent reference matched
+  at `201,847,488` bytes, SHA-256
+  `0eaed4b40c70b7dfebf6994186af8d5bbfb7e6088e12f09acf71cfadbb15f8f3`.
+  Chromium Downloads stayed empty.
+- Exact retained green output is `/tmp/dm-public-ted-retry6.log`:
+  `TED: PASS (output_bytes=201847488,
+  output_sha256=0eaed4b40c70b7dfebf6994186af8d5bbfb7e6088e12f09acf71cfadbb15f8f3,
+  browser_source_bytes=6309,
+  browser_source_sha256=565c4eece889cecd83f507d17bee1ab3641c95577a6cb81339d2ee9d9a00f7b1,
+  jobs=1, browser_downloads=[])` and
+  `PUBLIC-TED-CHROMIUM-PROBE: PASS`.
+- The first TED attempts exposed only probe seams: `cdp_drive` is a CLI
+  helper with import-time argument parsing; the consent check initially counted
+  a hidden retained Osano node; the CDN rejected script CORS fetches and did
+  not render an HLS document view; TED's player mount and the injected-button
+  capture were timing-sensitive. The final probe fixes use no product change:
+  bounded player-mount waiting, visible consent geometry, and CDP
+  Network-response-body readback. No product defect was established.

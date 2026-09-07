@@ -6806,3 +6806,10 @@ change and no site resolver exception:
 - Added a focused deferred-promise regression. Its red baseline returned `SNAPSHOT_RACE_RED_RC=1`; the monotonic subscription guard returned `SNAPSHOT_RACE_FIXED_RC=0` and preserves the live update.
 - Full Vitest passed `18` files and `69/69` tests with no warnings. The real manager-controls Chromium probe returned `MANAGER_RC=0`. The existing responsive probe initially hit `127.0.0.1:4177` with no server; after starting its required disposable Vite server, all `900x600`, `841x560`, and `780x560` viewports passed with contained document/body dimensions. Evidence: `/tmp/dm-snapshot-race-manager-real.log` and `/tmp/dm-snapshot-race-responsive-real-retry.log`.
 - The corrected complete fail-fast gate is captured at `/tmp/dm-snapshot-race-full-gate-corrected.log` and returned `GATE_RC=0`: TypeScript, Vitest `69/69`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Show provisional-creation failures in Add Download
+
+- `AddDownloadWindow.submit()` previously used `finally` only. A rejected `onCreate()` promise escaped as an unhandled rejection, and the existing form-error region stayed empty in standalone Add windows.
+- Added a focused manual-add regression. The red baseline returned `ADD_WINDOW_ERROR_RED_RC=1`, including the unhandled `Native core unavailable` rejection; the fixed test returned `ADD_WINDOW_ERROR_FIXED_RC=0` and verifies the message in `role="alert"`.
+- The existing real `manual_add_ui_probe.py` completed the actual Add URL → native provisional → resident completion → commit path: `ADD_WINDOW_ERROR_REAL_RC=0`, one provisional job, one source request, `262144` output bytes, and SHA-256 `ac6533c30d2d4fcc01be82be68bd63a592d37c49fe769b05aebfb4504fa146b3`. Evidence: `/tmp/dm-add-window-error-real.log`.
+- The complete fail-fast gate is captured at `/tmp/dm-add-window-error-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `70/70`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

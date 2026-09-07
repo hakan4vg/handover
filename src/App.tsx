@@ -131,10 +131,11 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
   const selected = filteredJobs.find((job) => job.id === selectedId) ?? filteredJobs[0];
 
   useEffect(() => {
+    if (filter === ('settings' as FilterKey)) return;
     const nextVisibleId = filteredJobs[0]?.id ?? '';
     if (selectedId && filteredJobs.some((job) => job.id === selectedId)) return;
     if (selectedId !== nextVisibleId) setSelectedId(nextVisibleId);
-  }, [filteredJobs, selectedId]);
+  }, [filteredJobs, filter, selectedId]);
 
   useEffect(() => {
     if (!notice) return;
@@ -332,7 +333,7 @@ function titleFor(filter: FilterKey) {
 }
 
 function SidebarItem({ icon, label, count, active, onClick }: { icon: IconName; label: string; count?: number; active: boolean; onClick: () => void }) {
-  return <button className={`sidebar-item ${active ? 'selected' : ''}`} onClick={onClick}><Icon name={icon} size={18} /><span>{label}</span>{count !== undefined && <span className="nav-count">{count}</span>}</button>;
+  return <button className={`sidebar-item ${active ? 'selected' : ''}`} aria-current={active ? 'page' : undefined} onClick={onClick}><Icon name={icon} size={18} /><span>{label}</span>{count !== undefined && <span className="nav-count">{count}</span>}</button>;
 }
 
 export function SortMenu({ value, onChange }: { value: 'created' | 'name' | 'size' | 'state'; onChange: (value: 'created' | 'name' | 'size' | 'state') => void }) {
@@ -466,7 +467,7 @@ export function SettingsView({ adapter, settings, page, onPageChange }: { adapte
       setSaveError(errorMessage(reason, 'Could not save settings'));
     }
   };
-  return <main className="settings-main"><div className="settings-nav"><div className="settings-nav-title">Settings</div>{settingsNav.map((item) => <button className={`settings-nav-item ${page === item.key ? 'selected' : ''}`} key={item.key} onClick={() => onPageChange(item.key)}><Icon name={item.icon} size={17} /><span>{item.label}</span></button>)}</div><div className="settings-content">{saveError && <div className="form-error settings-error" role="alert"><Icon name="error" size={14} />{saveError}</div>}{page === 'general' && <GeneralSettings settings={settings} update={update} />}{page === 'downloads' && <DownloadSettings settings={settings} update={update} />}{page === 'browser' && <BrowserSettings settings={settings} update={update} />}{page === 'network' && <NetworkSettings settings={settings} update={update} />}{page === 'notifications' && <NotificationSettings settings={settings} update={update} />}{page === 'appearance' && <AppearanceSettings settings={settings} update={update} />}</div></main>;
+  return <main className="settings-main"><div className="settings-nav"><div className="settings-nav-title">Settings</div>{settingsNav.map((item) => <button className={`settings-nav-item ${page === item.key ? 'selected' : ''}`} key={item.key} aria-current={page === item.key ? 'page' : undefined} onClick={() => onPageChange(item.key)}><Icon name={item.icon} size={17} /><span>{item.label}</span></button>)}</div><div className="settings-content">{saveError && <div className="form-error settings-error" role="alert"><Icon name="error" size={14} />{saveError}</div>}{page === 'general' && <GeneralSettings settings={settings} update={update} />}{page === 'downloads' && <DownloadSettings settings={settings} update={update} />}{page === 'browser' && <BrowserSettings settings={settings} update={update} />}{page === 'network' && <NetworkSettings settings={settings} update={update} />}{page === 'notifications' && <NotificationSettings settings={settings} update={update} />}{page === 'appearance' && <AppearanceSettings settings={settings} update={update} />}</div></main>;
 }
 
 function SettingsHeading({ title, description }: { title: string; description?: string }) {

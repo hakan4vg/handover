@@ -125,6 +125,13 @@ def main() -> int:
             names = {item["name"] for item in current}
             assert len(current) == expected_count, (label, current)
             assert names == expected_names, (label, names, expected_names)
+            navigation = evaluate_json(
+                client,
+                "(()=>{const items=[...document.querySelectorAll('button.sidebar-item')];return items.map(item=>({text:item.textContent?.trim()||'',selected:item.classList.contains('selected'),current:item.getAttribute('aria-current')}));})()",
+            )
+            selected_navigation = [item for item in navigation if item["selected"]]
+            assert len(selected_navigation) == 1 and selected_navigation[0]["current"] == "page", (label, navigation)
+            assert all(item["current"] is None for item in navigation if not item["selected"]), (label, navigation)
             heading = evaluate_json(client, "{title:document.querySelector('.toolbar-heading h1')?.textContent?.trim()||'',count:document.querySelector('.heading-count')?.textContent?.trim()||''}")
             assert heading["count"] == str(expected_count), (label, heading)
             selected_names = [item["name"] for item in current if item["selected"]]
@@ -138,7 +145,36 @@ def main() -> int:
                 assert selected_heading == '', (label, selected_heading)
             observed[label] = {"count": len(current), "names": sorted(names), "heading": heading, "selected": selected_names, "inspector": selected_heading}
 
+        click_text(client, "button.sidebar-item", "Settings")
+        deadline = time.time() + 5
+        settings_navigation = {}
+        while time.time() < deadline:
+            settings_navigation = evaluate_json(
+                client,
+                "(()=>{const items=[...document.querySelectorAll('button.settings-nav-item')];return items.map(item=>({text:item.textContent?.trim()||'',selected:item.classList.contains('selected'),current:item.getAttribute('aria-current')}));})()",
+            )
+            if settings_navigation:
+                break
+            time.sleep(0.1)
+        selected_settings = [item for item in settings_navigation if item["selected"]]
+        assert len(selected_settings) == 1 and selected_settings[0]["text"] == "General" and selected_settings[0]["current"] == "page", settings_navigation
+        assert all(item["current"] is None for item in settings_navigation if not item["selected"]), settings_navigation
+        click_text(client, "button.settings-nav-item", "Browser Integration")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            settings_navigation = evaluate_json(
+                client,
+                "(()=>{const items=[...document.querySelectorAll('button.settings-nav-item')];return items.map(item=>({text:item.textContent?.trim()||'',selected:item.classList.contains('selected'),current:item.getAttribute('aria-current')}));})()",
+            )
+            selected_settings = [item for item in settings_navigation if item["selected"]]
+            if selected_settings and selected_settings[0]["text"] == "Browser Integration":
+                break
+            time.sleep(0.1)
+        assert len(selected_settings) == 1 and selected_settings[0]["current"] == "page", settings_navigation
+        assert all(item["current"] is None for item in settings_navigation if not item["selected"]), settings_navigation
         click_text(client, "button.sidebar-item", "All")
+        restored_selection = evaluate_json(client, "document.querySelector('.inspector-heading h2')?.textContent?.trim()||''")
+        assert restored_selection == "Big Buck Bunny (1080p).mkv", restored_selection
         click_text(client, ".subtle-button", "Sort")
         sort_state = evaluate_json(
             client,

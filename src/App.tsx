@@ -302,7 +302,7 @@ function SortMenu({ value, onChange }: { value: 'created' | 'name' | 'size' | 's
   return <div className="sort-menu">{options.map(([key, label]) => <button key={key} className={value === key ? 'selected' : ''} onClick={() => onChange(key)}><span>{label}</span>{value === key && <Icon name="check" size={14} />}</button>)}</div>;
 }
 
-function DownloadRow({ job, selected, onSelect, onPause, onResume, onRetry, onMenu }: { job: DownloadJob; selected: boolean; onSelect: () => void; onPause: () => void; onResume: () => void; onRetry: () => void; onMenu: () => void }) {
+export function DownloadRow({ job, selected, onSelect, onPause, onResume, onRetry, onMenu }: { job: DownloadJob; selected: boolean; onSelect: () => void; onPause: () => void; onResume: () => void; onRetry: () => void; onMenu: () => void }) {
   const isTransfer = ['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state);
   const stateLabel = stateText(job.state);
   const action = job.state === 'downloading' || job.state === 'connecting' || job.state === 'finalizing' ? onPause : job.state === 'paused' || job.state === 'pending' ? onResume : job.state === 'failed' ? onRetry : undefined;
@@ -315,7 +315,7 @@ function DownloadRow({ job, selected, onSelect, onPause, onResume, onRetry, onMe
       <div className="row-meta"><span>{formatBytes(job.downloaded)}{job.total ? ` / ${formatBytes(job.total)}` : ''}</span><span>{job.eta ?? (job.state === 'completed' ? 'Completed' : '—')}</span>{job.mediaDetails && <span>{job.mediaDetails}</span>}{isTransfer && <span>{job.connections ? `${job.connections} connection${job.connections === 1 ? '' : 's'}` : 'No active connections'}</span>}</div>
     </div>
     <div className="row-speed">{job.speed ? formatSpeed(job.speed) : job.state === 'completed' ? formatBytes(job.total) : '—'}</div>
-    <div className="row-actions">{action && <button className="row-action" aria-label={job.state === 'failed' ? 'Retry' : job.state === 'paused' || job.state === 'pending' ? 'Resume' : 'Pause'} onClick={(event) => { event.stopPropagation(); action(); }}><Icon name={job.state === 'failed' ? 'refresh' : job.state === 'paused' || job.state === 'pending' ? 'play' : 'pause'} size={16} /></button>}<button className="row-action" aria-label="More actions" onClick={(event) => { event.stopPropagation(); onMenu(); }}><Icon name="more" size={16} /></button></div>
+    <div className="row-actions">{action && <button className="row-action" aria-label={job.state === 'failed' ? `Retry ${job.name}` : job.state === 'paused' || job.state === 'pending' ? `Resume ${job.name}` : `Pause ${job.name}`} onClick={(event) => { event.stopPropagation(); action(); }}><Icon name={job.state === 'failed' ? 'refresh' : job.state === 'paused' || job.state === 'pending' ? 'play' : 'pause'} size={16} /></button>}<button className="row-action" aria-label={`More actions for ${job.name}`} onClick={(event) => { event.stopPropagation(); onMenu(); }}><Icon name="more" size={16} /></button></div>
   </article>;
 }
 

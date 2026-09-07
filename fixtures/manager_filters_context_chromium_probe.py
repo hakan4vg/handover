@@ -142,7 +142,7 @@ def main() -> int:
         target = evaluate_json(
             client,
             "(()=>{const row=[...document.querySelectorAll('.download-row')].find(item=>item.querySelector('.row-title-line strong')?.textContent?.trim()==='backup-manifest.json');"
-            "const button=row?.querySelector('button[aria-label=\"More actions\"]');if(!row||!button)return {error:'target missing'};row.scrollIntoView({block:'center'});"
+            "const button=row?.querySelector('button[aria-label^=\"More actions for \"]');if(!row||!button)return {error:'target missing'};row.scrollIntoView({block:'center'});"
             "const r=button.getBoundingClientRect();return {x:r.left+3,y:r.top+3,row:row.querySelector('.row-title-line strong').textContent.trim()};})()",
         )
         if target.get("error"):

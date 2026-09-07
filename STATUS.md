@@ -6915,3 +6915,11 @@ change and no site resolver exception:
 - The focused regression returned `ADD_ACCESSIBILITY_FIXED_RC=0` (`1/1`) and TypeScript returned `ADD_ACCESSIBILITY_TSC_RC=0`. Evidence: `/tmp/dm-add-accessibility-fixed.log` and `/tmp/dm-add-accessibility-tsc.log`.
 - Real Chromium readback returned `advanced=true`, `Source URL`, `Filename`, `Save destination`, `Per-download maximum connections`, `Per-download bandwidth limit`, `Per-download bandwidth unit`, and a two-radio `Per-download bandwidth cap` group. Evidence: `/tmp/dm-add-accessibility-real-fixed.log` and `/tmp/dm-add-accessibility-real-fixed.png`.
 - The complete fail-fast gate returned `ADD_ACCESSIBILITY_GATE_RC=0`: Vitest `24` files/`80` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-add-accessibility-full-gate.log`.
+
+## 2026-09-07 — Identify Download row actions
+
+- Manager row actions exposed only generic names such as `Pause`, `Retry`, and `More actions`, leaving screen-reader users to infer which job each control affected. The focused regression reproduced `Pause` instead of `Pause project-assets.zip` at `/tmp/dm-row-labels-red.log` (`ROW_LABELS_RED_RC=1`).
+- Row state actions now say `Pause <job>`, `Resume <job>`, or `Retry <job>`, and overflow actions say `More actions for <job>`. The existing real filter/context probe was updated only to match the new prefix; click routing and menu behavior are unchanged.
+- The focused regression returned `ROW_LABELS_FIXED_RC=0` with `2/2` tests across downloading, paused, pending, failed, and completed states. TypeScript and the updated probe compilation returned `ROW_LABELS_TSC_RC=0` and `ROW_LABELS_PROBE_COMPILE_RC=0`. Evidence: `/tmp/dm-row-labels-fixed.log`, `/tmp/dm-row-labels-tsc.log`, and the probe compile command output.
+- Real Chromium filter/context verification returned `ROW_LABELS_MANAGER_REAL_RC=0`: all filter counts and selections, keyboard row selection, context-menu targeting, removal, and selection preservation passed. Evidence: `/tmp/dm-row-labels-manager-real.log`.
+- The complete fail-fast gate returned `ROW_LABELS_GATE_RC=0`: Vitest `25` files/`82` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-row-labels-full-gate.log`.

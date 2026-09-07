@@ -346,6 +346,8 @@ function EmptyState({ filter, onAdd }: { filter: FilterKey; onAdd: () => void })
 export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter: DownloadAdapter; onClose: () => void }) {
   const [tab, setTab] = useState<'Overview' | 'Network' | 'Media' | 'Files' | 'Log'>('Overview');
   const [pathError, setPathError] = useState('');
+  const [removeError, setRemoveError] = useState('');
+  const [removing, setRemoving] = useState(false);
   const availableTabs = job.media ? ['Overview', 'Network', 'Media', 'Files', 'Log'] as const : ['Overview', 'Network', 'Files', 'Log'] as const;
   useEffect(() => { if (!availableTabs.includes(tab as never)) setTab('Overview'); }, [job.id, job.media]);
   const openPath = (path: string) => {
@@ -355,7 +357,19 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
   const openFile = () => openPath(job.destination);
   const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
   const openFolder = () => openPath(folder);
-  return <aside className="inspector"><div className="inspector-tabs">{availableTabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll"><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} onOpen={openFolder} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile}><Icon name="open" size={15} /> Open file</button><button className="button" onClick={() => adapter.removeJob(job.id)}><Icon name="delete" size={15} /> Remove</button></div></aside>;
+  const remove = async () => {
+    setRemoveError('');
+    setRemoving(true);
+    try {
+      await adapter.removeJob(job.id);
+      onClose();
+    } catch (reason) {
+      setRemoveError(reason instanceof Error && reason.message ? reason.message : 'Could not remove the download.');
+    } finally {
+      setRemoving(false);
+    }
+  };
+  return <aside className="inspector"><div className="inspector-tabs">{availableTabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll"><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} onOpen={openFolder} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile}><Icon name="open" size={15} /> Open file</button><button className="button" disabled={removing} onClick={() => void remove()}><Icon name="delete" size={15} /> {removing ? 'Removing…' : 'Remove'}</button></div></aside>;
 }
 
 function DetailGrid({ items }: { items: Array<{ label: string; value: string; tone?: string }> }) {

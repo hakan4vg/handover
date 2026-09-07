@@ -6829,3 +6829,18 @@ change and no site resolver exception:
 - The focused cancellation regression initially returned `ADD_WINDOW_CANCEL_ERROR_RED_RC=1`; the fixed combined Add-window set returned `ADD_WINDOW_CANCEL_ERROR_FIXED_RC=0` (`6/6`) with no warnings. Full Vitest later passed `21/21` files and `72/72` tests with no warnings.
 - The existing real manual Add probe was attempted at `/tmp/dm-add-window-cancel-real.log` but stopped before product interaction at the known external boundary: `WebKit inspector did not become ready: [Errno 111] Connection refused`. No real cancellation acceptance claim is made for that run.
 - The complete fail-fast gate is captured at `/tmp/dm-add-window-cancel-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `72/72`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Close-to-tray lifecycle re-audit boundary
+
+- Consumed both earlier red re-audits, `/tmp/dm-close-to-tray-reaudit.log` and `/tmp/dm-close-to-tray-reaudit-retry.log`. Both stop in `wait_inspector()` with `WebKit inspector did not become ready: [Errno 111] Connection refused` before `wait_tauri()`, before any window lookup or user action.
+- Ran the requested fresh clean-state current-build probe. `/tmp/dm-close-to-tray-current.log` returned `CLOSE_TRAY_CURRENT_RC=1` with the same traceback and exact inspector connection-refused error. The run did not reach the close button, X11 map-state check, tray reopen, or exit assertions, so it is not product lifecycle evidence.
+- Reviewed the native wiring in `src-tauri/src/main.rs`: the main `CloseRequested` handler prevents close and hides `main` when `closeBehavior=tray`; the native tray `open-manager` item shows and focuses `main`. No lifecycle production change was made without a reachable product failure.
+- The resident/process cleanup check after the blocked run found no Download Manager or Xvfb process left by the probe. This remains an external WebKit Inspector startup boundary; prior corrected close-to-tray acceptance remains the latest valid evidence.
+
+## 2026-09-07 — Inspector removal failure feedback
+
+- The Inspector `Remove` button previously called `adapter.removeJob(job.id)` without awaiting or handling rejection. A native/database failure could leave the user with no feedback and an unhandled promise.
+- Added `src/inspector-remove.test.tsx`. Its red baseline returned `INSPECTOR_REMOVE_RED_RC=1` because no `role="alert"` was rendered after `removeJob` rejected with `Native core unavailable`.
+- `Inspector` now awaits removal, closes only after success, and keeps the Inspector open with a visible error alert on synchronous or asynchronous failure. The button is disabled and labelled `Removing…` while the operation is pending.
+- The existing real manager-controls Chromium probe passed after the change with all previously covered inline pause/resume/retry, bulk controls, sorting, transient-menu dismissal, and Add URL checks: `/tmp/dm-inspector-remove-manager-real-retry.log`, `MANAGER-INLINE-CONTROLS: PASS`.
+- The complete fail-fast gate is captured at `/tmp/dm-inspector-remove-full-gate.log` and returned `INSPECTOR_REMOVE_GATE_RC=0`: focused Inspector removal `1/1`, TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

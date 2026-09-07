@@ -94,6 +94,24 @@ def main() -> int:
         client = public.connect_chrome(chrome_port)
         wait_page(client)
 
+        keyboard = evaluate_json(
+            client,
+            "(()=>{const row=[...document.querySelectorAll('.download-row')].find(item=>item.querySelector('.row-title-line strong')?.textContent?.trim()==='project-assets.zip');"
+            "if(!row)return {error:'keyboard target missing'};row.focus();row.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true}));"
+            "return {role:row.getAttribute('role'),tabIndex:row.tabIndex,focused:document.activeElement===row};})()",
+        )
+        assert not keyboard.get("error"), keyboard
+        assert keyboard["role"] == "button" and keyboard["tabIndex"] >= 0 and keyboard["focused"], keyboard
+        deadline = time.time() + 5
+        keyboard_heading = ""
+        while time.time() < deadline:
+            keyboard_heading = evaluate_json(client, "document.querySelector('.inspector-heading h2')?.textContent?.trim()||''")
+            if keyboard_heading == "project-assets.zip":
+                break
+            time.sleep(0.1)
+        assert keyboard_heading == "project-assets.zip", keyboard_heading
+        click_text(client, ".download-row .row-title-line strong", "Big Buck Bunny")
+
         observed: dict[str, dict] = {}
         for label, (expected_count, expected_names) in EXPECTED.items():
             click_text(client, "button.sidebar-item", label)

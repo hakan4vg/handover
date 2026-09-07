@@ -303,7 +303,7 @@ function DownloadRow({ job, selected, onSelect, onPause, onResume, onRetry, onMe
   const isTransfer = ['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state);
   const stateLabel = stateText(job.state);
   const action = job.state === 'downloading' || job.state === 'connecting' || job.state === 'finalizing' ? onPause : job.state === 'paused' || job.state === 'pending' ? onResume : job.state === 'failed' ? onRetry : undefined;
-  return <article className={`download-row ${selected ? 'selected' : ''}`} onClick={onSelect}>
+  return <article className={`download-row ${selected ? 'selected' : ''}`} role="button" tabIndex={0} aria-pressed={selected} onClick={onSelect} onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(); } }}>
     <div className="file-cell"><FileIcon kind={job.kind} /><span className="file-type">{typeLabel(job.name)}</span></div>
     <div className="row-main">
       <div className="row-title-line"><strong title={job.name}>{job.name}</strong><span className={`state ${stateTone(job.state)}`}>{stateLabel}</span></div>

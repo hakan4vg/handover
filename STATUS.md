@@ -6852,3 +6852,11 @@ change and no site resolver exception:
 - `Manager` now derives its selected job from `filteredJobs` and synchronizes `selectedId` to the first visible job when the current selection leaves the filter. Empty filters no longer fall back to an unrelated global job.
 - The existing filter/context Chromium probe returned `FILTER_SELECTION_FIXED_RC=0`. It passed selection and matching Inspector headings for `All`, `Active`, `Completed`, `Failed`, `Media`, and `Paused`, and retained its context-menu targeting checks. Evidence: `/tmp/dm-filter-selection-fixed.log`.
 - The complete fail-fast gate is captured at `/tmp/dm-filter-selection-full-gate.log` and returned `FILTER_SELECTION_GATE_RC=0`: TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Make download rows keyboard-selectable
+
+- Download rows were clickable `<article>` elements but had no focus target or keyboard activation. The existing manager probe’s generalized accessibility assertion was red at `/tmp/dm-row-keyboard-red.log`: `role=None`, `tabIndex=-1`, and `focused=False`.
+- Rows now expose `role="button"`, `tabIndex=0`, and `aria-pressed`, and Enter/Space selects the focused row. Keyboard events from nested Pause/Resume/Retry and More actions do not select the row.
+- The existing filter/context Chromium probe returned `ROW_KEYBOARD_FIXED_RC=0` and still passed every filter-selection and context-menu assertion. It selected `project-assets.zip` through Enter before restoring the normal selection. Evidence: `/tmp/dm-row-keyboard-fixed.log`.
+- Focused TypeScript and Vitest checks returned `ROW_KEYBOARD_FOCUSED_RC=0`; full Vitest was `22` files/`73` tests with no warnings. Evidence: `/tmp/dm-row-keyboard-focused.log`.
+- The complete fail-fast gate is captured at `/tmp/dm-row-keyboard-full-gate.log` and returned `ROW_KEYBOARD_GATE_RC=0`: TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

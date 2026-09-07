@@ -109,7 +109,16 @@ def main() -> int:
             assert names == expected_names, (label, names, expected_names)
             heading = evaluate_json(client, "{title:document.querySelector('.toolbar-heading h1')?.textContent?.trim()||'',count:document.querySelector('.heading-count')?.textContent?.trim()||''}")
             assert heading["count"] == str(expected_count), (label, heading)
-            observed[label] = {"count": len(current), "names": sorted(names), "heading": heading}
+            selected_names = [item["name"] for item in current if item["selected"]]
+            selected_heading = evaluate_json(client, "document.querySelector('.inspector-heading h2')?.textContent?.trim()||''")
+            expected_selected = 1 if expected_count else 0
+            assert len(selected_names) == expected_selected, (label, "selected rows", selected_names)
+            if expected_count:
+                assert selected_names[0] in expected_names, (label, selected_names, expected_names)
+                assert selected_heading == selected_names[0], (label, selected_heading, selected_names)
+            else:
+                assert selected_heading == '', (label, selected_heading)
+            observed[label] = {"count": len(current), "names": sorted(names), "heading": heading, "selected": selected_names, "inspector": selected_heading}
 
         click_text(client, "button.sidebar-item", "All")
         target = evaluate_json(

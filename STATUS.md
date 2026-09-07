@@ -6844,3 +6844,11 @@ change and no site resolver exception:
 - `Inspector` now awaits removal, closes only after success, and keeps the Inspector open with a visible error alert on synchronous or asynchronous failure. The button is disabled and labelled `Removing…` while the operation is pending.
 - The existing real manager-controls Chromium probe passed after the change with all previously covered inline pause/resume/retry, bulk controls, sorting, transient-menu dismissal, and Add URL checks: `/tmp/dm-inspector-remove-manager-real-retry.log`, `MANAGER-INLINE-CONTROLS: PASS`.
 - The complete fail-fast gate is captured at `/tmp/dm-inspector-remove-full-gate.log` and returned `INSPECTOR_REMOVE_GATE_RC=0`: focused Inspector removal `1/1`, TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Keep Inspector selection inside the active filter
+
+- The existing `fixtures/manager_filters_context_chromium_probe.py` showed a reachable inconsistency: changing from `All` to a filter could leave no visible row selected while the Inspector continued showing the previously selected job from another filter.
+- The generalized selection assertion was red before the product change: `FILTER_SELECTION_RED_RC=1`, with `Paused` showing one row, `selected=[]`, and the stale active Inspector. No new scenario-specific harness was added.
+- `Manager` now derives its selected job from `filteredJobs` and synchronizes `selectedId` to the first visible job when the current selection leaves the filter. Empty filters no longer fall back to an unrelated global job.
+- The existing filter/context Chromium probe returned `FILTER_SELECTION_FIXED_RC=0`. It passed selection and matching Inspector headings for `All`, `Active`, `Completed`, `Failed`, `Media`, and `Paused`, and retained its context-menu targeting checks. Evidence: `/tmp/dm-filter-selection-fixed.log`.
+- The complete fail-fast gate is captured at `/tmp/dm-filter-selection-full-gate.log` and returned `FILTER_SELECTION_GATE_RC=0`: TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

@@ -106,7 +106,6 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
 
   const active = snapshot.jobs.filter((job) => ['connecting', 'downloading', 'finalizing'].includes(job.state));
   const paused = snapshot.jobs.filter((job) => job.state === 'paused' || job.state === 'pending');
-  const selected = snapshot.jobs.find((job) => job.id === selectedId) ?? snapshot.jobs[0];
   const contextJob = contextJobId ? snapshot.jobs.find((job) => job.id === contextJobId) : undefined;
   const filteredJobs = useMemo(() => {
     const jobs = snapshot.jobs.filter((job) => {
@@ -123,10 +122,13 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
       return snapshot.jobs.indexOf(left) - snapshot.jobs.indexOf(right);
     });
   }, [filter, snapshot.jobs, sortBy]);
+  const selected = filteredJobs.find((job) => job.id === selectedId) ?? filteredJobs[0];
 
   useEffect(() => {
-    if (!selectedId || !snapshot.jobs.some((job) => job.id === selectedId)) setSelectedId(snapshot.jobs[0]?.id ?? '');
-  }, [selectedId, snapshot.jobs]);
+    const nextVisibleId = filteredJobs[0]?.id ?? '';
+    if (selectedId && filteredJobs.some((job) => job.id === selectedId)) return;
+    if (selectedId !== nextVisibleId) setSelectedId(nextVisibleId);
+  }, [filteredJobs, selectedId]);
 
   useEffect(() => {
     if (!notice) return;

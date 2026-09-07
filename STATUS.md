@@ -6762,3 +6762,24 @@ change and no site resolver exception:
   `71/71`, both production builds, Cargo build, Python compilation, and
   `git diff --check`:
   `/tmp/dm-browser-policy-load-full-gate.log`.
+
+## 2026-09-07 — Distinguish success and failure toasts
+
+- The main UI stored success and error messages in the same string and always
+  rendered a green check icon. A failed pause, retry, cancel, or acquisition
+  action could therefore look successful.
+- `src/App.tsx` now carries a success/error tone through the shared action
+  wrapper, manual acquisition, and context-menu paths. `NoticeToast` renders
+  error messages as an assertive alert with an error icon; `src/styles.css`
+  gives them a red treatment.
+- The focused toast test was red before the fix (`NOTICE_TOAST_RED_RC=1`):
+  `/tmp/dm-notice-toast-red.log`.
+- The fixed toast test passed (`NOTICE_TOAST_FIXED_RC=0`):
+  `/tmp/dm-notice-toast-fixed.log`.
+- The existing real Chromium manager-controls probe passed with pause/resume,
+  retry, bulk controls, sort-menu dismissal, and Add URL behavior:
+  `/tmp/dm-notice-toast-real.log`.
+- The fail-fast aggregate gate returned `GATE_RC=0` with Vitest `63/63`, Rust
+  `71/71`, both production builds, Cargo build, Python compilation, and
+  `git diff --check`:
+  `/tmp/dm-notice-toast-full-gate.log`.

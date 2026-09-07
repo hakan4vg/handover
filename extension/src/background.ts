@@ -1,5 +1,5 @@
 import { DEFAULT_POLICY, NATIVE_HOST, isHttp, type BrowserPolicy } from './shared';
-import { chooseMediaSelection, choosePlayerEvidence, mediaKindFor, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
+import { choosePlayerEvidence, chooseWorkerMediaSelection, isMediaCandidate, mediaKindFor, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 
@@ -196,7 +196,10 @@ chrome.webRequest.onResponseStarted.addListener(
     if (details.tabId < 0) return;
     const type = details.type;
     if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return;
-    rememberMedia(details.url, details.tabId, details.frameId, undefined, details.documentId);
+    const role = roleFor(details.url);
+    const kind = mediaKindFor(details.url);
+    if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return;
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind);
   },
   { urls: ['<all_urls>'] },
 );
@@ -208,7 +211,9 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return undefined;
     const contentType = details.responseHeaders?.find((header) => header.name.toLowerCase() === 'content-type')?.value ?? '';
     const role = roleFor(details.url, contentType);
-    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, activePlayerKey(details.tabId, details.frameId, details.documentId), mediaKindFor(details.url, contentType));
+    const kind = mediaKindFor(details.url, contentType);
+    if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return undefined;
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, activePlayerKey(details.tabId, details.frameId, details.documentId), kind);
     return undefined;
   },
   { urls: ['<all_urls>'] },
@@ -337,7 +342,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       let selectedSegments: string[] = [];
       if (!isHttp(source) && sender.tab?.id !== undefined) {
         // blob:/MSE player — resolve to the real traffic behind the element.
-        const selection = chooseMediaSelection(recentMedia, sender.tab.id, sender.frameId ?? 0, playerKey, documentId);
+        const selection = chooseWorkerMediaSelection(recentMedia, recentPlayers, sender.tab.id, sender.frameId ?? 0, playerKey, documentId);
         source = selection?.source ?? '';
         selectedSegments = selection?.selectedSegments ?? [];
       }

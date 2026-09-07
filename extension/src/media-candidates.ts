@@ -84,6 +84,12 @@ export function isLikelyRepresentation(url: string): boolean {
   }
 }
 
+export function isMediaCandidate(candidate: Pick<MediaCandidate, 'url' | 'role' | 'kind'>): boolean {
+  return candidate.role !== 'unknown'
+    || (candidate.kind !== undefined && candidate.kind !== 'unknown')
+    || isLikelyRepresentation(candidate.url);
+}
+
 function activeRepresentationHints(candidates: MediaCandidate[]): string[] {
   const representations = candidates.filter((item) => item.role === 'unknown' && isLikelyRepresentation(item.url));
   if (!representations.length) return [];
@@ -155,4 +161,57 @@ export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number
 
 export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): string | undefined {
   return chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId)?.source;
+}
+
+// Some players fetch blob/MSE media through a worker. Chromium can attribute
+// those worker requests to frame 0 even when the clicked media element lives in
+// a child frame with a different documentId. Keep the normal document-scoped
+// selection first. Only use the frame-0 fallback when one fresh visible/playing
+// player is the sole active player in the tab and exactly one unowned media URL
+// is available; otherwise refusing is safer than cross-player capture.
+export function chooseWorkerMediaSelection(
+  candidates: MediaCandidate[],
+  players: MediaPlayerEvidence[],
+  tabId: number,
+  frameId: number,
+  playerKey?: string,
+  documentId?: string,
+  now = Date.now(),
+): MediaSelection | undefined {
+  const direct = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId);
+  if (direct || frameId === 0 || !playerKey) return direct;
+
+  const freshPlayer = players.some((item) =>
+    item.tabId === tabId &&
+    item.frameId === frameId &&
+    item.playerKey === playerKey &&
+    (!documentId || item.documentId === documentId) &&
+    now - item.at <= 15_000 &&
+    item.playing &&
+    item.visible,
+  );
+  if (!freshPlayer) return undefined;
+
+  const activeKeys = new Set(
+    players
+      .filter((item) => item.tabId === tabId && now - item.at <= 15_000 && item.playing && item.visible)
+      .map((item) => item.playerKey),
+  );
+  if (activeKeys.size !== 1 || !activeKeys.has(playerKey)) return undefined;
+
+  const workerCandidates = candidates.filter((item) =>
+    item.tabId === tabId &&
+    item.frameId === 0 &&
+    !item.playerKey &&
+    now - item.at <= 90_000 &&
+    item.at - now <= 5_000 &&
+    isMediaCandidate(item)
+  );
+  const mediaSources = new Set(workerCandidates.filter((item) => item.role !== 'segment').map((item) => item.url));
+  if (mediaSources.size !== 1 || !workerCandidates.some((item) => item.documentId !== documentId)) return undefined;
+  const selection = chooseMediaSelection(workerCandidates, tabId, 0);
+  if (!selection) return undefined;
+  return workerCandidates.some((item) => item.role === 'manifest' || item.role === 'segment')
+    ? selection
+    : { ...selection, selectedSegments: [] };
 }

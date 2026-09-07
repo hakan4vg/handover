@@ -6530,3 +6530,47 @@ change and no site resolver exception:
   `http://clappr.io/highline.mp4` source did not become a playable player. This
   is recorded as a page/player boundary; no Download Manager acceptance claim
   or workaround was added.
+
+## 2026-09-07 — Xigua/xgplayer MSE worker-source attribution
+
+- The official Xigua/xgplayer examples page
+  `https://h5player.bytedance.com/en/examples/` exposed a real finite child-frame
+  video. The player was visible, playing, `readyState=4`, and `90.08` seconds
+  long. Its media element exposed a `blob:` URL while Chromium observed the
+  underlying progressive MP4 at
+  `https://sf1-cdn-tos.huoshanstatic.com/obj/media-fe/xgplayer_doc_video/mp4/xgplayer-demo-360p.mp4`.
+- The first guarded implementation correctly refused the capture rather than
+  trusting an unscoped recent request: the clicked player was frame `3` with a
+  child `documentId`, while the worker requests were frame `0`. The fresh
+  diagnostic showed `workerCount=60`, all `unknown`, and the ring had been filled
+  by page JavaScript assets before the click. This was a generalized observation
+  bug, not an Xigua-specific resolver problem.
+- Fixed the generic path in `extension/src/background.ts` and
+  `extension/src/media-candidates.ts`: a shared media-shape predicate retains
+  response traffic only when it is a media/manifest/segment role, has an audio
+  or video MIME-derived kind, or has a media-file URL. The guarded frame-zero
+  worker fallback applies that same predicate and still requires a fresh,
+  visible, playing sole player plus exactly one unowned source. Generic page
+  assets cannot evict the observed media or become a cross-player selection.
+- Added focused regression coverage in `extension/src/shared.test.ts` for the
+  media-shape predicate, the JavaScript-asset flood, sole-player fallback,
+  competing-player refusal, and multiple-source refusal. The new regression was
+  observed red (`31 tests | 1 failed`) before the production change, then green.
+- The tracked real Chromium probe
+  `fixtures/public_xgplayer_chromium_probe.py` now passes the complete browser →
+  extension → native provisional job → resident commit → independent browser
+  reference loop. A trusted child-frame Download click created exactly one
+  media job. Resident `--commit` exited `0`; the job ended `completed` with
+  `provisional=false`; Chromium Downloads remained empty. The fresh tracked
+  evidence is `/tmp/dm-public-xgplayer-tracked-fix.log`.
+- The managed output
+  `/tmp/dm-xgplayer-iframe-video-chromium-i8yz0psn/Managed/xgplayer-iframe-video.mp4`
+  is `4,691,480` bytes with SHA-256
+  `5b38348290651df564ec88abaf1927d4278c9c46d53b638e3d1f13903150835b`, exactly
+  matching the independent browser reference. `ffprobe` reports MP4,
+  H.264 `640x360`, AAC `48,000 Hz` stereo, duration `90.080000`.
+- Exact probe result: `XGPLAYER-CHROMIUM-PROBE: PASS`, with `traffic=7`,
+  `jobs=1`, and `browser_downloads=[]`. Full verification after the fix passed
+  Vitest `55/55`, TypeScript, frontend and extension builds, Rust `70/70`,
+  Cargo build, Python compilation, and `git diff --check`. No site-specific
+  resolver was added.

@@ -4,6 +4,8 @@ import {
   chooseMediaCandidate,
   chooseMediaSelection,
   choosePlayerEvidence,
+  chooseWorkerMediaSelection,
+  isMediaCandidate,
   isSubtitlePlaylist,
   mediaKindFor,
   roleFor,
@@ -89,6 +91,13 @@ describe('DEFAULT_POLICY', () => {
 });
 
 describe('media candidate selection', () => {
+  it('classifies media-shaped traffic without retaining generic page assets', () => {
+    expect(isMediaCandidate({ url: 'https://cdn.test/assets/player.js', role: 'unknown', kind: 'unknown' })).toBe(false);
+    expect(isMediaCandidate({ url: 'https://cdn.test/vod/asset.mp4', role: 'unknown', kind: 'unknown' })).toBe(true);
+    expect(isMediaCandidate({ url: 'https://cdn.test/vod/asset', role: 'unknown', kind: 'video' })).toBe(true);
+    expect(isMediaCandidate({ url: 'https://cdn.test/vod/segment', role: 'segment', kind: 'unknown' })).toBe(true);
+  });
+
   it('classifies HLS/DASH manifests and fragment traffic', () => {
     expect(roleFor('https://cdn.test/vod/playlist.m3u8')).toBe('manifest');
     expect(roleFor('https://cdn.test/vod/manifest', 'application/dash+xml')).toBe('manifest');
@@ -252,5 +261,55 @@ describe('media candidate selection', () => {
       { playerKey: 'new', tabId: 4, frameId: 0, documentId: 'doc-new', at: 998, active: false, hovered: false, playing: true, visible: true },
     ];
     expect(choosePlayerEvidence(players, 4, 0, 1000, 'doc-new')?.playerKey).toBe('new');
+  });
+
+  it('uses one unowned frame-zero worker source for a sole child player', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
+    ];
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, active: true, hovered: false, playing: true, visible: true },
+    ];
+    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 100)).toEqual({
+      source: 'https://cdn.test/vod/xgplayer-demo.mp4',
+      selectedSegments: [],
+    });
+  });
+
+  it('refuses frame-zero worker fallback when another player is active', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
+    ];
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, active: true, hovered: false, playing: true, visible: true },
+      { playerKey: 'other-player', tabId: 4, frameId: 5, documentId: 'other-doc', at: 100, active: false, hovered: false, playing: true, visible: true },
+    ];
+    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 100)).toBeUndefined();
+  });
+
+  it('refuses frame-zero worker fallback when several unowned sources exist', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/one.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
+      { url: 'https://cdn.test/vod/two.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 101, role: 'unknown' },
+    ];
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 101, active: true, hovered: false, playing: true, visible: true },
+    ];
+    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 101)).toBeUndefined();
+  });
+
+  it('ignores unclassified worker page assets when selecting a progressive media source', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/assets/player.js', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
+      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 101, role: 'unknown', kind: 'video' },
+      { url: 'https://cdn.test/assets/chunk.js', tabId: 4, frameId: 0, documentId: 'top-doc', at: 102, role: 'unknown' },
+    ];
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 102, active: true, hovered: false, playing: true, visible: true },
+    ];
+    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 102)).toEqual({
+      source: 'https://cdn.test/vod/xgplayer-demo.mp4',
+      selectedSegments: [],
+    });
   });
 });

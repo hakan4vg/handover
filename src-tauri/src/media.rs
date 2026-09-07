@@ -390,6 +390,7 @@ struct DashSegmentBaseCandidate {
 
 struct DashTrackBuilder {
     kind: String,
+    unsupported_kind: bool,
     base_urls: Vec<String>,
     segment_refs: Vec<(String, Option<(u64, u64)>)>,
     template: Option<DashTemplate>,
@@ -406,9 +407,10 @@ struct DashTrackBuilder {
 }
 
 impl DashTrackBuilder {
-    fn new(kind: Option<String>) -> Self { Self { kind: kind.as_deref().and_then(track_kind).unwrap_or_default(), base_urls: Vec::new(), segment_refs: Vec::new(), template: None, representation_id: String::new(), bandwidth: String::new(), representation_ids: Vec::new(), selected_representation: false, representation_open: false, base_text_depth: None, segment_base: false, segment_base_candidates: Vec::new(), active_representation: None, active_segment_base: None } }
+    fn new(kind: Option<String>) -> Self { Self { kind: kind.as_deref().and_then(track_kind).unwrap_or_default(), unsupported_kind: kind.as_deref().map_or(false, |value| track_kind(value).is_none()), base_urls: Vec::new(), segment_refs: Vec::new(), template: None, representation_id: String::new(), bandwidth: String::new(), representation_ids: Vec::new(), selected_representation: false, representation_open: false, base_text_depth: None, segment_base: false, segment_base_candidates: Vec::new(), active_representation: None, active_segment_base: None } }
 
     fn finish(self, source: &str, inherited_base: Option<&str>, presentation_duration: Option<u64>, selected_segments: &[String]) -> Option<MediaTrack> {
+        if self.unsupported_kind { return None; }
         if self.segment_base {
             let candidate = if selected_segments.is_empty() {
                 self.segment_base_candidates.first()?
@@ -835,6 +837,13 @@ mod tests {
         assert_eq!(tracks.iter().map(|track| track.kind.as_str()).collect::<Vec<_>>(), ["video", "audio"]);
         assert_eq!(tracks[0].segments[1].url, "https://cdn.example.test/v/one.m4s");
         assert_eq!(tracks[1].segments[1].url, "https://cdn.example.test/a/one.m4s");
+    }
+
+    #[test]
+    fn ignores_non_audio_video_dash_adaptations() {
+        let body = "<MPD type=\"static\" mediaPresentationDuration=\"PT4S\"><Period><AdaptationSet contentType=\"video\"><Representation id=\"v\"><BaseURL>https://cdn.example.test/v/</BaseURL><SegmentList><Initialization sourceURL=\"init.m4s\"/><SegmentURL media=\"one.m4s\"/></SegmentList></Representation></AdaptationSet><AdaptationSet contentType=\"audio\"><Representation id=\"a\"><BaseURL>https://cdn.example.test/a/</BaseURL><SegmentList><Initialization sourceURL=\"init.m4s\"/><SegmentURL media=\"one.m4s\"/></SegmentList></Representation></AdaptationSet><AdaptationSet contentType=\"image\" mimeType=\"image/jpeg\"><SegmentTemplate timescale=\"1\" duration=\"2\" media=\"tile-$Number$.jpg\"/><Representation id=\"thumbs\"><BaseURL>https://cdn.example.test/t/</BaseURL></Representation></AdaptationSet></Period></MPD>";
+        let tracks = parse_dash_tracks("https://cdn.example.test/manifest.mpd", body).expect("audio/video tracks");
+        assert_eq!(tracks.iter().map(|track| track.kind.as_str()).collect::<Vec<_>>(), ["video", "audio"]);
     }
 
     #[test]

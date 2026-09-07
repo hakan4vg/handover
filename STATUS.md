@@ -6574,3 +6574,42 @@ change and no site resolver exception:
   Vitest `55/55`, TypeScript, frontend and extension builds, Rust `70/70`,
   Cargo build, Python compilation, and `git diff --check`. No site-specific
   resolver was added.
+
+## 2026-09-07 — Hexaglobe Player DASH thumbnail-adaptation filtering
+
+- The official Hexaglobe Player fully featured VOD page
+  `https://player-demo.hexaglobe.net/vod-fully-featured.html` loaded a real
+  Shaka/MSE-backed video at `readyState=4`, active playback, and finite duration
+  `634.566` seconds. Its documented public source was the static Big Buck Bunny
+  MPD `https://dash.akamaized.net/akamai/bbb_30fps/bbb_with_tiled_thumbnails.mpd`.
+- The first real browser → native loop exposed a generalized DASH parser defect:
+  the MPD's `image/jpeg` tiled-thumbnail adaptation was emitted as a third
+  native media track. The output contained an unwanted MJPEG `3200x180` stream;
+  the independent audio/video reference was `83,850,531` bytes while the native
+  output was `84,799,148` bytes. This was not accepted as a probe-reference
+  mismatch because the extra stream was visible in native `ffprobe` and the job
+  reported `mediaTracks=3`.
+- Added a red-then-green Rust regression in `src-tauri/src/media.rs` and fixed
+  `DashTrackBuilder::finish` to discard adaptations explicitly declared with a
+  non-audio/video kind such as `image/jpeg`. Representation-level MIME
+  inference remains available, and kind-less legacy media adaptations remain
+  supported.
+- Added `fixtures/public_hexaglobe_dash_chromium_probe.py`. It drives the real
+  Hexaglobe player and Download control, records browser MPD/segment traffic,
+  derives the exact browser-selected representation from native segment hints,
+  independently fetches and muxes all finite audio/video DASH segments, and
+  checks byte/hash equality, stream validity, duration, one managed job, and an
+  empty Chromium Downloads directory.
+- The fresh tracked probe passed with one native provisional job, resident
+  `--commit` exit `0`, final `completed` and `provisional=false`, and no browser
+  download. Independent and native output were both `83,850,531` bytes with
+  SHA-256 `f4d8507d028660da6a8f70ab59964f89a5ae7b2cf08831fff74282839dc5f379`.
+  The retained output was
+  `/tmp/dm-hexaglobe-dash-chromium-ebzor7nb/Managed/hexa-dash-bbb.mp4`.
+- `ffprobe` reports exactly H.264 `640x360` video and AAC `48,000 Hz` stereo
+  audio, duration `634.566667`; the thumbnail stream is absent. The fresh log
+  is `/tmp/dm-public-hexaglobe-dash-final.log`, with
+  `HEXA-DASH-CHROMIUM-PROBE: PASS`, `jobs=1`, and `browser_downloads=[]`.
+  The complete post-fix aggregate gate is captured at
+  `/tmp/dm-hexaglobe-full-gate.log` and returned `GATE_RC=0`.
+  No site-specific resolver was added.

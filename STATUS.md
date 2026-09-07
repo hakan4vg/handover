@@ -6492,3 +6492,41 @@ change and no site resolver exception:
   `50/50`, TypeScript, extension build, Rust `70/70`, Cargo build, Python
   compilation, and `git diff --check`. No site-specific resolver or production
   source change was added.
+
+## 2026-09-07 — Direct public Ogg/Theora/Vorbis capture
+
+- The HTML5Demo wrapper was already known to lack a usable content-script
+  context. Its exact finite asset was independently reachable at
+  `https://html5demo.yo.fr/demo/media/windowsill.ogv`, returning `200` with
+  `Content-Type: video/ogg` and `3,258,782` bytes. A direct top-level Chromium
+  media document was used instead of relaxing the wrapper requirement.
+- Added `fixtures/public_direct_ogg_chromium_probe.py` by specializing the
+  existing direct-player harness only for this new public Ogg path. A fresh
+  Chromium profile exposed one playable `<video>` with `readyState=4`,
+  `paused=false`, and duration `20` seconds. The real injected Download button
+  was trusted-clicked at `x=732.4453125, y=649.3984375`.
+- The native path created exactly one media job for
+  `https://html5demo.yo.fr/demo/media/windowsill.ogv`; resident `--commit`
+  exited `0`; the job completed with `provisional=false`; Chromium Downloads
+  stayed empty. Two fresh runs, disposable and tracked, both produced
+  `3,258,782` bytes and SHA-256
+  `d56958121ee39c27731a7c96a3b1be04f750cbb1fd43dc0f52dcca47b9280235`, matching
+  the browser-side independent reference. Logs:
+  `/tmp/dm-public-direct-ogg.log` and
+  `/tmp/dm-public-direct-ogg-tracked.log`.
+- Independent `ffprobe` on the retained native output
+  `/tmp/dm-direct-mp4-z6fxt_n5/Managed/windowsill-direct.ogv` reports an Ogg
+  container, Theora video `426x240`, Vorbis audio at `44,100 Hz` stereo,
+  duration `20.000000`, and size `3,258,782` bytes.
+- Exact tracked output ended with
+  `DIRECT-OGG: PASS (output_bytes=3258782,
+  output_sha256=d56958121ee39c27731a7c96a3b1be04f750cbb1fd43dc0f52dcca47b9280235,
+  jobs=1, browser_downloads=[])` and `DIRECT-OGG-PROBE: PASS`. Python
+  compilation and `git diff --check` passed; no production source or
+  site-specific resolver change was needed.
+- Clappr's official demo was checked as the next page candidate, but fresh
+  browser inspection displayed `Could not play video. There was a problem
+  trying to load the video. Error code: html5_video:4` while its declared
+  `http://clappr.io/highline.mp4` source did not become a playable player. This
+  is recorded as a page/player boundary; no Download Manager acceptance claim
+  or workaround was added.

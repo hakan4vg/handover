@@ -6899,3 +6899,11 @@ change and no site resolver exception:
 - The theme regression was red at `/tmp/dm-theme-radio-red.log` (`1 failed | 2 passed`) and then passed with `THEME_RADIO_FIXED_RC=0`; the accent regression was red at `/tmp/dm-accent-radio-red.log` (`1 failed | 3 passed`) and then passed with `ACCENT_RADIO_FIXED_RC=0`. TypeScript returned `THEME_RADIO_TSC_RC=0` and `ACCENT_RADIO_TSC_RC=0`.
 - Real Chromium reports both groups and selected arrays, including `Theme [true,false,false]` and `Accent [true,false,false,false,false,false,false,false]`: `ACCENT_RADIO_REAL_RC=0`. Evidence: `/tmp/dm-accent-radio-real.log` and `/tmp/dm-appearance-accessible.png`.
 - The complete fail-fast gate returned `APPEARANCE_GATE_RC=0`: Vitest `23` files/`78` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-appearance-full-gate.log`.
+
+## 2026-09-07 — Name editable settings fields precisely
+
+- The settings pages rendered generic or missing accessible names for editable controls. The red focused regression returned `SETTINGS_LABELS_RED_RC=1`; it received `Folder path` for both download-folder inputs and an unnamed collision selector. Evidence: `/tmp/dm-settings-labels-red.log`.
+- Added setting-specific names to `PathField`, every settings `Select`, the global/connection/retry number inputs, the excluded-media-site input, and the captured Add Download per-download bandwidth selector. The visible settings layout and update behavior are unchanged.
+- The focused regression returned `SETTINGS_LABELS_FIXED_RC=0` with `5/5` tests and TypeScript returned `SETTINGS_LABELS_TSC_RC=0`. Evidence: `/tmp/dm-settings-labels-fixed.log` and `/tmp/dm-settings-labels-tsc.log`.
+- Real Chromium rendered the exact names on Downloads, Network, Appearance, and Browser routes. Evidence: `/tmp/dm-settings-labels-real-downloads.log`, `/tmp/dm-settings-labels-real-network.log`, `/tmp/dm-settings-labels-real-appearance.log`, and `/tmp/dm-settings-labels-real-browser.log`; screenshots are retained beside those logs.
+- The complete fail-fast gate returned `SETTINGS_LABELS_GATE_RC=0`: Vitest `23` files/`79` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-settings-labels-full-gate.log`.

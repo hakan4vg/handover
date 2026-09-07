@@ -125,4 +125,43 @@ describe('SettingsView', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('gives editable settings fields specific accessible names', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const adapter = {
+      updateSettings: vi.fn().mockResolvedValue(undefined),
+    } as unknown as DownloadAdapter;
+
+    const renderPage = async (page: 'downloads' | 'network' | 'appearance' | 'browser') => {
+      await act(async () => {
+        root.render(<SettingsView adapter={adapter} settings={settings} page={page} onPageChange={() => undefined} />);
+      });
+    };
+
+    await renderPage('downloads');
+    expect(Array.from(host.querySelectorAll('.path-field input')).map((input) => input.getAttribute('aria-label'))).toEqual([
+      'Default download folder',
+      'Temporary / cache folder',
+    ]);
+    expect(host.querySelector('select')?.getAttribute('aria-label')).toBe('File name collisions');
+
+    await renderPage('network');
+    expect(Array.from(host.querySelectorAll('input.number-input')).map((input) => input.getAttribute('aria-label'))).toEqual([
+      'Global bandwidth limit',
+      'Default maximum connections per download',
+      'Max retry attempts',
+    ]);
+    expect(host.querySelector('select')?.getAttribute('aria-label')).toBe('Bandwidth unit');
+
+    await renderPage('appearance');
+    expect(host.querySelector('select')?.getAttribute('aria-label')).toBe('App density');
+
+    await renderPage('browser');
+    expect(host.querySelector('.add-site input')?.getAttribute('aria-label')).toBe('Add excluded media site');
+
+    act(() => root.unmount());
+    host.remove();
+  });
 });

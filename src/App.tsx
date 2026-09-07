@@ -618,11 +618,32 @@ function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
   return <div className="popup-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="popup-header"><span className="product-logo"><Icon name="download" size={17} /></span><strong>Download Manager</strong><button className="icon-button" aria-label="Close" onClick={closeSurface}><Icon name="close" size={15} /></button></div><div className="popup-toggles"><SettingToggle icon="download" title="Intercept browser downloads" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} /><SettingToggle icon="media" title="Show media buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} /></div><div className="popup-site"><span className="eyebrow">Current site</span><strong>{site}</strong>{excluded ? <span className="excluded-copy">Media buttons excluded on this site</span> : <span className="enabled-copy">Media buttons enabled on this site</span>}<button className="button" onClick={toggleSite}>{excluded ? 'Enable on this site' : 'Exclude this site'}</button></div><button className="popup-manager-button" onClick={() => openManagerSurface()}><span>Open Manager</span><Icon name="open" size={15} /></button></div>;
 }
 
-function TrayMenu({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
+export function TrayMenu({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
+  const [error, setError] = useState('');
   const active = snapshot.jobs.filter((job) => ['downloading', 'connecting', 'finalizing'].includes(job.state)).length;
   const paused = active === 0 && snapshot.jobs.some((job) => job.state === 'paused' || job.state === 'pending');
-  const update = (patch: Partial<AppSettings>) => { void adapter.updateSettings(patch); };
-  return <div className="tray-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="tray-status"><span className="status-dot" /><span>{active} active downloads</span><strong>{formatSpeed(snapshot.aggregateSpeed)}</strong></div><TrayAction icon="window" label="Open Download Manager" onClick={openManagerSurface} /><TrayAction icon={paused ? 'play' : 'pause'} label={paused ? 'Resume All' : 'Pause All'} onClick={() => void (paused ? adapter.resumeAll() : adapter.pauseAll())} /><div className="tray-divider" /><TrayToggle icon="globe" label="Browser Integration" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} /><TrayToggle icon="media" label="Media Buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} /><TrayAction icon="network" label="Set Bandwidth Limit" chevron onClick={() => { window.location.href = `${window.location.pathname}?settings=network`; }} /><div className="tray-divider" /><TrayAction icon="power" label="Exit Manager" danger onClick={closeSurface} /></div>;
+  const run = (operation: () => Promise<void>) => {
+    setError('');
+    try {
+      void operation().catch((reason: unknown) => setError(reason instanceof Error && reason.message ? reason.message : 'Tray action failed.'));
+    } catch (reason) {
+      setError(reason instanceof Error && reason.message ? reason.message : 'Tray action failed.');
+    }
+  };
+  const update = (patch: Partial<AppSettings>) => run(() => adapter.updateSettings(patch));
+  const toggleAll = () => run(() => paused ? adapter.resumeAll() : adapter.pauseAll());
+  return <div className="tray-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}>
+    <div className="tray-status"><span className="status-dot" /><span>{active} active downloads</span><strong>{formatSpeed(snapshot.aggregateSpeed)}</strong></div>
+    {error && <div className="form-error tray-error" role="alert"><Icon name="error" size={14} />{error}</div>}
+    <TrayAction icon="window" label="Open Download Manager" onClick={openManagerSurface} />
+    <TrayAction icon={paused ? 'play' : 'pause'} label={paused ? 'Resume All' : 'Pause All'} onClick={toggleAll} />
+    <div className="tray-divider" />
+    <TrayToggle icon="globe" label="Browser Integration" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} />
+    <TrayToggle icon="media" label="Media Buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} />
+    <TrayAction icon="network" label="Set Bandwidth Limit" chevron onClick={() => { window.location.href = `${window.location.pathname}?settings=network`; }} />
+    <div className="tray-divider" />
+    <TrayAction icon="power" label="Exit Manager" danger onClick={closeSurface} />
+  </div>;
 }
 
 function TrayAction({ icon, label, onClick, chevron, danger }: { icon: IconName; label: string; onClick?: () => void; chevron?: boolean; danger?: boolean }) {

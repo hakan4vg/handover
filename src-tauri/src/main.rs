@@ -2100,6 +2100,7 @@ fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput,
                 job.source = input.source.clone();
                 job.selected_segments = input.selected_segments.clone();
                 job.referrer = input.referrer.clone();
+                job.post_body = input.post_body.clone();
                 job.user_agent = input.user_agent.as_deref().and_then(user_agent_value).map(str::to_string);
                 job.domain = domain(&input.source);
                 job.state = "connecting".into();

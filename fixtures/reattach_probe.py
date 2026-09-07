@@ -227,8 +227,11 @@ def boot_and_stop(home: str):
     support.terminate_only(process, "reattach database bootstrap")
 
 
-def send_capture(home: str, source: str, name: str):
-    message = {"type": "capture-acquisition", "payload": {"source": source, "name": name}}
+def send_capture(home: str, source: str, name: str, post_body: str | None = None):
+    payload = {"source": source, "name": name}
+    if post_body is not None:
+        payload["postBody"] = post_body
+    message = {"type": "capture-acquisition", "payload": payload}
     process = subprocess.Popen(
         [BIN, "--capture", json.dumps(message)],
         env=support.app_env(home, None),

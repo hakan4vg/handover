@@ -104,8 +104,9 @@ def main() -> int:
         assert len([job for job in reattach.read_jobs(db) if job.get("id") == JOB_ID]) == 1
         assert unrelated.get("provisional") is True, unrelated
 
-        reattach.send_capture(home, renewed_source, "reattach-targeted.bin")
+        reattach.send_capture(home, renewed_source, "reattach-targeted.bin", "fixture=reattach-renewed")
         completed = reattach.wait_job(db, JOB_ID, lambda job: job.get("state") == "completed")
+        assert completed.get("postBody") == "fixture=reattach-renewed", completed
         output = Path(completed["destination"])
         output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
         requests = proxy.requests_snapshot()

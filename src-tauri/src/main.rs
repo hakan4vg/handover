@@ -2520,6 +2520,18 @@ fn tray_image() -> Image<'static> {
     Image::new_owned(pixels, 32, 32)
 }
 
+// Pure toggle decision shared by both tray check arms (SPEC §12): each arm
+// flips exactly its own flag and keeps the other, so tray and Settings can
+// never diverge into two policies. Unit-covered; the visual check direction
+// stays source-verified because GUI event injection is blocked (XTEST).
+fn tray_toggle_next(current: (bool, bool), which: &str) -> (bool, bool) {
+    match which {
+        "browser-integration" => (!current.0, current.1),
+        "media-buttons" => (current.0, !current.1),
+        _ => current,
+    }
+}
+
 // Keeps the native tray checkmarks coherent with Settings (SPEC §12: one
 // policy, not two copies). Called from every writer of the two flags — the
 // tray toggle arms, update_settings, apply_browser_policy — because neither
@@ -2554,8 +2566,8 @@ fn install_tray(app: &tauri::AppHandle, intercept_downloads: bool, show_media_bu
             "open-manager" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }
             "pause-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused from the system tray", Some("warning"))); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(app, &state); }
             "resume-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(app, &state); for (id, source) in sources { let _ = spawn_transfer(app, state.inner(), id, source); } }
-            "browser-integration" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.intercept_downloads = !snapshot.settings.intercept_downloads; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons)) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
-            "media-buttons" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { snapshot.settings.show_media_buttons = !snapshot.settings.show_media_buttons; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons)) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
+            "browser-integration" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { let next = tray_toggle_next((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons), "browser-integration"); snapshot.settings.intercept_downloads = next.0; snapshot.settings.show_media_buttons = next.1; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some(next) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
+            "media-buttons" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { let next = tray_toggle_next((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons), "media-buttons"); snapshot.settings.intercept_downloads = next.0; snapshot.settings.show_media_buttons = next.1; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some(next) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
             "bandwidth" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); let _ = window.eval("window.location.href = window.location.pathname + '?settings=network'"); } }
             "exit-manager" => app.exit(0),
             _ => {}
@@ -2626,7 +2638,7 @@ fn main() {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job, provisional_input_from_message, redact_url_credentials, referer_value, restrict_data_dir, restrict_file, source_compatible, tray_status_text, DownloadJob, ProvisionalInput};
+    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job, provisional_input_from_message, redact_url_credentials, referer_value, restrict_data_dir, restrict_file, source_compatible, tray_status_text, tray_toggle_next, DownloadJob, ProvisionalInput};
     use serde_json::json;
 
     #[test]
@@ -3386,6 +3398,14 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         assert!(!clean.contains("#frag"), "fragment leaked: {clean}");
         assert!(clean.contains("https://cdn.example.test/v.mp4"), "host/path lost: {clean}");
         assert_eq!(redact_url_credentials("Could not write temporary data"), "Could not write temporary data");
+    }
+
+    #[test]
+    fn tray_toggle_flips_one_flag_only() {
+        assert_eq!(tray_toggle_next((true, true), "browser-integration"), (false, true));
+        assert_eq!(tray_toggle_next((true, true), "media-buttons"), (true, false));
+        assert_eq!(tray_toggle_next((false, true), "browser-integration"), (true, true));
+        assert_eq!(tray_toggle_next((true, false), "bogus"), (true, false));
     }
 
     #[test]

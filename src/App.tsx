@@ -96,6 +96,11 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
   const [moreOpen, setMoreOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
 
+  const dismissMenus = () => {
+    setSortOpen(false);
+    setMoreOpen(false);
+  };
+
   const active = snapshot.jobs.filter((job) => ['connecting', 'downloading', 'finalizing'].includes(job.state));
   const paused = snapshot.jobs.filter((job) => job.state === 'paused' || job.state === 'pending');
   const selected = snapshot.jobs.find((job) => job.id === selectedId) ?? snapshot.jobs[0];
@@ -131,6 +136,8 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
   };
 
   const openAdd = () => {
+    dismissMenus();
+    setContextJobId(null);
     setShowManualAdd(true);
     setAddWindowId(null);
   };
@@ -167,10 +174,10 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
       <div className="manager-body">
         <aside className="sidebar">
           <nav className="sidebar-nav" aria-label="Download filters">
-            {filterLabels.map((item) => <SidebarItem key={item.key} icon={item.icon} label={item.label} active={filter === item.key} count={countFor(item.key, snapshot.jobs)} onClick={() => { setFilter(item.key); setContextJobId(null); }} />)}
+            {filterLabels.map((item) => <SidebarItem key={item.key} icon={item.icon} label={item.label} active={filter === item.key} count={countFor(item.key, snapshot.jobs)} onClick={() => { setFilter(item.key); dismissMenus(); setContextJobId(null); }} />)}
           </nav>
           <div className="sidebar-spacer" />
-          <SidebarItem icon="settings" label="Settings" active={isSettings} onClick={() => { setFilter('settings' as FilterKey); setContextJobId(null); }} />
+          <SidebarItem icon="settings" label="Settings" active={isSettings} onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }} />
           <div className="sidebar-footer"><span className="status-dot" /> <span>Connected</span><span className="footer-divider" /><span>Browser integration {snapshot.settings.interceptDownloads ? 'on' : 'off'}</span></div>
         </aside>
         {isSettings ? <SettingsView adapter={adapter} settings={snapshot.settings} page={settingsPage} onPageChange={setSettingsPage} /> : (
@@ -180,20 +187,20 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
               <div className="toolbar-actions">
                 {active.length > 0 ? <button className="button" onClick={() => run(adapter.pauseAll())}><Icon name="pause" size={15} /> Pause All</button> : paused.length > 0 ? <button className="button" onClick={() => run(adapter.resumeAll())}><Icon name="play" size={15} /> Resume All</button> : null}
                 <button className="button primary" onClick={openAdd}><Icon name="add" size={17} /> Add URL</button>
-                 <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <div className="toolbar-menu"><button onClick={() => { setFilter('settings' as FilterKey); setMoreOpen(false); }}><Icon name="settings" size={15} /> Settings</button><button onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></div>}</div>
+                 <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <div className="toolbar-menu"><button onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={15} /> Settings</button><button onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></div>}</div>
               </div>
             </div>
             <div className="workspace-columns">
               <section className="download-list" aria-label="Downloads">
                  <div className="list-header"><span>Downloads</span><div className="list-header-actions"><button className="subtle-button" onClick={() => { setSortOpen(!sortOpen); setMoreOpen(false); }}><Icon name="sort" size={15} /> Sort <Icon name="chevron-down" size={13} /></button>{sortOpen && <SortMenu value={sortBy} onChange={(value) => { setSortBy(value); setSortOpen(false); }} />}</div></div>
                 <div className="rows">
-                  {filteredJobs.length ? filteredJobs.map((job) => <DownloadRow key={job.id} job={job} selected={job.id === selected?.id} onSelect={() => { setSelectedId(job.id); setInspectorOpen(true); setContextJobId(null); }} onPause={() => run(adapter.pauseJob(job.id))} onResume={() => run(adapter.resumeJob(job.id))} onRetry={() => run(adapter.retryJob(job.id))} onMenu={() => setContextJobId(contextJobId === job.id ? null : job.id)} />) : <EmptyState filter={filter} onAdd={openAdd} />}
+                  {filteredJobs.length ? filteredJobs.map((job) => <DownloadRow key={job.id} job={job} selected={job.id === selected?.id} onSelect={() => { setSelectedId(job.id); setInspectorOpen(true); dismissMenus(); setContextJobId(null); }} onPause={() => run(adapter.pauseJob(job.id))} onResume={() => run(adapter.resumeJob(job.id))} onRetry={() => run(adapter.retryJob(job.id))} onMenu={() => { dismissMenus(); setContextJobId(contextJobId === job.id ? null : job.id); }} />) : <EmptyState filter={filter} onAdd={openAdd} />}
                 </div>
                 {contextJob && <JobContextMenu job={contextJob} adapter={adapter} onClose={() => setContextJobId(null)} onNotice={setNotice} />}
               </section>
               {selected && (inspectorOpen ? <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} /> : <button className="inspector-reopen" onClick={() => setInspectorOpen(true)} aria-label="Open inspector"><Icon name="chevron-left" size={17} /><span>Details</span></button>)}
             </div>
-             <div className="manager-statusbar"><div className="aggregate-status"><span className="status-dot" /><span>Connected</span><span className="footer-divider" /><span>{active.length} active</span><span>·</span><span>{formatSpeed(snapshot.aggregateSpeed)}</span></div><span className="status-live">Live transfer state</span><button className="icon-button" aria-label="Settings" onClick={() => setFilter('settings' as FilterKey)}><Icon name="settings" size={16} /></button></div>
+             <div className="manager-statusbar"><div className="aggregate-status"><span className="status-dot" /><span>Connected</span><span className="footer-divider" /><span>{active.length} active</span><span>·</span><span>{formatSpeed(snapshot.aggregateSpeed)}</span></div><span className="status-live">Live transfer state</span><button className="icon-button" aria-label="Settings" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={16} /></button></div>
           </main>
         )}
       </div>

@@ -2,8 +2,8 @@
 """Real Chromium proof for manager inline controls and bulk actions in mock mode.
 
 Covers SPEC §10.2 inline row pause/resume/retry, §10.3 Pause All/Resume All,
-sorting, and the Add URL overlay, all driven by trusted CDP input against the
-explicit mock adapter.
+sorting, transient menu dismissal, and the Add URL overlay, all driven by trusted
+CDP input against the explicit mock adapter.
 """
 from __future__ import annotations
 
@@ -171,6 +171,18 @@ def main() -> int:
         resumed_all = wait_state(client, ACTIVE_NAME, "last['state'] not in ('Paused','Pending') and last['action'] == 'Pause'", timeout=10.0)
         wait_toolbar(client, "Pause All")
         print("RESUME-ALL:", json.dumps({"active": resumed_all, "toolbar": evaluate_json(client, "Array.from(document.querySelectorAll('.toolbar-actions button')).map(item=>item.textContent.trim())")}, sort_keys=True), flush=True)
+
+        # Selecting a row while the sort menu is open must dismiss the menu
+        # rather than leaving an overlay stranded over the workspace.
+        click_text(client, ".subtle-button", "Sort")
+        time.sleep(0.25)
+        assert evaluate_json(client, "!!document.querySelector('.sort-menu')")
+        row_point = evaluate_json(client, "(()=>{const row=document.querySelector('.download-row');const r=row.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};})()")
+        click_point(client, row_point)
+        time.sleep(0.25)
+        menu_after_row = evaluate_json(client, "!!document.querySelector('.sort-menu')")
+        print("SORT-MENU-ROW-DISMISS:", json.dumps({"menu_after_row": menu_after_row}, sort_keys=True), flush=True)
+        assert not menu_after_row, menu_after_row
 
         # Sort by Name: DOM order must match localeCompare order.
         click_sort_option(client, "Name")

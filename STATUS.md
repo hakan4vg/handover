@@ -6639,3 +6639,24 @@ change and no site resolver exception:
   `/tmp/dm-responsive-full-gate.log` and returned `GATE_RC=0`: Vitest `55/55`,
   Rust `71/71`, both production builds, Cargo build, Python compilation, and
   `git diff --check` passed. No native or extension behavior changed.
+
+## 2026-09-07 — Transient manager-menu dismissal
+
+- The existing real Chromium controls probe was extended with a reachable UI
+  regression. It opened the Sort menu, clicked a download row, and observed that
+  `.sort-menu` remained mounted (`menu_after_row=true`), leaving an overlay over
+  the newly selected workspace. Red evidence: `/tmp/dm-manager-menu-dismiss-red.log`.
+- Added a small `dismissMenus` state transition in `src/App.tsx`. Add URL,
+  sidebar/settings navigation, row selection, row action menus, and the status
+  settings action now clear transient Sort/More menus while preserving the
+  selected row and sort value.
+- The existing `fixtures/manager_inline_controls_chromium_probe.py` now covers
+  the regression. Fresh trusted Chromium input reported
+  `SORT-MENU-ROW-DISMISS: {"menu_after_row": false}` and still passed inline
+  pause/resume/retry, Pause All/Resume All, sorting, Add URL open/close, and
+  `MANAGER-INLINE-CONTROLS: PASS`. Evidence:
+  `/tmp/dm-manager-menu-dismiss-fixed.log`.
+- The complete post-change gate is captured at
+  `/tmp/dm-menu-dismiss-full-gate.log` and returned `GATE_RC=0`: Vitest `55/55`,
+  Rust `71/71`, both production builds, Cargo build, Python compilation, and
+  `git diff --check` passed. No native or extension behavior changed.

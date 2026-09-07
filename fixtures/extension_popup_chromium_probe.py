@@ -83,6 +83,10 @@ def main() -> int:
         public.wait_page(client, PAGE, timeout=30)
         initial = wait_dom(client, "document.querySelector('.popup-surface') && document.body.innerText")
         print("POPUP-INITIAL:", type(initial).__name__, repr(initial), file=sys.stderr, flush=True)
+        containment = evaluate_json(client, "({viewportHeight:innerHeight,documentHeight:document.documentElement.clientHeight,documentScrollHeight:document.documentElement.scrollHeight,bodyHeight:document.body.clientHeight,bodyScrollHeight:document.body.scrollHeight})")
+        print("POPUP-CONTAINMENT:", json.dumps(containment, sort_keys=True), file=sys.stderr, flush=True)
+        assert containment["documentScrollHeight"] == containment["documentHeight"], containment
+        assert containment["bodyScrollHeight"] == containment["bodyHeight"], containment
         assert "CURRENT SITE" in initial and "example.com" in initial, initial
         assert "Exclude this site" in initial, initial
 

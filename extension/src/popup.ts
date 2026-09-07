@@ -13,9 +13,14 @@ function paint(): void {
   setSwitch('media', policy.showMediaButtons);
   document.getElementById('site')!.textContent = site || 'This page';
   const excluded = site !== '' && policy.excludedSites.includes(site);
-  document.getElementById('site-state')!.textContent = excluded
-    ? 'Media buttons excluded on this site'
-    : 'Media buttons enabled on this site';
+  const siteState = document.getElementById('site-state');
+  if (siteState) {
+    siteState.textContent = excluded
+      ? 'Media buttons excluded on this site'
+      : 'Media buttons enabled on this site';
+    siteState.classList.toggle('excluded-copy', excluded);
+    siteState.classList.toggle('enabled-copy', !excluded);
+  }
   document.getElementById('site-toggle')!.textContent = excluded ? 'Enable on this site' : 'Exclude this site';
 }
 
@@ -81,6 +86,7 @@ async function init(): Promise<void> {
       : [...policy.excludedSites, site];
     void push();
   });
+  document.getElementById('close')?.addEventListener('click', () => window.close());
   document.getElementById('open')!.addEventListener('click', () => {
     setStatus('');
     void chrome.runtime.sendMessage({ type: 'open-manager' }).then((response: { ok?: boolean; error?: string } | undefined) => {

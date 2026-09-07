@@ -2,41 +2,45 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <style>
-      body { width: 264px; margin: 0; padding: 14px; font: 13px system-ui, sans-serif; color: #171a1e; }
-      h1 { margin: 0 0 12px; font-size: 14px; }
-      .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 0; border-top: 1px solid #e2e6eb; }
-      .row small { display: block; color: #68717d; font-size: 11px; }
-      .site { margin: 10px 0; padding: 10px; border: 1px solid #e2e6eb; border-radius: 7px; background: #f7f9fc; }
-      .site strong { display: block; margin-bottom: 4px; }
-      .site span { font-size: 11px; color: #68717d; }
-      button { cursor: pointer; border: 1px solid #d3d9e1; border-radius: 5px; background: #fff; padding: 6px 10px; font-size: 12px; }
-      button:hover { background: #f7f9fc; }
-      .switch { position: relative; width: 34px; height: 20px; flex: 0 0 auto; border: 0; border-radius: 999px; background: #aeb7c1; padding: 0; }
-      .switch.on { background: #0878ed; }
-      .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; }
-      .switch.on::after { left: 17px; }
-      #status { margin-top: 8px; color: #b3261e; font-size: 11px; line-height: 1.35; }
-      #open { width: 100%; margin-top: 6px; }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f3f6fa" />
+    <title>Download Manager</title>
+    <link rel="stylesheet" href="./popup.css" />
   </head>
   <body>
-    <h1>Download Manager</h1>
-    <div class="row">
-      <div>Intercept browser downloads<small>Take over eligible downloads.</small></div>
-      <button class="switch" id="intercept" aria-label="Intercept browser downloads" aria-pressed="false"></button>
+    <div id="root">
+      <div class="popup-surface">
+        <div class="popup-header">
+          <span class="product-logo" aria-hidden="true">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"><path d="M12 4v10M8 11l4 4 4-4M5 19h14" /></svg>
+          </span>
+          <strong>Download Manager</strong>
+          <button class="icon-button" id="close" aria-label="Close" type="button">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"><path d="m6 6 12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+        <div id="status" class="form-error popup-error" role="alert" aria-live="assertive" hidden></div>
+        <div class="popup-toggles">
+          <div class="setting-line">
+            <svg class="setting-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" aria-hidden="true"><path d="M12 4v10M8 11l4 4 4-4M5 19h14" /></svg>
+            <div class="setting-copy"><strong>Intercept browser downloads</strong></div>
+            <button class="toggle switch" id="intercept" aria-label="Intercept browser downloads" aria-pressed="false" type="button"></button>
+          </div>
+          <div class="setting-line">
+            <svg class="setting-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3" /><path d="m10 8 6 4-6 4V8Z" /></svg>
+            <div class="setting-copy"><strong>Show media buttons</strong></div>
+            <button class="toggle switch" id="media" aria-label="Show media buttons" aria-pressed="false" type="button"></button>
+          </div>
+        </div>
+        <div class="popup-site">
+          <span class="eyebrow">Current site</span>
+          <strong id="site">…</strong>
+          <span id="site-state" class="enabled-copy"></span>
+          <button class="button" id="site-toggle" type="button"></button>
+        </div>
+        <button class="popup-manager-button" id="open" type="button"><span>Open Manager</span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" aria-hidden="true"><path d="M7 17.5h10a2 2 0 0 0 2-2V9.8" /><path d="M12 5h7v7M19 5l-8 8" /></svg></button>
+      </div>
     </div>
-    <div class="row">
-      <div>Show media buttons<small>Download controls on videos.</small></div>
-      <button class="switch" id="media" aria-label="Show media buttons" aria-pressed="false"></button>
-    </div>
-    <div class="site">
-      <strong id="site">…</strong>
-      <span id="site-state"></span>
-      <div style="margin-top: 8px"><button id="site-toggle"></button></div>
-    </div>
-    <div id="status" role="status" aria-live="polite" hidden></div>
-    <button id="open">Open Manager</button>
     <script type="module" src="./src/popup.ts"></script>
   </body>
 </html>

@@ -93,6 +93,9 @@ def set_interception_off(client: public.cdp_drive.CDP) -> dict:
         time.sleep(0.2)
     else:
         raise RuntimeError(f"extension page did not load: {last}")
+    visual = json.loads(client.evaluate("JSON.stringify({surface:!!document.querySelector('.popup-surface'),header:!!document.querySelector('.popup-header'),logo:!!document.querySelector('.product-logo'),managerButton:!!document.querySelector('#open.popup-manager-button'),bodyWidth:document.body.getBoundingClientRect().width})"))
+    print("EXTENSION-POPUP-VISUAL:", json.dumps(visual, sort_keys=True), flush=True)
+    assert visual["surface"] and visual["header"] and visual["logo"] and visual["managerButton"], visual
     raw = client.evaluate(
         "(async()=>await chrome.runtime.sendMessage({type:'update-policy',patch:{interceptDownloads:false}}))()"
     )

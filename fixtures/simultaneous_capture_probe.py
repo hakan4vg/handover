@@ -51,6 +51,7 @@ def main() -> int:
         sources = {
             f"{base}?variant=1&capture=one": 0x55,
             f"{base}?variant=2&capture=two": 0x56,
+            f"{base}?variant=3&capture=three": 0x57,
         }
         expected = {}
         for source in sources:
@@ -83,17 +84,17 @@ def main() -> int:
             reattach.send_capture(home, source, f"capture-{index}.bin")
         jobs = wait_for_sources(db, set(sources))
         jobs_by_source = {job["source"]: job for job in jobs}
-        assert len(jobs_by_source) == 2
-        assert len({job["id"] for job in jobs}) == 2
+        assert len(jobs_by_source) == 3
+        assert len({job["id"] for job in jobs}) == 3
         assert all(job.get("provisional") is True for job in jobs), jobs
         for source, seed in sources.items():
             job = jobs_by_source[source]
             temp = Path(job["tempPath"])
             assert temp.exists(), temp
             assert hashlib.sha256(temp.read_bytes()).hexdigest() == hashlib.sha256(expected[source]).hexdigest()
-            assert job["name"] in {"capture-1.bin", "capture-2.bin"}
+            assert job["name"] in {"capture-1.bin", "capture-2.bin", "capture-3.bin"}
         counts = proxy.snapshot()
-        assert counts.get("/changed.bin") == 4, counts
+        assert counts.get("/changed.bin") == 6, counts
         print(f"SIMULTANEOUS-CAPTURES: PASS (jobs={sorted(job['id'] for job in jobs)})", flush=True)
         print(f"CAPTURE-SOURCES: PASS ({sorted(jobs_by_source)})", flush=True)
         print(f"REQUESTS: {counts}", flush=True)

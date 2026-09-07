@@ -490,16 +490,22 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
     AppSnapshot { jobs, settings, connected: true, aggregate_speed: 0, notifications: vec![] }
 }
 
-fn save_snapshot(state: &CoreState) {
-    if let Ok(snapshot) = state.snapshot.lock() {
-        if let Ok(database) = state.database.lock() {
-            let _ = database.execute("INSERT OR REPLACE INTO settings (id, payload) VALUES (1, ?1)", params![serde_json::to_string(&snapshot.settings).unwrap_or_default()]);
-            let _ = database.execute("DELETE FROM jobs", []);
-            for job in &snapshot.jobs {
-                let _ = database.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", params![job.id, job.created, serde_json::to_string(job).unwrap_or_default()]);
-            }
-        }
+fn save_snapshot(state: &CoreState) -> Result<(), String> {
+    let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
+    let settings_payload = serde_json::to_string(&snapshot.settings).map_err(|error| format!("Could not serialize settings: {error}"))?;
+    let jobs = snapshot.jobs.iter().map(|job| {
+        serde_json::to_string(job)
+            .map(|payload| (job.id.clone(), job.created.clone(), payload))
+            .map_err(|error| format!("Could not serialize job {}: {error}", job.id))
+    }).collect::<Result<Vec<_>, String>>()?;
+    let mut database = state.database.lock().map_err(|_| "Database unavailable".to_string())?;
+    let transaction = database.transaction().map_err(|error| format!("Could not begin snapshot transaction: {error}"))?;
+    transaction.execute("INSERT OR REPLACE INTO settings (id, payload) VALUES (1, ?1)", params![settings_payload]).map_err(|error| format!("Could not persist settings: {error}"))?;
+    transaction.execute("DELETE FROM jobs", []).map_err(|error| format!("Could not replace jobs: {error}"))?;
+    for (id, created, payload) in jobs {
+        transaction.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", params![id, created, payload]).map_err(|error| format!("Could not persist job {id}: {error}"))?;
     }
+    transaction.commit().map_err(|error| format!("Could not commit snapshot: {error}"))
 }
 
 fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
@@ -512,8 +518,11 @@ fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
 }
 
 fn emit_snapshot(app: &AppHandle, state: &CoreState) {
+    if let Err(error) = save_snapshot(state) {
+        eprintln!("Snapshot persistence failed: {error}");
+        return;
+    }
     if let Ok(snapshot) = state.snapshot.lock() { let _ = app.emit("state-changed", snapshot.clone()); }
-    save_snapshot(state);
     refresh_tray(app, state);
 }
 
@@ -2510,7 +2519,7 @@ fn main() {
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
             app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) });
-            save_snapshot(&app.state::<CoreState>());
+            save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             if let Some(window) = app.get_webview_window("main") {
                 let close_handle = app.handle().clone();
@@ -2851,7 +2860,7 @@ mod capture_tests {
         // come back through the same SQL row and boot parser the app uses.
         let patched = apply_settings_patch(&default_settings(), &serde_json::json!({"maxConnections": 4, "bandwidthLimit": 1048576}));
         state.snapshot.lock().unwrap().settings = patched;
-        save_snapshot(&state);
+        save_snapshot(&state).expect("settings snapshot persistence");
         let payload: String = state.database.lock().unwrap().query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
         let rebooted = settings_from_stored(&payload);
         assert_eq!(rebooted.max_connections, 4);
@@ -3179,5 +3188,76 @@ mod capture_tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         assert!(runtime.block_on(super::commit_wait_for_transfer_idle(&state, "job-1")));
         assert!(!state.transfer_controls.is_active("job-1"));
+    }
+
+    #[test]
+    fn snapshot_persistence_is_atomic_when_job_write_fails() {
+        use super::{save_snapshot, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+
+        let job = |id: &str| serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": "file.bin",
+            "source": "http://127.0.0.1:9/file.bin",
+            "domain": "127.0.0.1",
+            "kind": "document",
+            "state": "downloading",
+            "progress": 0.0,
+            "downloaded": 0,
+            "total": 1,
+            "speed": 0,
+            "eta": null,
+            "connections": 1,
+            "maxConnections": 1,
+            "bandwidthLimit": null,
+            "mode": "single-stream",
+            "media": false,
+            "mediaDetails": null,
+            "mediaTracks": null,
+            "destination": "/tmp/file.bin",
+            "tempPath": "/tmp/file.part",
+            "resumable": false,
+            "mime": null,
+            "error": null,
+            "created": "now",
+            "started": null,
+            "completed": null,
+            "provisional": false,
+            "segments": null,
+            "completedRanges": [],
+            "resourceIdentity": null,
+            "destinationReservation": null,
+            "selectedSegments": [],
+            "referrer": null,
+            "postBody": null,
+            "userAgent": null,
+            "events": [{"at": "now", "message": "test", "tone": null}]
+        })).unwrap();
+
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        database.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", rusqlite::params!["old-job", "old", "old-payload"]).unwrap();
+        database.execute("INSERT INTO settings (id, payload) VALUES (1, ?1)", rusqlite::params!["old-settings"]).unwrap();
+        let state = CoreState {
+            snapshot: Mutex::new(AppSnapshot { jobs: vec![job("same-id"), job("same-id")], settings: super::default_settings(), connected: true, aggregate_speed: 0, notifications: vec![] }),
+            database: Mutex::new(database),
+            reattach_target: Mutex::new(None),
+            bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
+            job_bandwidth: Mutex::new(std::collections::HashMap::new()),
+            transfer_controls: TransferRegistry::default(),
+            lifecycle: Mutex::new(()),
+            tray_checks: Mutex::new(None),
+        };
+
+        let error = save_snapshot(&state).expect_err("duplicate job ids must fail snapshot persistence");
+        assert!(error.contains("same-id"), "unexpected persistence error: {error}");
+        let database = state.database.lock().unwrap();
+        let payload: String = database.query_row("SELECT payload FROM jobs WHERE id = 'old-job'", [], |row| row.get(0)).unwrap();
+        assert_eq!(payload, "old-payload");
+        let settings: String = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(settings, "old-settings");
+        let count: i64 = database.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
     }
 }

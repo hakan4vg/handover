@@ -101,7 +101,7 @@ def main() -> int:
             "return {role:row.getAttribute('role'),tabIndex:row.tabIndex,focused:document.activeElement===row};})()",
         )
         assert not keyboard.get("error"), keyboard
-        assert keyboard["role"] == "button" and keyboard["tabIndex"] >= 0 and keyboard["focused"], keyboard
+        assert keyboard["role"] == "group" and keyboard["tabIndex"] >= 0 and keyboard["focused"], keyboard
         deadline = time.time() + 5
         keyboard_heading = ""
         while time.time() < deadline:

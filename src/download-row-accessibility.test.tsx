@@ -58,6 +58,32 @@ describe('DownloadRow action names', () => {
     act(() => root.unmount());
   });
 
+  it('keeps row selection separate from nested action buttons', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(
+        <DownloadRow
+          job={job}
+          selected
+          onSelect={() => undefined}
+          onPause={() => undefined}
+          onResume={() => undefined}
+          onRetry={() => undefined}
+          onMenu={() => undefined}
+        />,
+      );
+    });
+    const row = host.querySelector('.download-row');
+    expect(row?.getAttribute('role')).toBe('group');
+    expect(row?.getAttribute('aria-label')).toBe('Select project-assets.zip');
+    expect(row?.getAttribute('aria-current')).toBe('true');
+    expect(row?.querySelectorAll('button')).toHaveLength(2);
+
+    act(() => root.unmount());
+  });
+
   it('keeps state-specific action names attached to the same job', () => {
     const host = document.createElement('div');
     document.body.appendChild(host);

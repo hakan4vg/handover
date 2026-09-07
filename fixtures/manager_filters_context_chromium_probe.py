@@ -139,6 +139,36 @@ def main() -> int:
             observed[label] = {"count": len(current), "names": sorted(names), "heading": heading, "selected": selected_names, "inspector": selected_heading}
 
         click_text(client, "button.sidebar-item", "All")
+        click_text(client, ".subtle-button", "Sort")
+        sort_state = evaluate_json(
+            client,
+            "(()=>{const trigger=document.querySelector('.subtle-button');const menu=document.querySelector('.sort-menu');return {expanded:trigger?.getAttribute('aria-expanded'),role:menu?.getAttribute('role'),label:menu?.getAttribute('aria-label'),items:menu?.querySelectorAll('[role=\\\"menuitemradio\\\"]').length??0};})()",
+        )
+        assert sort_state == {"expanded": "true", "role": "menu", "label": "Sort downloads", "items": 4}, sort_state
+        client.evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))")
+        deadline = time.time() + 5
+        while time.time() < deadline and evaluate_json(client, "!!document.querySelector('.sort-menu')"):
+            time.sleep(0.1)
+        assert not evaluate_json(client, "!!document.querySelector('.sort-menu')"), "Sort menu stayed open after Escape"
+
+        toolbar_more = evaluate_json(
+            client,
+            "(()=>{const trigger=document.querySelector('.toolbar-more');if(!trigger)return {error:'toolbar more missing'};const r=trigger.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2};})()",
+        )
+        if toolbar_more.get("error"):
+            raise RuntimeError(toolbar_more["error"])
+        click_point(client, toolbar_more)
+        toolbar_state = evaluate_json(
+            client,
+            "(()=>{const trigger=document.querySelector('.toolbar-more');const menu=document.querySelector('.toolbar-menu');return {expanded:trigger?.getAttribute('aria-expanded'),role:menu?.getAttribute('role'),label:menu?.getAttribute('aria-label'),items:menu?.querySelectorAll('[role=\\\"menuitem\\\"]').length??0};})()",
+        )
+        assert toolbar_state == {"expanded": "true", "role": "menu", "label": "Manager options", "items": 2}, toolbar_state
+        client.evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))")
+        deadline = time.time() + 5
+        while time.time() < deadline and evaluate_json(client, "!!document.querySelector('.toolbar-menu')"):
+            time.sleep(0.1)
+        assert not evaluate_json(client, "!!document.querySelector('.toolbar-menu')"), "Toolbar menu stayed open after Escape"
+
         target = evaluate_json(
             client,
             "(()=>{const row=[...document.querySelectorAll('.download-row')].find(item=>item.querySelector('.row-title-line strong')?.textContent?.trim()==='backup-manifest.json');"
@@ -149,6 +179,24 @@ def main() -> int:
             raise RuntimeError(target["error"])
         click_point(client, target)
         menu = {"visible": False, "labels": []}
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            menu = evaluate_json(client, "{visible:!!document.querySelector('.context-menu'),labels:Array.from(document.querySelectorAll('.context-menu .menu-action')).map(item=>item.textContent.trim())}")
+            if menu["visible"]:
+                break
+            time.sleep(0.1)
+        assert menu["visible"] and "Remove from list" in menu["labels"], menu
+        context_state = evaluate_json(
+            client,
+            "(()=>{const row=[...document.querySelectorAll('.download-row')].find(item=>item.querySelector('.row-title-line strong')?.textContent?.trim()==='backup-manifest.json');const trigger=[...row?.querySelectorAll('button')??[]].find(item=>(item.getAttribute('aria-label')||'').startsWith('More actions for '));const menu=document.querySelector('.context-menu');return {expanded:trigger?.getAttribute('aria-expanded'),role:menu?.getAttribute('role'),label:menu?.getAttribute('aria-label'),items:menu?.querySelectorAll('[role=\\\"menuitem\\\"]').length??0};})()",
+        )
+        assert context_state == {"expanded": "true", "role": "menu", "label": "Actions for backup-manifest.json", "items": 5}, context_state
+        client.evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))")
+        deadline = time.time() + 5
+        while time.time() < deadline and evaluate_json(client, "!!document.querySelector('.context-menu')"):
+            time.sleep(0.1)
+        assert not evaluate_json(client, "!!document.querySelector('.context-menu')"), "Context menu stayed open after Escape"
+        click_point(client, target)
         deadline = time.time() + 5
         while time.time() < deadline:
             menu = evaluate_json(client, "{visible:!!document.querySelector('.context-menu'),labels:Array.from(document.querySelectorAll('.context-menu .menu-action')).map(item=>item.textContent.trim())}")

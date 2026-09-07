@@ -563,7 +563,58 @@ fn complete_job(job: &mut DownloadJob) {
     job.state = "completed".into();
     job.progress = 100.0;
     job.completed = Some(now_label());
+    // SPEC §16: replay context is only needed while the job can transfer
+    // again. A completed job never resumes, retries, or reattaches, so its
+    // capture-page URL, form body, and browser UA must not outlive it in
+    // the database. Failed jobs keep theirs: they are still resumable.
+    job.referrer = None;
+    job.post_body = None;
+    job.user_agent = None;
     job.events.insert(0, job_event("Download completed", Some("success")));
+}
+
+/// SPEC §16: transport errors embed the request URL, which may carry
+/// single-use tokens in its query or fragment. Persist the host/path so a
+/// failure stays diagnosable, never the credential tail. Identity for text
+/// without URLs.
+fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = ["http://", "https://"].iter().filter_map(|scheme| rest.find(scheme)).min();
+        let Some(offset) = next else { break };
+        let (head, tail) = rest.split_at(offset);
+        out.push_str(head);
+        let end = tail.find(|char: char| char.is_whitespace() || matches!(char, '"' | '\'' | ')' | '<')).unwrap_or(tail.len());
+        let (url, after) = tail.split_at(end);
+        match url.find(|char| char == '?' || char == '#') {
+            Some(cut) => { out.push_str(&url[..cut]); out.push_str("[redacted]"); }
+            None => out.push_str(url),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// SPEC §16: the database holds resumable sources and replay context, so
+/// the data dir and database are owner-only on Unix. No-op elsewhere;
+/// Windows ACLs belong to the Windows delivery pass.
+fn restrict_data_dir(root: &Path) {
+    let _ = std::fs::create_dir_all(root);
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))] { let _ = root; }
+}
+
+fn restrict_file(path: &Path) {
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))] { let _ = path; }
 }
 
 fn domain(source: &str) -> String { reqwest::Url::parse(source).ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_else(|| "source unavailable".into()) }
@@ -1845,13 +1896,13 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                     Some(replay) => match replay.send().await {
                         Ok(posted) if posted.status().is_success() => posted,
                         Ok(posted) => { let retryable = retryable_status(posted.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", posted.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
-                        Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+                        Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
                     },
                     None => { let retryable = retryable_status(_response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", _response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
                 }
             }
             Ok(response) => { let retryable = retryable_status(response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
-            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         }
     };
     if !transfer_can_continue(&app, &id, generation) { return false; }
@@ -1860,7 +1911,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         response = match acquisition_request(&client, &app, &id, &source).send().await {
             Ok(response) if response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT => response,
             Ok(_response) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("The source returned an invalid partial response".into()); job.eta = None; job.events.insert(0, job_event("Source returned an invalid partial response", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
-            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         };
     }
     if !transfer_can_continue(&app, &id, generation) { return false; }
@@ -1938,7 +1989,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         if !transfer_is_downloading(&app, &id, generation) { drop(stream); drop(file); return false; }
         match chunk {
             Ok(bytes) => {
-                if let Err(error) = file.write_all(&bytes).await { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Could not write temporary data", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
+                if let Err(error) = file.write_all(&bytes).await { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Could not write temporary data", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
                 if !transfer_can_continue(&app, &id, generation) { return false; }
                 downloaded += bytes.len() as u64;
                 let speed = (downloaded as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
@@ -1946,7 +1997,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 emit_snapshot(&app, &state);
                 if !throttle(&app, &id, bytes.len(), generation).await { drop(stream); drop(file); return false; }
             }
-            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Network stream interrupted", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Network stream interrupted", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
         }
     }
     drop(file);
@@ -1986,7 +2037,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reservation.as_deref()).await {
             clear_destination_reservation(&app, &state, &id);
             if !transfer_can_continue(&app, &id, generation) { return false; }
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
+            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
             add_notification(&app, &state, &id, "failed");
             return false;
@@ -2314,7 +2365,7 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         Err(error) => {
             if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
             if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.to_string()); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
+            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
             emit_snapshot(&app, &state);
             return Err(error.to_string());
         }
@@ -2527,7 +2578,9 @@ fn main() {
             let root = app_data_root();
             std::fs::create_dir_all(&root).ok();
             register_native_host(&root);
+            restrict_data_dir(&root);
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
+            restrict_file(&root.join("download-manager.db"));
             database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
             let mut settings = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0)).ok().map(|payload| settings_from_stored(&payload)).unwrap_or_else(default_settings);
             if let Some(policy) = load_browser_policy(&root) { settings.intercept_downloads = policy.0; settings.show_media_buttons = policy.1; settings.excluded_sites = policy.2; } else { write_browser_policy(&root, &settings_policy(&settings)); }
@@ -2573,7 +2626,7 @@ fn main() {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, provisional_input_from_message, referer_value, source_compatible, tray_status_text, ProvisionalInput};
+    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job, provisional_input_from_message, redact_url_credentials, referer_value, restrict_data_dir, restrict_file, source_compatible, tray_status_text, DownloadJob, ProvisionalInput};
     use serde_json::json;
 
     #[test]
@@ -3309,5 +3362,46 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         assert_eq!(settings, "old-settings");
         let count: i64 = database.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn finished_job_with_context() -> DownloadJob {
+        DownloadJob { id: "done-1".into(), name: "archive.zip".into(), source: "https://cdn.example.test/archive.zip?token=abc".into(), domain: "cdn.example.test".into(), kind: "archive".into(), state: "downloading".into(), progress: 100.0, downloaded: 1024, total: Some(1024), speed: 0, eta: None, connections: 1, max_connections: 8, bandwidth_limit: None, mode: "whole-object".into(), media: false, media_details: None, media_tracks: None, destination: "/tmp/archive.zip".into(), temp_path: "/tmp/done-1.part".into(), resumable: true, mime: None, error: None, created: "now".into(), started: Some("now".into()), completed: None, provisional: Some(false), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: vec![], referrer: Some("https://example.test/page?session=s3cr3t".into()), post_body: Some("fixture=renewed".into()), user_agent: Some("Mozilla/5.0".into()), events: vec![] }
+    }
+
+    #[test]
+    fn completed_job_drops_replay_context() {
+        let mut job = finished_job_with_context();
+        complete_job(&mut job);
+        assert_eq!(job.state, "completed");
+        assert_eq!(job.referrer, None, "capture-page URL must not outlive the job");
+        assert_eq!(job.post_body, None, "form body must not outlive the job");
+        assert_eq!(job.user_agent, None, "browser UA must not outlive the job");
+    }
+
+    #[test]
+    fn transport_error_redacts_url_credentials() {
+        let raw = "error sending request for url (https://cdn.example.test/v.mp4?token=secret&sig=abc#frag): connection closed";
+        let clean = redact_url_credentials(raw);
+        assert!(!clean.contains("token=secret"), "query leaked: {clean}");
+        assert!(!clean.contains("#frag"), "fragment leaked: {clean}");
+        assert!(clean.contains("https://cdn.example.test/v.mp4"), "host/path lost: {clean}");
+        assert_eq!(redact_url_credentials("Could not write temporary data"), "Could not write temporary data");
+    }
+
+    #[test]
+    fn data_dir_restricts_permissions() {
+        let dir = std::env::temp_dir().join(format!("dm-perm-{}", uuid::Uuid::new_v4()));
+        restrict_data_dir(&dir);
+        let file = dir.join("download-manager.db");
+        std::fs::write(&file, b"{}").unwrap();
+        restrict_file(&file);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "data dir too open: {dir_mode:o}");
+            assert_eq!(file_mode, 0o600, "database too open: {file_mode:o}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

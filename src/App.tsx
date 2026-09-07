@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createAdapter, formatBytes, formatSpeed } from './adapters';
@@ -393,6 +393,19 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
   const [removeError, setRemoveError] = useState('');
   const [removing, setRemoving] = useState(false);
   const availableTabs = job.media ? ['Overview', 'Network', 'Media', 'Files', 'Log'] as const : ['Overview', 'Network', 'Files', 'Log'] as const;
+  const panelId = `inspector-panel-${job.id}`;
+  const tabId = (item: typeof availableTabs[number]) => `inspector-tab-${job.id}-${item.toLowerCase()}`;
+  const selectTab = (index: number) => {
+    const next = availableTabs[index];
+    setTab(next);
+    window.setTimeout(() => document.getElementById(tabId(next))?.focus(), 0);
+  };
+  const handleTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    const nextIndex = event.key === 'ArrowRight' ? (index + 1) % availableTabs.length : event.key === 'ArrowLeft' ? (index - 1 + availableTabs.length) % availableTabs.length : event.key === 'Home' ? 0 : event.key === 'End' ? availableTabs.length - 1 : -1;
+    if (nextIndex < 0) return;
+    event.preventDefault();
+    selectTab(nextIndex);
+  };
   useEffect(() => { if (!availableTabs.includes(tab as never)) setTab('Overview'); }, [job.id, job.media]);
   const openPath = (path: string) => {
     setPathError('');
@@ -413,7 +426,7 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
       setRemoving(false);
     }
   };
-  return <aside className="inspector"><div className="inspector-tabs">{availableTabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll"><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} onOpen={openFolder} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile}><Icon name="open" size={15} /> Open file</button><button className="button" disabled={removing} onClick={() => void remove()}><Icon name="delete" size={15} /> {removing ? 'Removing…' : 'Remove'}</button></div></aside>;
+  return <aside className="inspector"><div className="inspector-tabs" role="tablist" aria-label="Download details">{availableTabs.map((item, index) => <button key={item} id={tabId(item)} role="tab" aria-selected={tab === item} aria-controls={panelId} tabIndex={tab === item ? 0 : -1} className={tab === item ? 'active' : ''} onClick={() => setTab(item)} onKeyDown={(event) => handleTabKeyDown(event, index)}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll" id={panelId} role="tabpanel" tabIndex={0} aria-labelledby={tabId(tab)}><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} onOpen={openFolder} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile}><Icon name="open" size={15} /> Open file</button><button className="button" disabled={removing} onClick={() => void remove()}><Icon name="delete" size={15} /> {removing ? 'Removing…' : 'Remove'}</button></div></aside>;
 }
 
 function DetailGrid({ items }: { items: Array<{ label: string; value: string; tone?: string }> }) {

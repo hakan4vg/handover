@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { JobContextMenu, SortMenu } from './App';
+import { JobContextMenu, Inspector, SortMenu } from './App';
 import type { DownloadAdapter, DownloadJob } from './types';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
@@ -67,6 +67,34 @@ describe('transient menu semantics', () => {
     expect(menu?.getAttribute('role')).toBe('menu');
     expect(menu?.getAttribute('aria-label')).toBe('Actions for project-assets.zip');
     expect(menu?.querySelectorAll('[role="menuitem"]')).toHaveLength(5);
+    act(() => root.unmount());
+  });
+
+  it('exposes inspector tabs and their labelled panel relationship', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(<Inspector job={job} adapter={adapter} onClose={() => undefined} />);
+    });
+
+    const tablist = host.querySelector('.inspector-tabs');
+    expect(tablist?.getAttribute('role')).toBe('tablist');
+    expect(tablist?.getAttribute('aria-label')).toBe('Download details');
+    const tabs = Array.from(tablist?.querySelectorAll('[role="tab"]') ?? []);
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['Overview', 'Network', 'Files', 'Log']);
+    expect(tabs.map((tab) => tab.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false', 'false']);
+    expect(tabs.map((tab) => tab.getAttribute('tabindex'))).toEqual(['0', '-1', '-1', '-1']);
+    const panel = host.querySelector('.inspector-scroll');
+    expect(panel?.getAttribute('role')).toBe('tabpanel');
+    expect(panel?.getAttribute('aria-labelledby')).toBe(tabs[0]?.id);
+    expect(tabs.every((tab) => tab.getAttribute('aria-controls') === panel?.id)).toBe(true);
+    act(() => {
+      (tabs[0] as HTMLButtonElement).dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    });
+    const selectedAfterArrow = Array.from(tablist?.querySelectorAll('[role="tab"]') ?? []).filter((tab) => tab.getAttribute('aria-selected') === 'true');
+    expect(selectedAfterArrow.map((tab) => tab.textContent)).toEqual(['Network']);
+    expect(panel?.getAttribute('aria-labelledby')).toBe(selectedAfterArrow[0]?.id);
     act(() => root.unmount());
   });
 });

@@ -477,7 +477,7 @@ function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => v
   return <button className="radio" onClick={onClick}><span className={checked ? 'checked' : ''} />{label}</button>;
 }
 
-export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void; onClose: () => void }) {
+export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void | Promise<void>; onClose: () => void }) {
   const [source, setSource] = useState(job?.source ?? '');
   const [name, setName] = useState(job?.name ?? '');
   const [nameTouched, setNameTouched] = useState(false);
@@ -525,7 +525,26 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
     setBusy(true);
     try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } catch (reason) { setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not start the download.'); } finally { setBusy(false); }
   };
-  const cancel = () => { if (job && job.provisional !== false) onCancel(job.id); else onClose(); };
+  const cancel = async () => {
+    if (job && job.provisional !== false) {
+      setFormError('');
+      let waitingForCancel = false;
+      try {
+        const result = onCancel(job.id);
+        if (result) {
+          waitingForCancel = true;
+          setBusy(true);
+          await result;
+        }
+      } catch (reason) {
+        setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not cancel the download.');
+      } finally {
+        if (waitingForCancel) setBusy(false);
+      }
+      return;
+    }
+    onClose();
+  };
   return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} aria-label="Add Download"><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input autoFocus={!job} value={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input value={destination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} /></div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : 'Checking…'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim())} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busy ? 'Starting…' : job ? 'Download' : 'Start Download'}</button><button className="button" onClick={cancel}>Cancel</button></div></div></section>;
 }
 
@@ -542,7 +561,7 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const currentJob = snapshot.jobs.find((item) => item.id === createdId);
   const close = () => window.close();
   const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit }));
-  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
+  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={async (id) => { await adapter.cancelJob(id); close(); }} onClose={close} /></div>;
 }
 
 function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {

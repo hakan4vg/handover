@@ -6821,3 +6821,11 @@ change and no site resolver exception:
 - The focused failure regression initially returned `ADD_WINDOW_COMMIT_ERROR_RED_RC=1` with no alert; the refined implementation returned `ADD_WINDOW_COMMIT_ERROR_CLEAN_RC=0` for the failure case and the existing commit wiring cases (`4/4`) with no React warnings.
 - The existing real `manual_add_ui_probe.py` still completed the normal captured commit path: `ADD_WINDOW_COMMIT_REAL_RC=0`, one provisional job, one source request, `262144` output bytes, and SHA-256 `ac6533c30d2d4fcc01be82be68bd63a592d37c49fe769b05aebfb4504fa146b3`. Evidence: `/tmp/dm-add-window-commit-real.log`.
 - The complete fail-fast gate is captured at `/tmp/dm-add-window-commit-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `71/71`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Keep Add Download open when cancellation fails
+
+- Captured-job `onCancel` previously accepted only a synchronous callback. The standalone Add window fire-and-forget `cancelJob(...); close()`, so a native cancellation failure could close the surface while leaving the provisional job and produce an unhandled rejection.
+- `AddDownloadWindow` now accepts synchronous or promise-returning cancel callbacks, waits for async cancellation, and renders failures in its existing `role="alert"` form region without closing. The standalone callback closes only after native cancellation success; synchronous main-manager cancellation keeps its existing global error-toast path.
+- The focused cancellation regression initially returned `ADD_WINDOW_CANCEL_ERROR_RED_RC=1`; the fixed combined Add-window set returned `ADD_WINDOW_CANCEL_ERROR_FIXED_RC=0` (`6/6`) with no warnings. Full Vitest later passed `21/21` files and `72/72` tests with no warnings.
+- The existing real manual Add probe was attempted at `/tmp/dm-add-window-cancel-real.log` but stopped before product interaction at the known external boundary: `WebKit inspector did not become ready: [Errno 111] Connection refused`. No real cancellation acceptance claim is made for that run.
+- The complete fail-fast gate is captured at `/tmp/dm-add-window-cancel-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `72/72`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

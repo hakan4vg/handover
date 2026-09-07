@@ -87,6 +87,32 @@ describe('download action error boundary', () => {
     host.remove();
   });
 
+  it('preserves a plain string rejection from the native command boundary', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const onNotice = vi.fn();
+    const onClose = vi.fn();
+    const adapter = {
+      retryJob: vi.fn().mockRejectedValue('native retry unavailable'),
+      removeJob: vi.fn(),
+    } as unknown as DownloadAdapter;
+
+    act(() => {
+      root.render(<JobContextMenu job={job} adapter={adapter} onClose={onClose} onNotice={onNotice} />);
+    });
+    const retry = Array.from(host.querySelectorAll('button')).find((button) => button.textContent?.includes('Retry')) as HTMLButtonElement;
+
+    await act(async () => {
+      retry.click();
+      await Promise.resolve();
+    });
+
+    expect(onNotice).toHaveBeenCalledWith('native retry unavailable', 'error');
+    expect(onClose).not.toHaveBeenCalled();
+    act(() => root.unmount());
+    host.remove();
+  });
   it('reports a synchronous adapter throw from an inline row action', async () => {
     const activeJob: DownloadJob = { ...job, id: 'active-action-error-1', name: 'active.bin', state: 'downloading', progress: 25 };
     const snapshot: AppSnapshot = {

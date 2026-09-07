@@ -42,7 +42,7 @@ export function useAppSnapshot(adapter: DownloadAdapter) {
     let mounted = true;
     let receivedSubscriptionSnapshot = false;
     const reportError = (reason: unknown) => {
-      if (mounted) setError(reason instanceof Error ? reason.message : 'The application core could not be reached.');
+      if (mounted) setError(errorMessage(reason, 'The application core could not be reached.'));
     };
     let dispose: () => void = () => undefined;
     try {
@@ -178,7 +178,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
       setAddWindowId(id);
       setSelectedId(id);
     } catch (reason) {
-      showNotice(reason instanceof Error ? reason.message : 'Could not start acquisition', 'error');
+      showNotice(errorMessage(reason, 'Could not start acquisition'), 'error');
     }
   };
 
@@ -249,8 +249,18 @@ export function NoticeToast({ message, tone }: { message: string; tone: 'success
 
 type DownloadAction = () => Promise<void> | void;
 
+function errorMessage(reason: unknown, fallback: string) {
+  if (reason instanceof Error && reason.message) return reason.message;
+  if (typeof reason === 'string' && reason.trim()) return reason;
+  if (reason && typeof reason === 'object') {
+    const message = (reason as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim()) return message;
+  }
+  return fallback;
+}
+
 function actionErrorMessage(reason: unknown) {
-  return reason instanceof Error && reason.message ? reason.message : 'Action failed';
+  return errorMessage(reason, 'Action failed');
 }
 
 function runAction(action: DownloadAction, onSuccess: () => void, onError: (message: string) => void) {
@@ -278,7 +288,7 @@ export async function openLocalPath(path: string): Promise<string | undefined> {
       await invoke('open_path', { path });
       return undefined;
     } catch (reason) {
-      return reason instanceof Error && reason.message ? reason.message : 'Could not open the selected path.';
+      return errorMessage(reason, 'Could not open the selected path.');
     }
   }
   try {
@@ -295,7 +305,7 @@ export async function copySourceUrl(source: string): Promise<string | undefined>
     await navigator.clipboard.writeText(source);
     return undefined;
   } catch (reason) {
-    return reason instanceof Error && reason.message ? reason.message : 'Could not copy the source URL.';
+    return errorMessage(reason, 'Could not copy the source URL.');
   }
 }
 
@@ -397,7 +407,7 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
       await adapter.removeJob(job.id);
       onClose();
     } catch (reason) {
-      setRemoveError(reason instanceof Error && reason.message ? reason.message : 'Could not remove the download.');
+      setRemoveError(errorMessage(reason, 'Could not remove the download.'));
     } finally {
       setRemoving(false);
     }
@@ -451,9 +461,9 @@ export function SettingsView({ adapter, settings, page, onPageChange }: { adapte
   const update = (patch: Partial<AppSettings>) => {
     setSaveError('');
     try {
-      void adapter.updateSettings(patch).catch((reason: unknown) => setSaveError(reason instanceof Error ? reason.message : 'Could not save settings'));
+      void adapter.updateSettings(patch).catch((reason: unknown) => setSaveError(errorMessage(reason, 'Could not save settings')));
     } catch (reason) {
-      setSaveError(reason instanceof Error ? reason.message : 'Could not save settings');
+      setSaveError(errorMessage(reason, 'Could not save settings'));
     }
   };
   return <main className="settings-main"><div className="settings-nav"><div className="settings-nav-title">Settings</div>{settingsNav.map((item) => <button className={`settings-nav-item ${page === item.key ? 'selected' : ''}`} key={item.key} onClick={() => onPageChange(item.key)}><Icon name={item.icon} size={17} /><span>{item.label}</span></button>)}</div><div className="settings-content">{saveError && <div className="form-error settings-error" role="alert"><Icon name="error" size={14} />{saveError}</div>}{page === 'general' && <GeneralSettings settings={settings} update={update} />}{page === 'downloads' && <DownloadSettings settings={settings} update={update} />}{page === 'browser' && <BrowserSettings settings={settings} update={update} />}{page === 'network' && <NetworkSettings settings={settings} update={update} />}{page === 'notifications' && <NotificationSettings settings={settings} update={update} />}{page === 'appearance' && <AppearanceSettings settings={settings} update={update} />}</div></main>;
@@ -560,7 +570,7 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
           await result;
         }
       } catch (reason) {
-        setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not add the download.');
+        setFormError(errorMessage(reason, 'Could not add the download.'));
       } finally {
         busyRef.current = false;
         if (waitingForCommit) setBusyAction(null);
@@ -578,7 +588,7 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
     busyRef.current = true;
     setFormError('');
     setBusyAction('create');
-    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } catch (reason) { setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not start the download.'); } finally { busyRef.current = false; setBusyAction(null); }
+    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } catch (reason) { setFormError(errorMessage(reason, 'Could not start the download.')); } finally { busyRef.current = false; setBusyAction(null); }
   };
   const cancel = async () => {
     if (busy || busyRef.current) return;
@@ -594,7 +604,7 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
           await result;
         }
       } catch (reason) {
-        setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not cancel the download.');
+        setFormError(errorMessage(reason, 'Could not cancel the download.'));
       } finally {
         busyRef.current = false;
         if (waitingForCancel) setBusyAction(null);
@@ -622,12 +632,40 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={async (id) => { await adapter.cancelJob(id); close(); }} onClose={close} /></div>;
 }
 
-function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
+export function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
+  const [error, setError] = useState('');
   const site = new URLSearchParams(window.location.search).get('site') ?? 'twitter.com';
   const excluded = snapshot.settings.excludedSites.includes(site);
-  const update = (patch: Partial<AppSettings>) => { void adapter.updateSettings(patch); };
+  const update = (patch: Partial<AppSettings>) => {
+    setError('');
+    try {
+      void adapter.updateSettings(patch).catch((reason: unknown) => setError(errorMessage(reason, 'Could not update browser integration settings.')));
+    } catch (reason) {
+      setError(errorMessage(reason, 'Could not update browser integration settings.'));
+    }
+  };
   const toggleSite = () => update({ excludedSites: excluded ? snapshot.settings.excludedSites.filter((item) => item !== site) : [...snapshot.settings.excludedSites, site] });
-  return <div className="popup-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="popup-header"><span className="product-logo"><Icon name="download" size={17} /></span><strong>Download Manager</strong><button className="icon-button" aria-label="Close" onClick={closeSurface}><Icon name="close" size={15} /></button></div><div className="popup-toggles"><SettingToggle icon="download" title="Intercept browser downloads" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} /><SettingToggle icon="media" title="Show media buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} /></div><div className="popup-site"><span className="eyebrow">Current site</span><strong>{site}</strong>{excluded ? <span className="excluded-copy">Media buttons excluded on this site</span> : <span className="enabled-copy">Media buttons enabled on this site</span>}<button className="button" onClick={toggleSite}>{excluded ? 'Enable on this site' : 'Exclude this site'}</button></div><button className="popup-manager-button" onClick={() => openManagerSurface()}><span>Open Manager</span><Icon name="open" size={15} /></button></div>;
+  return (
+    <div className="popup-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}>
+      <div className="popup-header">
+        <span className="product-logo"><Icon name="download" size={17} /></span>
+        <strong>Download Manager</strong>
+        <button className="icon-button" aria-label="Close" onClick={closeSurface}><Icon name="close" size={15} /></button>
+      </div>
+      {error && <div className="form-error popup-error" role="alert"><Icon name="error" size={14} />{error}</div>}
+      <div className="popup-toggles">
+        <SettingToggle icon="download" title="Intercept browser downloads" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} />
+        <SettingToggle icon="media" title="Show media buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} />
+      </div>
+      <div className="popup-site">
+        <span className="eyebrow">Current site</span>
+        <strong>{site}</strong>
+        {excluded ? <span className="excluded-copy">Media buttons excluded on this site</span> : <span className="enabled-copy">Media buttons enabled on this site</span>}
+        <button className="button" onClick={toggleSite}>{excluded ? 'Enable on this site' : 'Exclude this site'}</button>
+      </div>
+      <button className="popup-manager-button" onClick={() => openManagerSurface()}><span>Open Manager</span><Icon name="open" size={15} /></button>
+    </div>
+  );
 }
 
 export function TrayMenu({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
@@ -637,9 +675,9 @@ export function TrayMenu({ adapter, snapshot }: { adapter: DownloadAdapter; snap
   const run = (operation: () => Promise<void>) => {
     setError('');
     try {
-      void operation().catch((reason: unknown) => setError(reason instanceof Error && reason.message ? reason.message : 'Tray action failed.'));
+      void operation().catch((reason: unknown) => setError(errorMessage(reason, 'Tray action failed.')));
     } catch (reason) {
-      setError(reason instanceof Error && reason.message ? reason.message : 'Tray action failed.');
+      setError(errorMessage(reason, 'Tray action failed.'));
     }
   };
   const update = (patch: Partial<AppSettings>) => run(() => adapter.updateSettings(patch));

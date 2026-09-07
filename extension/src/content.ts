@@ -105,7 +105,7 @@ function rememberBrowserOwnedClick(event: MouseEvent): void {
 
 function interceptDownloadClick(event: MouseEvent): void {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  if (!policy?.interceptDownloads || !siteAllowed()) return;
+  if (policy && (!policy.interceptDownloads || !siteAllowed())) return;
   const target = event.target;
   if (!(target instanceof Element)) return;
   const anchor = target.closest('a');
@@ -445,14 +445,15 @@ function flashError(): void {
   }, 1600);
 }
 
+document.addEventListener('click', rememberBrowserOwnedClick, true);
+document.addEventListener('click', interceptDownloadClick, true);
+document.addEventListener('mouseenter', track, true);
+document.addEventListener('scroll', track, { capture: true, passive: true });
+chrome.storage.onChanged.addListener(() => void refreshPolicy());
+
 void refreshPolicy().then(() => {
   window.setInterval(track, 500);
   window.setInterval(refreshPolicy, 10_000);
   new MutationObserver(track).observe(document.documentElement, { childList: true, subtree: true });
-  document.addEventListener('click', rememberBrowserOwnedClick, true);
-  document.addEventListener('click', interceptDownloadClick, true);
-  document.addEventListener('mouseenter', track, true);
-  document.addEventListener('scroll', track, { capture: true, passive: true });
-  chrome.storage.onChanged.addListener(() => void refreshPolicy());
   track();
 });

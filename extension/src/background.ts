@@ -1,4 +1,4 @@
-import { DEFAULT_POLICY, NATIVE_HOST, isHttp, type BrowserPolicy } from './shared';
+import { DEFAULT_POLICY, NATIVE_HOST, isHttp, siteOf, type BrowserPolicy } from './shared';
 import { choosePlayerEvidence, chooseWorkerMediaSelection, isMediaCandidate, mediaKindFor, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
@@ -144,9 +144,12 @@ function cleanFilename(value: unknown): string | undefined {
 }
 
 async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
+  await policyReady;
   const source = typeof payload.source === 'string' ? payload.source.trim() : '';
-  if (!policy.interceptDownloads || !isHttp(source)) {
-    return { ok: false, error: 'ordinary interception disabled or invalid source' };
+  const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : '';
+  const pageSite = siteOf(pageUrl);
+  if (!policy.interceptDownloads || (pageSite && policy.excludedSites.includes(pageSite)) || !isHttp(source)) {
+    return { ok: false, error: 'ordinary interception disabled, site excluded, or invalid source' };
   }
   const response = (await sendNative({
     type: 'capture-acquisition',

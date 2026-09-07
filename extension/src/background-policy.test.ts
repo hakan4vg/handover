@@ -71,4 +71,36 @@ describe('background policy persistence', () => {
     expect(response.error).toContain('storage read unavailable');
     expect(response.policy).toEqual(DEFAULT_POLICY);
   });
+
+  it('waits for policy before forwarding capture and honors an excluded page', async () => {
+    let resolveStored: (value: unknown) => void = () => undefined;
+    const stored = new Promise((resolve) => { resolveStored = resolve; });
+    const storageGet = vi.fn().mockReturnValue(stored);
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet);
+    vi.stubGlobal('chrome', chrome);
+    await import('./background');
+
+    const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
+    expect(listener).toBeTypeOf('function');
+    let resolveReply: (value: Record<string, unknown>) => void = () => undefined;
+    const reply = new Promise<Record<string, unknown>>((resolve) => { resolveReply = resolve; });
+    listener({
+      type: 'ordinary-capture',
+      payload: { source: 'https://cdn.example.test/file.zip', pageUrl: 'https://www.example.test/downloads' },
+    }, {}, resolveReply);
+    await Promise.resolve();
+    expect(chrome.runtime.sendNativeMessage).not.toHaveBeenCalledWith(
+      'com.downloadmanager.host',
+      expect.objectContaining({ type: 'capture-acquisition' }),
+    );
+
+    resolveStored({ ["dm-policy"]: { interceptDownloads: true, showMediaButtons: true, excludedSites: ['example.test'] } });
+    const response = await reply;
+    expect(response.ok).toBe(false);
+    expect(response.error).toContain('site excluded');
+    expect(chrome.runtime.sendNativeMessage).not.toHaveBeenCalledWith(
+      'com.downloadmanager.host',
+      expect.objectContaining({ type: 'capture-acquisition' }),
+    );
+  });
 });

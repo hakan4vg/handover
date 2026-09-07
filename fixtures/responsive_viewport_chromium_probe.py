@@ -27,6 +27,7 @@ import segmented_restart_probe as support
 
 URL = "http://127.0.0.1:4177/"
 VIEWPORTS = (
+    ("reference", {"width": 1120, "height": 657, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-reference.png")),
     ("desktop", {"width": 900, "height": 600, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-chromium.png")),
     ("transition", {"width": 841, "height": 560, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-transition.png")),
     ("minimum", {"width": 780, "height": 560, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-min.png")),
@@ -61,6 +62,10 @@ def measure(client) -> dict:
         body:{clientWidth:document.body.clientWidth,scrollWidth:document.body.scrollWidth,clientHeight:document.body.clientHeight,scrollHeight:document.body.scrollHeight},
         shell:box('.desktop-shell'), manager:box('.manager-body'), footer:box('.manager-statusbar'),
         workspace:box('.workspace-columns'), list:box('.download-list'), inspector:box('.inspector'),
+        inspectorTabs:(()=>{const element=q('.inspector-tabs'); return element?{clientWidth:element.clientWidth,scrollWidth:element.scrollWidth}:null})(),
+        inspectorScroll:(()=>{const element=q('.inspector-scroll'); return element?{clientWidth:element.clientWidth,scrollWidth:element.scrollWidth}:null})(),
+        rowHeights:[...document.querySelectorAll('.download-row')].slice(0,3).map(row=>Math.round(row.getBoundingClientRect().height)),
+        firstTitle:(()=>{const title=document.querySelector('.download-row .row-title-line strong'); return title?{text:title.textContent,clientWidth:title.clientWidth,scrollWidth:title.scrollWidth,overflow:title.scrollWidth>title.clientWidth}:null})(),
       };
     })()""")
 
@@ -110,6 +115,12 @@ def main() -> int:
                 assert workspace["right"] <= manager["right"] + 1, metrics
                 assert inspector["width"] > 0, metrics
                 assert inspector["right"] <= workspace["right"] + 1, metrics
+            if viewport_size["width"] >= 1000:
+                assert inspector["width"] <= 280, metrics
+                assert metrics["inspectorTabs"]["scrollWidth"] <= metrics["inspectorTabs"]["clientWidth"] + 1, metrics
+                assert metrics["inspectorScroll"]["scrollWidth"] <= metrics["inspectorScroll"]["clientWidth"] + 1, metrics
+                assert all(height <= 92 for height in metrics["rowHeights"]), metrics
+                assert not metrics["firstTitle"]["overflow"], metrics
             print(f"RESPONSIVE-VIEWPORT: PASS ({label} contained)", flush=True)
         return 0
     finally:

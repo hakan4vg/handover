@@ -68,7 +68,7 @@ def rows(client) -> list[dict]:
         "Array.from(document.querySelectorAll('.download-row')).map(row=>({"
         "name:row.querySelector('.row-title-line strong')?.textContent?.trim()||'',"
         "state:row.querySelector('.state')?.textContent?.trim()||'',"
-        "action:row.querySelector('button[aria-label=\"Pause\"],button[aria-label=\"Resume\"],button[aria-label=\"Retry\"]')?.getAttribute('aria-label')||''"
+        "action:row.querySelector('button[aria-label^=\"Pause \"],button[aria-label^=\"Resume \"],button[aria-label^=\"Retry \"]')?.getAttribute('aria-label')||''"
         "}))",
     )
 
@@ -82,7 +82,7 @@ def row_action_point(client, name: str) -> dict:
         client,
         "(()=>{const row=[...document.querySelectorAll('.download-row')].find(item=>item.querySelector('.row-title-line strong')?.textContent?.trim()==="
         + json.dumps(name)
-        + ");const button=row?.querySelector('button[aria-label=\"Pause\"],button[aria-label=\"Resume\"],button[aria-label=\"Retry\"]');"
+        + ");const button=row?.querySelector('button[aria-label^=\"Pause \"],button[aria-label^=\"Resume \"],button[aria-label^=\"Retry \"]');"
         "if(!button)return {error:'missing'};const r=button.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,label:button.getAttribute('aria-label')};})()",
     )
     if point.get("error"):
@@ -141,23 +141,23 @@ def main() -> int:
 
         # Inline Pause on the active row.
         point = row_action_point(client, ACTIVE_NAME)
-        assert point["label"] == "Pause", point
+        assert point["label"] == f"Pause {ACTIVE_NAME}", point
         click_point(client, point)
-        paused = wait_state(client, ACTIVE_NAME, "last['state'] == 'Paused' and last['action'] == 'Resume'")
+        paused = wait_state(client, ACTIVE_NAME, "last['state'] == 'Paused' and last['action'].startswith('Resume ')")
         print("INLINE-PAUSE:", json.dumps(paused, sort_keys=True), flush=True)
 
         # Inline Resume.
         point = row_action_point(client, ACTIVE_NAME)
-        assert point["label"] == "Resume", point
+        assert point["label"] == f"Resume {ACTIVE_NAME}", point
         click_point(client, point)
-        resumed = wait_state(client, ACTIVE_NAME, "last['state'] not in ('Paused','Pending') and last['action'] == 'Pause'")
+        resumed = wait_state(client, ACTIVE_NAME, "last['state'] not in ('Paused','Pending') and last['action'].startswith('Pause ')")
         print("INLINE-RESUME:", json.dumps(resumed, sort_keys=True), flush=True)
 
         # Inline Retry on the failed row.
         point = row_action_point(client, FAILED_NAME)
-        assert point["label"] == "Retry", point
+        assert point["label"] == f"Retry {FAILED_NAME}", point
         click_point(client, point)
-        retried = wait_state(client, FAILED_NAME, "last['state'] not in ('Failed',) and last['action'] == 'Pause'", timeout=10.0)
+        retried = wait_state(client, FAILED_NAME, "last['state'] not in ('Failed',) and last['action'].startswith('Pause ')", timeout=10.0)
         print("INLINE-RETRY:", json.dumps(retried, sort_keys=True), flush=True)
 
         # Pause All.
@@ -168,7 +168,7 @@ def main() -> int:
 
         # Resume All.
         click_text(client, ".toolbar-actions button", "Resume All")
-        resumed_all = wait_state(client, ACTIVE_NAME, "last['state'] not in ('Paused','Pending') and last['action'] == 'Pause'", timeout=10.0)
+        resumed_all = wait_state(client, ACTIVE_NAME, "last['state'] not in ('Paused','Pending') and last['action'].startswith('Pause ')", timeout=10.0)
         wait_toolbar(client, "Pause All")
         print("RESUME-ALL:", json.dumps({"active": resumed_all, "toolbar": evaluate_json(client, "Array.from(document.querySelectorAll('.toolbar-actions button')).map(item=>item.textContent.trim())")}, sort_keys=True), flush=True)
 

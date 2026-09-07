@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -516,7 +516,9 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
   const [destination, setDestination] = useState(job?.destination ?? settings.defaultFolder);
   const [destTouched, setDestTouched] = useState(false);
   const [advanced, setAdvanced] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [busyAction, setBusyAction] = useState<'create' | 'commit' | 'cancel' | null>(null);
+  const busy = busyAction !== null;
   const [formError, setFormError] = useState('');
   const [maxConnections, setMaxConnections] = useState(job?.maxConnections ?? settings.maxConnections);
   const capInitial = bpsToParts(job?.bandwidthLimit ?? 50 * 1024 ** 2);
@@ -527,21 +529,24 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
   useEffect(() => { if (job?.maxConnections) setMaxConnections(job.maxConnections); }, [job?.id, job?.maxConnections]);
   useEffect(() => { if (job?.bandwidthLimit != null) { const parts = bpsToParts(job.bandwidthLimit); setCapLimited(true); setCapValue(parts.value); setCapUnit(parts.unit); } }, [job?.id]);
   const submit = async () => {
+    if (busy || busyRef.current) return;
     const bandwidthLimit = capLimited ? bandwidthToBps(capValue, capUnit) : null;
     if (job && onCommit) {
+      busyRef.current = true;
       setFormError('');
       let waitingForCommit = false;
       try {
         const result = onCommit(job.id, name, destination, maxConnections, bandwidthLimit);
-        if (result) {
+        if (result && typeof result.then === 'function') {
           waitingForCommit = true;
-          setBusy(true);
+          setBusyAction('commit');
           await result;
         }
       } catch (reason) {
         setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not add the download.');
       } finally {
-        if (waitingForCommit) setBusy(false);
+        busyRef.current = false;
+        if (waitingForCommit) setBusyAction(null);
       }
       return;
     }
@@ -553,31 +558,35 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
       setFormError(reason instanceof Error && reason.message === 'Use an HTTP or HTTPS URL.' ? reason.message : 'Enter a valid HTTP or HTTPS URL.');
       return;
     }
+    busyRef.current = true;
     setFormError('');
-    setBusy(true);
-    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } catch (reason) { setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not start the download.'); } finally { setBusy(false); }
+    setBusyAction('create');
+    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } catch (reason) { setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not start the download.'); } finally { busyRef.current = false; setBusyAction(null); }
   };
   const cancel = async () => {
+    if (busy || busyRef.current) return;
     if (job && job.provisional !== false) {
+      busyRef.current = true;
       setFormError('');
       let waitingForCancel = false;
       try {
         const result = onCancel(job.id);
-        if (result) {
+        if (result && typeof result.then === 'function') {
           waitingForCancel = true;
-          setBusy(true);
+          setBusyAction('cancel');
           await result;
         }
       } catch (reason) {
         setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not cancel the download.');
       } finally {
-        if (waitingForCancel) setBusy(false);
+        busyRef.current = false;
+        if (waitingForCancel) setBusyAction(null);
       }
       return;
     }
     onClose();
   };
-  return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} aria-label="Add Download"><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input aria-label="Source URL" autoFocus={!job} value={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input aria-label="Filename" value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input aria-label="Save destination" value={destination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} /></div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : 'Checking…'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input aria-label="Per-download maximum connections" className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row" role="radiogroup" aria-label="Per-download bandwidth cap"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input aria-label="Per-download bandwidth limit" className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select label="Per-download bandwidth unit" value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim())} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busy ? 'Starting…' : job ? 'Download' : 'Start Download'}</button><button className="button" onClick={cancel}>Cancel</button></div></div></section>;
+  return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} aria-label="Add Download" aria-busy={busy}><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" disabled={busy} onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input aria-label="Source URL" autoFocus={!job} value={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input aria-label="Filename" value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input aria-label="Save destination" value={destination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} /></div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : 'Checking…'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input aria-label="Per-download maximum connections" className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row" role="radiogroup" aria-label="Per-download bandwidth cap"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input aria-label="Per-download bandwidth limit" className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select label="Per-download bandwidth unit" value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim())} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busyAction === 'create' ? 'Starting…' : busyAction === 'commit' ? 'Adding…' : job ? 'Download' : 'Start Download'}</button><button className="button" disabled={busy} onClick={cancel}>{busyAction === 'cancel' ? 'Cancelling…' : 'Cancel'}</button></div></div></section>;
 }
 
 function Metric({ icon, label, value, tone }: { icon: IconName; label: string; value: string; tone?: string }) {

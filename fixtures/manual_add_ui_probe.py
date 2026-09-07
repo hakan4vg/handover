@@ -128,7 +128,7 @@ def main() -> int:
         support.wait_tauri(client)
         assert app.poll() is None, app.poll()
 
-        initial = client.evaluate("document.body.innerText") or ""
+        initial = wait_until(client, "document.body.innerText", lambda value: "Add URL" in (value or ""), timeout=30.0)
         assert "Add URL" in initial, initial[:500]
         assert server.requests == 0, server.requests
         client.evaluate("[...document.querySelectorAll('button')].find(button=>button.textContent?.includes('Add URL'))?.click()")

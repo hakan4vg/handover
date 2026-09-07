@@ -4,7 +4,11 @@ let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 let site = '';
 
 function paint(): void {
-  const setSwitch = (id: string, on: boolean) => document.getElementById(id)?.classList.toggle('on', on);
+  const setSwitch = (id: string, on: boolean) => {
+    const element = document.getElementById(id);
+    element?.classList.toggle('on', on);
+    element?.setAttribute('aria-pressed', String(on));
+  };
   setSwitch('intercept', policy.interceptDownloads);
   setSwitch('media', policy.showMediaButtons);
   document.getElementById('site')!.textContent = site || 'This page';
@@ -15,15 +19,30 @@ function paint(): void {
   document.getElementById('site-toggle')!.textContent = excluded ? 'Enable on this site' : 'Exclude this site';
 }
 
+function setStatus(message: string): void {
+  const element = document.getElementById('status');
+  if (!element) return;
+  element.textContent = message;
+  element.hidden = message === '';
+}
+
+function errorText(reason: unknown, fallback: string): string {
+  return reason instanceof Error && reason.message ? reason.message : fallback;
+}
+
 async function push(): Promise<void> {
   paint();
+  setStatus('');
   try {
     const response = (await chrome.runtime.sendMessage({ type: 'update-policy', patch: policy })) as {
+      ok?: boolean;
       policy?: BrowserPolicy;
+      error?: string;
     };
     if (response?.policy) policy = response.policy;
-  } catch {
-    // Background unreachable (e.g. popup open in a plain tab during dev).
+    if (response?.ok === false || !response?.policy) setStatus(response?.error ?? 'Could not save browser integration settings.');
+  } catch (reason) {
+    setStatus(errorText(reason, 'Could not save browser integration settings.'));
   }
   paint();
 }
@@ -37,11 +56,15 @@ async function init(): Promise<void> {
   }
   try {
     const response = (await chrome.runtime.sendMessage({ type: 'get-policy' })) as {
+      ok?: boolean;
       policy?: BrowserPolicy;
+      error?: string;
     };
     if (response?.policy) policy = response.policy;
-  } catch {
+    if (response?.ok === false || !response?.policy) setStatus(response?.error ?? 'Could not load browser integration settings.');
+  } catch (reason) {
     policy = { ...DEFAULT_POLICY };
+    setStatus(errorText(reason, 'Could not load browser integration settings.'));
   }
   document.getElementById('intercept')!.addEventListener('click', () => {
     policy.interceptDownloads = !policy.interceptDownloads;
@@ -59,7 +82,10 @@ async function init(): Promise<void> {
     void push();
   });
   document.getElementById('open')!.addEventListener('click', () => {
-    void chrome.runtime.sendMessage({ type: 'open-manager' }).catch(() => undefined);
+    setStatus('');
+    void chrome.runtime.sendMessage({ type: 'open-manager' }).then((response: { ok?: boolean; error?: string } | undefined) => {
+      if (response?.ok === false) setStatus(response.error ?? 'Could not open Download Manager.');
+    }).catch((reason: unknown) => setStatus(errorText(reason, 'Could not open Download Manager.')));
   });
   paint();
 }

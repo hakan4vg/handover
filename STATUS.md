@@ -6699,3 +6699,22 @@ change and no site resolver exception:
   `58/58`, Rust `71/71`, both production builds, Cargo build, Python
   compilation, and `git diff --check`:
   `/tmp/dm-settings-feedback-full-gate.log`.
+
+## 2026-09-07 — Extension popup action feedback
+
+- The popup previously swallowed background failures for policy load/save and
+  `Open Manager`, while switch state was visible only through CSS.
+- `extension/src/popup.ts` now renders failure text in an aria-live status region,
+  handles rejected and `{ok:false}` responses, and sets `aria-pressed` on both
+  policy switches. `extension/popup.html` supplies the status region and styling.
+- The focused test was red before the change (`POPUP_FEEDBACK_RED_RC=1`):
+  `/tmp/dm-popup-feedback-red.log`.
+- The focused popup tests passed `2/2` after the fix:
+  `/tmp/dm-popup-feedback-fixed.log`.
+- The existing real Chromium popup probe passed after rebuilding the extension:
+  exclusion toggled off/on, `example.com` persisted, and Open Manager reached
+  the manager with 14 rows:
+  `/tmp/dm-popup-real-fixed-retry.log`.
+- The fail-fast full gate returned `GATE_RC=0` with Vitest `60/60`, Rust `71/71`,
+  both production builds, Cargo build, Python compilation, and `git diff --check`:
+  `/tmp/dm-popup-feedback-full-gate.log`.

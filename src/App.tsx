@@ -360,9 +360,17 @@ function MenuAction({ icon, label, danger, onClick }: { icon: IconName; label: s
   return <button className={`menu-action ${danger ? 'danger' : ''}`} onClick={onClick}><Icon name={icon} size={16} /><span>{label}</span></button>;
 }
 
-function SettingsView({ adapter, settings, page, onPageChange }: { adapter: DownloadAdapter; settings: AppSettings; page: SettingsPage; onPageChange: (page: SettingsPage) => void }) {
-  const update = (patch: Partial<AppSettings>) => { void adapter.updateSettings(patch); };
-  return <main className="settings-main"><div className="settings-nav"><div className="settings-nav-title">Settings</div>{settingsNav.map((item) => <button className={`settings-nav-item ${page === item.key ? 'selected' : ''}`} key={item.key} onClick={() => onPageChange(item.key)}><Icon name={item.icon} size={17} /><span>{item.label}</span></button>)}</div><div className="settings-content">{page === 'general' && <GeneralSettings settings={settings} update={update} />}{page === 'downloads' && <DownloadSettings settings={settings} update={update} />}{page === 'browser' && <BrowserSettings settings={settings} update={update} />}{page === 'network' && <NetworkSettings settings={settings} update={update} />}{page === 'notifications' && <NotificationSettings settings={settings} update={update} />}{page === 'appearance' && <AppearanceSettings settings={settings} update={update} />}</div></main>;
+export function SettingsView({ adapter, settings, page, onPageChange }: { adapter: DownloadAdapter; settings: AppSettings; page: SettingsPage; onPageChange: (page: SettingsPage) => void }) {
+  const [saveError, setSaveError] = useState('');
+  const update = (patch: Partial<AppSettings>) => {
+    setSaveError('');
+    try {
+      void adapter.updateSettings(patch).catch((reason: unknown) => setSaveError(reason instanceof Error ? reason.message : 'Could not save settings'));
+    } catch (reason) {
+      setSaveError(reason instanceof Error ? reason.message : 'Could not save settings');
+    }
+  };
+  return <main className="settings-main"><div className="settings-nav"><div className="settings-nav-title">Settings</div>{settingsNav.map((item) => <button className={`settings-nav-item ${page === item.key ? 'selected' : ''}`} key={item.key} onClick={() => onPageChange(item.key)}><Icon name={item.icon} size={17} /><span>{item.label}</span></button>)}</div><div className="settings-content">{saveError && <div className="form-error settings-error" role="alert"><Icon name="error" size={14} />{saveError}</div>}{page === 'general' && <GeneralSettings settings={settings} update={update} />}{page === 'downloads' && <DownloadSettings settings={settings} update={update} />}{page === 'browser' && <BrowserSettings settings={settings} update={update} />}{page === 'network' && <NetworkSettings settings={settings} update={update} />}{page === 'notifications' && <NotificationSettings settings={settings} update={update} />}{page === 'appearance' && <AppearanceSettings settings={settings} update={update} />}</div></main>;
 }
 
 function SettingsHeading({ title, description }: { title: string; description?: string }) {

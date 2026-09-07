@@ -6680,5 +6680,22 @@ change and no site resolver exception:
   `/tmp/dm-notifications-native-after-live-fix.log`.
 - The corrected fail-fast full gate is captured at
   `/tmp/dm-notifications-full-gate-corrected.log` and returned `GATE_RC=0`:
-  Vitest `57/57`, Rust `71/71`, both production builds, Cargo build, valid
+  Vitest `58/58`, Rust `71/71`, both production builds, Cargo build, valid
   Python compilation, and `git diff --check` passed.
+
+## 2026-09-07 — Settings save failure feedback
+
+- A focused jsdom regression caught a silent rejection: settings controls called
+  `adapter.updateSettings` without a rejection handler, so an IPC or store error
+  left the user with no explanation.
+- `src/App.tsx` now renders an accessible `role="alert"` in Settings with the
+  adapter error text. It clears on the next save attempt and also handles a
+  synchronous adapter throw.
+- The test was red before the fix (`SETTINGS_FEEDBACK_RED_RC=1`, missing alert):
+  `/tmp/dm-settings-feedback-red.log`.
+- The fixed focused test passed (`SETTINGS_FEEDBACK_FIXED_RC=0`):
+  `/tmp/dm-settings-feedback-fixed.log`.
+- The corrected fail-fast aggregate gate passed (`GATE_RC=0`) with Vitest
+  `58/58`, Rust `71/71`, both production builds, Cargo build, Python
+  compilation, and `git diff --check`:
+  `/tmp/dm-settings-feedback-full-gate.log`.

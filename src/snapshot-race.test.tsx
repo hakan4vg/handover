@@ -73,4 +73,25 @@ describe('useAppSnapshot startup ordering', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('surfaces a synchronous subscription setup failure', async () => {
+    const adapter = {
+      subscribe: vi.fn(() => {
+        throw new Error('live subscription setup failed');
+      }),
+      getSnapshot: vi.fn(async () => snapshot(true)),
+    } as unknown as DownloadAdapter;
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+
+    await act(async () => {
+      root.render(<Probe adapter={adapter} />);
+      await Promise.resolve();
+    });
+
+    expect(host.querySelector('output')?.textContent).toBe('live subscription setup failed');
+    act(() => root.unmount());
+    host.remove();
+  });
 });

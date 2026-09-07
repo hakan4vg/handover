@@ -44,13 +44,18 @@ export function useAppSnapshot(adapter: DownloadAdapter) {
     const reportError = (reason: unknown) => {
       if (mounted) setError(reason instanceof Error ? reason.message : 'The application core could not be reached.');
     };
-    const dispose = adapter.subscribe((next) => {
-      if (mounted) {
-        receivedSubscriptionSnapshot = true;
-        setSnapshot(next);
-        setError('');
-      }
-    }, reportError);
+    let dispose: () => void = () => undefined;
+    try {
+      dispose = adapter.subscribe((next) => {
+        if (mounted) {
+          receivedSubscriptionSnapshot = true;
+          setSnapshot(next);
+          setError('');
+        }
+      }, reportError);
+    } catch (reason) {
+      reportError(reason);
+    }
     adapter.getSnapshot().then((next) => {
       if (mounted && !receivedSubscriptionSnapshot) setSnapshot(next);
     }).catch(reportError);

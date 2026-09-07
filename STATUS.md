@@ -6891,3 +6891,11 @@ change and no site resolver exception:
 - The component regression was red at `/tmp/dm-manager-add-error-red.log`: after `Destination is not writable`, the captured window was `null`. The fixed test returned `MANAGER_ADD_ERROR_FIXED_RC=0` (`1/1`), and TypeScript returned `MANAGER_ADD_ERROR_TSC_RC=0`.
 - The existing trusted Chromium manager-controls probe passed after the change with the normal Add URL open/cancel path and all prior row, bulk, sorting, and menu checks: `MANAGER_ADD_ERROR_MANAGER_REAL_RC=0`. Evidence: `/tmp/dm-manager-add-error-manager-real.log`.
 - The complete fail-fast gate returned `MANAGER_ADD_ERROR_GATE_RC=0`: Vitest `23` files/`76` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-manager-add-error-full-gate.log`.
+
+## 2026-09-07 — Give Appearance choices semantic selected states
+
+- Appearance theme cards and accent swatches had visible selection styling but no semantic group or selected state for assistive technology. A real Chromium audit at `/tmp/dm-appearance-audit.log` confirmed the rendered controls had no roles or checked/pressed state.
+- `src/App.tsx` now exposes labelled `Theme` and `Accent color` radio groups; every choice has `role="radio"` and `aria-checked` while retaining existing click behavior and styling. The regressions live in `src/settings-feedback.test.tsx`.
+- The theme regression was red at `/tmp/dm-theme-radio-red.log` (`1 failed | 2 passed`) and then passed with `THEME_RADIO_FIXED_RC=0`; the accent regression was red at `/tmp/dm-accent-radio-red.log` (`1 failed | 3 passed`) and then passed with `ACCENT_RADIO_FIXED_RC=0`. TypeScript returned `THEME_RADIO_TSC_RC=0` and `ACCENT_RADIO_TSC_RC=0`.
+- Real Chromium reports both groups and selected arrays, including `Theme [true,false,false]` and `Accent [true,false,false,false,false,false,false,false]`: `ACCENT_RADIO_REAL_RC=0`. Evidence: `/tmp/dm-accent-radio-real.log` and `/tmp/dm-appearance-accessible.png`.
+- The complete fail-fast gate returned `APPEARANCE_GATE_RC=0`: Vitest `23` files/`78` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-appearance-full-gate.log`.

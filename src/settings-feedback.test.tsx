@@ -77,4 +77,52 @@ describe('SettingsView', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('exposes theme choices as a labelled radio group', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const adapter = {
+      updateSettings: vi.fn().mockResolvedValue(undefined),
+    } as unknown as DownloadAdapter;
+
+    await act(async () => {
+      root.render(<SettingsView adapter={adapter} settings={settings} page="appearance" onPageChange={() => undefined} />);
+    });
+
+    const group = host.querySelector('.theme-options');
+    expect(group?.getAttribute('role')).toBe('radiogroup');
+    expect(group?.getAttribute('aria-label')).toBe('Theme');
+    const options = Array.from(host.querySelectorAll('button.theme-option'));
+    expect(options).toHaveLength(3);
+    expect(options.map((option) => option.getAttribute('role'))).toEqual(['radio', 'radio', 'radio']);
+    expect(options.map((option) => option.getAttribute('aria-checked'))).toEqual(['false', 'true', 'false']);
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it('exposes accent choices as a labelled radio group', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const adapter = {
+      updateSettings: vi.fn().mockResolvedValue(undefined),
+    } as unknown as DownloadAdapter;
+
+    await act(async () => {
+      root.render(<SettingsView adapter={adapter} settings={settings} page="appearance" onPageChange={() => undefined} />);
+    });
+
+    const group = host.querySelector('.accent-options');
+    expect(group?.getAttribute('role')).toBe('radiogroup');
+    expect(group?.getAttribute('aria-label')).toBe('Accent color');
+    const options = Array.from(host.querySelectorAll('button.accent-swatch'));
+    expect(options).toHaveLength(8);
+    expect(options.map((option) => option.getAttribute('role'))).toEqual(Array(8).fill('radio'));
+    expect(options.map((option) => option.getAttribute('aria-checked'))).toEqual(['true', ...Array(7).fill('false')]);
+
+    act(() => root.unmount());
+    host.remove();
+  });
 });

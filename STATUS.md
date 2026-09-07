@@ -6718,3 +6718,26 @@ change and no site resolver exception:
 - The fail-fast full gate returned `GATE_RC=0` with Vitest `60/60`, Rust `71/71`,
   both production builds, Cargo build, Python compilation, and `git diff --check`:
   `/tmp/dm-popup-feedback-full-gate.log`.
+
+## 2026-09-07 — Browser policy persistence failure contract
+
+- The background policy handler mutated its live policy and swallowed
+  `chrome.storage.local.set` failures, replying `ok:true` even though a later
+  popup reopen would lose the change.
+- `extension/src/background.ts` now persists a copied next policy before
+  publishing it, restores the previous policy on failure, and returns
+  `{ok:false,error,policy}`. Successful saves retain the existing native push.
+- The focused listener regression was red before the fix
+  (`BACKGROUND_POLICY_RED_RC=1`, received `ok:true`):
+  `/tmp/dm-background-policy-red.log`.
+- The fixed rollback/error contract passed (`BACKGROUND_POLICY_FIXED_RC=0`):
+  `/tmp/dm-background-policy-fixed.log`.
+- The focused popup/background pair passed `3/3`, the extension build passed, and
+  the real popup Chromium probe passed after the fix:
+  `/tmp/dm-browser-policy-focused-fixed.log`,
+  `/tmp/dm-browser-policy-extension-build.log`,
+  `/tmp/dm-browser-policy-popup-real.log`.
+- The fail-fast aggregate gate returned `GATE_RC=0` with Vitest `61/61`, Rust
+  `71/71`, both production builds, Cargo build, Python compilation, and
+  `git diff --check`:
+  `/tmp/dm-browser-policy-full-gate.log`.

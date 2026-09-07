@@ -82,12 +82,8 @@ async function loadPolicy(): Promise<void> {
   }
 }
 
-async function savePolicy(): Promise<void> {
-  try {
-    await chrome.storage.local.set({ [POLICY_KEY]: policy });
-  } catch {
-    // Storage failure must not break acquisition paths.
-  }
+async function savePolicy(next: BrowserPolicy = policy): Promise<void> {
+  await chrome.storage.local.set({ [POLICY_KEY]: next });
 }
 
 function sendNative(message: unknown): Promise<unknown> {
@@ -313,12 +309,20 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       reply({ ok: true, policy });
     } else if (type === 'update-policy') {
       const patch = (message as { patch?: Partial<BrowserPolicy> }).patch ?? {};
-      if (typeof patch.interceptDownloads === 'boolean') policy.interceptDownloads = patch.interceptDownloads;
-      if (typeof patch.showMediaButtons === 'boolean') policy.showMediaButtons = patch.showMediaButtons;
+      const previous = policy;
+      const next: BrowserPolicy = { ...policy, excludedSites: [...policy.excludedSites] };
+      if (typeof patch.interceptDownloads === 'boolean') next.interceptDownloads = patch.interceptDownloads;
+      if (typeof patch.showMediaButtons === 'boolean') next.showMediaButtons = patch.showMediaButtons;
       if (Array.isArray(patch.excludedSites)) {
-        policy.excludedSites = patch.excludedSites.filter((site): site is string => typeof site === 'string');
+        next.excludedSites = patch.excludedSites.filter((site): site is string => typeof site === 'string');
       }
-      await savePolicy();
+      try {
+        await savePolicy(next);
+      } catch (reason) {
+        reply({ ok: false, error: reason instanceof Error && reason.message ? reason.message : 'Could not save browser integration settings.', policy: previous });
+        return;
+      }
+      policy = next;
       reply({ ok: true, policy });
       // Best-effort push so the resident app (when running) stays coherent.
       void sendNative({ type: 'update-policy', payload: policy });

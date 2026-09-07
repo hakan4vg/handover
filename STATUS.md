@@ -6398,6 +6398,13 @@ change and no site resolver exception:
   the download list and inspector retain their intended internal scroll areas:
   `/tmp/dm-ui-responsive-chromium.log` and
   `/tmp/dm-ui-responsive-chromium.png`.
+- The rebuilt native Tauri/WebKit window was also resized through X11 to
+  `900x600`. Its live DOM reported equal document/body client and scroll
+  dimensions, `.manager-body` from `top=48` to `bottom=600` with `minHeight=0px`,
+  and `.manager-statusbar` from `566` to `600`. The native DOM probe ended with
+  `NATIVE-RESPONSIVE-PROBE: PASS`; WebKit's unsupported `Page.captureScreenshot`
+  method was a tooling limitation only. Evidence:
+  `/tmp/dm-native-responsive-dom-pass.log`.
 - Verification: `npm test -- --run` passed `50/50`, `npx tsc -b`,
   `npm run build:extension`, the fresh responsive Chromium probe, and
   `git diff --check` all passed. No native or extension production behavior

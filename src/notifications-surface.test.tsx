@@ -44,6 +44,26 @@ describe('NotificationsSurface live state', () => {
     host.remove();
   });
 
+  it('gives each notification dismissal a distinct accessible name', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const first = notification('one', 'first.bin · 1 KB');
+    const second = notification('two', 'second.bin · 2 KB');
+
+    act(() => {
+      root.render(<NotificationsSurface snapshot={snapshot([first, second])} />);
+    });
+    const dismissals = Array.from(host.querySelectorAll('.notification-close')) as HTMLButtonElement[];
+    expect(dismissals.map((button) => button.getAttribute('aria-label'))).toEqual([
+      'Dismiss Download completed: first.bin · 1 KB',
+      'Dismiss Download completed: second.bin · 2 KB',
+    ]);
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
   it('keeps explicit dismissals hidden while showing later notifications', () => {
     const host = document.createElement('div');
     document.body.appendChild(host);
@@ -54,8 +74,9 @@ describe('NotificationsSurface live state', () => {
     act(() => {
       root.render(<NotificationsSurface snapshot={snapshot([initial])} />);
     });
-    const dismiss = host.querySelector('button[aria-label="Dismiss"]');
+    const dismiss = host.querySelector('.notification-close');
     expect(dismiss).toBeInstanceOf(HTMLButtonElement);
+    expect(dismiss?.getAttribute('aria-label')).toBe('Dismiss Download completed: first.bin · 1 KB');
     act(() => {
       (dismiss as HTMLButtonElement).click();
     });

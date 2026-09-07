@@ -507,9 +507,16 @@ function TrayToggle({ icon, label, checked, onChange }: { icon: IconName; label:
   return <div className="tray-toggle"><Icon name={icon} size={17} /><span>{label}</span><Toggle checked={checked} onChange={onChange} /></div>;
 }
 
-function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {
-  const [items, setItems] = useState(snapshot.notifications);
-  return <div className="notifications-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="notification-stack-title"><strong>Notifications</strong><button className="icon-button" aria-label="Dismiss all" onClick={() => setItems([])}><Icon name="close" size={16} /></button></div>{items.map((item) => <NotificationCard key={item.id} item={item} job={snapshot.jobs.find((job) => job.id === item.jobId)} onDismiss={() => setItems(items.filter((current) => current.id !== item.id))} />)}{!items.length && <div className="empty-notifications"><Icon name="check" size={24} /><span>You're all caught up</span></div>}</div>;
+export function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set());
+  const items = snapshot.notifications.filter((item) => !dismissedIds.has(item.id));
+  const dismiss = (id: string) => setDismissedIds((current) => new Set(current).add(id));
+  const dismissAll = () => setDismissedIds((current) => {
+    const next = new Set(current);
+    snapshot.notifications.forEach((item) => next.add(item.id));
+    return next;
+  });
+  return <div className="notifications-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="notification-stack-title"><strong>Notifications</strong><button className="icon-button" aria-label="Dismiss all" onClick={dismissAll}><Icon name="close" size={16} /></button></div>{items.map((item) => <NotificationCard key={item.id} item={item} job={snapshot.jobs.find((job) => job.id === item.jobId)} onDismiss={() => dismiss(item.id)} />)}{!items.length && <div className="empty-notifications"><Icon name="check" size={24} /><span>You're all caught up</span></div>}</div>;
 }
 
 function NotificationCard({ item, job, onDismiss }: { item: AppSnapshot['notifications'][number]; job?: DownloadJob; onDismiss: () => void }) {

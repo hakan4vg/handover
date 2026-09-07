@@ -6660,3 +6660,25 @@ change and no site resolver exception:
   `/tmp/dm-menu-dismiss-full-gate.log` and returned `GATE_RC=0`: Vitest `55/55`,
   Rust `71/71`, both production builds, Cargo build, Python compilation, and
   `git diff --check` passed. No native or extension behavior changed.
+
+## 2026-09-07 — Live Notifications surface updates
+
+- A focused jsdom regression exposed that `NotificationsSurface` copied
+  `snapshot.notifications` into local state once. Rerendering with a later
+  application snapshot left the new card absent; red evidence:
+  `/tmp/dm-notifications-live-red.log`.
+- Changed `src/App.tsx` to derive visible cards from the current snapshot and
+  retain only explicit dismissals as a set of notification IDs. New completion
+  or failure cards now appear in an already-open surface, while per-card and
+  Dismiss all actions remain effective across state updates.
+- Added `src/notifications-surface.test.tsx`. The focused test passes `2/2` for
+  later-card rendering and dismissal persistence:
+  `/tmp/dm-notifications-live-fixed-2.log`.
+- The existing real native notification probe passed after the rebuild with one
+  completed card, `Open` and `Show in folder`, one `65,536`-byte managed output,
+  and the expected recorded file/folder opener calls:
+  `/tmp/dm-notifications-native-after-live-fix.log`.
+- The corrected fail-fast full gate is captured at
+  `/tmp/dm-notifications-full-gate-corrected.log` and returned `GATE_RC=0`:
+  Vitest `57/57`, Rust `71/71`, both production builds, Cargo build, valid
+  Python compilation, and `git diff --check` passed.

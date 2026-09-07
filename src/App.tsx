@@ -237,12 +237,21 @@ function startWindowDrag(event: ReactMouseEvent<HTMLElement>) {
   if ((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) void getCurrentWindow().startDragging();
 }
 
-function openLocalPath(path: string) {
+export async function openLocalPath(path: string): Promise<string | undefined> {
   if ((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
-    void invoke('open_path', { path }).catch(() => undefined);
-    return;
+    try {
+      await invoke('open_path', { path });
+      return undefined;
+    } catch (reason) {
+      return reason instanceof Error && reason.message ? reason.message : 'Could not open the selected path.';
+    }
   }
-  window.open(`file:///${path.replaceAll('\\', '/')}`, '_blank', 'noopener');
+  try {
+    const opened = window.open(`file:///${path.replaceAll('\\', '/')}`, '_blank', 'noopener');
+    return opened ? undefined : 'Could not open the selected path.';
+  } catch {
+    return 'Could not open the selected path.';
+  }
 }
 
 function openManagerSurface(jobId?: string) {
@@ -322,14 +331,19 @@ function EmptyState({ filter, onAdd }: { filter: FilterKey; onAdd: () => void })
   return <div className="empty-state"><div className="empty-icon"><Icon name={filter === 'failed' ? 'check' : 'download'} size={24} /></div><strong>{title}</strong><span>Downloads matching this view will appear here.</span>{filter === 'all' && <button className="button primary" onClick={onAdd}><Icon name="add" size={16} /> Add URL</button>}</div>;
 }
 
-function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter: DownloadAdapter; onClose: () => void }) {
+export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter: DownloadAdapter; onClose: () => void }) {
   const [tab, setTab] = useState<'Overview' | 'Network' | 'Media' | 'Files' | 'Log'>('Overview');
+  const [pathError, setPathError] = useState('');
   const availableTabs = job.media ? ['Overview', 'Network', 'Media', 'Files', 'Log'] as const : ['Overview', 'Network', 'Files', 'Log'] as const;
   useEffect(() => { if (!availableTabs.includes(tab as never)) setTab('Overview'); }, [job.id, job.media]);
-  const openFile = () => openLocalPath(job.destination);
+  const openPath = (path: string) => {
+    setPathError('');
+    void openLocalPath(path).then((error) => { if (error) setPathError(error); });
+  };
+  const openFile = () => openPath(job.destination);
   const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  const openFolder = () => openLocalPath(folder);
-  return <aside className="inspector"><div className="inspector-tabs">{availableTabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll"><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} onOpen={openFolder} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions"><button className="button" disabled={job.state !== 'completed'} onClick={openFile}><Icon name="open" size={15} /> Open file</button><button className="button" onClick={() => adapter.removeJob(job.id)}><Icon name="delete" size={15} /> Remove</button></div></aside>;
+  const openFolder = () => openPath(folder);
+  return <aside className="inspector"><div className="inspector-tabs">{availableTabs.map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll"><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} onOpen={openFolder} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile}><Icon name="open" size={15} /> Open file</button><button className="button" onClick={() => adapter.removeJob(job.id)}><Icon name="delete" size={15} /> Remove</button></div></aside>;
 }
 
 function DetailGrid({ items }: { items: Array<{ label: string; value: string; tone?: string }> }) {
@@ -364,7 +378,7 @@ function JobContextMenu({ job, adapter, onClose, onNotice }: { job: DownloadJob;
   const run = (action: Promise<void>, message?: string) => action.then(() => { if (message) onNotice(message, 'success'); onClose(); }).catch((reason: unknown) => onNotice(reason instanceof Error ? reason.message : 'Action failed', 'error'));
   const pauseAction = ['downloading', 'connecting', 'finalizing'].includes(job.state);
   const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <div className="context-menu" onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { openLocalPath(job.destination); onClose(); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { openLocalPath(folder); onClose(); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void navigator.clipboard?.writeText(job.source); onNotice('Source URL copied'); onClose(); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(adapter.removeJob(job.id), 'Removed from list')} />}</div>;
+  return <div className="context-menu" onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void navigator.clipboard?.writeText(job.source); onNotice('Source URL copied'); onClose(); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(adapter.removeJob(job.id), 'Removed from list')} />}</div>;
 }
 
 function MenuAction({ icon, label, danger, onClick }: { icon: IconName; label: string; danger?: boolean; onClick: () => void }) {
@@ -528,6 +542,7 @@ function TrayToggle({ icon, label, checked, onChange }: { icon: IconName; label:
 
 export function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set());
+  const [pathError, setPathError] = useState('');
   const items = snapshot.notifications.filter((item) => !dismissedIds.has(item.id));
   const dismiss = (id: string) => setDismissedIds((current) => new Set(current).add(id));
   const dismissAll = () => setDismissedIds((current) => {
@@ -535,13 +550,17 @@ export function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {
     snapshot.notifications.forEach((item) => next.add(item.id));
     return next;
   });
-  return <div className="notifications-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="notification-stack-title"><strong>Notifications</strong><button className="icon-button" aria-label="Dismiss all" onClick={dismissAll}><Icon name="close" size={16} /></button></div>{items.map((item) => <NotificationCard key={item.id} item={item} job={snapshot.jobs.find((job) => job.id === item.jobId)} onDismiss={() => dismiss(item.id)} />)}{!items.length && <div className="empty-notifications"><Icon name="check" size={24} /><span>You're all caught up</span></div>}</div>;
+  const openPath = (path: string) => {
+    setPathError('');
+    void openLocalPath(path).then((error) => { if (error) setPathError(error); });
+  };
+  return <div className="notifications-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="notification-stack-title"><strong>Notifications</strong><button className="icon-button" aria-label="Dismiss all" onClick={dismissAll}><Icon name="close" size={16} /></button></div>{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{items.map((item) => <NotificationCard key={item.id} item={item} job={snapshot.jobs.find((job) => job.id === item.jobId)} onDismiss={() => dismiss(item.id)} onOpen={openPath} />)}{!items.length && <div className="empty-notifications"><Icon name="check" size={24} /><span>You're all caught up</span></div>}</div>;
 }
 
-function NotificationCard({ item, job, onDismiss }: { item: AppSnapshot['notifications'][number]; job?: DownloadJob; onDismiss: () => void }) {
+function NotificationCard({ item, job, onDismiss, onOpen }: { item: AppSnapshot['notifications'][number]; job?: DownloadJob; onDismiss: () => void; onOpen: (path: string) => void }) {
   const completed = item.type === 'completed';
   const folder = job?.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <article className={`notification-card ${completed ? 'completed' : 'failed'}`}><div className="notification-icon"><Icon name={completed ? 'check' : 'error'} size={20} /></div><div className="notification-copy"><div><strong>{item.title}</strong><span>{item.time}</span></div><p>{item.detail}</p><div className="notification-actions"><button className="button" onClick={() => completed && job ? openLocalPath(job.destination) : openManagerSurface(item.jobId)}>{completed ? 'Open' : 'View details'}</button><button className="button" onClick={() => completed && folder ? openLocalPath(folder) : openManagerSurface(item.jobId)}>{completed ? 'Show in folder' : 'Open Manager'}</button></div></div><button className="notification-close" aria-label="Dismiss" onClick={onDismiss}><Icon name="close" size={15} /></button></article>;
+  return <article className={`notification-card ${completed ? 'completed' : 'failed'}`}><div className="notification-icon"><Icon name={completed ? 'check' : 'error'} size={20} /></div><div className="notification-copy"><div><strong>{item.title}</strong><span>{item.time}</span></div><p>{item.detail}</p><div className="notification-actions"><button className="button" onClick={() => completed && job ? onOpen(job.destination) : openManagerSurface(item.jobId)}>{completed ? 'Open' : 'View details'}</button><button className="button" onClick={() => completed && folder ? onOpen(folder) : openManagerSurface(item.jobId)}>{completed ? 'Show in folder' : 'Open Manager'}</button></div></div><button className="notification-close" aria-label="Dismiss" onClick={onDismiss}><Icon name="close" size={15} /></button></article>;
 }
 
 export default App;

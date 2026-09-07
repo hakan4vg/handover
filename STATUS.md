@@ -6783,3 +6783,11 @@ change and no site resolver exception:
   `71/71`, both production builds, Cargo build, Python compilation, and
   `git diff --check`:
   `/tmp/dm-notice-toast-full-gate.log`.
+
+## 2026-09-07 — Surface native file-opening failures
+
+- `openLocalPath` previously discarded `invoke('open_path')` failures, leaving Inspector, context-menu, and completed-notification file actions with no user feedback.
+- The helper now returns a safe error string for native opener rejection, browser popup blocking, and synchronous opener errors. Inspector and notification surfaces render that result as an alert; context-menu actions route it through the error toast.
+- The red helper regression returned `OPEN_PATH_RED_RC=1`; after the fix the helper and Inspector tests passed. The final refined focused run is captured at `/tmp/dm-open-path-final-focused-clean.log` and returned `OPEN_PATH_FINAL_CLEAN_RC=0`: two files, `3/3` tests, no React warnings.
+- The notification opener regression passed in `/tmp/dm-open-path-all-focused-clean2.log`. The real manager-controls Chromium probe remained green with `NOTICE_TOAST_REAL_RC=0`; the real notification probe was blocked before page interaction by the known WebKit inspector startup boundary (`WebKit inspector did not become ready: [Errno 111] Connection refused`), so it is not acceptance evidence.
+- The complete fail-fast gate is captured at `/tmp/dm-open-path-full-gate-final-clean.log` and returned `GATE_RC=0`: TypeScript, Vitest `66/66`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

@@ -5,6 +5,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { SettingsView } from './App';
 import type { AppSettings, DownloadAdapter } from './types';
 
+(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+
 const settings: AppSettings = {
   startAtSignIn: false,
   showManagerAtSignIn: false,

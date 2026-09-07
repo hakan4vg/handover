@@ -4,6 +4,8 @@ import { createRoot } from 'react-dom/client';
 import { describe, expect, it } from 'vitest';
 import { NoticeToast } from './App';
 
+(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+
 describe('NoticeToast', () => {
   it('renders failures as failures rather than success', () => {
     const host = document.createElement('div');

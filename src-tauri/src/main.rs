@@ -2,6 +2,7 @@
 
 mod lifecycle;
 mod media;
+mod notify;
 
 use futures_util::{future::Abortable, StreamExt};
 use lifecycle::{state_allows_transfer, TransferRegistry};
@@ -13,7 +14,6 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri_plugin_notification::NotificationExt;
 use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
@@ -727,18 +727,19 @@ fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) 
 }
 
 fn add_notification(app: &AppHandle, state: &CoreState, id: &str, kind: &str) {
-    let (item, enabled) = match state.snapshot.lock() {
+    let (item, enabled, destination) = match state.snapshot.lock() {
         Ok(mut snapshot) => {
             let Some(job) = snapshot.jobs.iter().find(|job| job.id == id).cloned() else { return; };
             let enabled = if kind == "completed" { snapshot.settings.completion_notifications } else { snapshot.settings.failure_notifications };
+            let destination = job.destination.clone();
             let item = NotificationItem { id: format!("{kind}-{id}"), notification_type: kind.into(), title: if kind == "completed" { "Download completed".into() } else { "Download failed".into() }, detail: if kind == "completed" { format!("{} · {}", job.name, format_bytes(job.total)) } else { format!("{} · {}", job.name, job.error.unwrap_or_else(|| "The source could not be acquired".into())) }, time: now_label(), job_id: id.into() };
             if enabled && !snapshot.notifications.iter().any(|current| current.id == item.id) { snapshot.notifications.insert(0, item.clone()); snapshot.notifications.truncate(40); }
-            (item, enabled)
+            (item, enabled, destination)
         }
         Err(_) => return,
     };
     emit_snapshot(app, state);
-    if enabled { let _ = app.notification().builder().title(item.title).body(item.detail).show(); }
+    if enabled { notify::show_job_notification(app, &item.title, &item.detail, kind, &item.job_id, &destination); }
 }
 
 fn format_bytes(value: Option<u64>) -> String {

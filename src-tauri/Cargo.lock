@@ -899,6 +899,7 @@ dependencies = [
  "cbc",
  "cipher",
  "futures-util",
+ "notify-rust",
  "quick-xml",
  "reqwest 0.12.28",
  "rusqlite",

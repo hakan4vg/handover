@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { createAdapter, formatBytes, formatSpeed } from './adapters';
 import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
 import { Icon, type IconName } from './icons';
+import { notificationActionJobId } from './notification-action';
 import { settingsPageFromSearch } from './settings-route';
 import { normalizeSite } from './site';
 import type {
@@ -136,6 +138,19 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
     if (selectedId && filteredJobs.some((job) => job.id === selectedId)) return;
     if (selectedId !== nextVisibleId) setSelectedId(nextVisibleId);
   }, [filteredJobs, filter, selectedId]);
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let dispose: (() => void) | undefined;
+    listen<{ jobId: string }>('notification-action', (event) => {
+      const id = notificationActionJobId(event.payload);
+      if (!id) return;
+      setFilter('all');
+      setSelectedId(id);
+      setInspectorOpen(true);
+    }).then((fn) => { dispose = fn; }).catch(() => undefined);
+    return () => dispose?.();
+  }, []);
 
   useEffect(() => {
     if (!notice) return;

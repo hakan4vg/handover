@@ -1,0 +1,54 @@
+// @vitest-environment jsdom
+import { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { describe, expect, it, vi } from 'vitest';
+import { useAppSnapshot } from './App';
+import type { AppSnapshot, DownloadAdapter } from './types';
+
+(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
+
+function snapshot(connected: boolean): AppSnapshot {
+  return {
+    jobs: [],
+    settings: { theme: 'light', accent: '#0878ed' } as AppSnapshot['settings'],
+    connected,
+    aggregateSpeed: 0,
+    notifications: [],
+  };
+}
+
+function Probe({ adapter }: { adapter: DownloadAdapter }) {
+  const { snapshot: current, error } = useAppSnapshot(adapter);
+  return <output>{error || (current?.connected ? 'connected' : current ? 'disconnected' : 'loading')}</output>;
+}
+
+describe('useAppSnapshot startup ordering', () => {
+  it('does not overwrite a live update with a stale initial response', async () => {
+    const initial = deferred<AppSnapshot>();
+    let notify!: (value: AppSnapshot) => void;
+    const adapter = {
+      subscribe: vi.fn((listener: (value: AppSnapshot) => void) => { notify = listener; return () => undefined; }),
+      getSnapshot: vi.fn(() => initial.promise),
+    } as unknown as DownloadAdapter;
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+
+    act(() => { root.render(<Probe adapter={adapter} />); });
+    await act(async () => {
+      notify(snapshot(true));
+      initial.resolve(snapshot(false));
+      await initial.promise;
+    });
+
+    expect(host.querySelector('output')?.textContent).toBe('connected');
+    act(() => root.unmount());
+    host.remove();
+  });
+});

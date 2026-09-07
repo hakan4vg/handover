@@ -35,19 +35,21 @@ const settingsNav: Array<{ key: SettingsPage; label: string; icon: IconName }> =
   { key: 'appearance', label: 'Appearance', icon: 'palette' },
 ];
 
-function useAppSnapshot(adapter: DownloadAdapter) {
+export function useAppSnapshot(adapter: DownloadAdapter) {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
   const [error, setError] = useState('');
   useEffect(() => {
     let mounted = true;
+    let receivedSubscriptionSnapshot = false;
     const dispose = adapter.subscribe((next) => {
       if (mounted) {
+        receivedSubscriptionSnapshot = true;
         setSnapshot(next);
         setError('');
       }
     });
     adapter.getSnapshot().then((next) => {
-      if (mounted) setSnapshot(next);
+      if (mounted && !receivedSubscriptionSnapshot) setSnapshot(next);
     }).catch((reason: unknown) => {
       if (mounted) setError(reason instanceof Error ? reason.message : 'The application core could not be reached.');
     });

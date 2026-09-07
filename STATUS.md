@@ -6799,3 +6799,10 @@ change and no site resolver exception:
 - The red helper test returned `COPY_SOURCE_RED_RC=1`; the fixed helper test returned `COPY_SOURCE_FIXED_RC=0`. The direct context-menu regression returned `CONTEXT_COPY_FIXED_RC=0` for the rejection path and verified that the menu closes after reporting the error.
 - The existing real manager-controls Chromium probe returned `CONTEXT_COPY_REAL_RC=0`; it covered the surrounding context-menu and manager paths but did not claim native clipboard access.
 - The complete fail-fast gate is captured at `/tmp/dm-copy-source-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `68/68`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Preserve newer subscription snapshots during startup
+
+- `useAppSnapshot` subscribed to live state and requested an initial snapshot in parallel. If the subscription delivered a newer state first, the later initial promise overwrote it with stale data.
+- Added a focused deferred-promise regression. Its red baseline returned `SNAPSHOT_RACE_RED_RC=1`; the monotonic subscription guard returned `SNAPSHOT_RACE_FIXED_RC=0` and preserves the live update.
+- Full Vitest passed `18` files and `69/69` tests with no warnings. The real manager-controls Chromium probe returned `MANAGER_RC=0`. The existing responsive probe initially hit `127.0.0.1:4177` with no server; after starting its required disposable Vite server, all `900x600`, `841x560`, and `780x560` viewports passed with contained document/body dimensions. Evidence: `/tmp/dm-snapshot-race-manager-real.log` and `/tmp/dm-snapshot-race-responsive-real-retry.log`.
+- The corrected complete fail-fast gate is captured at `/tmp/dm-snapshot-race-full-gate-corrected.log` and returned `GATE_RC=0`: TypeScript, Vitest `69/69`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

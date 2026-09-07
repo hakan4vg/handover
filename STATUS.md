@@ -6453,3 +6453,42 @@ change and no site resolver exception:
 - This closes the previously unverified live effects of both General sign-in
   toggles. No production source change was needed. Evidence:
   `/tmp/dm-startup-settings-current.log`.
+
+## 2026-09-07 — MDN styled custom-control media capture
+
+- The existing `fixtures/public_mdn_styled_player_chromium_probe.py` had a
+  reachable finite top-level player but stopped before Download Manager capture
+  on a page-only control assertion. A fresh red run reproduced the exact
+  boundary: trusted CDP input reached `#mute`, yet the page left
+  `video.muted=false`; the same page's programmatic click changes it. Red
+  evidence: `/tmp/dm-public-mdn-styled-red-current.log`.
+- The probe was narrowed without changing product code. It now records the
+  trusted mute result as `MDN-STYLED-MUTE-BOUNDARY` and continues to the
+  player-bound Download control. Its independent reference uses the HTTPS
+  origin because the page declares an HTTP source while Chromium upgrades the
+  actual media request to HTTPS; the original capture job/source is unchanged.
+- Fresh Chromium reached the real styled player at
+  `https://iandevlin.github.io/mdn/video-player-styled/`, then a trusted click on
+  `#playpause` started the visible finite Tears of Steel video. The injected
+  Download control was hit at `x=1094.4453125, y=97.8359375`; the real
+  extension/native path created exactly one media job for
+  `http://iandevlin.github.io/mdn/video-player/video/tears-of-steel-battle-clip-medium.mp4`.
+- Resident `--commit` exited `0`; the job ended `completed` with
+  `provisional=false`. The native output and independent browser reference were
+  both `15,256,787` bytes with SHA-256
+  `8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451`.
+  Chromium Downloads remained empty and the database contained exactly one
+  job. The full run is `/tmp/dm-public-mdn-styled-green.log`; a retained-output
+  rerun is `/tmp/dm-public-mdn-styled-retained.log`.
+- Independent `ffprobe` on
+  `/tmp/dm-mdn-styled-player-chromium-f0ecuauh/Managed/mdn-styled-tears-of-steel.mp4`
+  reports MP4 container, H.264 `800x332`, AAC `44,100 Hz` stereo, duration
+  `70.542222`, and size `15,256,787` bytes.
+- Exact output ended with
+  `MDN-STYLED-HTML5-CHROMIUM: PASS (output_bytes=15256787,
+  output_sha256=8f8b69ed443be171cb505c75fab22f3af25375b09817e713fe0fd7c88c78f451,
+  traffic=2, jobs=1, browser_downloads=[])` and
+  `MDN-STYLED-HTML5-CHROMIUM-PROBE: PASS`. Full verification passed Vitest
+  `50/50`, TypeScript, extension build, Rust `70/70`, Cargo build, Python
+  compilation, and `git diff --check`. No site-specific resolver or production
+  source change was added.

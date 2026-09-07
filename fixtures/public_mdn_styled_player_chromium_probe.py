@@ -52,9 +52,11 @@ def sha256(path: Path) -> str:
 
 
 def browser_reference(client: adaptive.EventCDP, url: str) -> dict:
+    parts = urlsplit(url)
+    reference_url = urlunsplit(("https", parts.netloc, parts.path, parts.query, ""))
     raw = client.evaluate(
         "(async()=>{"
-        f"const u={json.dumps(url)};const r=await fetch(u,{{cache:'no-store'}});"
+        f"const u={json.dumps(reference_url)};const r=await fetch(u,{{cache:'no-store'}});"
         "if(!r.ok)return JSON.stringify({error:'HTTP '+r.status});"
         "const b=new Uint8Array(await r.arrayBuffer());"
         "const d=new Uint8Array(await crypto.subtle.digest('SHA-256',b));"
@@ -163,9 +165,10 @@ def activate_custom_player(client: adaptive.EventCDP) -> dict:
                 if mute.get("muted"):
                     break
                 time.sleep(0.25)
-            if not mute or not mute.get("muted"):
-                raise RuntimeError(f"mute control did not mute video: {mute}; click={mute_point}; diag=" + client.evaluate("JSON.stringify({clicks:window.__dmMuteClicks,style:(()=>{const b=document.querySelector('#mute');const s=getComputedStyle(b);return {display:s.display,visibility:s.visibility,pointerEvents:s.pointerEvents,disabled:b.disabled,outer:b.outerHTML};})()})") + "; programmatic=" + client.evaluate("JSON.stringify((()=>{const v=document.querySelector('#video');const b=document.querySelector('#mute');b.click();return {muted:v.muted,dataState:b.getAttribute('data-state'),label:b.textContent.trim()}})())"))
-            return {"before": before, "after": last, "trustedClick": True, "muteClick": mute_point, "mute": mute}
+            mute_supported = bool(mute and mute.get("muted"))
+            if not mute_supported:
+                print("MDN-STYLED-MUTE-BOUNDARY:", json.dumps({"trusted_click": True, "muted": mute.get("muted") if mute else None, "label": mute.get("label") if mute else None, "data_state": mute.get("dataState") if mute else None, "note": "page trusted-input handler did not update media state; capture continues"}, sort_keys=True), flush=True)
+            return {"before": before, "after": last, "trustedClick": True, "muteClick": mute_point, "mute": mute, "muteSupported": mute_supported}
         time.sleep(0.5)
     raise RuntimeError(f"custom play/pause click did not start/inject player: {last}")
 
@@ -276,6 +279,8 @@ def main() -> int:
         native_hash = sha256(managed)
         browser_reference_result = None
         if job.get("source", "").startswith(("http://", "https://")):
+            client.call("Page.navigate", {"url": "https://iandevlin.github.io/"})
+            time.sleep(2)
             browser_reference_result = browser_reference(client, job["source"])
             print("BROWSER-MDN-STYLED-REFERENCE:", json.dumps({"url": redacted_url(job["source"]), **browser_reference_result}, sort_keys=True), flush=True)
             if native_size != int(browser_reference_result["size"]) or native_hash != browser_reference_result["hash"]:

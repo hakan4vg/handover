@@ -164,14 +164,16 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
     }
   };
 
-  const handleCommit = (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => {
-    run(adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }), 'Download added to Manager');
+  const handleCommit = async (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => {
+    await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit });
     setAddWindowId(null);
+    showNotice('Download added to Manager');
   };
 
-  const handleCancel = (id: string) => {
-    run(adapter.cancelJob(id), 'Acquisition cancelled');
+  const handleCancel = async (id: string) => {
+    await adapter.cancelJob(id);
     setAddWindowId(null);
+    showNotice('Acquisition cancelled');
   };
 
   const isSettings = filter === ('settings' as FilterKey);

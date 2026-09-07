@@ -6883,3 +6883,11 @@ change and no site resolver exception:
 - The focused regression was red at `/tmp/dm-subscription-red.log`: the initial snapshot test passed, while the new failure case received no error callback (`1 failed | 1 passed`). The fixed hook test returned `SUBSCRIPTION_FIXED_RC=0` with `2/2`; TypeScript returned `SUBSCRIPTION_TSC_RC=0`.
 - The existing trusted Chromium manager-controls probe passed against the changed frontend: `SUBSCRIPTION_MANAGER_REAL_RC=0`, including row actions, bulk controls, sorting, transient-menu dismissal, and Add URL. Evidence: `/tmp/dm-subscription-manager-real.log`.
 - The complete fail-fast gate returned `SUBSCRIPTION_GATE_RC=0`: Vitest `22` files/`75` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-subscription-full-gate.log`.
+
+## 2026-09-07 — Keep manager Add Download open on commit failure
+
+- The manager's manual Add URL path passed commit and cancellation promises to a fire-and-forget helper, then cleared the captured window immediately. A native failure could therefore close the only recovery surface.
+- `Manager` now awaits `commitProvisional` and `cancelJob`, closes the captured window only after success, and preserves the existing success notices. Rejections reach `AddDownloadWindow`'s visible `role="alert"` form region, so the user can correct the destination or retry.
+- The component regression was red at `/tmp/dm-manager-add-error-red.log`: after `Destination is not writable`, the captured window was `null`. The fixed test returned `MANAGER_ADD_ERROR_FIXED_RC=0` (`1/1`), and TypeScript returned `MANAGER_ADD_ERROR_TSC_RC=0`.
+- The existing trusted Chromium manager-controls probe passed after the change with the normal Add URL open/cancel path and all prior row, bulk, sorting, and menu checks: `MANAGER_ADD_ERROR_MANAGER_REAL_RC=0`. Evidence: `/tmp/dm-manager-add-error-manager-real.log`.
+- The complete fail-fast gate returned `MANAGER_ADD_ERROR_GATE_RC=0`: Vitest `23` files/`76` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-manager-add-error-full-gate.log`.

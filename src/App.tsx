@@ -219,12 +219,12 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
               <div className="toolbar-actions">
                 {active.length > 0 ? <button className="button" onClick={() => run(() => adapter.pauseAll())}><Icon name="pause" size={15} /> Pause All</button> : paused.length > 0 ? <button className="button" onClick={() => run(() => adapter.resumeAll())}><Icon name="play" size={15} /> Resume All</button> : null}
                 <button className="button primary" onClick={openAdd}><Icon name="add" size={17} /> Add URL</button>
-                 <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <div className="toolbar-menu" role="menu" aria-label="Manager options"><button role="menuitem" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={15} /> Settings</button><button role="menuitem" onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></div>}</div>
+                 <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <KeyboardMenu className="toolbar-menu" label="Manager options" onDismiss={() => setMoreOpen(false)}><button role="menuitem" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={15} /> Settings</button><button role="menuitem" onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></KeyboardMenu>}</div>
               </div>
             </div>
             <div className="workspace-columns">
               <section className="download-list" aria-label="Downloads">
-                 <div className="list-header"><span>Downloads</span><div className="list-header-actions"><button className="subtle-button" aria-haspopup="menu" aria-expanded={sortOpen} onClick={() => { setSortOpen(!sortOpen); setMoreOpen(false); }}><Icon name="sort" size={15} /> Sort <Icon name="chevron-down" size={13} /></button>{sortOpen && <SortMenu value={sortBy} onChange={(value) => { setSortBy(value); setSortOpen(false); }} />}</div></div>
+                 <div className="list-header"><span>Downloads</span><div className="list-header-actions"><button className="subtle-button" aria-haspopup="menu" aria-expanded={sortOpen} onClick={() => { setSortOpen(!sortOpen); setMoreOpen(false); }}><Icon name="sort" size={15} /> Sort <Icon name="chevron-down" size={13} /></button>{sortOpen && <SortMenu value={sortBy} onChange={(value) => { setSortBy(value); setSortOpen(false); }} onDismiss={() => setSortOpen(false)} />}</div></div>
                 <div className="rows">
                   {filteredJobs.length ? filteredJobs.map((job) => <DownloadRow key={job.id} job={job} selected={job.id === selected?.id} menuOpen={contextJobId === job.id} onSelect={() => { setSelectedId(job.id); setInspectorOpen(true); dismissMenus(); setContextJobId(null); }} onPause={() => run(() => adapter.pauseJob(job.id))} onResume={() => run(() => adapter.resumeJob(job.id))} onRetry={() => run(() => adapter.retryJob(job.id))} onMenu={() => { dismissMenus(); setContextJobId(contextJobId === job.id ? null : job.id); }} />) : <EmptyState filter={filter} onAdd={openAdd} />}
                 </div>
@@ -336,9 +336,44 @@ function SidebarItem({ icon, label, count, active, onClick }: { icon: IconName; 
   return <button className={`sidebar-item ${active ? 'selected' : ''}`} aria-current={active ? 'page' : undefined} onClick={onClick}><Icon name={icon} size={18} /><span>{label}</span>{count !== undefined && <span className="nav-count">{count}</span>}</button>;
 }
 
-export function SortMenu({ value, onChange }: { value: 'created' | 'name' | 'size' | 'state'; onChange: (value: 'created' | 'name' | 'size' | 'state') => void }) {
+function KeyboardMenu({ className, label, onDismiss, children }: { className: string; label: string; onDismiss?: () => void; children: ReactNode }) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const skipReturnFocusRef = useRef(false);
+  if (!returnFocusRef.current && document.activeElement instanceof HTMLElement) returnFocusRef.current = document.activeElement;
+  useEffect(() => {
+    const first = menuRef.current?.querySelector<HTMLElement>('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]');
+    first?.focus();
+    return () => {
+      const active = document.activeElement;
+      if (!skipReturnFocusRef.current && menuRef.current?.contains(active) && returnFocusRef.current?.isConnected) returnFocusRef.current.focus();
+    };
+  }, []);
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const items = Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]') ?? []);
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      onDismiss?.();
+      return;
+    }
+    if (event.key === 'Tab') {
+      skipReturnFocusRef.current = true;
+      onDismiss?.();
+      return;
+    }
+    if (!items.length) return;
+    const current = items.indexOf(document.activeElement as HTMLElement);
+    const nextIndex = event.key === 'ArrowDown' ? (current + 1 + items.length) % items.length : event.key === 'ArrowUp' ? (current - 1 + items.length) % items.length : event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : -1;
+    if (nextIndex < 0) return;
+    event.preventDefault();
+    items[nextIndex]?.focus();
+  };
+  return <div ref={menuRef} className={className} role="menu" aria-label={label} onKeyDown={onKeyDown}>{children}</div>;
+}
+
+export function SortMenu({ value, onChange, onDismiss }: { value: 'created' | 'name' | 'size' | 'state'; onChange: (value: 'created' | 'name' | 'size' | 'state') => void; onDismiss?: () => void }) {
   const options: Array<['created' | 'name' | 'size' | 'state', string]> = [['created', 'Recently added'], ['name', 'Name'], ['size', 'File size'], ['state', 'Status']];
-  return <div className="sort-menu" role="menu" aria-label="Sort downloads">{options.map(([key, label]) => <button key={key} className={value === key ? 'selected' : ''} role="menuitemradio" aria-checked={value === key} onClick={() => onChange(key)}><span>{label}</span>{value === key && <Icon name="check" size={14} />}</button>)}</div>;
+  return <KeyboardMenu className="sort-menu" label="Sort downloads" onDismiss={onDismiss}>{options.map(([key, label]) => <button key={key} className={value === key ? 'selected' : ''} role="menuitemradio" aria-checked={value === key} onClick={() => onChange(key)}><span>{label}</span>{value === key && <Icon name="check" size={14} />}</button>)}</KeyboardMenu>;
 }
 
 export function DownloadRow({ job, selected, menuOpen = false, onSelect, onPause, onResume, onRetry, onMenu }: { job: DownloadJob; selected: boolean; menuOpen?: boolean; onSelect: () => void; onPause: () => void; onResume: () => void; onRetry: () => void; onMenu: () => void }) {
@@ -463,7 +498,7 @@ export function JobContextMenu({ job, adapter, onClose, onNotice }: { job: Downl
   };
   const pauseAction = ['downloading', 'connecting', 'finalizing'].includes(job.state);
   const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <div className="context-menu" role="menu" aria-label={`Actions for ${job.name}`} onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(() => pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(() => adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(() => adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(() => adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(() => adapter.removeJob(job.id), 'Removed from list')} />}</div>;
+  return <KeyboardMenu className="context-menu" label={`Actions for ${job.name}`} onDismiss={onClose}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(() => pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(() => adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(() => adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(() => adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(() => adapter.removeJob(job.id), 'Removed from list')} />}</KeyboardMenu>;
 }
 
 function MenuAction({ icon, label, danger, onClick }: { icon: IconName; label: string; danger?: boolean; onClick: () => void }) {

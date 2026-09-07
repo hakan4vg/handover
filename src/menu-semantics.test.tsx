@@ -55,6 +55,32 @@ describe('transient menu semantics', () => {
     act(() => root.unmount());
   });
 
+  it('moves focus through menu items and dismisses on Escape', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const onDismiss = vi.fn();
+    act(() => root.render(<SortMenu value="created" onChange={() => undefined} onDismiss={onDismiss} />));
+
+    const menu = host.querySelector('.sort-menu') as HTMLDivElement;
+    const items = Array.from(menu.querySelectorAll('[role="menuitemradio"]')) as HTMLButtonElement[];
+    expect(document.activeElement).toBe(items[0]);
+    act(() => {
+      items[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    });
+    expect(document.activeElement).toBe(items[1]);
+    act(() => {
+      items[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+    });
+    expect(document.activeElement).toBe(items[3]);
+    act(() => {
+      menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    expect(onDismiss).toHaveBeenCalledOnce();
+
+    act(() => root.unmount());
+  });
+
   it('names row context actions and exposes menu items', () => {
     const host = document.createElement('div');
     document.body.appendChild(host);

@@ -2,13 +2,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_POLICY } from './shared';
 
-function chromeMock(storageSet: ReturnType<typeof vi.fn>) {
+function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({})) {
   const event = () => ({ addListener: vi.fn() });
   const onMessage = { addListener: vi.fn() };
   return {
     storage: {
       local: {
-        get: vi.fn().mockResolvedValue({}),
+        get: storageGet,
         set: storageSet,
       },
     },
@@ -51,6 +51,24 @@ describe('background policy persistence', () => {
 
     expect(response.ok).toBe(false);
     expect(response.error).toContain('storage unavailable');
+    expect(response.policy).toEqual(DEFAULT_POLICY);
+  });
+
+  it('reports storage failure when loading the policy', async () => {
+    const storageGet = vi.fn().mockRejectedValue(new Error('storage read unavailable'));
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet);
+    vi.stubGlobal('chrome', chrome);
+    await import('./background');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
+    expect(listener).toBeTypeOf('function');
+    const response = await new Promise<Record<string, unknown>>((resolve) => {
+      listener({ type: 'get-policy' }, {}, resolve);
+    });
+
+    expect(response.ok).toBe(false);
+    expect(response.error).toContain('storage read unavailable');
     expect(response.policy).toEqual(DEFAULT_POLICY);
   });
 });

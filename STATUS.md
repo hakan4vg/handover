@@ -6741,3 +6741,24 @@ change and no site resolver exception:
   `71/71`, both production builds, Cargo build, Python compilation, and
   `git diff --check`:
   `/tmp/dm-browser-policy-full-gate.log`.
+
+## 2026-09-07 — Browser policy load failure contract
+
+- `loadPolicy()` previously caught storage-read failures and let `get-policy`
+  return `ok:true` with defaults, hiding an unavailable browser-integration store.
+- `extension/src/background.ts` now records the startup read result, makes
+  `get-policy` wait for readiness, and returns `{ok:false,error,policy}` when
+  the read fails. A later successful save clears the load error.
+- The focused regression was red before the fix (`BACKGROUND_POLICY_LOAD_RED_RC=1`):
+  `/tmp/dm-background-policy-load-red.log`.
+- The fixed background pair passed `2/2`:
+  `/tmp/dm-background-policy-load-fixed.log`.
+- The popup/background pair passed `4/4`, the extension build passed, and the
+  real popup Chromium probe passed after the change:
+  `/tmp/dm-browser-policy-load-focused.log`,
+  `/tmp/dm-browser-policy-load-build.log`,
+  `/tmp/dm-browser-policy-load-real.log`.
+- The fail-fast aggregate gate returned `GATE_RC=0` with Vitest `62/62`, Rust
+  `71/71`, both production builds, Cargo build, Python compilation, and
+  `git diff --check`:
+  `/tmp/dm-browser-policy-load-full-gate.log`.

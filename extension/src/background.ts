@@ -15,6 +15,8 @@ const PLAYER_BUFFER_MAX = 40;
 const PLAYER_BUFFER_MS = 15_000;
 
 let policy: BrowserPolicy = { ...DEFAULT_POLICY };
+let policyLoadError = '';
+let policyReady: Promise<void> = Promise.resolve();
 
 type PendingBrowserFallback = { source: string; name?: string; at: number };
 const pendingBrowserFallbacks: PendingBrowserFallback[] = [];
@@ -77,8 +79,10 @@ async function loadPolicy(): Promise<void> {
         excludedSites: Array.isArray(saved.excludedSites) ? saved.excludedSites : [],
       };
     }
-  } catch {
+    policyLoadError = '';
+  } catch (reason) {
     policy = { ...DEFAULT_POLICY };
+    policyLoadError = reason instanceof Error && reason.message ? reason.message : 'Could not load browser integration settings.';
   }
 }
 
@@ -306,7 +310,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
   void (async () => {
     const type = (message as { type?: string })?.type;
     if (type === 'get-policy') {
-      reply({ ok: true, policy });
+      await policyReady;
+      reply(policyLoadError ? { ok: false, error: policyLoadError, policy } : { ok: true, policy });
     } else if (type === 'update-policy') {
       const patch = (message as { patch?: Partial<BrowserPolicy> }).patch ?? {};
       const previous = policy;
@@ -323,6 +328,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         return;
       }
       policy = next;
+      policyLoadError = '';
       reply({ ok: true, policy });
       // Best-effort push so the resident app (when running) stays coherent.
       void sendNative({ type: 'update-policy', payload: policy });
@@ -366,7 +372,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
   return true;
 });
 
-void loadPolicy()
+policyReady = loadPolicy();
+void policyReady
   .then(() => sendNative({ type: 'get-policy' }))
   .then((response) => {
     const remote = (response as { policy?: Partial<BrowserPolicy> } | undefined)?.policy;

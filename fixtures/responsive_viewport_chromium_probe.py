@@ -2,9 +2,11 @@
 """Real Chromium proof that the manager stays contained at a narrow viewport.
 
 The probe uses the running Vite mock surface and a fresh Chromium profile. CDP
-sets a deterministic 900x600 CSS viewport because headless Chromium may ignore
-its launch window-size flag. The manager must not make the document taller or
-wider than the viewport, and its status footer must remain inside the window.
+sets deterministic 900x600, 841x560, and 780x560 CSS viewports because headless
+Chromium may ignore its launch window-size flag. The manager must not make the
+document taller or wider than the viewport, its status footer must remain inside
+the window, and the two-column inspector must not be clipped at the transition
+width.
 """
 from __future__ import annotations
 
@@ -24,8 +26,11 @@ import public_chromium_probe as public
 import segmented_restart_probe as support
 
 URL = "http://127.0.0.1:4177/"
-VIEWPORT = {"width": 900, "height": 600, "deviceScaleFactor": 1, "mobile": False}
-SCREENSHOT = Path("/tmp/dm-ui-responsive-chromium.png")
+VIEWPORTS = (
+    ("desktop", {"width": 900, "height": 600, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-chromium.png")),
+    ("transition", {"width": 841, "height": 560, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-transition.png")),
+    ("minimum", {"width": 780, "height": 560, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-min.png")),
+)
 
 
 def evaluate_json(client, expression: str):
@@ -55,6 +60,7 @@ def measure(client) -> dict:
         document:{clientWidth:document.documentElement.clientWidth,scrollWidth:document.documentElement.scrollWidth,clientHeight:document.documentElement.clientHeight,scrollHeight:document.documentElement.scrollHeight},
         body:{clientWidth:document.body.clientWidth,scrollWidth:document.body.scrollWidth,clientHeight:document.body.clientHeight,scrollHeight:document.body.scrollHeight},
         shell:box('.desktop-shell'), manager:box('.manager-body'), footer:box('.manager-statusbar'),
+        workspace:box('.workspace-columns'), list:box('.download-list'), inspector:box('.inspector'),
       };
     })()""")
 
@@ -78,26 +84,33 @@ def main() -> int:
     try:
         public.wait_chrome(port)
         client = public.connect_chrome(port)
-        client.call("Emulation.setDeviceMetricsOverride", VIEWPORT)
-        client.call("Page.reload", {"ignoreCache": True})
-        wait_for_render(client)
-        metrics = measure(client)
-        print("RESPONSIVE-VIEWPORT:", json.dumps(metrics, sort_keys=True), flush=True)
-        screenshot = client.call("Page.captureScreenshot", {"format": "png"})
-        SCREENSHOT.write_bytes(base64.b64decode(screenshot["data"]))
-        print(f"RESPONSIVE-VIEWPORT-SCREENSHOT: {SCREENSHOT} bytes={SCREENSHOT.stat().st_size}", flush=True)
-        document = metrics["document"]
-        body = metrics["body"]
-        footer = metrics["footer"]
-        manager = metrics["manager"]
-        viewport = metrics["viewport"]
-        assert document["scrollHeight"] == document["clientHeight"], metrics
-        assert document["scrollWidth"] == document["clientWidth"], metrics
-        assert body["scrollHeight"] == body["clientHeight"], metrics
-        assert body["scrollWidth"] == body["clientWidth"], metrics
-        assert manager["minHeight"] == "0px", metrics
-        assert footer["bottom"] <= viewport["height"], metrics
-        print("RESPONSIVE-VIEWPORT: PASS (900x600 document and footer contained)", flush=True)
+        for label, viewport, screenshot_path in VIEWPORTS:
+            client.call("Emulation.setDeviceMetricsOverride", viewport)
+            client.call("Page.reload", {"ignoreCache": True})
+            wait_for_render(client)
+            metrics = measure(client)
+            print(f"RESPONSIVE-VIEWPORT[{label}]:", json.dumps(metrics, sort_keys=True), flush=True)
+            screenshot = client.call("Page.captureScreenshot", {"format": "png"})
+            screenshot_path.write_bytes(base64.b64decode(screenshot["data"]))
+            print(f"RESPONSIVE-VIEWPORT-SCREENSHOT[{label}]: {screenshot_path} bytes={screenshot_path.stat().st_size}", flush=True)
+            document = metrics["document"]
+            body = metrics["body"]
+            footer = metrics["footer"]
+            manager = metrics["manager"]
+            workspace = metrics["workspace"]
+            inspector = metrics["inspector"]
+            viewport_size = metrics["viewport"]
+            assert document["scrollHeight"] == document["clientHeight"], metrics
+            assert document["scrollWidth"] == document["clientWidth"], metrics
+            assert body["scrollHeight"] == body["clientHeight"], metrics
+            assert body["scrollWidth"] == body["clientWidth"], metrics
+            assert manager["minHeight"] == "0px", metrics
+            assert footer["bottom"] <= viewport_size["height"], metrics
+            if viewport_size["width"] > 840:
+                assert workspace["right"] <= manager["right"] + 1, metrics
+                assert inspector["width"] > 0, metrics
+                assert inspector["right"] <= workspace["right"] + 1, metrics
+            print(f"RESPONSIVE-VIEWPORT: PASS ({label} contained)", flush=True)
         return 0
     finally:
         if client is not None:

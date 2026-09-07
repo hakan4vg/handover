@@ -6613,3 +6613,29 @@ change and no site resolver exception:
   The complete post-fix aggregate gate is captured at
   `/tmp/dm-hexaglobe-full-gate.log` and returned `GATE_RC=0`.
   No site-specific resolver was added.
+
+## 2026-09-07 — Responsive inspector transition containment
+
+- A fresh Chromium baseline at `841x560` exposed a real user-visible boundary
+  defect. The `<=1080px` workspace required a `390px` list column plus a `282px`
+  inspector, but the usable workspace was only `649px`. The outer shell masked
+  the resulting overflow; the inspector ended at `x=855` while the workspace
+  ended at `x=832`, visibly clipping the last tab and bottom actions. Red evidence:
+  `/tmp/dm-ui-boundary-841.log` and `/tmp/dm-ui-boundary-841.png`.
+- Changed only the responsive workspace grid in `src/styles.css` from
+  `minmax(390px, 1fr) 282px` to `minmax(0, 1fr) 282px`. The existing `<=840px`
+  one-column fallback remains unchanged. Updated the existing
+  `fixtures/responsive_viewport_chromium_probe.py` to check the inspector edge
+  and run fresh `900x600`, `841x560`, and `780x560` cases.
+- The repaired `841x560` layout keeps the inspector entirely inside the
+  workspace (`x=550..832`), with the `Log` tab, close control, and bottom actions
+  visible. All three cases report equal document/body client and scroll
+  dimensions and an in-window footer. Evidence:
+  `/tmp/dm-ui-responsive-transition-fixed.log` and screenshots
+  `/tmp/dm-ui-responsive-chromium.png`,
+  `/tmp/dm-ui-responsive-transition.png`, and
+  `/tmp/dm-ui-responsive-min.png`.
+- The complete post-change gate is captured at
+  `/tmp/dm-responsive-full-gate.log` and returned `GATE_RC=0`: Vitest `55/55`,
+  Rust `71/71`, both production builds, Cargo build, Python compilation, and
+  `git diff --check` passed. No native or extension behavior changed.

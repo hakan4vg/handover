@@ -517,13 +517,17 @@ fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
     }
 }
 
-fn emit_snapshot(app: &AppHandle, state: &CoreState) {
-    if let Err(error) = save_snapshot(state) {
-        eprintln!("Snapshot persistence failed: {error}");
-        return;
-    }
-    if let Ok(snapshot) = state.snapshot.lock() { let _ = app.emit("state-changed", snapshot.clone()); }
+fn emit_snapshot_event(app: &AppHandle, state: &CoreState) -> Result<(), String> {
+    let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?.clone();
+    app.emit("state-changed", snapshot).map_err(|error| error.to_string())?;
     refresh_tray(app, state);
+    Ok(())
+}
+
+fn emit_snapshot(app: &AppHandle, state: &CoreState) {
+    if let Err(error) = save_snapshot(state).and_then(|_| emit_snapshot_event(app, state)) {
+        eprintln!("Snapshot update failed: {error}");
+    }
 }
 
 // SPEC §12: the tray shows the live active-download count and aggregate
@@ -2318,19 +2322,33 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
     Ok(())
 }
 
-#[tauri::command]
-fn update_settings(app: AppHandle, state: State<'_, CoreState>, patch: Value) {
-    if let Ok(mut snapshot) = state.snapshot.lock() {
-        if let Value::Object(patch) = patch.get("patch").cloned().unwrap_or(patch) {
-            snapshot.settings = apply_settings_patch(&snapshot.settings, &Value::Object(patch));
-            write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings));
-            let checks = (snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons);
-            sync_tray_checks(&app, checks.0, checks.1);
-        }
+fn update_settings_snapshot(state: &CoreState, patch: &Value) -> Result<Option<(bool, bool, bool)>, String> {
+    let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable".to_string())?;
+    let (previous, checks) = {
+        let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
+        let payload = patch.get("patch").unwrap_or(patch);
+        let Value::Object(entries) = payload else { return Ok(None); };
+        let previous = snapshot.clone();
+        snapshot.settings = apply_settings_patch(&snapshot.settings, &Value::Object(entries.clone()));
+        (
+            previous,
+            (snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons, snapshot.settings.start_at_sign_in),
+        )
+    };
+    if let Err(error) = save_snapshot(state) {
+        if let Ok(mut snapshot) = state.snapshot.lock() { *snapshot = previous; }
+        return Err(error);
     }
-    let enabled = state.snapshot.lock().map(|snapshot| snapshot.settings.start_at_sign_in).unwrap_or(true);
-    sync_startup(enabled);
-    emit_snapshot(&app, &state);
+    Ok(Some(checks))
+}
+
+#[tauri::command]
+fn update_settings(app: AppHandle, state: State<'_, CoreState>, patch: Value) -> Result<(), String> {
+    let Some((intercept_downloads, show_media_buttons, start_at_sign_in)) = update_settings_snapshot(state.inner(), &patch)? else { return Ok(()); };
+    write_browser_policy(&browser_policy_root(), &settings_policy(&state.snapshot.lock().map_err(|_| "State unavailable".to_string())?.settings));
+    sync_tray_checks(&app, intercept_downloads, show_media_buttons);
+    sync_startup(start_at_sign_in);
+    emit_snapshot_event(&app, &state)
 }
 
 #[tauri::command]
@@ -3188,6 +3206,37 @@ mod capture_tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         assert!(runtime.block_on(super::commit_wait_for_transfer_idle(&state, "job-1")));
         assert!(!state.transfer_controls.is_active("job-1"));
+    }
+
+    #[test]
+    fn settings_update_rolls_back_when_snapshot_persistence_fails() {
+        use super::{default_settings, update_settings_snapshot, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
+        use rusqlite::Connection;
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL);
+CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        database.execute("INSERT INTO settings (id, payload) VALUES (1, ?1)", rusqlite::params!["old-settings"]).unwrap();
+        database.execute_batch("CREATE TRIGGER reject_settings BEFORE INSERT ON settings BEGIN SELECT RAISE(ABORT, 'settings locked'); END;").unwrap();
+        let state = CoreState {
+            snapshot: Mutex::new(AppSnapshot { jobs: Vec::new(), settings: default_settings(), connected: true, aggregate_speed: 0, notifications: Vec::new() }),
+            database: Mutex::new(database),
+            reattach_target: Mutex::new(None),
+            bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
+            job_bandwidth: Mutex::new(std::collections::HashMap::new()),
+            transfer_controls: TransferRegistry::default(),
+            lifecycle: Mutex::new(()),
+            tray_checks: Mutex::new(None),
+        };
+        let before = state.snapshot.lock().unwrap().clone();
+        let error = update_settings_snapshot(&state, &json!({ "maxConnections": 7 })).expect_err("settings persistence failure must reach the command");
+        assert!(error.contains("settings locked"), "unexpected settings error: {error}");
+        assert_eq!(state.snapshot.lock().unwrap().settings.max_connections, before.settings.max_connections);
+        let database = state.database.lock().unwrap();
+        let stored: String = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(stored, "old-settings");
     }
 
     #[test]

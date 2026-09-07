@@ -90,8 +90,12 @@ async function savePolicy(next: BrowserPolicy = policy): Promise<void> {
   await chrome.storage.local.set({ [POLICY_KEY]: next });
 }
 
-function sendNative(message: unknown): Promise<unknown> {
-  return chrome.runtime.sendNativeMessage(NATIVE_HOST, message as object).catch(() => ({ ok: false, error: 'native host unreachable' }));
+async function sendNative(message: unknown): Promise<unknown> {
+  try {
+    return await chrome.runtime.sendNativeMessage(NATIVE_HOST, message as object);
+  } catch {
+    return { ok: false, error: 'native host unreachable' };
+  }
 }
 
 function pruneMedia(now = Date.now()): void {
@@ -143,13 +147,21 @@ function cleanFilename(value: unknown): string | undefined {
   return leaf || undefined;
 }
 
+function ordinaryCaptureError(source: string, pageUrl: string): string | undefined {
+  const pageSite = siteOf(pageUrl);
+  if (!policy.interceptDownloads) return 'ordinary interception disabled';
+  if (pageSite && policy.excludedSites.includes(pageSite)) return 'site excluded';
+  if (!isHttp(source)) return 'invalid source';
+  return undefined;
+}
+
 async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
   await policyReady;
   const source = typeof payload.source === 'string' ? payload.source.trim() : '';
   const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : '';
-  const pageSite = siteOf(pageUrl);
-  if (!policy.interceptDownloads || (pageSite && policy.excludedSites.includes(pageSite)) || !isHttp(source)) {
-    return { ok: false, error: 'ordinary interception disabled, site excluded, or invalid source' };
+  const captureError = ordinaryCaptureError(source, pageUrl);
+  if (captureError) {
+    return { ok: false, error: captureError };
   }
   const response = (await sendNative({
     type: 'capture-acquisition',
@@ -288,24 +300,35 @@ function takeFormBody(url: string): string | undefined {
 // URL basename for redirected downloads; `onDeterminingFilename` supplies the
 // header-resolved name while still allowing the browser transaction to proceed.
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  if (!policy.interceptDownloads || consumeBrowserFallback(item) || consumeBrowserOwnedDownload(item) || item.byExtensionId === chrome.runtime.id || !item.url || !isHttp(item.url)) {
+  const source = item.finalUrl || item.url || '';
+  if (consumeBrowserFallback(item) || consumeBrowserOwnedDownload(item) || item.byExtensionId === chrome.runtime.id || !isHttp(source)) {
     suggest();
     return;
   }
-  void sendNative({
-    type: 'capture-acquisition',
-    payload: {
-      source: item.finalUrl || item.url,
-      name: cleanFilename(item.filename),
-      pageUrl: item.referrer,
-      referrer: item.referrer,
-      // The Downloads API exposes no tab/frame identifier, so do not guess a
-      // User-Agent from another document on this fallback path.
-      // One-shot POST replay: a form body observed for this URL rides along;
-      // absent (or already consumed) means the native side replays a safe GET.
-      postBody: takeFormBody(item.finalUrl || item.url),
-    },
-  }).finally(() => suggest());
+  void (async () => {
+    try {
+      await policyReady;
+      if (ordinaryCaptureError(source, item.referrer ?? '')) {
+        return;
+      }
+      await sendNative({
+        type: 'capture-acquisition',
+        payload: {
+          source,
+          name: cleanFilename(item.filename),
+          pageUrl: item.referrer,
+          referrer: item.referrer,
+          // The Downloads API exposes no tab/frame identifier, so do not guess a
+          // User-Agent from another document on this fallback path.
+          // One-shot POST replay: a form body observed for this URL rides along;
+          // absent (or already consumed) means the native side replays a safe GET.
+          postBody: takeFormBody(source),
+        },
+      });
+    } finally {
+      suggest();
+    }
+  })();
   return true;
 });
 

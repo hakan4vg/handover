@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_POLICY } from './shared';
 
-function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({})) {
+function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({}), sendNativeMessage: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({})) {
   const event = () => ({ addListener: vi.fn() });
   const onMessage = { addListener: vi.fn() };
   return {
@@ -15,7 +15,7 @@ function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType
     runtime: {
       id: 'extension-test',
       onMessage,
-      sendNativeMessage: vi.fn().mockResolvedValue({}),
+      sendNativeMessage,
     },
     webRequest: {
       onResponseStarted: event(),
@@ -102,5 +102,59 @@ describe('background policy persistence', () => {
       'com.downloadmanager.host',
       expect.objectContaining({ type: 'capture-acquisition' }),
     );
+  });
+
+  it('waits for policy before forwarding browser fallback and honors an excluded referrer', async () => {
+    let resolveStored: (value: unknown) => void = () => undefined;
+    const stored = new Promise((resolve) => { resolveStored = resolve; });
+    const storageGet = vi.fn().mockReturnValue(stored);
+    const sendNativeMessage = vi.fn().mockResolvedValue({ ok: true });
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet, sendNativeMessage);
+    vi.stubGlobal('chrome', chrome);
+
+    await import('./background');
+    const determine = chrome.downloads.onDeterminingFilename.addListener.mock.calls[0]?.[0];
+    expect(determine).toBeTypeOf('function');
+    let suggestions = 0;
+    const result = determine({
+      id: 7,
+      url: 'https://cdn.example.test/file.zip',
+      finalUrl: 'https://cdn.example.test/file.zip',
+      filename: 'file.zip',
+      referrer: 'https://www.example.test/page',
+      byExtensionId: undefined,
+    }, () => { suggestions += 1; });
+    expect(result).toBe(true);
+    await Promise.resolve();
+    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'capture-acquisition' }));
+
+    resolveStored({ ["dm-policy"]: { interceptDownloads: true, showMediaButtons: true, excludedSites: ['example.test'] } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(suggestions).toBe(1);
+    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'capture-acquisition' }));
+  });
+
+  it('still releases the browser download when native forwarding throws synchronously', async () => {
+    const sendNativeMessage = vi.fn(() => {
+      throw new Error('native bridge startup failed');
+    });
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue({}), sendNativeMessage);
+    vi.stubGlobal('chrome', chrome);
+
+    await import('./background');
+    const determine = chrome.downloads.onDeterminingFilename.addListener.mock.calls[0]?.[0];
+    expect(determine).toBeTypeOf('function');
+    let suggestions = 0;
+    const result = determine({
+      id: 8,
+      url: 'https://cdn.example.test/file.zip',
+      finalUrl: 'https://cdn.example.test/file.zip',
+      filename: 'file.zip',
+      referrer: 'https://www.example.test/page',
+      byExtensionId: undefined,
+    }, () => { suggestions += 1; });
+    expect(result).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(suggestions).toBe(1);
   });
 });

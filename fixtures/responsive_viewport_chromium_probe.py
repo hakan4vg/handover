@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Real Chromium proof that the manager stays contained at a narrow viewport.
+"""Real Chromium proof that the manager and settings stay contained at narrow viewports.
 
 The probe uses the running Vite mock surface and a fresh Chromium profile. CDP
 sets deterministic 900x600, 841x560, and 780x560 CSS viewports because headless
 Chromium may ignore its launch window-size flag. The manager must not make the
 document taller or wider than the viewport, its status footer must remain inside
 the window, and the two-column inspector must not be clipped at the transition
-width.
+width. The supported minimum-width settings navigation must keep every route
+label visible as well.
 """
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ VIEWPORTS = (
     ("transition", {"width": 841, "height": 560, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-transition.png")),
     ("minimum", {"width": 780, "height": 560, "deviceScaleFactor": 1, "mobile": False}, Path("/tmp/dm-ui-responsive-min.png")),
 )
+SETTINGS_PAGES = ("general", "downloads", "browser", "network", "notifications", "appearance")
 
 
 def evaluate_json(client, expression: str):
@@ -66,6 +68,19 @@ def measure(client) -> dict:
         inspectorScroll:(()=>{const element=q('.inspector-scroll'); return element?{clientWidth:element.clientWidth,scrollWidth:element.scrollWidth}:null})(),
         rowHeights:[...document.querySelectorAll('.download-row')].slice(0,3).map(row=>Math.round(row.getBoundingClientRect().height)),
         firstTitle:(()=>{const title=document.querySelector('.download-row .row-title-line strong'); return title?{text:title.textContent,clientWidth:title.clientWidth,scrollWidth:title.scrollWidth,overflow:title.scrollWidth>title.clientWidth}:null})(),
+      };
+    })()""")
+
+
+def measure_settings(client) -> dict:
+    return evaluate_json(client, """(()=>{
+      const labels=[...document.querySelectorAll('.settings-nav-item > span')].map(element=>({text:element.textContent,clientWidth:element.clientWidth,scrollWidth:element.scrollWidth}));
+      const box=selector=>{const element=document.querySelector(selector), rect=element?.getBoundingClientRect(); return element&&rect?{left:rect.left,right:rect.right,top:rect.top,bottom:rect.bottom,width:rect.width,height:rect.height}:null;};
+      return {
+        viewport:{width:innerWidth,height:innerHeight},
+        document:{clientWidth:document.documentElement.clientWidth,scrollWidth:document.documentElement.scrollWidth,clientHeight:document.documentElement.clientHeight,scrollHeight:document.documentElement.scrollHeight},
+        body:{clientWidth:document.body.clientWidth,scrollWidth:document.body.scrollWidth,clientHeight:document.body.clientHeight,scrollHeight:document.body.scrollHeight},
+        settingsMain:box('.settings-main'), settingsNav:box('.settings-nav'), settingsContent:box('.settings-content'), labels,
       };
     })()""")
 
@@ -122,6 +137,27 @@ def main() -> int:
                 assert all(height <= 92 for height in metrics["rowHeights"]), metrics
                 assert not metrics["firstTitle"]["overflow"], metrics
             print(f"RESPONSIVE-VIEWPORT: PASS ({label} contained)", flush=True)
+        settings_viewport = {"width": 780, "height": 560, "deviceScaleFactor": 1, "mobile": False}
+        client.call("Emulation.setDeviceMetricsOverride", settings_viewport)
+        for page in SETTINGS_PAGES:
+            settings_url = f"{URL}?settings={page}"
+            client.call("Page.navigate", {"url": settings_url})
+            wait_for_render(client)
+            metrics = measure_settings(client)
+            screenshot_path = Path(f"/tmp/dm-ui-settings-responsive-{page}.png")
+            screenshot = client.call("Page.captureScreenshot", {"format": "png"})
+            screenshot_path.write_bytes(base64.b64decode(screenshot["data"]))
+            print(f"SETTINGS-VIEWPORT[{page}]:", json.dumps(metrics, sort_keys=True), flush=True)
+            print(f"SETTINGS-VIEWPORT-SCREENSHOT[{page}]: {screenshot_path} bytes={screenshot_path.stat().st_size}", flush=True)
+            document = metrics["document"]
+            body = metrics["body"]
+            viewport_size = metrics["viewport"]
+            assert document["scrollWidth"] == document["clientWidth"], metrics
+            assert body["scrollWidth"] == body["clientWidth"], metrics
+            assert metrics["settingsMain"]["right"] <= viewport_size["width"] + 1, metrics
+            assert metrics["settingsContent"]["right"] <= viewport_size["width"] + 1, metrics
+            assert all(label["scrollWidth"] <= label["clientWidth"] + 1 for label in metrics["labels"]), metrics
+            print(f"SETTINGS-VIEWPORT: PASS ({page} contained with complete nav labels)", flush=True)
         return 0
     finally:
         if client is not None:

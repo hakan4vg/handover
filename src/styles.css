@@ -307,7 +307,7 @@ button:disabled { cursor: default; opacity: .56; }
 }
 
 @media (max-width: 840px) {
-  .workspace-columns { grid-template-columns: minmax(0, 1fr); }.inspector, .inspector-reopen { display: none; }.toolbar { padding-left: 14px; }.settings-main { grid-template-columns: 155px minmax(0, 1fr); }.settings-content { padding-left: 20px; padding-right: 20px; }.network-grid { grid-template-columns: 1fr; }.usage-card { display: none; }
+  .workspace-columns { grid-template-columns: minmax(0, 1fr); }.inspector, .inspector-reopen { display: none; }.toolbar { padding-left: 14px; }.settings-main { grid-template-columns: 190px minmax(0, 1fr); }.settings-content { padding-left: 20px; padding-right: 20px; }.network-grid { grid-template-columns: 1fr; }.usage-card { display: none; }
 }
 
 .list-header-actions, .toolbar-menu-wrap { position: relative; display: flex; align-items: center; }

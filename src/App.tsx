@@ -477,7 +477,7 @@ function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => v
   return <button className="radio" onClick={onClick}><span className={checked ? 'checked' : ''} />{label}</button>;
 }
 
-export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void; onCancel: (id: string) => void; onClose: () => void }) {
+export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void; onClose: () => void }) {
   const [source, setSource] = useState(job?.source ?? '');
   const [name, setName] = useState(job?.name ?? '');
   const [nameTouched, setNameTouched] = useState(false);
@@ -496,7 +496,23 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
   useEffect(() => { if (job?.bandwidthLimit != null) { const parts = bpsToParts(job.bandwidthLimit); setCapLimited(true); setCapValue(parts.value); setCapUnit(parts.unit); } }, [job?.id]);
   const submit = async () => {
     const bandwidthLimit = capLimited ? bandwidthToBps(capValue, capUnit) : null;
-    if (job && onCommit) { onCommit(job.id, name, destination, maxConnections, bandwidthLimit); return; }
+    if (job && onCommit) {
+      setFormError('');
+      let waitingForCommit = false;
+      try {
+        const result = onCommit(job.id, name, destination, maxConnections, bandwidthLimit);
+        if (result) {
+          waitingForCommit = true;
+          setBusy(true);
+          await result;
+        }
+      } catch (reason) {
+        setFormError(reason instanceof Error && reason.message ? reason.message : 'Could not add the download.');
+      } finally {
+        if (waitingForCommit) setBusy(false);
+      }
+      return;
+    }
     if (!source.trim() || !onCreate) return;
     try {
       const parsed = new URL(source.trim());
@@ -526,7 +542,7 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const currentJob = snapshot.jobs.find((item) => item.id === createdId);
   const close = () => window.close();
   const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit }));
-  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={(id, name, destination, maxConnections, bandwidthLimit) => { void adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }).then(close); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
+  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={(id) => { void adapter.cancelJob(id); close(); }} onClose={close} /></div>;
 }
 
 function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {

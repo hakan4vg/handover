@@ -6813,3 +6813,11 @@ change and no site resolver exception:
 - Added a focused manual-add regression. The red baseline returned `ADD_WINDOW_ERROR_RED_RC=1`, including the unhandled `Native core unavailable` rejection; the fixed test returned `ADD_WINDOW_ERROR_FIXED_RC=0` and verifies the message in `role="alert"`.
 - The existing real `manual_add_ui_probe.py` completed the actual Add URL → native provisional → resident completion → commit path: `ADD_WINDOW_ERROR_REAL_RC=0`, one provisional job, one source request, `262144` output bytes, and SHA-256 `ac6533c30d2d4fcc01be82be68bd63a592d37c49fe769b05aebfb4504fa146b3`. Evidence: `/tmp/dm-add-window-error-real.log`.
 - The complete fail-fast gate is captured at `/tmp/dm-add-window-error-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `70/70`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Keep Add Download open when commit fails
+
+- Captured-job `onCommit` previously accepted only a synchronous callback. The standalone Add window fire-and-forget `commitProvisional(...).then(close)`, so a native commit failure became an unhandled rejection with no recovery surface.
+- `AddDownloadWindow` now accepts synchronous or promise-returning commit callbacks, waits for async commits, and renders failures in its existing `role="alert"` form region without closing the window. The standalone callback closes only after native commit success; synchronous main-manager callbacks retain their existing global error-toast path.
+- The focused failure regression initially returned `ADD_WINDOW_COMMIT_ERROR_RED_RC=1` with no alert; the refined implementation returned `ADD_WINDOW_COMMIT_ERROR_CLEAN_RC=0` for the failure case and the existing commit wiring cases (`4/4`) with no React warnings.
+- The existing real `manual_add_ui_probe.py` still completed the normal captured commit path: `ADD_WINDOW_COMMIT_REAL_RC=0`, one provisional job, one source request, `262144` output bytes, and SHA-256 `ac6533c30d2d4fcc01be82be68bd63a592d37c49fe769b05aebfb4504fa146b3`. Evidence: `/tmp/dm-add-window-commit-real.log`.
+- The complete fail-fast gate is captured at `/tmp/dm-add-window-commit-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `71/71`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

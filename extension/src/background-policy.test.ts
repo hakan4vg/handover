@@ -134,6 +134,53 @@ describe('background policy persistence', () => {
     expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'capture-acquisition' }));
   });
 
+  it('waits for policy before forwarding media and keeps media independent from ordinary interception', async () => {
+    let resolveStored: (value: unknown) => void = () => undefined;
+    const stored = new Promise((resolve) => { resolveStored = resolve; });
+    const sendNativeMessage = vi.fn().mockResolvedValue({ ok: true });
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockReturnValue(stored), sendNativeMessage);
+    vi.stubGlobal('chrome', chrome);
+
+    await import('./background');
+    const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
+    expect(listener).toBeTypeOf('function');
+    let resolveReply: (value: Record<string, unknown>) => void = () => undefined;
+    const excludedReply = new Promise<Record<string, unknown>>((resolve) => { resolveReply = resolve; });
+    listener({ type: 'media-capture', payload: { source: 'https://cdn.example.test/video.mp4', pageUrl: 'https://www.example.test/watch', media: true } }, { tab: { id: 12 }, frameId: 0 }, resolveReply);
+    await Promise.resolve();
+    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+
+    resolveStored({ ['dm-policy']: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] } });
+    const excluded = await excludedReply;
+    expect(excluded.ok).toBe(false);
+    expect(excluded.error).toContain('site excluded');
+    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+
+    sendNativeMessage.mockClear();
+    const allowed = await new Promise<Record<string, unknown>>((resolve) => {
+      listener({ type: 'media-capture', payload: { source: 'https://cdn.example.test/video.mp4', pageUrl: 'https://other.example.test/watch', media: true } }, { tab: { id: 12 }, frameId: 0 }, resolve);
+    });
+    expect(allowed.ok).toBe(true);
+    expect(sendNativeMessage).toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+  });
+
+  it('rejects media capture when media buttons are disabled', async () => {
+    const sendNativeMessage = vi.fn().mockResolvedValue({ ok: true });
+    const storageGet = vi.fn().mockResolvedValue({ ['dm-policy']: { interceptDownloads: true, showMediaButtons: false, excludedSites: [] } });
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet, sendNativeMessage);
+    vi.stubGlobal('chrome', chrome);
+
+    await import('./background');
+    const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
+    expect(listener).toBeTypeOf('function');
+    const response = await new Promise<Record<string, unknown>>((resolve) => {
+      listener({ type: 'media-capture', payload: { source: 'https://cdn.example.test/video.mp4', pageUrl: 'https://www.example.test/watch', media: true } }, { tab: { id: 13 }, frameId: 0 }, resolve);
+    });
+    expect(response.ok).toBe(false);
+    expect(response.error).toContain('media buttons disabled');
+    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+  });
+
   it('still releases the browser download when native forwarding throws synchronously', async () => {
     const sendNativeMessage = vi.fn(() => {
       throw new Error('native bridge startup failed');

@@ -155,6 +155,13 @@ function ordinaryCaptureError(source: string, pageUrl: string): string | undefin
   return undefined;
 }
 
+function mediaCapturePolicyError(pageUrl: string): string | undefined {
+  if (!policy.showMediaButtons) return 'media buttons disabled';
+  const pageSite = siteOf(pageUrl);
+  if (pageSite && policy.excludedSites.includes(pageSite)) return 'site excluded';
+  return undefined;
+}
+
 async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
   await policyReady;
   const source = typeof payload.source === 'string' ? payload.source.trim() : '';
@@ -371,7 +378,14 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       if (tabId !== undefined) rememberPlayer((message as { payload?: Record<string, unknown> }).payload ?? {}, tabId, sender.frameId ?? 0, sender.documentId);
       reply({ ok: true });
     } else if (type === 'media-capture') {
+      await policyReady;
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
+      const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined;
+      const policyError = mediaCapturePolicyError(pageUrl ?? '');
+      if (policyError) {
+        reply({ ok: false, error: policyError });
+        return;
+      }
       const documentId = sender.documentId;
       const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey : (sender.tab?.id === undefined ? undefined : activePlayerKey(sender.tab.id, sender.frameId ?? 0, documentId));
       let source = typeof payload.source === 'string' ? payload.source : '';
@@ -386,7 +400,6 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         reply({ ok: false, error: 'no acquirable source for this media' });
         return;
       }
-      const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined;
       const userAgent = cleanUserAgent(payload.userAgent);
       reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments, referrer: pageUrl, userAgent } }));
     } else if (type === 'open-manager') {

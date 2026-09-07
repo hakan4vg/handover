@@ -431,11 +431,11 @@ function SettingsHeading({ title, description }: { title: string; description?: 
 }
 
 function SettingToggle({ icon, title, description, checked, onChange }: { icon?: IconName; title: string; description?: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  return <div className="setting-line">{icon && <Icon name={icon} size={20} />}<div className="setting-copy"><strong>{title}</strong>{description && <span>{description}</span>}</div><Toggle checked={checked} onChange={onChange} /></div>;
+  return <div className="setting-line">{icon && <Icon name={icon} size={20} />}<div className="setting-copy"><strong>{title}</strong>{description && <span>{description}</span>}</div><Toggle label={title} checked={checked} onChange={onChange} /></div>;
 }
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
-  return <button aria-label={checked ? 'On' : 'Off'} aria-pressed={checked} className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}><span /></button>;
+function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
+  return <button aria-label={label} aria-pressed={checked} className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}><span /></button>;
 }
 
 function SettingCard({ children, className = '' }: { children: ReactNode; className?: string }) {
@@ -600,7 +600,7 @@ function TrayAction({ icon, label, onClick, chevron, danger }: { icon: IconName;
 }
 
 function TrayToggle({ icon, label, checked, onChange }: { icon: IconName; label: string; checked: boolean; onChange: (value: boolean) => void }) {
-  return <div className="tray-toggle"><Icon name={icon} size={17} /><span>{label}</span><Toggle checked={checked} onChange={onChange} /></div>;
+  return <div className="tray-toggle"><Icon name={icon} size={17} /><span>{label}</span><Toggle label={label} checked={checked} onChange={onChange} /></div>;
 }
 
 export function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {

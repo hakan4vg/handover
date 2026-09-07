@@ -42,8 +42,9 @@ describe('SettingsView', () => {
     await act(async () => {
       root.render(<SettingsView adapter={adapter} settings={settings} page="general" onPageChange={() => undefined} />);
     });
-    const toggle = host.querySelector('button[aria-label="Off"]');
+    const toggle = host.querySelector('button.toggle');
     expect(toggle).not.toBeNull();
+    expect(toggle?.getAttribute('aria-label')).toContain('Start download service at sign-in');
     await act(async () => {
       (toggle as HTMLButtonElement).click();
       await Promise.resolve();

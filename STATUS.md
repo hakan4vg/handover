@@ -6860,3 +6860,11 @@ change and no site resolver exception:
 - The existing filter/context Chromium probe returned `ROW_KEYBOARD_FIXED_RC=0` and still passed every filter-selection and context-menu assertion. It selected `project-assets.zip` through Enter before restoring the normal selection. Evidence: `/tmp/dm-row-keyboard-fixed.log`.
 - Focused TypeScript and Vitest checks returned `ROW_KEYBOARD_FOCUSED_RC=0`; full Vitest was `22` files/`73` tests with no warnings. Evidence: `/tmp/dm-row-keyboard-focused.log`.
 - The complete fail-fast gate is captured at `/tmp/dm-row-keyboard-full-gate.log` and returned `ROW_KEYBOARD_GATE_RC=0`: TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Name shared toggle controls for assistive technology
+
+- The shared React `Toggle` exposed only `aria-label="On"` or `"Off"`, so a focused setting, extension-surface, or tray-surface control did not identify which preference it changed. The existing settings regression was red at `/tmp/dm-toggle-label-red.log`: received `Off`, expected the setting name.
+- `SettingToggle` and `TrayToggle` now pass their existing human labels to the shared control. `aria-pressed` continues to expose the on/off state without changing the visible UI.
+- The focused settings test returned `TOGGLE_LABEL_FIXED_RC=0` (`1/1`), and TypeScript returned `TOGGLE_LABEL_TSC_RC=0`. Evidence: `/tmp/dm-toggle-label-fixed.log` and `/tmp/dm-toggle-label-tsc.log`.
+- Direct rendered DOM checks returned `TOGGLE_EXTENSION_REAL_RC=0` and `TOGGLE_TRAY_REAL_RETRY_RC=0`: extension labels were `Intercept browser downloads` and `Show media buttons`; tray labels were `Browser Integration` and `Media Buttons`, each retaining `aria-pressed=true`. Evidence: `/tmp/dm-toggle-label-extension-real.log` and `/tmp/dm-toggle-label-tray-real-retry.log`.
+- The complete fail-fast gate is captured at `/tmp/dm-toggle-label-full-gate.log` and returned `TOGGLE_LABEL_GATE_RC=0`: TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

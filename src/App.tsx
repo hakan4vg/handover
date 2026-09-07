@@ -91,7 +91,7 @@ function Disconnected({ message }: { message: string }) {
   return <div className="loading-screen disconnected"><div className="loading-mark"><Icon name="error" size={23} /></div><strong>Download Manager is unavailable</strong><span>{message}</span><button className="button primary" onClick={() => window.location.reload()}>Try again</button></div>;
 }
 
-function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
+export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
   const [filter, setFilter] = useState<FilterKey>(() => new URLSearchParams(window.location.search).has('settings') ? 'settings' as FilterKey : 'all');
   const [settingsPage, setSettingsPage] = useState<SettingsPage>(() => settingsPageFromSearch(window.location.search));
   const [selectedId, setSelectedId] = useState(() => new URLSearchParams(window.location.search).get('job') ?? 'job-2');
@@ -160,8 +160,8 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
     setNotice(message);
   };
 
-  const run = (promise: Promise<void>, success?: string) => {
-    promise.then(() => success && showNotice(success)).catch((reason: unknown) => showNotice(reason instanceof Error ? reason.message : 'Action failed', 'error'));
+  const run = (action: DownloadAction, success?: string) => {
+    runAction(action, () => { if (success) showNotice(success); }, (message) => showNotice(message, 'error'));
   };
 
   const openAdd = () => {
@@ -216,7 +216,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
             <div className="toolbar">
               <div className="toolbar-heading"><h1>{titleFor(filter)}</h1><span className="heading-count">{filteredJobs.length}</span></div>
               <div className="toolbar-actions">
-                {active.length > 0 ? <button className="button" onClick={() => run(adapter.pauseAll())}><Icon name="pause" size={15} /> Pause All</button> : paused.length > 0 ? <button className="button" onClick={() => run(adapter.resumeAll())}><Icon name="play" size={15} /> Resume All</button> : null}
+                {active.length > 0 ? <button className="button" onClick={() => run(() => adapter.pauseAll())}><Icon name="pause" size={15} /> Pause All</button> : paused.length > 0 ? <button className="button" onClick={() => run(() => adapter.resumeAll())}><Icon name="play" size={15} /> Resume All</button> : null}
                 <button className="button primary" onClick={openAdd}><Icon name="add" size={17} /> Add URL</button>
                  <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <div className="toolbar-menu" role="menu" aria-label="Manager options"><button role="menuitem" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={15} /> Settings</button><button role="menuitem" onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></div>}</div>
               </div>
@@ -225,7 +225,7 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
               <section className="download-list" aria-label="Downloads">
                  <div className="list-header"><span>Downloads</span><div className="list-header-actions"><button className="subtle-button" aria-haspopup="menu" aria-expanded={sortOpen} onClick={() => { setSortOpen(!sortOpen); setMoreOpen(false); }}><Icon name="sort" size={15} /> Sort <Icon name="chevron-down" size={13} /></button>{sortOpen && <SortMenu value={sortBy} onChange={(value) => { setSortBy(value); setSortOpen(false); }} />}</div></div>
                 <div className="rows">
-                  {filteredJobs.length ? filteredJobs.map((job) => <DownloadRow key={job.id} job={job} selected={job.id === selected?.id} menuOpen={contextJobId === job.id} onSelect={() => { setSelectedId(job.id); setInspectorOpen(true); dismissMenus(); setContextJobId(null); }} onPause={() => run(adapter.pauseJob(job.id))} onResume={() => run(adapter.resumeJob(job.id))} onRetry={() => run(adapter.retryJob(job.id))} onMenu={() => { dismissMenus(); setContextJobId(contextJobId === job.id ? null : job.id); }} />) : <EmptyState filter={filter} onAdd={openAdd} />}
+                  {filteredJobs.length ? filteredJobs.map((job) => <DownloadRow key={job.id} job={job} selected={job.id === selected?.id} menuOpen={contextJobId === job.id} onSelect={() => { setSelectedId(job.id); setInspectorOpen(true); dismissMenus(); setContextJobId(null); }} onPause={() => run(() => adapter.pauseJob(job.id))} onResume={() => run(() => adapter.resumeJob(job.id))} onRetry={() => run(() => adapter.retryJob(job.id))} onMenu={() => { dismissMenus(); setContextJobId(contextJobId === job.id ? null : job.id); }} />) : <EmptyState filter={filter} onAdd={openAdd} />}
                 </div>
                 {contextJob && <JobContextMenu job={contextJob} adapter={adapter} onClose={() => setContextJobId(null)} onNotice={showNotice} />}
               </section>
@@ -245,6 +245,16 @@ function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: Ap
 export function NoticeToast({ message, tone }: { message: string; tone: 'success' | 'error' }) {
   const error = tone === 'error';
   return <div className={`toast ${error ? 'toast-error' : 'toast-success'}`} role={error ? 'alert' : 'status'} aria-live={error ? 'assertive' : 'polite'}><span data-notice-icon={tone}><Icon name={error ? 'error' : 'check'} size={16} /></span>{message}</div>;
+}
+
+type DownloadAction = () => Promise<void> | void;
+
+function actionErrorMessage(reason: unknown) {
+  return reason instanceof Error && reason.message ? reason.message : 'Action failed';
+}
+
+function runAction(action: DownloadAction, onSuccess: () => void, onError: (message: string) => void) {
+  void Promise.resolve().then(action).then(onSuccess).catch((reason: unknown) => onError(actionErrorMessage(reason)));
 }
 
 function WindowControls() {
@@ -424,10 +434,12 @@ function SectionTitle({ icon, title }: { icon: IconName; title: string }) {
 }
 
 export function JobContextMenu({ job, adapter, onClose, onNotice }: { job: DownloadJob; adapter: DownloadAdapter; onClose: () => void; onNotice: (message: string, tone?: 'success' | 'error') => void }) {
-  const run = (action: Promise<void>, message?: string) => action.then(() => { if (message) onNotice(message, 'success'); onClose(); }).catch((reason: unknown) => onNotice(reason instanceof Error ? reason.message : 'Action failed', 'error'));
+  const run = (action: DownloadAction, message?: string) => {
+    runAction(action, () => { if (message) onNotice(message, 'success'); onClose(); }, (error) => onNotice(error, 'error'));
+  };
   const pauseAction = ['downloading', 'connecting', 'finalizing'].includes(job.state);
   const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <div className="context-menu" role="menu" aria-label={`Actions for ${job.name}`} onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(adapter.removeJob(job.id), 'Removed from list')} />}</div>;
+  return <div className="context-menu" role="menu" aria-label={`Actions for ${job.name}`} onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(() => pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(() => adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(() => adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(() => adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(() => adapter.removeJob(job.id), 'Removed from list')} />}</div>;
 }
 
 function MenuAction({ icon, label, danger, onClick }: { icon: IconName; label: string; danger?: boolean; onClick: () => void }) {

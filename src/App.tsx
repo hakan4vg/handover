@@ -254,6 +254,16 @@ export async function openLocalPath(path: string): Promise<string | undefined> {
   }
 }
 
+export async function copySourceUrl(source: string): Promise<string | undefined> {
+  try {
+    if (!navigator.clipboard) return 'Clipboard is unavailable.';
+    await navigator.clipboard.writeText(source);
+    return undefined;
+  } catch (reason) {
+    return reason instanceof Error && reason.message ? reason.message : 'Could not copy the source URL.';
+  }
+}
+
 function openManagerSurface(jobId?: string) {
   window.location.href = `${window.location.pathname}${jobId ? `?job=${encodeURIComponent(jobId)}` : ''}`;
 }
@@ -374,11 +384,11 @@ function SectionTitle({ icon, title }: { icon: IconName; title: string }) {
   return <div className="section-title"><Icon name={icon} size={16} /><strong>{title}</strong></div>;
 }
 
-function JobContextMenu({ job, adapter, onClose, onNotice }: { job: DownloadJob; adapter: DownloadAdapter; onClose: () => void; onNotice: (message: string, tone?: 'success' | 'error') => void }) {
+export function JobContextMenu({ job, adapter, onClose, onNotice }: { job: DownloadJob; adapter: DownloadAdapter; onClose: () => void; onNotice: (message: string, tone?: 'success' | 'error') => void }) {
   const run = (action: Promise<void>, message?: string) => action.then(() => { if (message) onNotice(message, 'success'); onClose(); }).catch((reason: unknown) => onNotice(reason instanceof Error ? reason.message : 'Action failed', 'error'));
   const pauseAction = ['downloading', 'connecting', 'finalizing'].includes(job.state);
   const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <div className="context-menu" onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void navigator.clipboard?.writeText(job.source); onNotice('Source URL copied'); onClose(); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(adapter.removeJob(job.id), 'Removed from list')} />}</div>;
+  return <div className="context-menu" onClick={(event) => event.stopPropagation()}>{(pauseAction || job.state === 'paused' || job.state === 'pending') && <MenuAction icon={pauseAction ? 'pause' : 'play'} label={pauseAction ? 'Pause' : 'Resume'} onClick={() => run(pauseAction ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{['downloading', 'connecting', 'paused', 'pending', 'finalizing'].includes(job.state) && <MenuAction icon="close" label="Cancel" onClick={() => run(adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.state !== 'completed' && <MenuAction icon="link" label="Reattach download" onClick={() => run(adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(adapter.removeJob(job.id), 'Removed from list')} />}</div>;
 }
 
 function MenuAction({ icon, label, danger, onClick }: { icon: IconName; label: string; danger?: boolean; onClick: () => void }) {

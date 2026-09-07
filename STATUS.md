@@ -6791,3 +6791,11 @@ change and no site resolver exception:
 - The red helper regression returned `OPEN_PATH_RED_RC=1`; after the fix the helper and Inspector tests passed. The final refined focused run is captured at `/tmp/dm-open-path-final-focused-clean.log` and returned `OPEN_PATH_FINAL_CLEAN_RC=0`: two files, `3/3` tests, no React warnings.
 - The notification opener regression passed in `/tmp/dm-open-path-all-focused-clean2.log`. The real manager-controls Chromium probe remained green with `NOTICE_TOAST_REAL_RC=0`; the real notification probe was blocked before page interaction by the known WebKit inspector startup boundary (`WebKit inspector did not become ready: [Errno 111] Connection refused`), so it is not acceptance evidence.
 - The complete fail-fast gate is captured at `/tmp/dm-open-path-full-gate-final-clean.log` and returned `GATE_RC=0`: TypeScript, Vitest `66/66`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Report clipboard copy failures
+
+- The context-menu `Copy source URL` action previously announced success immediately while ignoring the asynchronous Clipboard API result. MDN documents that `writeText()` returns a promise and rejects when clipboard access is denied or unavailable.
+- Added `copySourceUrl` result handling. A resolved write produces the existing success notice; missing or rejected clipboard access produces the error-tone notice instead.
+- The red helper test returned `COPY_SOURCE_RED_RC=1`; the fixed helper test returned `COPY_SOURCE_FIXED_RC=0`. The direct context-menu regression returned `CONTEXT_COPY_FIXED_RC=0` for the rejection path and verified that the menu closes after reporting the error.
+- The existing real manager-controls Chromium probe returned `CONTEXT_COPY_REAL_RC=0`; it covered the surrounding context-menu and manager paths but did not claim native clipboard access.
+- The complete fail-fast gate is captured at `/tmp/dm-copy-source-full-gate.log` and returned `GATE_RC=0`: TypeScript, Vitest `68/68`, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.

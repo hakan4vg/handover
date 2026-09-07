@@ -6868,3 +6868,10 @@ change and no site resolver exception:
 - The focused settings test returned `TOGGLE_LABEL_FIXED_RC=0` (`1/1`), and TypeScript returned `TOGGLE_LABEL_TSC_RC=0`. Evidence: `/tmp/dm-toggle-label-fixed.log` and `/tmp/dm-toggle-label-tsc.log`.
 - Direct rendered DOM checks returned `TOGGLE_EXTENSION_REAL_RC=0` and `TOGGLE_TRAY_REAL_RETRY_RC=0`: extension labels were `Intercept browser downloads` and `Show media buttons`; tray labels were `Browser Integration` and `Media Buttons`, each retaining `aria-pressed=true`. Evidence: `/tmp/dm-toggle-label-extension-real.log` and `/tmp/dm-toggle-label-tray-real-retry.log`.
 - The complete fail-fast gate is captured at `/tmp/dm-toggle-label-full-gate.log` and returned `TOGGLE_LABEL_GATE_RC=0`: TypeScript, full Vitest `22` files/`73` tests, frontend and extension builds, Rust `71/71`, Cargo build, Python compilation, and `git diff --check`.
+
+## 2026-09-07 — Give Network bandwidth choices semantic radio states
+
+- The Network settings bandwidth choices were visually styled buttons without a labelled group or radio state. The focused regression was red at `/tmp/dm-radio-red.log`.
+- `src/App.tsx` now exposes a `Global bandwidth limit` `radiogroup`; its `Unlimited` and `Limited to:` choices expose `role="radio"` and `aria-checked` while retaining existing click behavior and styling. The regression remains in `src/settings-feedback.test.tsx`.
+- The focused test and TypeScript checks returned `RADIO_FIXED_RC=0` and `RADIO_TSC_RC=0`; the rendered Chromium DOM check returned `RADIO_REAL_RC=0` with one labelled group and `true/false` radio states. Evidence: `/tmp/dm-radio-fixed.log`, `/tmp/dm-radio-tsc.log`, and `/tmp/dm-radio-real.log`.
+- The complete fail-fast gate returned `RADIO_GATE_RC=0`: Vitest `22` files/`74` tests, TypeScript, frontend and extension builds, Rust tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-radio-full-gate.log`.

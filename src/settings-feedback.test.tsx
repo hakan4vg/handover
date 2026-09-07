@@ -54,4 +54,27 @@ describe('SettingsView', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('exposes bandwidth limit choices as a labelled radio group', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const adapter = {
+      updateSettings: vi.fn().mockResolvedValue(undefined),
+    } as unknown as DownloadAdapter;
+
+    await act(async () => {
+      root.render(<SettingsView adapter={adapter} settings={settings} page="network" onPageChange={() => undefined} />);
+    });
+
+    const group = host.querySelector('[role="radiogroup"]');
+    expect(group?.getAttribute('aria-label')).toBe('Global bandwidth limit');
+    const radios = Array.from(host.querySelectorAll('button.radio'));
+    expect(radios).toHaveLength(2);
+    expect(radios.map((radio) => radio.getAttribute('role'))).toEqual(['radio', 'radio']);
+    expect(radios.map((radio) => radio.getAttribute('aria-checked'))).toEqual(['true', 'false']);
+
+    act(() => root.unmount());
+    host.remove();
+  });
 });

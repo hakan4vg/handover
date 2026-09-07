@@ -51,4 +51,26 @@ describe('useAppSnapshot startup ordering', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('surfaces a live subscription failure after the initial snapshot', async () => {
+    let reportError: ((reason: unknown) => void) | undefined;
+    const adapter = {
+      subscribe: vi.fn((_listener: (value: AppSnapshot) => void, onError?: (reason: unknown) => void) => {
+        reportError = onError;
+        return () => undefined;
+      }),
+      getSnapshot: vi.fn(async () => snapshot(true)),
+    } as unknown as DownloadAdapter;
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+
+    await act(async () => { root.render(<Probe adapter={adapter} />); });
+    expect(reportError).toEqual(expect.any(Function));
+    await act(async () => { reportError?.(new Error('live state unavailable')); });
+
+    expect(host.querySelector('output')?.textContent).toBe('live state unavailable');
+    act(() => root.unmount());
+    host.remove();
+  });
 });

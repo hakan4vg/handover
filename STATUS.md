@@ -6875,3 +6875,11 @@ change and no site resolver exception:
 - `src/App.tsx` now exposes a `Global bandwidth limit` `radiogroup`; its `Unlimited` and `Limited to:` choices expose `role="radio"` and `aria-checked` while retaining existing click behavior and styling. The regression remains in `src/settings-feedback.test.tsx`.
 - The focused test and TypeScript checks returned `RADIO_FIXED_RC=0` and `RADIO_TSC_RC=0`; the rendered Chromium DOM check returned `RADIO_REAL_RC=0` with one labelled group and `true/false` radio states. Evidence: `/tmp/dm-radio-fixed.log`, `/tmp/dm-radio-tsc.log`, and `/tmp/dm-radio-real.log`.
 - The complete fail-fast gate returned `RADIO_GATE_RC=0`: Vitest `22` files/`74` tests, TypeScript, frontend and extension builds, Rust tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-radio-full-gate.log`.
+
+## 2026-09-07 — Surface live subscription failures
+
+- `NativeAdapter.subscribe()` passed Tauri's promise-returning `listen()` through without a rejection handler. The resident UI could render its initial snapshot and then silently stop receiving live state updates if listener registration failed.
+- `DownloadAdapter.subscribe()` now accepts an optional error callback. `useAppSnapshot` routes that callback through the existing disconnected state, and the native adapter reports `listen()` rejection while suppressing it after unmount. Recovery remains possible when a later state event arrives.
+- The focused regression was red at `/tmp/dm-subscription-red.log`: the initial snapshot test passed, while the new failure case received no error callback (`1 failed | 1 passed`). The fixed hook test returned `SUBSCRIPTION_FIXED_RC=0` with `2/2`; TypeScript returned `SUBSCRIPTION_TSC_RC=0`.
+- The existing trusted Chromium manager-controls probe passed against the changed frontend: `SUBSCRIPTION_MANAGER_REAL_RC=0`, including row actions, bulk controls, sorting, transient-menu dismissal, and Add URL. Evidence: `/tmp/dm-subscription-manager-real.log`.
+- The complete fail-fast gate returned `SUBSCRIPTION_GATE_RC=0`: Vitest `22` files/`75` tests, TypeScript, frontend and extension builds, Rust `71/71` tests/build, Python compilation, and `git diff --check`. Evidence: `/tmp/dm-subscription-full-gate.log`.

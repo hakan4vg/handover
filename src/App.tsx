@@ -41,18 +41,19 @@ export function useAppSnapshot(adapter: DownloadAdapter) {
   useEffect(() => {
     let mounted = true;
     let receivedSubscriptionSnapshot = false;
+    const reportError = (reason: unknown) => {
+      if (mounted) setError(reason instanceof Error ? reason.message : 'The application core could not be reached.');
+    };
     const dispose = adapter.subscribe((next) => {
       if (mounted) {
         receivedSubscriptionSnapshot = true;
         setSnapshot(next);
         setError('');
       }
-    });
+    }, reportError);
     adapter.getSnapshot().then((next) => {
       if (mounted && !receivedSubscriptionSnapshot) setSnapshot(next);
-    }).catch((reason: unknown) => {
-      if (mounted) setError(reason instanceof Error ? reason.message : 'The application core could not be reached.');
-    });
+    }).catch(reportError);
     return () => {
       mounted = false;
       dispose();

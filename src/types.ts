@@ -106,7 +106,7 @@ export interface AppSnapshot {
 
 export interface DownloadAdapter {
   getSnapshot(): Promise<AppSnapshot>;
-  subscribe(listener: (snapshot: AppSnapshot) => void): () => void;
+  subscribe(listener: (snapshot: AppSnapshot) => void, onError?: (reason: unknown) => void): () => void;
   pauseJob(id: string): Promise<void>;
   resumeJob(id: string): Promise<void>;
   retryJob(id: string): Promise<void>;

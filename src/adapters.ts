@@ -331,12 +331,14 @@ class NativeAdapter implements DownloadAdapter {
     return invoke<AppSnapshot>('get_snapshot');
   }
 
-  subscribe(listener: (snapshot: AppSnapshot) => void) {
+  subscribe(listener: (snapshot: AppSnapshot) => void, onError?: (reason: unknown) => void) {
     let stopped = false;
     let unlisten: (() => void) | undefined;
     listen<AppSnapshot>('state-changed', (event) => listener(event.payload)).then((dispose) => {
       if (stopped) dispose();
       else unlisten = dispose;
+    }).catch((reason: unknown) => {
+      if (!stopped) onError?.(reason);
     });
     return () => { stopped = true; unlisten?.(); };
   }

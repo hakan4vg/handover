@@ -1,5 +1,5 @@
 import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, DEFAULT_POLICY, isHttp, siteOf, type BrowserPolicy } from './shared';
-import { choosePlayerEvidence, chooseWorkerMediaSelection, mediaKindFor, type MediaCandidate, type MediaPlayerEvidence } from './media-candidates';
+import { choosePlayerEvidence, chooseWorkerMediaSelection, isMediaCandidate, mediaKindFor, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 
@@ -9,6 +9,8 @@ const POLICY_KEY = 'dm-policy';
 // source behind blob:/MSE players. URLs only, no bodies, no cookies.
 const recentMedia: MediaCandidate[] = [];
 const recentPlayers: MediaPlayerEvidence[] = [];
+const MEDIA_BUFFER_MAX = 60;
+const MEDIA_BUFFER_MS = 90_000;
 const PLAYER_BUFFER_MAX = 40;
 const PLAYER_BUFFER_MS = 15_000;
 
@@ -183,6 +185,19 @@ async function syncPolicyFromResident(): Promise<void> {
   if (adoptResidentPolicy(response)) await savePolicy();
 }
 
+let residentPolicySync: Promise<void> | null = null;
+let residentPolicySyncedAt = 0;
+
+async function refreshResidentPolicy(): Promise<void> {
+  if (Date.now() - residentPolicySyncedAt < 1000) return;
+  if (!residentPolicySync) {
+    residentPolicySync = syncPolicyFromResident()
+      .then(() => { residentPolicySyncedAt = Date.now(); })
+      .finally(() => { residentPolicySync = null; });
+  }
+  await residentPolicySync;
+}
+
 async function sendApp(message: unknown): Promise<unknown> {
   const type = (message as { type?: string })?.type;
   const route = type === 'get-policy' ? '/v1/policy' : type === 'open-manager' ? '/v1/manager' : type === 'update-policy' ? '/v1/policy' : '/v1/capture';
@@ -203,6 +218,11 @@ async function sendApp(message: unknown): Promise<unknown> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function pruneMedia(now = Date.now()): void {
+  while (recentMedia.length && now - recentMedia[0].at > MEDIA_BUFFER_MS) recentMedia.shift();
+  while (recentMedia.length > MEDIA_BUFFER_MAX) recentMedia.shift();
 }
 
 function prunePlayers(now = Date.now()): void {
@@ -300,6 +320,106 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   }
 }
 
+function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey = activePlayerKey(tabId, frameId, documentId), kind: MediaKind = mediaKindFor(url)): void {
+  if (!isHttp(url)) return;
+  pruneMedia();
+  const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
+  if (existing) {
+    if (role === 'manifest' || existing.role === 'unknown') existing.role = role;
+    if (playerKey && !existing.playerKey) existing.playerKey = playerKey;
+    if (kind !== 'unknown' || !existing.kind) existing.kind = kind;
+    existing.at = Date.now();
+    return;
+  }
+  recentMedia.push({ url, tabId, frameId, at: Date.now(), role, kind, documentId, playerKey });
+}
+
+// Observe (never block) response traffic that feeds media elements.
+chrome.webRequest.onResponseStarted.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    const type = details.type;
+    if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return;
+    const role = roleFor(details.url);
+    const kind = mediaKindFor(details.url);
+    if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return;
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind);
+  },
+  { urls: ['<all_urls>'] },
+);
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (details.tabId < 0) return undefined;
+    const type = details.type;
+    if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return undefined;
+    const contentType = details.responseHeaders?.find((header) => header.name.toLowerCase() === 'content-type')?.value ?? '';
+    const role = roleFor(details.url, contentType);
+    const kind = mediaKindFor(details.url, contentType);
+    if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return undefined;
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, activePlayerKey(details.tabId, details.frameId, details.documentId), kind);
+    return undefined;
+  },
+  { urls: ['<all_urls>'] },
+  ['responseHeaders'],
+);
+
+// Bounded observation of reproducible URL-encoded POST bodies.
+const FORM_BODY_MAX = 64 * 1024;
+const FORM_BODY_TTL_MS = 60_000;
+const FORM_BODY_PER_URL = 4;
+const recentFormBodies: Array<{ url: string; body: string; at: number; tabId: number; frameId: number }> = [];
+
+function pruneFormBodies(now = Date.now()): void {
+  while (recentFormBodies.length && now - recentFormBodies[0].at > FORM_BODY_TTL_MS) recentFormBodies.shift();
+  while (recentFormBodies.length > 64) recentFormBodies.shift();
+}
+
+function formBodyFromDetails(details: chrome.webRequest.OnBeforeRequestDetails): string | undefined {
+  const formData = details.requestBody?.formData;
+  if (!formData) return undefined;
+  const params = new URLSearchParams();
+  for (const [key, values] of Object.entries(formData)) {
+    for (const value of values) {
+      if (typeof value !== 'string') return undefined;
+      params.append(key, value);
+    }
+  }
+  const text = params.toString();
+  return text.length > 0 && text.length <= FORM_BODY_MAX ? text : undefined;
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details): undefined => {
+    if (details.tabId < 0 || details.method !== 'POST') return undefined;
+    const body = formBodyFromDetails(details);
+    if (body === undefined) return undefined;
+    pruneFormBodies();
+    const url = details.url.split('#')[0];
+    const queued = recentFormBodies.filter((item) => item.url === url);
+    if (queued.length >= FORM_BODY_PER_URL) {
+      const oldest = recentFormBodies.findIndex((item) => item.url === url);
+      if (oldest >= 0) recentFormBodies.splice(oldest, 1);
+    }
+    recentFormBodies.push({ url, body, at: Date.now(), tabId: details.tabId, frameId: details.frameId });
+    return undefined;
+  },
+  { urls: ['<all_urls>'] },
+  ['requestBody'],
+);
+
+function takeFormBody(url: string, tabId?: number): string | undefined {
+  pruneFormBodies();
+  const now = Date.now();
+  let index = tabId !== undefined && tabId >= 0
+    ? recentFormBodies.findIndex((item) => item.url === url && item.tabId === tabId)
+    : -1;
+  if (index < 0) index = recentFormBodies.findIndex((item) => item.url === url);
+  if (index < 0) return undefined;
+  const [found] = recentFormBodies.splice(index, 1);
+  return now - found.at <= FORM_BODY_TTL_MS ? found.body : undefined;
+}
+
 // Downloads without an interceptable page anchor are handed over
 // transactionally: pause Chromium, create the native provisional job, then
 // cancel Chromium. Any failed step resumes the browser and rolls back the
@@ -326,6 +446,8 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       }
       // The Downloads API exposes no tab/frame identifier, so do not guess a
       // User-Agent from another document on this fallback path.
+      // A matching observed POST is replayed once; otherwise acquisition uses GET.
+      const postBody = takeFormBody(source);
       const response = await sendApp({
         type: 'capture-acquisition',
         payload: {
@@ -333,6 +455,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
           name: cleanFilename(item.filename),
           pageUrl: item.referrer,
           referrer: item.referrer,
+          ...(postBody === undefined ? {} : { method: 'POST', postBody }),
         },
       }) as { ok?: boolean; id?: string };
       if (!response?.ok || typeof response.id !== 'string') {
@@ -363,12 +486,10 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     const type = (message as { type?: string })?.type;
     if (type === 'get-policy') {
       await policyReady;
-      if (!sender.tab) {
-        try {
-          await syncPolicyFromResident();
-        } catch {
-          // Keep the last browser-owned policy when the resident app is stopped.
-        }
+      try {
+        await refreshResidentPolicy();
+      } catch {
+        // Keep the last browser-owned policy when the resident app is stopped.
       }
       reply(policyLoadError ? { ok: false, error: policyLoadError, policy } : { ok: true, policy });
     } else if (type === 'update-policy') {
@@ -388,9 +509,9 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       }
       policy = next;
       policyLoadError = '';
+      await sendApp({ type: 'update-policy', payload: policy });
+      residentPolicySyncedAt = Date.now();
       reply({ ok: true, policy });
-      // Best-effort push so the resident app (when running) stays coherent.
-      void sendApp({ type: 'update-policy', payload: policy });
     } else if (type === 'ordinary-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
       reply(await captureOrdinary(payload));
@@ -455,6 +576,6 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
 
 policyReady = loadPolicy();
 void policyReady
-  .then(() => syncPolicyFromResident())
+  .then(() => refreshResidentPolicy())
   .catch(() => undefined);
 void hydrateResolvedMedia();

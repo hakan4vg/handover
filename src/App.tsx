@@ -227,7 +227,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
           </nav>
           <div className="sidebar-spacer" />
           <SidebarItem icon="settings" label="Settings" active={isSettings} onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }} />
-          <div className="sidebar-footer"><span className="status-dot" /><span>{snapshot.bridgeAvailable === false ? 'Bridge unavailable' : `Browser integration ${snapshot.settings.interceptDownloads ? 'on' : 'off'}`}</span></div>
+          <div className="sidebar-footer"><span className={`status-dot ${snapshot.bridgeAvailable === false ? 'error' : snapshot.settings.interceptDownloads ? '' : 'off'}`} /><span>{snapshot.bridgeAvailable === false ? 'Bridge unavailable' : `Browser integration ${snapshot.settings.interceptDownloads ? 'on' : 'off'}`}</span></div>
         </aside>
         {isSettings ? <SettingsView adapter={adapter} settings={snapshot.settings} page={settingsPage} onPageChange={setSettingsPage} /> : (
           <main className="manager-main">
@@ -249,7 +249,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
               </section>
               {selected && (inspectorOpen ? <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} /> : <button className="inspector-reopen" onClick={() => setInspectorOpen(true)} aria-label="Open inspector"><Icon name="chevron-left" size={17} /><span>Details</span></button>)}
             </div>
-             <div className="manager-statusbar"><div className="aggregate-status"><span className="status-dot" /><span>Connected</span><span className="footer-divider" /><span>{active.length} active</span><span>·</span><span>{formatSpeed(snapshot.aggregateSpeed)}</span></div><span className="status-live">Live transfer state</span></div>
+             <div className="manager-statusbar"><div className="aggregate-status"><span>{active.length} active</span><span>·</span><span>{formatSpeed(snapshot.aggregateSpeed)}</span></div><span className="status-live">Live transfer state</span></div>
           </main>
         )}
       </div>

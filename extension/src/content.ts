@@ -456,11 +456,13 @@ document.addEventListener('click', rememberBrowserOwnedClick, true);
 document.addEventListener('click', interceptDownloadClick, true);
 document.addEventListener('mouseenter', track, true);
 document.addEventListener('scroll', track, { capture: true, passive: true });
-chrome.storage.onChanged.addListener(() => void refreshPolicy());
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === 'local' && changes['dm-policy']) void refreshPolicy();
+});
 
 void refreshPolicy().then(() => {
   window.setInterval(track, 500);
-  window.setInterval(refreshPolicy, 10_000);
+  if (window.top === window) window.setInterval(refreshPolicy, 1000);
   let queuedTrack: number | null = null;
   const scheduleTrack = () => {
     if (queuedTrack !== null) return;

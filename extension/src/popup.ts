@@ -54,6 +54,18 @@ async function push(): Promise<void> {
   paint();
 }
 
+async function pull(): Promise<void> {
+  try {
+    const response = (await chrome.runtime.sendMessage({ type: 'get-policy' })) as { policy?: BrowserPolicy };
+    if (response?.policy) {
+      policy = response.policy;
+      paint();
+    }
+  } catch {
+    // Keep the last visible state while the service worker restarts.
+  }
+}
+
 async function init(): Promise<void> {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -95,6 +107,7 @@ async function init(): Promise<void> {
     }).catch((reason: unknown) => setStatus(errorText(reason, 'Could not open Download Manager.')));
   });
   paint();
+  window.setInterval(() => void pull(), 1000);
 }
 
 void init();

@@ -501,17 +501,23 @@ fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
 }
 
 fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolicy) -> Result<(), String> {
-    // File first: a cache write failure leaves the in-memory authority
-    // untouched instead of diverging from it (F14).
+    let previous = state
+        .snapshot
+        .lock()
+        .map(|snapshot| settings_policy(&snapshot.settings))
+        .map_err(|_| "State unavailable".to_string())?;
     write_browser_policy(&browser_policy_root(), &policy)?;
-    if let Ok(mut snapshot) = state.snapshot.lock() {
-        snapshot.settings.intercept_downloads = policy.0;
-        snapshot.settings.show_media_buttons = policy.1;
-        snapshot.settings.excluded_sites = policy.2;
-        sync_tray_checks(app, policy.0, policy.1);
+    let patch = json!({
+        "interceptDownloads": policy.0,
+        "showMediaButtons": policy.1,
+        "excludedSites": policy.2,
+    });
+    if let Err(error) = update_settings_snapshot(state, &patch) {
+        let _ = write_browser_policy(&browser_policy_root(), &previous);
+        return Err(error);
     }
-    emit_snapshot(app, state);
-    Ok(())
+    sync_tray_checks(app, policy.0, policy.1);
+    emit_snapshot_event(app, state)
 }
 
 fn cleanup_media_track_files(temp_path: &str) {

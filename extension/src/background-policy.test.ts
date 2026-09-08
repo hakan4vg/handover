@@ -82,7 +82,7 @@ describe('background policy persistence', () => {
     expect(response.policy).toEqual(DEFAULT_POLICY);
   });
 
-  it('refreshes the cached policy from the resident app on each policy read', async () => {
+  it('coalesces policy reads behind the resident refresh window', async () => {
     const storageSet = vi.fn().mockResolvedValue(undefined);
     const chrome = chromeMock(storageSet);
     const fetchBridge = bridgeMock({
@@ -104,7 +104,7 @@ describe('background policy persistence', () => {
       ok: true,
       policy: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] },
     });
-    expect(bridgeCalls(fetchBridge, '/v1/policy').length).toBeGreaterThanOrEqual(2);
+    expect(bridgeCalls(fetchBridge, '/v1/policy')).toHaveLength(1);
     expect(storageSet).toHaveBeenCalledWith({
       ['dm-policy']: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] },
     });

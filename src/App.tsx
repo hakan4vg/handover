@@ -227,7 +227,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
           </nav>
           <div className="sidebar-spacer" />
           <SidebarItem icon="settings" label="Settings" active={isSettings} onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }} />
-          <div className="sidebar-footer"><span className="status-dot" /> <span>Connected</span><span className="footer-divider" /><span>{snapshot.bridgeAvailable === false ? 'Bridge unavailable' : `Browser integration ${snapshot.settings.interceptDownloads ? 'on' : 'off'}`}</span></div>
+          <div className="sidebar-footer"><span className="status-dot" /><span>{snapshot.bridgeAvailable === false ? 'Bridge unavailable' : `Browser integration ${snapshot.settings.interceptDownloads ? 'on' : 'off'}`}</span></div>
         </aside>
         {isSettings ? <SettingsView adapter={adapter} settings={snapshot.settings} page={settingsPage} onPageChange={setSettingsPage} /> : (
           <main className="manager-main">
@@ -249,7 +249,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
               </section>
               {selected && (inspectorOpen ? <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} /> : <button className="inspector-reopen" onClick={() => setInspectorOpen(true)} aria-label="Open inspector"><Icon name="chevron-left" size={17} /><span>Details</span></button>)}
             </div>
-             <div className="manager-statusbar"><div className="aggregate-status"><span className="status-dot" /><span>Connected</span><span className="footer-divider" /><span>{active.length} active</span><span>·</span><span>{formatSpeed(snapshot.aggregateSpeed)}</span></div><span className="status-live">Live transfer state</span><button className="icon-button" aria-label="Settings" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={16} /></button></div>
+             <div className="manager-statusbar"><div className="aggregate-status"><span className="status-dot" /><span>Connected</span><span className="footer-divider" /><span>{active.length} active</span><span>·</span><span>{formatSpeed(snapshot.aggregateSpeed)}</span></div><span className="status-live">Live transfer state</span></div>
           </main>
         )}
       </div>
@@ -289,19 +289,19 @@ function WindowControls() {
   const native = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
   const run = (action: 'minimize' | 'maximize' | 'close') => {
     if (!native) return;
-    if (action === 'close') {
-      void invoke('close_main_window');
-      return;
-    }
-    const current = getCurrentWindow();
-    void (action === 'minimize' ? current.minimize() : current.toggleMaximize());
+    void invoke('main_window_action', { action });
   };
   return <div className="window-controls" aria-label="Window controls"><button aria-label="Minimize" onClick={() => run('minimize')}><span className="minimize-glyph" /></button><button aria-label="Maximize" onClick={() => run('maximize')}><span className="maximize-glyph" /></button><button aria-label="Close" onClick={() => run('close')}><Icon name="close" size={15} /></button></div>;
 }
 
 function startWindowDrag(event: ReactMouseEvent<HTMLElement>) {
   if (event.button !== 0 || (event.target instanceof Element && event.target.closest('button, input, select, textarea, a'))) return;
-  if ((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) void getCurrentWindow().startDragging();
+  if ((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) void invoke('start_window_drag', { label: nativeWindowLabel() });
+}
+
+function nativeWindowLabel() {
+  const id = new URLSearchParams(window.location.search).get('id');
+  return id ? `add-${id}` : 'main';
 }
 
 export async function openLocalPath(path: string): Promise<string | undefined> {

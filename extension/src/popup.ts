@@ -88,7 +88,6 @@ async function init(): Promise<void> {
       : [...policy.excludedSites, site];
     void push();
   });
-  document.getElementById('close')?.addEventListener('click', () => window.close());
   document.getElementById('open')!.addEventListener('click', () => {
     setStatus('');
     void chrome.runtime.sendMessage({ type: 'open-manager' }).then((response: { ok?: boolean; error?: string } | undefined) => {

@@ -4203,8 +4203,33 @@ fn apply_main_window_close(app: &AppHandle, state: &CoreState) -> Result<(), Str
 }
 
 #[tauri::command]
-fn close_main_window(app: AppHandle, state: State<'_, CoreState>) -> Result<(), String> {
-    apply_main_window_close(&app, state.inner())
+fn main_window_action(app: AppHandle, state: State<'_, CoreState>, action: String) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window unavailable".to_string())?;
+    match action.as_str() {
+        "minimize" => window.minimize().map_err(|error| error.to_string()),
+        "maximize" => {
+            if window.is_maximized().map_err(|error| error.to_string())? {
+                window.unmaximize().map_err(|error| error.to_string())
+            } else {
+                window.maximize().map_err(|error| error.to_string())
+            }
+        }
+        "close" => apply_main_window_close(&app, state.inner()),
+        _ => Err("Unsupported window action".into()),
+    }
+}
+
+#[tauri::command]
+fn start_window_drag(app: AppHandle, label: String) -> Result<(), String> {
+    if label != "main" && !label.starts_with("add-") {
+        return Err("Unsupported window".into());
+    }
+    app.get_webview_window(&label)
+        .ok_or_else(|| "Window unavailable".to_string())?
+        .start_dragging()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -5623,7 +5648,7 @@ fn main() {
             for (id, source) in recovered { let _ = spawn_transfer(app.handle(), app.state::<CoreState>().inner(), id, source); }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, close_main_window])
+        .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, main_window_action, start_window_drag])
         .run(tauri::generate_context!())
         .expect("error while running Download Manager");
 }

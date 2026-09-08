@@ -35,15 +35,17 @@ pub fn hls_key_iv(key: &HlsKey) -> [u8; 16] {
 /// Decrypt one full-segment AES-128-CBC body and strip PKCS#7. Ciphertext
 /// must be non-empty and block-aligned; anything else is an honest error so
 /// undecryptable bytes never land in an output silently.
-pub fn decrypt_aes128_segment(ciphertext: &[u8], key_bytes: &[u8; 16], iv: [u8; 16]) -> Result<Vec<u8>, String> {
+pub fn decrypt_aes128_segment(mut ciphertext: Vec<u8>, key_bytes: &[u8; 16], iv: [u8; 16]) -> Result<Vec<u8>, String> {
     use aes::Aes128;
     use cbc::Decryptor;
     use cipher::{BlockDecryptMut, KeyIvInit};
     if ciphertext.is_empty() { return Err("The AES-128 segment is empty".into()); }
     if ciphertext.len() % 16 != 0 { return Err("The AES-128 segment is not block-aligned".into()); }
-    let mut buf = ciphertext.to_vec();
-    let decrypted = Decryptor::<Aes128>::new(key_bytes.into(), &iv.into()).decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut buf).map_err(|_| "The AES-128 segment failed PKCS#7 validation".to_string())?;
-    Ok(decrypted.to_vec())
+    // Decrypt and strip padding in the same buffer: no second segment-sized
+    // allocation on the media path (F08).
+    let decrypted_len = Decryptor::<Aes128>::new(key_bytes.into(), &iv.into()).decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut ciphertext).map_err(|_| "The AES-128 segment failed PKCS#7 validation".to_string())?.len();
+    ciphertext.truncate(decrypted_len);
+    Ok(ciphertext)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2024,15 +2026,17 @@ fn validate_multiplexed_moof(
     }
     Ok(())
 }
-
-pub fn finalize_fmp4(input: &[u8]) -> Result<Vec<u8>, String> {
+/// Validate one already-assembled fragmented MP4 resource in place. The bytes
+/// are correct as acquired, so validation borrows them and returns nothing:
+/// no full-file duplicate on the media path (F08).
+pub fn finalize_fmp4(input: &[u8]) -> Result<(), String> {
     let (_, _, _, _, trak_boxes) = fragmented_presentation_parts(input, "Media")?;
     if trak_boxes.len() == 1 {
         parse_fragmented_track(input, 0)?;
     } else {
         validate_multiplexed_fmp4(input, "Media")?;
     }
-    Ok(input.to_vec())
+    Ok(())
 }
 
 pub fn mux_fmp4_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> {
@@ -4177,13 +4181,13 @@ mod tests {
             0xb6, 0xc0, 0xb5, 0x18, 0x95, 0x3b, 0x30, 0x6d, 0xf8, 0xb9, 0x2b, 0xd1, 0xf5, 0x9b,
             0x94, 0xb7, 0xe7, 0x4d
         ];
-        let decrypted = decrypt_aes128_segment(&ciphertext, &key, iv).expect("known vector");
+        let decrypted = decrypt_aes128_segment(ciphertext.to_vec(), &key, iv).expect("known vector");
         assert_eq!(decrypted, plaintext);
-        assert!(decrypt_aes128_segment(&ciphertext[..15], &key, iv).is_err());
+        assert!(decrypt_aes128_segment(ciphertext[..15].to_vec(), &key, iv).is_err());
         let mut tampered = ciphertext;
         let last = tampered.len() - 1;
         tampered[last] ^= 0xff;
-        assert!(decrypt_aes128_segment(&tampered, &key, iv).is_err());
+        assert!(decrypt_aes128_segment(tampered.to_vec(), &key, iv).is_err());
     }
 
     fn synthetic_pts(pts: u64, prefix: u8) -> [u8; 5] {
@@ -4420,7 +4424,7 @@ mod tests {
                 include_bytes!("../../fixtures/media/v-2.m4s")
             ]
         );
-        assert_eq!(finalize_fmp4(&input).expect("fragmented track"), input);
+        finalize_fmp4(&input).expect("fragmented track validates");
     }
 
     #[test]
@@ -4544,6 +4548,6 @@ mod tests {
             &[include_bytes!("../../fixtures/media/a-0.m4s")]
         );
         let multiplexed = mux_fmp4_tracks(&[video, audio]).expect("muxed fragmented tracks");
-        assert_eq!(finalize_fmp4(&multiplexed).expect("multiplexed fMP4"), multiplexed);
+        finalize_fmp4(&multiplexed).expect("multiplexed fMP4 validates");
     }
 }

@@ -138,7 +138,101 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle> }
+
+/// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
+/// instead of rewriting the whole database. UI emits run at most 4 Hz shared
+/// across jobs; dirty jobs persist at most every 2 s plus on every terminal
+/// transition (which keeps full emit_snapshot). A crash loses at most 2 s of
+/// progress claims — refetched, never trusted.
+struct ProgressThrottle { dirty_jobs: std::collections::HashSet<String>, last_emit: std::time::Instant, last_persist: std::time::Instant }
+
+impl Default for ProgressThrottle {
+    fn default() -> Self {
+        let now = std::time::Instant::now();
+        Self { dirty_jobs: std::collections::HashSet::new(), last_emit: now, last_persist: now }
+    }
+}
+
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
+
+fn emit_progress(app: &AppHandle, state: &CoreState, id: &str) {
+    let now = std::time::Instant::now();
+    let (should_emit, should_persist) = match state.progress.lock() {
+        Ok(mut progress) => {
+            progress.dirty_jobs.insert(id.to_string());
+            let should_emit = now.duration_since(progress.last_emit) >= PROGRESS_EMIT_INTERVAL;
+            let should_persist = now.duration_since(progress.last_persist) >= PROGRESS_PERSIST_INTERVAL;
+            if should_emit {
+                progress.last_emit = now;
+            }
+            if should_persist {
+                progress.last_persist = now;
+            }
+            (should_emit, should_persist)
+        }
+        Err(_) => (true, true),
+    };
+    if should_persist {
+        if let Err(error) = persist_dirty_jobs(state) {
+            eprintln!("Progress checkpoint failed: {error}");
+        }
+    }
+    if should_emit {
+        if let Err(error) = emit_snapshot_event(app, state) {
+            eprintln!("Progress emit failed: {error}");
+        }
+    }
+}
+
+fn persist_dirty_jobs(state: &CoreState) -> Result<(), String> {
+    loop {
+        let next = state
+            .progress
+            .lock()
+            .map_err(|_| "State unavailable".to_string())?
+            .dirty_jobs
+            .iter()
+            .next()
+            .cloned();
+        let Some(id) = next else { break };
+        persist_job(state, &id)?;
+        state
+            .progress
+            .lock()
+            .map_err(|_| "State unavailable".to_string())?
+            .dirty_jobs
+            .remove(&id);
+    }
+    Ok(())
+}
+
+fn persist_job(state: &CoreState, id: &str) -> Result<(), String> {
+    let (created, payload) = {
+        let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
+        let job = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .ok_or_else(|| "Acquisition no longer exists".to_string())?;
+        let mut stored = job.clone();
+        protect_job_for_storage(&mut stored);
+        stored.error = stored.error.map(|error| redact_url_credentials(&error));
+        (
+            job.created.clone(),
+            serde_json::to_string(&stored).map_err(|error| format!("Could not serialize job {id}: {error}"))?,
+        )
+    };
+    let database = state.database.lock().map_err(|_| "Database unavailable".to_string())?;
+    database
+        .execute(
+            "INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at, payload = excluded.payload",
+            params![id, created, payload],
+        )
+        .map_err(|error| format!("Could not persist job {id}: {error}"))?;
+    Ok(())
+}
 
 // Transfer ownership is separate from persisted job state. A paused task may
 // still be inside an HTTP future; retaining its handle prevents Resume from
@@ -1136,22 +1230,9 @@ async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String
     if looks_like_webm(&input) {
         return Ok(());
     }
-    let finalized = media::finalize_fmp4(&input).map_err(|error| {
+    media::finalize_fmp4(&input).map_err(|error| {
         format!("Media finalization failed: {error}; downloaded parts were preserved")
     })?;
-    if finalized != input {
-        let output_path = format!(
-            "{temp_path}.final.{}",
-            extension.as_deref().unwrap_or("mkv")
-        );
-        if let Err(error) = tokio::fs::write(&output_path, finalized).await {
-            let _ = tokio::fs::remove_file(&output_path).await;
-            return Err(format!("Media finalization output could not be written: {error}; downloaded parts were preserved"));
-        }
-        tokio::fs::rename(&output_path, temp_path)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
     Ok(())
 }
 
@@ -1731,7 +1812,7 @@ async fn acquire_media_segment(
     // decryption path exists.
     let bytes = if let Some(key) = fragment.key.as_ref() {
         let key_bytes = fetch_hls_key_bytes(client, app, id, &key.uri).await?;
-        media::decrypt_aes128_segment(&raw_bytes, &key_bytes, media::hls_key_iv(key))?
+        media::decrypt_aes128_segment(raw_bytes, &key_bytes, media::hls_key_iv(key))?
     } else {
         raw_bytes
     };
@@ -1768,7 +1849,7 @@ async fn acquire_media_segment(
         job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) });
         job.connections = connection_cap.min((total_segments as u64).saturating_sub(finished_missing) as usize) as u32;
     });
-    emit_snapshot(app, &state);
+    emit_progress(app, &state, id);
     Ok(())
 }
 
@@ -2052,8 +2133,11 @@ async fn acquire_ranges(
     let started = std::time::Instant::now();
     let completed_workers = std::sync::Arc::new(AtomicU64::new(0));
     let total_ranges = ranges.len() as u64;
+    // One client per job: connection-pool and TLS-session reuse across every
+    // chunk instead of a fresh handshake per worker (F08).
+    let shared_client = std::sync::Arc::new(http_client());
     let mut transfers = futures_util::stream::iter(ranges.into_iter().map(|(start, end)| {
-        let client = http_client();
+        let client = shared_client.clone();
         let source = source.clone();
         let temp_path = temp_path.clone();
         let app = app.clone();
@@ -2127,7 +2211,7 @@ async fn acquire_ranges(
                 job.connections =
                     worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32;
             });
-            emit_snapshot(&app, &state);
+            emit_progress(&app, &state, &id);
             // No throttle here: intake was already paced piece-by-piece inside
             // range_bytes; charging the whole chunk again would halve the rate.
             Ok::<(), String>(())
@@ -2263,7 +2347,7 @@ async fn acquire_ranges(
                 job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
                 job.connections = 1;
             });
-            emit_snapshot(&app, &state);
+            emit_progress(&app, &state, &id);
         }
         if let Some(_error) = fallback_error {
             emit_job(&state, &id, |job| {
@@ -3608,7 +3692,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                         }
                     });
                 });
-                emit_snapshot(&app, &state);
+                emit_progress(&app, &state, &id);
                 if !throttle(&app, &id, bytes.len(), generation).await {
                     drop(stream);
                     drop(file);
@@ -4022,6 +4106,11 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     }
     if let Ok(mut buckets) = state.inner().job_bandwidth.lock() {
         buckets.remove(&id);
+    }
+    // Per-job upserts replaced the full-table rewrite, so removals need an
+    // explicit delete (F09).
+    if let Ok(database) = state.inner().database.lock() {
+        let _ = database.execute("DELETE FROM jobs WHERE id = ?1", params![id]);
     }
     if let Some(path) = temporary {
         let _ = std::fs::remove_file(&path);
@@ -5335,7 +5424,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());
@@ -5393,8 +5482,8 @@ mod capture_tests {
         provisional_input_from_message, protect_job_for_storage, redact_url_credentials,
         referer_value, restrict_data_dir, restrict_file, retryable_status, segment_identity,
         source_compatible, terminal_source_error, terminal_source_status, is_terminal_source_error,
-        page_instead_of_file, tray_status_text, tray_toggle_next, unprotect_job_from_storage,
-        DownloadJob, ProvisionalInput,
+        page_instead_of_file, persist_dirty_jobs, persist_job, tray_status_text, tray_toggle_next,
+        unprotect_job_from_storage, DownloadJob, ProgressThrottle, ProvisionalInput,
     };
     use super::ipc;
     use serde_json::json;
@@ -5849,7 +5938,7 @@ mod capture_tests {
         use std::sync::Mutex;
         let database = Connection::open_in_memory().unwrap();
         database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
-        let state = CoreState { snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![], bridge_available: true }), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) };
+        let state = CoreState { snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![], bridge_available: true }), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()) };
         // Simulate a live patch, then a restart: the patched values must
         // come back through the same SQL row and boot parser the app uses.
         let patched = apply_settings_patch(&default_settings(), &serde_json::json!({"maxConnections": 4, "bandwidthLimit": 1048576}));
@@ -6191,6 +6280,7 @@ mod capture_tests {
             transfer_controls: super::TransferRegistry::default(),
             lifecycle: std::sync::Mutex::new(()),
             tray_checks: std::sync::Mutex::new(None),
+            progress: std::sync::Mutex::new(super::ProgressThrottle::default()),
         });
         let (generation, _) = state.transfer_controls.claim_with_generation("job-1").expect("active owner");
         let release_state = std::sync::Arc::clone(&state);
@@ -6224,6 +6314,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
             transfer_controls: TransferRegistry::default(),
             lifecycle: Mutex::new(()),
             tray_checks: Mutex::new(None),
+            progress: Mutex::new(ProgressThrottle::default()),
         };
         let before = state.snapshot.lock().unwrap().clone();
         let error = update_settings_snapshot(&state, &json!({ "maxConnections": 7 })).expect_err("settings persistence failure must reach the command");
@@ -6299,6 +6390,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
             transfer_controls: TransferRegistry::default(),
             lifecycle: Mutex::new(()),
             tray_checks: Mutex::new(None),
+            progress: Mutex::new(ProgressThrottle::default()),
         };
 
         let error = save_snapshot(&state).expect_err("duplicate job ids must fail snapshot persistence");
@@ -6346,6 +6438,45 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         let mut loaded: DownloadJob = serde_json::from_str(&payload).expect("stored job loads");
         unprotect_job_from_storage(&mut loaded).expect("own envelopes open here");
         assert_eq!(loaded.source, source);
+    }
+
+    #[test]
+    fn persist_job_upserts_only_that_job() {
+        // F09: hot-loop checkpoints rewrite one row, never the whole table.
+        use super::{default_settings, save_snapshot, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        let second = DownloadJob { id: "done-2".into(), source: "https://cdn.example.test/other.bin".into(), ..finished_job_with_context() };
+        let state = CoreState {
+            snapshot: Mutex::new(AppSnapshot { jobs: vec![finished_job_with_context(), second], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![], bridge_available: true }),
+            database: Mutex::new(database),
+            reattach_target: Mutex::new(None),
+            bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
+            transfer_controls: TransferRegistry::default(),
+            job_bandwidth: Mutex::new(std::collections::HashMap::new()),
+            lifecycle: Mutex::new(()),
+            tray_checks: Mutex::new(None),
+            progress: Mutex::new(ProgressThrottle::default()),
+        };
+        save_snapshot(&state).expect("seed both jobs");
+        state.snapshot.lock().unwrap().jobs[0].downloaded = 2048;
+        persist_job(&state, "done-1").expect("upsert one job");
+        let database = state.database.lock().unwrap();
+        let first_payload: String = database.query_row("SELECT payload FROM jobs WHERE id = 'done-1'", [], |row| row.get(0)).unwrap();
+        let second_payload: String = database.query_row("SELECT payload FROM jobs WHERE id = 'done-2'", [], |row| row.get(0)).unwrap();
+        assert!(first_payload.contains("2048"), "updated job missing: {first_payload}");
+        assert!(!first_payload.contains("token=abc"), "signed query at rest: {first_payload}");
+        assert!(second_payload.contains("1024"), "sibling job rewritten: {second_payload}");
+        drop(database);
+        state.snapshot.lock().unwrap().jobs[1].downloaded = 4096;
+        state.progress.lock().unwrap().dirty_jobs.insert("done-2".into());
+        persist_dirty_jobs(&state).expect("drain dirty set");
+        assert!(state.progress.lock().unwrap().dirty_jobs.is_empty());
+        let database = state.database.lock().unwrap();
+        let second_payload: String = database.query_row("SELECT payload FROM jobs WHERE id = 'done-2'", [], |row| row.get(0)).unwrap();
+        assert!(second_payload.contains("4096"), "dirty job missing: {second_payload}");
     }
 
     #[test]

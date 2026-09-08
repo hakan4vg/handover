@@ -123,11 +123,12 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
       if (filter === 'media') return job.media;
       return job.state === filter;
     });
+    const order = new Map(jobs.map((job, index) => [job.id, index] as const));
     return [...jobs].sort((left, right) => {
       if (sortBy === 'name') return left.name.localeCompare(right.name);
       if (sortBy === 'size') return (right.total ?? 0) - (left.total ?? 0);
       if (sortBy === 'state') return stateText(left.state).localeCompare(stateText(right.state));
-      return snapshot.jobs.indexOf(left) - snapshot.jobs.indexOf(right);
+      return (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0);
     });
   }, [filter, snapshot.jobs, sortBy]);
   const selected = filteredJobs.find((job) => job.id === selectedId) ?? filteredJobs[0];

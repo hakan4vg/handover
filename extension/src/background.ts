@@ -1,4 +1,4 @@
-import { DEFAULT_POLICY, NATIVE_HOST, isHttp, siteOf, type BrowserPolicy } from './shared';
+import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, DEFAULT_POLICY, isHttp, siteOf, type BrowserPolicy } from './shared';
 import { choosePlayerEvidence, chooseWorkerMediaSelection, isMediaCandidate, mediaKindFor, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
@@ -90,11 +90,43 @@ async function savePolicy(next: BrowserPolicy = policy): Promise<void> {
   await chrome.storage.local.set({ [POLICY_KEY]: next });
 }
 
-async function sendNative(message: unknown): Promise<unknown> {
+function adoptResidentPolicy(response: unknown): boolean {
+  const remote = (response as { policy?: Partial<BrowserPolicy> } | undefined)?.policy;
+  if (!remote || typeof remote.interceptDownloads !== 'boolean') return false;
+  policy = {
+    interceptDownloads: remote.interceptDownloads,
+    showMediaButtons: remote.showMediaButtons ?? policy.showMediaButtons,
+    excludedSites: Array.isArray(remote.excludedSites)
+      ? remote.excludedSites.filter((site): site is string => typeof site === 'string')
+      : policy.excludedSites,
+  };
+  return true;
+}
+
+async function syncPolicyFromResident(): Promise<void> {
+  const response = await sendApp({ type: 'get-policy' });
+  if (adoptResidentPolicy(response)) await savePolicy();
+}
+
+async function sendApp(message: unknown): Promise<unknown> {
+  const type = (message as { type?: string })?.type;
+  const route = type === 'get-policy' ? '/v1/policy' : type === 'open-manager' ? '/v1/manager' : type === 'update-policy' ? '/v1/policy' : '/v1/capture';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), APP_BRIDGE_TIMEOUT_MS);
   try {
-    return await chrome.runtime.sendNativeMessage(NATIVE_HOST, message as object);
+    const response = await fetch(`${APP_BRIDGE_ORIGIN}${route}`, {
+      method: type === 'get-policy' ? 'GET' : 'POST',
+      headers: type === 'get-policy' ? undefined : { 'Content-Type': 'application/json' },
+      body: type === 'get-policy' ? undefined : JSON.stringify(message),
+      signal: controller.signal,
+    });
+    const payload = await response.json() as unknown;
+    if (!response.ok && typeof payload === 'object' && payload !== null && 'error' in payload) return payload;
+    return payload;
   } catch {
-    return { ok: false, error: 'native host unreachable' };
+    return { ok: false, error: 'Download Manager is not running' };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -170,7 +202,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   if (captureError) {
     return { ok: false, error: captureError };
   }
-  const response = (await sendNative({
+  const response = (await sendApp({
     type: 'capture-acquisition',
     payload: {
       source,
@@ -181,7 +213,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
     },
   })) as { ok?: boolean };
   if (response?.ok) return { ok: true };
-  // The pre-browser path consumed the anchor event. If native messaging is
+  // The pre-browser path consumed the anchor event. If the resident app is
   // unavailable, preserve the user's download through the extension API;
   // the onCreated listener ignores downloads started by this extension.
   try {
@@ -194,7 +226,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
     return { ok: typeof id === 'number' };
   } catch {
     // No safe fallback remains. Do not navigate the page or invent success.
-    return { ok: false, error: 'native host and browser fallback unavailable' };
+    return { ok: false, error: 'Download Manager and browser fallback are unavailable' };
   }
 }
 
@@ -246,7 +278,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 // body when safely reproducible). Bounded one-shot ring: urlencoded form
 // bodies up to 64 KiB, 60 s TTL, consumed on first matching capture.
 // Multipart/file uploads, raw bodies, and larger forms are left out — the
-// native side replays a safe GET for those, exactly as before. Observe-only:
+// The resident app replays a safe GET for those, exactly as before. Observe-only:
 // no blocking, no modification.
 const FORM_BODY_MAX = 64 * 1024;
 const FORM_BODY_TTL_MS = 60_000;
@@ -318,7 +350,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       if (ordinaryCaptureError(source, item.referrer ?? '')) {
         return;
       }
-      await sendNative({
+      await sendApp({
         type: 'capture-acquisition',
         payload: {
           source,
@@ -328,7 +360,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
           // The Downloads API exposes no tab/frame identifier, so do not guess a
           // User-Agent from another document on this fallback path.
           // One-shot POST replay: a form body observed for this URL rides along;
-          // absent (or already consumed) means the native side replays a safe GET.
+          // absent (or already consumed) means the resident app replays a safe GET.
           postBody: takeFormBody(source),
         },
       });
@@ -344,6 +376,11 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     const type = (message as { type?: string })?.type;
     if (type === 'get-policy') {
       await policyReady;
+      try {
+        await syncPolicyFromResident();
+      } catch {
+        // Keep the last browser-owned policy when the resident app is stopped.
+      }
       reply(policyLoadError ? { ok: false, error: policyLoadError, policy } : { ok: true, policy });
     } else if (type === 'update-policy') {
       const patch = (message as { patch?: Partial<BrowserPolicy> }).patch ?? {};
@@ -364,7 +401,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       policyLoadError = '';
       reply({ ok: true, policy });
       // Best-effort push so the resident app (when running) stays coherent.
-      void sendNative({ type: 'update-policy', payload: policy });
+      void sendApp({ type: 'update-policy', payload: policy });
     } else if (type === 'ordinary-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
       reply(await captureOrdinary(payload));
@@ -401,9 +438,9 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         return;
       }
       const userAgent = cleanUserAgent(payload.userAgent);
-      reply(await sendNative({ type: 'media-capture', payload: { ...payload, source, selectedSegments, referrer: pageUrl, userAgent } }));
+      reply(await sendApp({ type: 'media-capture', payload: { ...payload, source, selectedSegments, referrer: pageUrl, userAgent } }));
     } else if (type === 'open-manager') {
-      reply(await sendNative({ type: 'open-manager' }));
+      reply(await sendApp({ type: 'open-manager' }));
     } else {
       reply({ ok: false, error: 'unsupported message' });
     }
@@ -413,16 +450,5 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
 
 policyReady = loadPolicy();
 void policyReady
-  .then(() => sendNative({ type: 'get-policy' }))
-  .then((response) => {
-    const remote = (response as { policy?: Partial<BrowserPolicy> } | undefined)?.policy;
-    if (remote && typeof remote.interceptDownloads === 'boolean') {
-      policy = {
-        interceptDownloads: remote.interceptDownloads,
-        showMediaButtons: remote.showMediaButtons ?? policy.showMediaButtons,
-        excludedSites: Array.isArray(remote.excludedSites) ? (remote.excludedSites as string[]) : policy.excludedSites,
-      };
-      void savePolicy();
-    }
-  })
+  .then(() => syncPolicyFromResident())
   .catch(() => undefined);

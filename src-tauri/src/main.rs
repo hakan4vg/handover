@@ -1,21 +1,30 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ipc;
 mod lifecycle;
 mod media;
 mod notify;
+mod startup;
 
 use futures_util::{future::Abortable, StreamExt};
 use lifecycle::{state_allows_transfer, TransferRegistry};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{io::{Read, SeekFrom, Write}, path::{Path, PathBuf}, process::{Command, Stdio}, sync::{atomic::{AtomicU64, Ordering}, Mutex}};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use std::{
+    io::{SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex
+    }
+};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::time::{sleep, Duration};
+use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -152,7 +161,9 @@ struct CommitInput { name: String, destination: String, max_connections: Option<
 // Option<Option<u64>> would collapse null into None and make "clear"
 // indistinguishable from "keep".
 fn opt_opt_u64<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     Option::<u64>::deserialize(deserializer).map(Some)
 }
 
@@ -162,9 +173,8 @@ fn default_collision_behavior() -> String { "rename".into() }
 
 fn clamp_connections(value: u32) -> u32 { value.clamp(1, 32) }
 
-const EXTENSION_ID: &str = "mfdaoipoffnpeijnjminkdhecpnoemel";
+#[cfg(not(windows))]
 const APP_IDENTIFIER: &str = "com.downloadmanager.app";
-const NATIVE_HOST_NAME: &str = "com.downloadmanager.host";
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -175,134 +185,64 @@ fn home_dir() -> PathBuf {
 
 // Single resolver for the per-user application data directory on every OS.
 // Mirrors the platform convention Tauri itself uses for the same bundle
-// identifier, so the database, browser policy, and native-host registration
-// always land in the same place whether or not a Tauri handle is available.
+// identifier, so the database and browser policy use one stable location.
 fn app_data_root() -> PathBuf {
     #[cfg(windows)]
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"));
-    #[cfg(target_os = "macos")]
-    let base = home_dir().join("Library").join("Application Support");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home_dir().join(".local").join("share"));
-    base.join(APP_IDENTIFIER)
-}
-
-// Published extension ID plus any development IDs from DM_EXTENSION_ID
-// (comma/space separated). Unpacked dev builds get a random ID; without an
-// override the browser refuses to talk to the native host.
-fn extension_ids() -> Vec<String> {
-    let mut ids = vec![EXTENSION_ID.to_string()];
-    if let Ok(extra) = std::env::var("DM_EXTENSION_ID") {
-        for id in extra.split([',', ' ', ';']) {
-            let id = id.trim();
-            if !id.is_empty() && !ids.iter().any(|known| known == id) {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    ids
-}
-
-fn sync_startup(enabled: bool) {
-    #[cfg(windows)]
     {
-        let key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-        if enabled {
-            if let Ok(executable) = std::env::current_exe() { let value = format!("\"{}\" --startup", executable.display()); let _ = Command::new("reg.exe").args(["ADD", key, "/v", "Download Manager", "/t", "REG_SZ", "/d", &value, "/f"]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
-        } else { let _ = Command::new("reg.exe").args(["DELETE", key, "/v", "Download Manager", "/f"]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
+        return std::env::current_exe()
+            .ok()
+            .and_then(|executable| executable.parent().map(|parent| parent.join("data")))
+            .unwrap_or_else(|| PathBuf::from("data"));
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(not(windows))]
     {
-        let entry = home_dir().join(".config").join("autostart").join("download-manager.desktop");
-        if enabled {
-            if let Ok(executable) = std::env::current_exe() {
-                let _ = std::fs::create_dir_all(entry.parent().unwrap_or_else(|| Path::new(".")));
-                let _ = std::fs::write(&entry, format!("[Desktop Entry]\nType=Application\nName=Download Manager\nExec=\"{}\" --startup\nHidden=false\nX-GNOME-Autostart-enabled=true\n", executable.display()));
-            }
-        } else {
-            let _ = std::fs::remove_file(&entry);
-        }
+        #[cfg(target_os = "macos")]
+        let base = home_dir().join("Library").join("Application Support");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home_dir().join(".local").join("share"));
+        base.join(APP_IDENTIFIER)
     }
-    #[cfg(target_os = "macos")]
-    let _ = enabled;
-}
-
-fn native_host_browser_directories() -> &'static [&'static str] {
-    // Chrome for Testing uses its own user-level directory from Chrome 146;
-    // keep the ordinary Chromium-family directories registered as well.
-    &["google-chrome", "google-chrome-for-testing", "chromium", "microsoft-edge", "vivaldi"]
-}
-
-fn register_native_host(root: &Path) {
-    let Ok(executable) = std::env::current_exe() else { return; };
-    let _ = std::fs::create_dir_all(root);
-    let origins: Vec<String> = extension_ids().into_iter().map(|id| format!("chrome-extension://{id}/")).collect();
-    // Browsers launch the manifest path without arguments, so the manifest
-    // points at a small wrapper that adds --native-host. Registering the bare
-    // executable would start the full application, which does not speak the
-    // framed stdio protocol the extension expects.
-    #[cfg(windows)]
-    {
-        let wrapper = root.join("com.downloadmanager.host.cmd");
-        let _ = std::fs::write(&wrapper, format!("@echo off\r\n\"{}\" --native-host\r\n", executable.display()));
-        let manifest_path = root.join("com.downloadmanager.host.json");
-        let manifest = json!({ "name": NATIVE_HOST_NAME, "description": "Download Manager browser bridge", "path": wrapper, "type": "stdio", "allowed_origins": origins });
-        let Ok(contents) = serde_json::to_string_pretty(&manifest) else { return; };
-        if std::fs::write(&manifest_path, contents).is_err() { return; }
-        let manifest = manifest_path.to_string_lossy().into_owned();
-        let keys = [
-            "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.downloadmanager.host",
-            "HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.downloadmanager.host",
-            "HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\com.downloadmanager.host",
-            "HKCU\\Software\\Vivaldi\\NativeMessagingHosts\\com.downloadmanager.host",
-        ];
-        for key in keys { let _ = Command::new("reg.exe").arg("ADD").arg(key).arg("/ve").arg("/t").arg("REG_SZ").arg("/d").arg(&manifest).arg("/f").stdout(Stdio::null()).stderr(Stdio::null()).status(); }
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-        let wrapper = root.join("com.downloadmanager.host.sh");
-        if std::fs::write(&wrapper, format!("#!/bin/sh\nexec \"{}\" --native-host\n", executable.display())).is_err() { return; }
-        #[cfg(unix)]
-        let _ = std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755));
-        let manifest = json!({ "name": NATIVE_HOST_NAME, "description": "Download Manager browser bridge", "path": wrapper, "type": "stdio", "allowed_origins": origins });
-        let Ok(contents) = serde_json::to_string_pretty(&manifest) else { return; };
-        let _ = std::fs::write(root.join("com.downloadmanager.host.json"), &contents);
-        let config = home_dir().join(".config");
-        for browser in native_host_browser_directories() {
-            let dir = config.join(browser).join("NativeMessagingHosts");
-            if std::fs::create_dir_all(&dir).is_ok() {
-                let _ = std::fs::write(dir.join("com.downloadmanager.host.json"), &contents);
-            }
-        }
-        let brave = config.join("BraveSoftware").join("Brave-Browser").join("NativeMessagingHosts");
-        if std::fs::create_dir_all(&brave).is_ok() {
-            let _ = std::fs::write(brave.join("com.downloadmanager.host.json"), &contents);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    let _ = (root, origins);
 }
 
 fn default_settings() -> AppSettings {
     let home = home_dir();
     #[cfg(windows)]
-    let (default_folder, temp_folder) = (
-        home.join("Downloads"),
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home.join("AppData").join("Local")).join("Download Manager").join("Temp"),
-    );
+    let (default_folder, temp_folder) = (home.join("Downloads"), app_data_root().join("tmp"));
     #[cfg(not(windows))]
     let (default_folder, temp_folder) = (
         home.join("Downloads"),
-        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|path| path.is_absolute()).unwrap_or_else(|| home.join(".cache")).join("download-manager").join("tmp"),
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".cache"))
+            .join("download-manager")
+            .join("tmp")
     );
-    AppSettings { start_at_sign_in: true, show_manager_at_sign_in: true, close_behavior: "tray".into(), default_folder: default_folder.to_string_lossy().into_owned(), temp_folder: temp_folder.to_string_lossy().into_owned(), collision_behavior: default_collision_behavior(), intercept_downloads: true, show_media_buttons: true, excluded_sites: vec![], bandwidth_limit: None, bandwidth_unit: "MB/s".into(), max_connections: 8, per_download_overrides: true, retry_automatically: true, max_retries: 5, completion_notifications: true, failure_notifications: true, theme: "system".into(), accent: "#0878ed".into(), density: "comfortable".into() }
+    AppSettings {
+        start_at_sign_in: true,
+        show_manager_at_sign_in: true,
+        close_behavior: "tray".into(),
+        default_folder: default_folder.to_string_lossy().into_owned(),
+        temp_folder: temp_folder.to_string_lossy().into_owned(),
+        collision_behavior: default_collision_behavior(),
+        intercept_downloads: true,
+        show_media_buttons: true,
+        excluded_sites: vec![],
+        bandwidth_limit: None,
+        bandwidth_unit: "MB/s".into(),
+        max_connections: 8,
+        per_download_overrides: true,
+        retry_automatically: true,
+        max_retries: 5,
+        completion_notifications: true,
+        failure_notifications: true,
+        theme: "system".into(),
+        accent: "#0878ed".into(),
+        density: "comfortable".into()
+    }
 }
 
 type BrowserPolicy = (bool, bool, Vec<String>);
@@ -317,7 +257,9 @@ fn browser_policy_value(policy: &BrowserPolicy) -> Value {
 
 fn normalize_policy_site(value: &str) -> String {
     let input = value.trim();
-    if input.is_empty() { return String::new(); }
+    if input.is_empty() {
+        return String::new();
+    }
     let candidate = if input.starts_with("//") {
         format!("https:{input}")
     } else if input.contains("://") {
@@ -327,8 +269,18 @@ fn normalize_policy_site(value: &str) -> String {
     };
     reqwest::Url::parse(&candidate)
         .ok()
-        .and_then(|url| url.host_str().map(|host| host.trim_start_matches("www.").to_ascii_lowercase()))
-        .unwrap_or_else(|| input.split(['/', '?', '#']).next().unwrap_or("").trim_start_matches("www.").to_ascii_lowercase())
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_start_matches("www.").to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| {
+            input
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("www.")
+                .to_ascii_lowercase()
+        })
 }
 
 fn browser_policy_from_value(value: &Value) -> Option<BrowserPolicy> {
@@ -360,11 +312,30 @@ fn settings_policy(settings: &AppSettings) -> BrowserPolicy {
 // to its default. Runs once per boot, so the per-key re-parse cost is trivial.
 fn settings_from_stored(stored: &str) -> AppSettings {
     let defaults = default_settings();
-    let Ok(overlay) = serde_json::from_str::<Value>(stored) else { return defaults; };
+    let Ok(overlay) = serde_json::from_str::<Value>(stored) else {
+        return defaults;
+    };
     let mut settings = apply_settings_patch(&defaults, &overlay);
-    if settings.default_folder.trim().is_empty() { settings.default_folder = defaults.default_folder.clone(); }
-    if settings.temp_folder.trim().is_empty() { settings.temp_folder = defaults.temp_folder.clone(); }
+    if settings.default_folder.trim().is_empty() {
+        settings.default_folder = defaults.default_folder.clone();
+    }
+    if settings.temp_folder.trim().is_empty() {
+        settings.temp_folder = defaults.temp_folder.clone();
+    }
+    #[cfg(windows)]
+    normalize_portable_temp_folder(&mut settings);
     settings
+}
+
+#[cfg(windows)]
+fn normalize_portable_temp_folder(settings: &mut AppSettings) {
+    let configured = Path::new(&settings.temp_folder);
+    let normalized = settings.temp_folder.replace('/', "\\").to_ascii_lowercase();
+    let is_known_default =
+        normalized.ends_with("\\data\\tmp") || normalized.ends_with("\\download manager\\temp");
+    if is_known_default || !configured.is_absolute() {
+        settings.temp_folder = app_data_root().join("tmp").to_string_lossy().into_owned();
+    }
 }
 
 // Per-key patch application shared by boot recovery and the live
@@ -450,22 +421,114 @@ fn cleanup_orphaned_media_track_files(temp_folder: &str, preserved_temp_paths: &
     }
 }
 
+#[cfg(windows)]
+fn copy_directory(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let destination = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&entry.path(), &destination)?;
+        } else {
+            std::fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn relocate_temp_artifact(from: &Path, to: &Path) -> bool {
+    if from == to || !from.exists() || to.exists() {
+        return true;
+    }
+    if let Some(parent) = to.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::rename(from, to).is_ok() {
+        return true;
+    }
+    if from.is_dir() {
+        if copy_directory(from, to).is_ok() {
+            let _ = std::fs::remove_dir_all(from);
+            return true;
+        }
+    } else if std::fs::copy(from, to).is_ok() {
+        let _ = std::fs::remove_file(from);
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn relocate_job_temp_artifacts(job: &mut DownloadJob, temp_folder: &Path) {
+    let old_path = PathBuf::from(&job.temp_path);
+    let new_path = temp_folder.join(format!("{}.part", job.id));
+    if old_path == new_path {
+        return;
+    }
+    if relocate_temp_artifact(&old_path, &new_path) {
+        relocate_temp_artifact(
+            &PathBuf::from(format!("{}.segments", old_path.display())),
+            &PathBuf::from(format!("{}.segments", new_path.display()))
+        );
+        if let (Some(old_parent), Some(old_name), Some(new_parent), Some(new_name)) = (
+            old_path.parent(),
+            old_path.file_name(),
+            new_path.parent(),
+            new_path.file_name()
+        ) {
+            let prefix = format!("{}.", old_name.to_string_lossy());
+            if let Ok(entries) = std::fs::read_dir(old_parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    let Some(suffix) = name.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    relocate_temp_artifact(
+                        &entry.path(),
+                        &new_parent.join(format!("{}.{}", new_name.to_string_lossy(), suffix))
+                    );
+                }
+            }
+        }
+        job.temp_path = new_path.to_string_lossy().into_owned();
+    }
+}
+
 fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSnapshot {
     let mut jobs = Vec::new();
     let mut preserved_temp_paths = Vec::new();
-    if let Ok(mut statement) = database.prepare("SELECT payload FROM jobs ORDER BY created_at DESC") {
+    #[cfg(windows)]
+    let temp_folder = PathBuf::from(&settings.temp_folder);
+    if let Ok(mut statement) = database.prepare("SELECT payload FROM jobs ORDER BY created_at DESC")
+    {
         if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
             for payload in rows.flatten() {
                 if let Ok(mut job) = serde_json::from_str::<DownloadJob>(&payload) {
+                    #[cfg(windows)]
+                    relocate_job_temp_artifacts(&mut job, &temp_folder);
                     if let Some(marker) = job.destination_reservation.clone() {
-                        match reconcile_destination_reservation(Path::new(&job.destination), &marker, job.total == Some(0)) {
-                            DestinationReservationRecovery::Retry | DestinationReservationRecovery::Missing => job.destination_reservation = None,
+                        match reconcile_destination_reservation(
+                            Path::new(&job.destination),
+                            &marker,
+                            job.total == Some(0)
+                        ) {
+                            DestinationReservationRecovery::Retry
+                            | DestinationReservationRecovery::Missing => {
+                                job.destination_reservation = None
+                            }
                             DestinationReservationRecovery::Completed => {
                                 job.destination_reservation = None;
-                                if ["connecting", "downloading", "finalizing"].contains(&job.state.as_str()) {
+                                if ["connecting", "downloading", "finalizing"]
+                                    .contains(&job.state.as_str())
+                                {
                                     complete_job(&mut job);
                                     let _ = std::fs::remove_file(&job.temp_path);
-                                    let _ = std::fs::remove_dir_all(format!("{}.segments", job.temp_path));
+                                    let _ = std::fs::remove_dir_all(format!(
+                                        "{}.segments",
+                                        job.temp_path
+                                    ));
                                     cleanup_media_track_files(&job.temp_path);
                                 }
                             }
@@ -487,7 +550,13 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
         }
     }
     cleanup_orphaned_media_track_files(&settings.temp_folder, &preserved_temp_paths);
-    AppSnapshot { jobs, settings, connected: true, aggregate_speed: 0, notifications: vec![] }
+    AppSnapshot {
+        jobs,
+        settings,
+        connected: true,
+        aggregate_speed: 0,
+        notifications: vec![]
+    }
 }
 
 fn save_snapshot(state: &CoreState) -> Result<(), String> {
@@ -509,9 +578,21 @@ fn save_snapshot(state: &CoreState) -> Result<(), String> {
 }
 
 fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
-    let reservation = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).and_then(|job| job.destination_reservation.as_ref().map(|marker| (job.destination.clone(), marker.clone()))));
+    let reservation = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .and_then(|job| {
+                job.destination_reservation
+                    .as_ref()
+                    .map(|marker| (job.destination.clone(), marker.clone()))
+            })
+    });
     if let Some((destination, marker)) = reservation {
-        if std::fs::read(&destination).ok().as_deref() == Some(marker.as_bytes()) { let _ = std::fs::remove_file(destination); }
+        if std::fs::read(&destination).ok().as_deref() == Some(marker.as_bytes()) {
+            let _ = std::fs::remove_file(destination);
+        }
         emit_job(state, id, |job| job.destination_reservation = None);
         emit_snapshot(app, state);
     }
@@ -627,14 +708,54 @@ fn source_compatible(existing: &str, candidate: &str) -> bool {
 
 fn safe_filename(value: &str) -> String {
     let leaf = value.trim().rsplit(|character| character == '/' || character == '\\').next().unwrap_or("").trim();
-    if leaf.is_empty() || leaf == "." || leaf == ".." || leaf.contains('\0') { "download.bin".into() } else { leaf.into() }
+    let cleaned = leaf
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim_end_matches([' ', '.'])
+        .to_string();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return "download.bin".into();
+    }
+    #[cfg(windows)]
+    if windows_device_name(&cleaned) {
+        return format!("_{cleaned}");
+    }
+    cleaned
+}
+
+#[cfg(windows)]
+fn windows_device_name(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9")
 }
 
 fn destination_for_filename(folder: &str, name: &str) -> String {
     Path::new(folder).join(safe_filename(name)).to_string_lossy().into_owned()
 }
 
-fn source_name(source: &str) -> String { reqwest::Url::parse(source).ok().and_then(|url| url.path_segments().and_then(|segments| segments.last()).map(str::to_string)).filter(|name| !name.is_empty()).unwrap_or_else(|| "download.bin".into()) }
+fn source_name(source: &str) -> String {
+    reqwest::Url::parse(source)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|segments| segments.last())
+                .map(str::to_string)
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "download.bin".into())
+}
 
 fn collision_destination(path: &str, behavior: &str) -> String {
     let candidate = PathBuf::from(path);
@@ -656,20 +777,36 @@ enum DestinationReservationRecovery { Retry, Completed, Missing, Unknown }
 
 fn destination_reservation_marker() -> String { format!("{DESTINATION_RESERVATION_PREFIX}{}", Uuid::new_v4()) }
 
-fn reconcile_destination_reservation(path: &Path, marker: &str, allow_empty_completed: bool) -> DestinationReservationRecovery {
+fn reconcile_destination_reservation(
+    path: &Path,
+    marker: &str,
+    allow_empty_completed: bool
+) -> DestinationReservationRecovery {
     match std::fs::read(path) {
-        Ok(bytes) if bytes == marker.as_bytes() || (bytes.len() < marker.len() && marker.as_bytes().starts_with(&bytes) && bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes())) => match std::fs::remove_file(path) {
+        Ok(bytes)
+            if bytes == marker.as_bytes()
+                || (bytes.len() < marker.len()
+                    && marker.as_bytes().starts_with(&bytes)
+                    && bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes())) =>
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => DestinationReservationRecovery::Retry,
+                Err(_) => DestinationReservationRecovery::Unknown
+            }
+        }
+        Ok(bytes) if bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => {
+            DestinationReservationRecovery::Unknown
+        }
+        Ok(bytes) if bytes.is_empty() && !allow_empty_completed => match std::fs::remove_file(path)
+        {
             Ok(()) => DestinationReservationRecovery::Retry,
-            Err(_) => DestinationReservationRecovery::Unknown,
-        },
-        Ok(bytes) if bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => DestinationReservationRecovery::Unknown,
-        Ok(bytes) if bytes.is_empty() && !allow_empty_completed => match std::fs::remove_file(path) {
-            Ok(()) => DestinationReservationRecovery::Retry,
-            Err(_) => DestinationReservationRecovery::Unknown,
+            Err(_) => DestinationReservationRecovery::Unknown
         },
         Ok(_) => DestinationReservationRecovery::Completed,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DestinationReservationRecovery::Missing,
-        Err(_) => DestinationReservationRecovery::Unknown,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DestinationReservationRecovery::Missing
+        }
+        Err(_) => DestinationReservationRecovery::Unknown
     }
 }
 
@@ -824,9 +961,20 @@ fn user_agent_value(value: &str) -> Option<&str> {
 }
 
 fn job_context(app: &AppHandle, id: &str) -> (Option<String>, Option<String>, Option<String>) {
-    app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
-        snapshot.jobs.iter().find(|item| item.id == id).map(|job| (job.referrer.clone(), job.post_body.clone(), job.user_agent.clone()))
-    }).unwrap_or((None, None, None))
+    app.state::<CoreState>()
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot.jobs.iter().find(|item| item.id == id).map(|job| {
+                (
+                    job.referrer.clone(),
+                    job.post_body.clone(),
+                    job.user_agent.clone()
+                )
+            })
+        })
+        .unwrap_or((None, None, None))
 }
 
 fn acquisition_request(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> reqwest::RequestBuilder {
@@ -864,30 +1012,36 @@ fn retryable_status(status: reqwest::StatusCode) -> bool {
 }
 
 async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String> {
-    let extension = PathBuf::from(destination).extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase);
-    if matches!(extension.as_deref(), None | Some("ts") | Some("m4s")) { return Ok(()); }
-    let output_path = format!("{temp_path}.final.{}", extension.as_deref().unwrap_or("mkv"));
-    let input = temp_path.to_string();
-    let output = output_path.clone();
-    let result = tokio::task::spawn_blocking(move || Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i", &input, "-map", "0", "-c", "copy", &output]).status()).await.map_err(|error| error.to_string())?;
-    match result {
-        Ok(status) if status.success() => { tokio::fs::rename(&output_path, temp_path).await.map_err(|error| error.to_string())?; Ok(()) }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ffmpeg_missing_failure()),
-        Err(error) => Err(error.to_string()),
-        Ok(status) => { let _ = tokio::fs::remove_file(&output_path).await; Err(ffmpeg_remux_failure(&status)) }
+    let extension = PathBuf::from(destination)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(extension.as_deref(), None | Some("ts") | Some("m4s")) {
+        return Ok(());
     }
-}
-
-// A missing remuxer is a finalization failure, not a successful raw-file move.
-fn ffmpeg_missing_failure() -> String {
-    "FFmpeg is required to finalize segmented media; downloaded parts were preserved".into()
-}
-
-fn ffmpeg_remux_failure(status: &std::process::ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("Media remux failed (ffmpeg exit {code}); downloaded parts were preserved"),
-        None => "Media remux failed (ffmpeg terminated); downloaded parts were preserved".into(),
+    let input = tokio::fs::read(temp_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    if looks_like_webm(&input) {
+        return Ok(());
     }
+    let finalized = media::finalize_fmp4(&input).map_err(|error| {
+        format!("Media finalization failed: {error}; downloaded parts were preserved")
+    })?;
+    if finalized != input {
+        let output_path = format!(
+            "{temp_path}.final.{}",
+            extension.as_deref().unwrap_or("mkv")
+        );
+        if let Err(error) = tokio::fs::write(&output_path, finalized).await {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(format!("Media finalization output could not be written: {error}; downloaded parts were preserved"));
+        }
+        tokio::fs::rename(&output_path, temp_path)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn move_needs_fallback(error: &std::io::Error) -> bool {
@@ -906,80 +1060,80 @@ async fn cleanup_reserved_destination(destination: &str, marker: Option<&str>) {
 }
 
 #[cfg(test)]
-static FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
 fn inject_reserved_install_failure_for_test() {
-    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.store(true, std::sync::atomic::Ordering::SeqCst);
+    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.with(|flag| flag.set(true));
 }
 
 #[cfg(test)]
 fn fail_reserved_install_after_marker_removal() -> bool {
-    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.swap(false, std::sync::atomic::Ordering::SeqCst)
+    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.with(|flag| flag.replace(false))
 }
 
 #[cfg(not(test))]
 fn fail_reserved_install_after_marker_removal() -> bool { false }
 
 #[cfg(test)]
-static FORCE_RESERVED_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static FORCE_RESERVED_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
 fn inject_reserved_fallback_for_test() {
-    FORCE_RESERVED_FALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+    FORCE_RESERVED_FALLBACK.with(|flag| flag.set(true));
 }
 
 #[cfg(test)]
 fn force_reserved_fallback_for_test() -> bool {
-    FORCE_RESERVED_FALLBACK.swap(false, std::sync::atomic::Ordering::SeqCst)
+    FORCE_RESERVED_FALLBACK.with(|flag| flag.replace(false))
 }
 
 #[cfg(not(test))]
 fn force_reserved_fallback_for_test() -> bool { false }
 
 #[cfg(test)]
-static FORCE_RESERVED_NONFALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static FORCE_RESERVED_NONFALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
 fn inject_reserved_nonfallback_for_test() {
-    FORCE_RESERVED_NONFALLBACK.store(true, std::sync::atomic::Ordering::SeqCst);
+    FORCE_RESERVED_NONFALLBACK.with(|flag| flag.set(true));
 }
 
 #[cfg(test)]
 fn force_reserved_nonfallback_for_test() -> bool {
-    FORCE_RESERVED_NONFALLBACK.swap(false, std::sync::atomic::Ordering::SeqCst)
+    FORCE_RESERVED_NONFALLBACK.with(|flag| flag.replace(false))
 }
 
 #[cfg(not(test))]
 fn force_reserved_nonfallback_for_test() -> bool { false }
 
 #[cfg(test)]
-static FAIL_SOURCE_CLEANUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static FAIL_SOURCE_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
 fn inject_source_cleanup_failure_for_test() {
-    FAIL_SOURCE_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
+    FAIL_SOURCE_CLEANUP.with(|flag| flag.set(true));
 }
 
 #[cfg(test)]
 fn fail_source_cleanup_for_test() -> bool {
-    FAIL_SOURCE_CLEANUP.swap(false, std::sync::atomic::Ordering::SeqCst)
+    FAIL_SOURCE_CLEANUP.with(|flag| flag.replace(false))
 }
 
 #[cfg(not(test))]
 fn fail_source_cleanup_for_test() -> bool { false }
 
 #[cfg(test)]
-static FAIL_REPLACEMENT_RESTORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! { static FAIL_REPLACEMENT_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
 fn inject_replacement_restore_failure_for_test() {
-    FAIL_REPLACEMENT_RESTORE.store(true, std::sync::atomic::Ordering::SeqCst);
+    FAIL_REPLACEMENT_RESTORE.with(|flag| flag.set(true));
 }
 
 #[cfg(test)]
 fn fail_replacement_restore_for_test() -> bool {
-    FAIL_REPLACEMENT_RESTORE.swap(false, std::sync::atomic::Ordering::SeqCst)
+    FAIL_REPLACEMENT_RESTORE.with(|flag| flag.replace(false))
 }
 
 #[cfg(not(test))]
@@ -1002,10 +1156,17 @@ enum ReservationRestore {
 }
 
 async fn restore_reservation_marker(destination: &str, marker: &str) -> ReservationRestore {
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(destination).await {
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .await
+    {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return ReservationRestore::DestinationChanged,
-        Err(error) => return ReservationRestore::Failed(error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return ReservationRestore::DestinationChanged
+        }
+        Err(error) => return ReservationRestore::Failed(error.to_string())
     };
     if let Err(error) = file.write_all(marker.as_bytes()).await {
         return ReservationRestore::Failed(error.to_string());
@@ -1019,8 +1180,12 @@ async fn restore_reservation_marker(destination: &str, marker: &str) -> Reservat
 fn reservation_restore_message(result: &ReservationRestore) -> String {
     match result {
         ReservationRestore::Restored => "reservation marker restored".into(),
-        ReservationRestore::DestinationChanged => "destination changed; reservation marker not restored".into(),
-        ReservationRestore::Failed(error) => format!("could not restore reservation marker: {error}"),
+        ReservationRestore::DestinationChanged => {
+            "destination changed; reservation marker not restored".into()
+        }
+        ReservationRestore::Failed(error) => {
+            format!("could not restore reservation marker: {error}")
+        }
     }
 }
 
@@ -1141,28 +1306,79 @@ fn media_extension(destination: &str) -> String {
     PathBuf::from(destination).extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).unwrap_or_else(|| "mkv".into())
 }
 
-async fn mux_media_tracks(track_paths: &[String], output_path: &str) -> Result<(), String> {
-    if track_paths.len() < 2 { return Err("Separate media tracks require at least two inputs".into()); }
-    let paths = track_paths.to_vec();
-    let output = output_path.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut command = Command::new("ffmpeg");
-        command.args(["-hide_banner", "-loglevel", "error", "-y"]);
-        for path in &paths { command.arg("-i").arg(path); }
-        for index in 0..paths.len() { command.args(["-map", &format!("{index}:0")]); }
-        command.args(["-c", "copy", &output]).status()
-    }).await.map_err(|error| error.to_string())?;
-    match result {
-        Ok(status) if status.success() => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err("FFmpeg is required to combine separate audio and video tracks".into()),
-        Err(error) => Err(error.to_string()),
-        Ok(_) => { let _ = tokio::fs::remove_file(output_path).await; Err("Media track finalization failed; downloaded parts were preserved".into()) }
+fn looks_like_mpeg_ts(input: &[u8]) -> bool {
+    input.len() >= 188
+        && input.len() % 188 == 0
+        && input
+            .chunks_exact(188)
+            .all(|packet| packet.first() == Some(&0x47))
+}
+
+fn looks_like_webm(input: &[u8]) -> bool {
+    input.len() >= 4 && &input[..4] == [0x1a, 0x45, 0xdf, 0xa3]
+}
+
+fn destination_with_output_extension(destination: &str, output_path: &str) -> String {
+    let Some(extension) = Path::new(output_path)
+        .extension()
+        .and_then(|value| value.to_str())
+    else {
+        return destination.to_string();
+    };
+    let mut path = PathBuf::from(destination);
+    path.set_extension(extension);
+    path.to_string_lossy().into_owned()
+}
+
+async fn mux_media_tracks(track_paths: &[String], output_path: &str) -> Result<String, String> {
+    if track_paths.len() < 2 {
+        return Err("Separate media tracks require at least two inputs".into());
     }
+    let mut inputs = Vec::with_capacity(track_paths.len());
+    for path in track_paths {
+        inputs.push(
+            tokio::fs::read(path)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+    }
+    let webm_count = inputs.iter().filter(|input| looks_like_webm(input)).count();
+    let mixed_webm = inputs.len() == 2
+        && webm_count == 1
+        && !inputs.iter().any(|input| looks_like_mpeg_ts(input));
+    let (merged, actual_output_path) = if inputs.iter().all(|input| looks_like_mpeg_ts(input)) {
+        (
+            media::mux_mpeg_ts_tracks(&inputs),
+            PathBuf::from(output_path)
+        )
+    } else if mixed_webm {
+        let mut path = PathBuf::from(output_path);
+        path.set_extension("mkv");
+        (media::mux_webm_fmp4_tracks(&inputs), path)
+    } else {
+        (media::mux_fmp4_tracks(&inputs), PathBuf::from(output_path))
+    };
+    let merged = merged.map_err(|error| {
+        format!("Media track finalization failed: {error}; downloaded parts were preserved")
+    })?;
+    if let Err(error) = tokio::fs::write(&actual_output_path, merged).await {
+        let _ = tokio::fs::remove_file(&actual_output_path).await;
+        return Err(format!(
+            "Media track output could not be written: {error}; downloaded parts were preserved"
+        ));
+    }
+    Ok(actual_output_path.to_string_lossy().into_owned())
 }
 
 fn job_state(app: &AppHandle, id: &str) -> Option<String> {
     let state = app.state::<CoreState>();
-    state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.state.clone()))
+    state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .map(|job| job.state.clone())
+    })
 }
 
 fn transfer_is_current(app: &AppHandle, id: &str, generation: u64) -> bool {
@@ -1272,18 +1488,31 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize, generation: u64) -> b
     transfer_can_continue(app, id, generation)
 }
 
-async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source: &str, byte_range: Option<(u64, u64)>, retries: u32, generation: u64) -> Result<Vec<u8>, String> {
+async fn fragment_bytes(
+    client: &reqwest::Client,
+    app: &AppHandle,
+    id: &str,
+    source: &str,
+    byte_range: Option<(u64, u64)>,
+    retries: u32,
+    generation: u64
+) -> Result<Vec<u8>, String> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     let expected_length = byte_range.map(|(_, length)| length);
     for attempt in 0..attempts {
         if attempt > 0 {
             sleep(Duration::from_millis(100)).await;
-            if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+            if !transfer_can_continue(app, id, generation) {
+                return Err("paused".to_string());
+            }
         }
         let mut request = acquisition_request(client, app, id, source);
         if let Some((start, length)) = byte_range {
-            let Some(end) = start.checked_add(length).and_then(|value| value.checked_sub(1)) else {
+            let Some(end) = start
+                .checked_add(length)
+                .and_then(|value| value.checked_sub(1))
+            else {
                 return Err("The HLS byte range exceeds the addressable resource size".into());
             };
             request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
@@ -1292,7 +1521,12 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
             Ok(response) if response.status().is_success() => {
                 if let Some((start, length)) = byte_range {
                     let valid_range = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
-                        && content_range(&response).map(|(actual_start, actual_end, _)| actual_start == start && actual_end == start.saturating_add(length).saturating_sub(1)).unwrap_or(false);
+                        && content_range(&response)
+                            .map(|(actual_start, actual_end, _)| {
+                                actual_start == start
+                                    && actual_end == start.saturating_add(length).saturating_sub(1)
+                            })
+                            .unwrap_or(false);
                     if !valid_range {
                         last_error = "The server returned an invalid HLS byte range".into();
                         continue;
@@ -1303,18 +1537,39 @@ async fn fragment_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, sou
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(chunk) => {
-                            if !throttle(app, id, chunk.len(), generation).await { return Err("paused".to_string()); }
+                            if !throttle(app, id, chunk.len(), generation).await {
+                                return Err("paused".to_string());
+                            }
                             bytes.extend_from_slice(&chunk);
-                            if expected_length.map(|length| bytes.len() as u64 > length).unwrap_or(false) { last_error = "The server returned an overlong HLS byte range".into(); bytes.clear(); break; }
+                            if expected_length
+                                .map(|length| bytes.len() as u64 > length)
+                                .unwrap_or(false)
+                            {
+                                last_error =
+                                    "The server returned an overlong HLS byte range".into();
+                                bytes.clear();
+                                break;
+                            }
                         }
-                        Err(error) => { last_error = error.to_string(); bytes.clear(); break; }
+                        Err(error) => {
+                            last_error = error.to_string();
+                            bytes.clear();
+                            break;
+                        }
                     }
                 }
-                if expected_length.map(|length| bytes.len() as u64 == length).unwrap_or(!bytes.is_empty()) { return Ok(bytes); }
-                if expected_length.is_some() { last_error = "The server returned an incomplete HLS byte range".into(); }
+                if expected_length
+                    .map(|length| bytes.len() as u64 == length)
+                    .unwrap_or(!bytes.is_empty())
+                {
+                    return Ok(bytes);
+                }
+                if expected_length.is_some() {
+                    last_error = "The server returned an incomplete HLS byte range".into();
+                }
             }
             Ok(response) => last_error = format!("source returned {}", response.status()),
-            Err(error) => last_error = error.to_string(),
+            Err(error) => last_error = error.to_string()
         }
     }
     Err(last_error)
@@ -1398,16 +1653,42 @@ fn content_range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
     Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
 }
 
-async fn range_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source: &str, start: u64, end: u64, retries: u32, expected: &ResourceIdentity, generation: u64) -> Result<Vec<u8>, String> {
+async fn range_bytes(
+    client: &reqwest::Client,
+    app: &AppHandle,
+    id: &str,
+    source: &str,
+    start: u64,
+    end: u64,
+    retries: u32,
+    expected: &ResourceIdentity,
+    generation: u64
+) -> Result<Vec<u8>, String> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("range request failed");
     let total_len = end.saturating_sub(start).saturating_add(1);
     for _ in 0..attempts {
-        match acquisition_request(client, app, id, source).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send().await {
+        match acquisition_request(client, app, id, source)
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .await
+        {
             Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                let valid_range = content_range(&response).map(|(actual_start, actual_end, actual_total)| actual_start == start && actual_end == end && actual_total == expected.length).unwrap_or(false);
-                if !valid_range { last_error = "The server returned an invalid byte range".into(); continue; }
-                if !valid_range_identity(&response, expected) { last_error = "The resource changed while it was being acquired".into(); continue; }
+                let valid_range = content_range(&response)
+                    .map(|(actual_start, actual_end, actual_total)| {
+                        actual_start == start
+                            && actual_end == end
+                            && actual_total == expected.length
+                    })
+                    .unwrap_or(false);
+                if !valid_range {
+                    last_error = "The server returned an invalid byte range".into();
+                    continue;
+                }
+                if !valid_range_identity(&response, expected) {
+                    last_error = "The resource changed while it was being acquired".into();
+                    continue;
+                }
                 let mut buf = Vec::new();
                 let mut stream = response.bytes_stream();
                 let mut overflow = false;
@@ -1415,74 +1696,217 @@ async fn range_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, source
                     match chunk {
                         Ok(bytes) => {
                             buf.extend_from_slice(&bytes);
-                            if buf.len() as u64 > total_len { overflow = true; break; }
+                            if buf.len() as u64 > total_len {
+                                overflow = true;
+                                break;
+                            }
                             // Pace each received chunk. The byte counter is
                             // deliberately updated only after the complete
                             // range is durably written by the caller. That
                             // keeps displayed progress and persisted ranges
                             // truthful if pause or a retry interrupts here.
-                            if !throttle(app, id, bytes.len(), generation).await { return Err("paused".to_string()); }
+                            if !throttle(app, id, bytes.len(), generation).await {
+                                return Err("paused".to_string());
+                            }
                         }
-                        Err(error) => { last_error = error.to_string(); buf.clear(); break; }
+                        Err(error) => {
+                            last_error = error.to_string();
+                            buf.clear();
+                            break;
+                        }
                     }
                 }
-                if overflow { last_error = "The server returned an overlong byte range".into(); continue; }
-                if buf.len() as u64 == total_len { return Ok(buf); }
-                if buf.is_empty() { continue; }
+                if overflow {
+                    last_error = "The server returned an overlong byte range".into();
+                    continue;
+                }
+                if buf.len() as u64 == total_len {
+                    return Ok(buf);
+                }
+                if buf.is_empty() {
+                    continue;
+                }
                 last_error = "The server returned an incomplete byte range".into();
             }
             Ok(response) => last_error = format!("range request returned {}", response.status()),
-            Err(error) => last_error = error.to_string(),
+            Err(error) => last_error = error.to_string()
         }
     }
     Err(last_error)
 }
 
-async fn acquire_ranges(app: AppHandle, id: String, source: String, response: reqwest::Response, total: u64, generation: u64) -> Result<(), String> {
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+async fn acquire_ranges(
+    app: AppHandle,
+    id: String,
+    source: String,
+    response: reqwest::Response,
+    total: u64,
+    generation: u64
+) -> Result<(), String> {
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
     let state = app.state::<CoreState>();
-    let (temp_path, max_connections, retry_count, replace_existing) = state.snapshot.lock().map_err(|_| "State unavailable".to_string()).and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.temp_path.clone(), job.max_connections, if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }, snapshot.settings.collision_behavior == "replace")).ok_or_else(|| "Acquisition no longer exists".to_string()))?;
+    let (temp_path, max_connections, retry_count, replace_existing) = state
+        .snapshot
+        .lock()
+        .map_err(|_| "State unavailable".to_string())
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| {
+                    (
+                        job.temp_path.clone(),
+                        job.max_connections,
+                        if snapshot.settings.retry_automatically {
+                            snapshot.settings.max_retries
+                        } else {
+                            0
+                        },
+                        snapshot.settings.collision_behavior == "replace"
+                    )
+                })
+                .ok_or_else(|| "Acquisition no longer exists".to_string())
+        })?;
     let identity = identity_from_response(&response, total);
     let first = response.bytes().await.map_err(|error| error.to_string())?;
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    if first.len() != 1 { return Err("The range probe returned an unexpected payload".into()); }
-    let Some(parent) = PathBuf::from(&temp_path).parent().map(PathBuf::from) else { return Err("Temporary path is invalid".into()); };
-    tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    let existing = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.resource_identity.clone(), job.completed_ranges.clone())));
-    let mut completed_ranges = existing.as_ref().filter(|(stored_identity, ranges)| identities_match(stored_identity.as_ref(), &identity) && !ranges.is_empty()).map(|(_, ranges)| ranges.iter().filter(|range| range.start <= range.end && range.end < total).cloned().collect::<Vec<_>>()).unwrap_or_default();
-    completed_ranges = completed_ranges.into_iter().fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
-    let mut can_resume = !completed_ranges.is_empty() && tokio::fs::metadata(&temp_path).await.map(|metadata| metadata.len() == total).unwrap_or(false);
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    if first.len() != 1 {
+        return Err("The range probe returned an unexpected payload".into());
+    }
+    let Some(parent) = PathBuf::from(&temp_path).parent().map(PathBuf::from) else {
+        return Err("Temporary path is invalid".into());
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    let existing = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .map(|job| (job.resource_identity.clone(), job.completed_ranges.clone()))
+    });
+    let mut completed_ranges = existing
+        .as_ref()
+        .filter(|(stored_identity, ranges)| {
+            identities_match(stored_identity.as_ref(), &identity) && !ranges.is_empty()
+        })
+        .map(|(_, ranges)| {
+            ranges
+                .iter()
+                .filter(|range| range.start <= range.end && range.end < total)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    completed_ranges = completed_ranges
+        .into_iter()
+        .fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
+    let mut can_resume = !completed_ranges.is_empty()
+        && tokio::fs::metadata(&temp_path)
+            .await
+            .map(|metadata| metadata.len() == total)
+            .unwrap_or(false);
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
     if can_resume {
-        let mut existing_file = File::open(&temp_path).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        let mut existing_file = File::open(&temp_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
         let mut existing_first = [0u8; 1];
-        can_resume = existing_file.read_exact(&mut existing_first).await.is_ok() && existing_first[0] == first[0];
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        can_resume = existing_file.read_exact(&mut existing_first).await.is_ok()
+            && existing_first[0] == first[0];
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
     }
     if !can_resume {
         completed_ranges = vec![ByteRange { start: 0, end: 0 }];
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        let mut initial = File::create(&temp_path).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        initial.write_all(&first).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        initial.set_len(total).await.map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        let mut initial = File::create(&temp_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        initial
+            .write_all(&first)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        initial
+            .set_len(total)
+            .await
+            .map_err(|error| error.to_string())?;
     } else if !completed_ranges.iter().any(|range| range.start == 0) {
-        let mut initial = OpenOptions::new().write(true).open(&temp_path).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        initial.seek(SeekFrom::Start(0)).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        initial.write_all(&first).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        let mut initial = OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        initial
+            .seek(SeekFrom::Start(0))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        initial
+            .write_all(&first)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
         completed_ranges = merge_range(&completed_ranges, ByteRange { start: 0, end: 0 });
     }
     let ranges = missing_ranges(total, &completed_ranges, max_connections);
     let worker_count = max_connections.clamp(1, 32).min(ranges.len().max(1) as u32) as usize;
     let initial_downloaded = covered_bytes(&completed_ranges).min(total);
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = Some(total); job.downloaded = initial_downloaded; job.progress = initial_downloaded as f64 / total as f64 * 100.0; job.resumable = true; job.mode = "whole-object".into(); job.resource_identity = Some(identity.clone()); job.completed_ranges = completed_ranges.clone(); job.connections = if ranges.is_empty() { 0 } else { worker_count as u32 }; job.events.insert(0, job_event(&format!("Range support verified; {worker_count} workers started"), Some("success"))); });
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    emit_job(&state, &id, |job| {
+        job.state = "downloading".into();
+        job.total = Some(total);
+        job.downloaded = initial_downloaded;
+        job.progress = initial_downloaded as f64 / total as f64 * 100.0;
+        job.resumable = true;
+        job.mode = "whole-object".into();
+        job.resource_identity = Some(identity.clone());
+        job.completed_ranges = completed_ranges.clone();
+        job.connections = if ranges.is_empty() {
+            0
+        } else {
+            worker_count as u32
+        };
+        job.events.insert(
+            0,
+            job_event(
+                &format!("Range support verified; {worker_count} workers started"),
+                Some("success")
+            )
+        );
+    });
     emit_snapshot(&app, &state);
     let downloaded = std::sync::Arc::new(AtomicU64::new(initial_downloaded));
     let started = std::time::Instant::now();
@@ -1498,36 +1922,128 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
         let downloaded = downloaded.clone();
         let completed_workers = completed_workers.clone();
         async move {
-            if !transfer_is_downloading(&app, &id, generation) { return Err("paused".to_string()); }
-            let bytes = range_bytes(&client, &app, &id, &source, start, end, retry_count, &identity, generation).await?;
-            if !transfer_is_downloading(&app, &id, generation) { return Err("paused".to_string()); }
-            let mut file = OpenOptions::new().write(true).open(&temp_path).await.map_err(|error| error.to_string())?;
-            if !transfer_is_downloading(&app, &id, generation) { return Err("paused".to_string()); }
-            file.seek(SeekFrom::Start(start)).await.map_err(|error| error.to_string())?;
-            if !transfer_is_downloading(&app, &id, generation) { return Err("paused".to_string()); }
-            file.write_all(&bytes).await.map_err(|error| error.to_string())?;
-            if !transfer_is_downloading(&app, &id, generation) { return Err("paused".to_string()); }
-            let total_downloaded = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
-            let speed = ((total_downloaded.saturating_sub(initial_downloaded)) as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
+            if !transfer_is_downloading(&app, &id, generation) {
+                return Err("paused".to_string());
+            }
+            let bytes = range_bytes(
+                &client,
+                &app,
+                &id,
+                &source,
+                start,
+                end,
+                retry_count,
+                &identity,
+                generation
+            )
+            .await?;
+            if !transfer_is_downloading(&app, &id, generation) {
+                return Err("paused".to_string());
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&temp_path)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !transfer_is_downloading(&app, &id, generation) {
+                return Err("paused".to_string());
+            }
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|error| error.to_string())?;
+            if !transfer_is_downloading(&app, &id, generation) {
+                return Err("paused".to_string());
+            }
+            file.write_all(&bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !transfer_is_downloading(&app, &id, generation) {
+                return Err("paused".to_string());
+            }
+            let total_downloaded =
+                downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            let speed = ((total_downloaded.saturating_sub(initial_downloaded)) as f64
+                / started.elapsed().as_secs_f64().max(0.1)) as u64;
             let finished = completed_workers.fetch_add(1, Ordering::Relaxed) + 1;
             let state = app.state::<CoreState>();
-            emit_job(&state, &id, |job| { job.downloaded = total_downloaded; job.speed = speed; job.eta = if speed > 0 { Some(format!("{}s left", total.saturating_sub(total_downloaded) / speed)) } else { None }; job.progress = total_downloaded as f64 / total as f64 * 100.0; job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end }); job.connections = worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32; });
+            emit_job(&state, &id, |job| {
+                job.downloaded = total_downloaded;
+                job.speed = speed;
+                job.eta = if speed > 0 {
+                    Some(format!(
+                        "{}s left",
+                        total.saturating_sub(total_downloaded) / speed
+                    ))
+                } else {
+                    None
+                };
+                job.progress = total_downloaded as f64 / total as f64 * 100.0;
+                job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
+                job.connections =
+                    worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32;
+            });
             emit_snapshot(&app, &state);
             // No throttle here: intake was already paced piece-by-piece inside
             // range_bytes; charging the whole chunk again would halve the rate.
             Ok::<(), String>(())
         }
-    })).buffer_unordered(worker_count);
+    }))
+    .buffer_unordered(worker_count);
     let mut transfer_error = None;
-    while let Some(result) = transfers.next().await { if let Err(error) = result { transfer_error = Some(error); } }
+    while let Some(result) = transfers.next().await {
+        if let Err(error) = result {
+            transfer_error = Some(error);
+        }
+    }
     if let Some(initial_error) = transfer_error {
-        if !transfer_is_current(&app, &id, generation) { return Ok(()); }
-        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused with verified byte ranges preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
-        let mut fallback_completed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.completed_ranges.clone())).unwrap_or_default();
+        if !transfer_is_current(&app, &id, generation) {
+            return Ok(());
+        }
+        if job_state(&app, &id).as_deref() == Some("paused") {
+            emit_job(&state, &id, |job| {
+                job.connections = 0;
+                job.speed = 0;
+                job.eta = Some("Paused".into());
+                job.events.insert(
+                    0,
+                    job_event(
+                        "Paused with verified byte ranges preserved",
+                        Some("warning")
+                    )
+                );
+            });
+            emit_snapshot(&app, &state);
+            return Ok(());
+        }
+        let mut fallback_completed = state
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .jobs
+                    .iter()
+                    .find(|job| job.id == id)
+                    .map(|job| job.completed_ranges.clone())
+            })
+            .unwrap_or_default();
         fallback_completed.sort_by_key(|range| (range.start, range.end));
-        fallback_completed = fallback_completed.into_iter().fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
+        fallback_completed = fallback_completed
+            .into_iter()
+            .fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
         let fallback_ranges = missing_ranges(total, &fallback_completed, 1);
-        emit_job(&state, &id, |job| { job.connections = if fallback_ranges.is_empty() { 0 } else { 1 }; job.speed = 0; job.eta = Some("Retrying with one connection".into()); job.events.insert(0, job_event("Parallel range acquisition was rejected; retrying with one connection", Some("warning"))); });
+        emit_job(&state, &id, |job| {
+            job.connections = if fallback_ranges.is_empty() { 0 } else { 1 };
+            job.speed = 0;
+            job.eta = Some("Retrying with one connection".into());
+            job.events.insert(
+                0,
+                job_event(
+                    "Parallel range acquisition was rejected; retrying with one connection",
+                    Some("warning")
+                )
+            );
+        });
         emit_snapshot(&app, &state);
         let fallback_client = http_client();
         let mut fallback_error = None;
@@ -1536,17 +2052,41 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
         // consumed the server's burst allowance.
         sleep(Duration::from_millis(500)).await;
         for (start, end) in fallback_ranges {
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-            let bytes = match range_bytes(&fallback_client, &app, &id, &source, start, end, retry_count.max(1), &identity, generation).await {
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
+            let bytes = match range_bytes(
+                &fallback_client,
+                &app,
+                &id,
+                &source,
+                start,
+                end,
+                retry_count.max(1),
+                &identity,
+                generation
+            )
+            .await
+            {
                 Ok(bytes) => bytes,
-                Err(error) => { fallback_error = Some(error); break; }
+                Err(error) => {
+                    fallback_error = Some(error);
+                    break;
+                }
             };
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
             let mut file = match OpenOptions::new().write(true).open(&temp_path).await {
                 Ok(file) => file,
-                Err(error) => { fallback_error = Some(error.to_string()); break; }
+                Err(error) => {
+                    fallback_error = Some(error.to_string());
+                    break;
+                }
             };
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
             if let Err(error) = file.seek(SeekFrom::Start(start)).await {
                 fallback_error = Some(error.to_string());
                 break;
@@ -1555,80 +2095,209 @@ async fn acquire_ranges(app: AppHandle, id: String, source: String, response: re
                 fallback_error = Some(error.to_string());
                 break;
             }
-            let total_downloaded = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
-            emit_job(&state, &id, |job| { job.downloaded = total_downloaded; job.speed = 0; job.eta = Some("Retrying with one connection".into()); job.progress = total_downloaded as f64 / total as f64 * 100.0; job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end }); job.connections = 1; });
+            let total_downloaded =
+                downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+            emit_job(&state, &id, |job| {
+                job.downloaded = total_downloaded;
+                job.speed = 0;
+                job.eta = Some("Retrying with one connection".into());
+                job.progress = total_downloaded as f64 / total as f64 * 100.0;
+                job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
+                job.connections = 1;
+            });
             emit_snapshot(&app, &state);
         }
         if let Some(_error) = fallback_error {
-            emit_job(&state, &id, |job| { job.connections = 1; job.speed = 0; job.eta = Some("Retrying as one stream".into()); job.events.insert(0, job_event("Range requests remained unavailable; retrying as one stream", Some("warning"))); });
+            emit_job(&state, &id, |job| {
+                job.connections = 1;
+                job.speed = 0;
+                job.eta = Some("Retrying as one stream".into());
+                job.events.insert(
+                    0,
+                    job_event(
+                        "Range requests remained unavailable; retrying as one stream",
+                        Some("warning")
+                    )
+                );
+            });
             emit_snapshot(&app, &state);
             sleep(Duration::from_secs(3)).await;
             let stream_client = http_client();
-            let response = match acquisition_request(&stream_client, &app, &id, &source).send().await {
+            let response = match acquisition_request(&stream_client, &app, &id, &source)
+                .send()
+                .await
+            {
                 Ok(response) if response.status().is_success() => response,
-                Ok(response) => return Err(format!("{initial_error}; one-stream fallback failed: source returned {}", response.status())),
-                Err(stream_error) => return Err(format!("{initial_error}; one-stream fallback failed: {stream_error}")),
+                Ok(response) => {
+                    return Err(format!(
+                        "{initial_error}; one-stream fallback failed: source returned {}",
+                        response.status()
+                    ))
+                }
+                Err(stream_error) => {
+                    return Err(format!(
+                        "{initial_error}; one-stream fallback failed: {stream_error}"
+                    ))
+                }
             };
-            let fallback_mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string);
-            let mut file = File::create(&temp_path).await.map_err(|stream_error| format!("{initial_error}; one-stream fallback failed: {stream_error}"))?;
+            let fallback_mime = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let mut file = File::create(&temp_path).await.map_err(|stream_error| {
+                format!("{initial_error}; one-stream fallback failed: {stream_error}")
+            })?;
             let mut full_downloaded = 0u64;
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                if !transfer_is_downloading(&app, &id, generation) { return Ok(()); }
-                let bytes = chunk.map_err(|stream_error| format!("{initial_error}; one-stream fallback failed: {stream_error}"))?;
-                file.write_all(&bytes).await.map_err(|stream_error| format!("{initial_error}; one-stream fallback failed: {stream_error}"))?;
+                if !transfer_is_downloading(&app, &id, generation) {
+                    return Ok(());
+                }
+                let bytes = chunk.map_err(|stream_error| {
+                    format!("{initial_error}; one-stream fallback failed: {stream_error}")
+                })?;
+                file.write_all(&bytes).await.map_err(|stream_error| {
+                    format!("{initial_error}; one-stream fallback failed: {stream_error}")
+                })?;
                 full_downloaded = full_downloaded.saturating_add(bytes.len() as u64);
-                if !throttle(&app, &id, bytes.len(), generation).await { return Ok(()); }
+                if !throttle(&app, &id, bytes.len(), generation).await {
+                    return Ok(());
+                }
                 let progress = full_downloaded as f64 / total as f64 * 100.0;
-                emit_job(&state, &id, |job| { job.downloaded = full_downloaded; job.progress = progress; job.speed = 0; job.eta = Some("Retrying as one stream".into()); job.connections = 1; });
+                emit_job(&state, &id, |job| {
+                    job.downloaded = full_downloaded;
+                    job.progress = progress;
+                    job.speed = 0;
+                    job.eta = Some("Retrying as one stream".into());
+                    job.connections = 1;
+                });
                 emit_snapshot(&app, &state);
             }
             drop(file);
-            if full_downloaded != total { return Err(format!("{initial_error}; one-stream fallback returned {full_downloaded} bytes, expected {total}")); }
+            if full_downloaded != total {
+                return Err(format!("{initial_error}; one-stream fallback returned {full_downloaded} bytes, expected {total}"));
+            }
             downloaded.store(full_downloaded, Ordering::Relaxed);
-            emit_job(&state, &id, |job| { job.downloaded = full_downloaded; job.progress = 100.0; job.speed = 0; job.connections = 1; job.resumable = false; job.mode = "single-stream".into(); job.completed_ranges = Vec::new(); job.mime = fallback_mime.clone(); job.eta = Some("Finalizing".into()); });
+            emit_job(&state, &id, |job| {
+                job.downloaded = full_downloaded;
+                job.progress = 100.0;
+                job.speed = 0;
+                job.connections = 1;
+                job.resumable = false;
+                job.mode = "single-stream".into();
+                job.completed_ranges = Vec::new();
+                job.mime = fallback_mime.clone();
+                job.eta = Some("Finalizing".into());
+            });
             emit_snapshot(&app, &state);
         }
     }
-    if !transfer_is_current(&app, &id, generation) { return Ok(()); }
-    if job_state(&app, &id).as_deref() != Some("downloading") {
-        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); }
+    if !transfer_is_current(&app, &id, generation) {
         return Ok(());
     }
-    let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+    if job_state(&app, &id).as_deref() != Some("downloading") {
+        if job_state(&app, &id).as_deref() == Some("paused") {
+            emit_job(&state, &id, |job| {
+                job.connections = 0;
+                job.speed = 0;
+                job.eta = Some("Paused".into());
+            });
+            emit_snapshot(&app, &state);
+        }
+        return Ok(());
+    }
+    let committed = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| (job.provisional != Some(true), job.destination.clone()))
+        })
+        .unwrap_or((false, String::new()));
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
     if committed.0 && !committed.1.is_empty() {
         if let Some(parent) = PathBuf::from(&committed.1).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
         }
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        let (destination, reserved, reservation) = managed_destination(&committed.1, replace_existing)?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        let (destination, reserved, reservation) =
+            managed_destination(&committed.1, replace_existing)?;
         if destination != committed.1 || reservation.is_some() {
             let reservation_marker = reservation.clone();
             emit_job(&state, &id, |job| {
                 job.destination = destination.clone();
                 job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != committed.1 { job.name = file_name.to_string(); } }
-                if destination != committed.1 { job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning"))); }
+                if let Some(file_name) = PathBuf::from(&destination)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                {
+                    if destination != committed.1 {
+                        job.name = file_name.to_string();
+                    }
+                }
+                if destination != committed.1 {
+                    job.events.insert(
+                        0,
+                        job_event("Destination renamed to avoid a collision", Some("warning"))
+                    );
+                }
             });
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
-            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
+            if reserved {
+                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+            }
             clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
-        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reservation.as_deref()).await {
+        if let Err(error) = move_completed_file(
+            &temp_path,
+            &destination,
+            replace_existing,
+            reservation.as_deref()
+        )
+        .await
+        {
             clear_destination_reservation(&app, &state, &id);
             return Err(error);
         }
         clear_destination_reservation(&app, &state, &id);
     }
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    emit_job(&state, &id, |job| {
+        job.speed = 0;
+        job.connections = 0;
+        if committed.0 {
+            complete_job(job);
+        } else {
+            job.state = "finalizing".into();
+            job.progress = 100.0;
+            job.eta = Some("Ready to save".into());
+            job.events.insert(
+                0,
+                job_event("Download ready; waiting for destination", Some("warning"))
+            );
+        }
+    });
     emit_snapshot(&app, &state);
-    if committed.0 { add_notification(&app, &state, &id, "completed"); }
+    if committed.0 {
+        add_notification(&app, &state, &id, "completed");
+    }
     Ok(())
 }
 
@@ -1653,7 +2322,14 @@ fn segment_identity(tracks: &[media::MediaTrack]) -> String {
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x100000001b3);
             }
-            for byte in segment.range.iter().flat_map(|(start, length)| start.to_le_bytes().into_iter().chain(length.to_le_bytes())).chain([0xfd]) {
+            for byte in segment
+                .range
+                .iter()
+                .flat_map(|(start, length)| {
+                    start.to_le_bytes().into_iter().chain(length.to_le_bytes())
+                })
+                .chain([0xfd])
+            {
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x100000001b3);
             }
@@ -1688,187 +2364,557 @@ async fn materialize_dash_segment_bases(client: &reqwest::Client, app: &AppHandl
     Ok(tracks)
 }
 
-async fn acquire_manifest(app: AppHandle, id: String, source: String, body: String, _mime: Option<String>, selected_segments: Vec<String>, generation: u64) -> Result<(), String> {
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+async fn acquire_manifest(
+    app: AppHandle,
+    id: String,
+    source: String,
+    body: String,
+    _mime: Option<String>,
+    selected_segments: Vec<String>,
+    generation: u64
+) -> Result<(), String> {
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
     let client = http_client();
     let mut manifest_source = source;
     let mut manifest_body = body;
     let mut hls_track_sources = None;
+    let mut hls_all_mpeg_ts = false;
     for _ in 0..4 {
-        let is_hls = manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
-        if !is_hls { break; }
-        if let Some(sources) = media::hls_variant_tracks(&manifest_source, &manifest_body, &selected_segments) { hls_track_sources = Some(sources); break; }
-        let Some(variant) = (if is_hls { media::hls_variant(&manifest_source, &manifest_body) } else { None }) else { break };
-        let response = acquisition_request(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+        let is_hls = manifest_source.to_ascii_lowercase().contains(".m3u8")
+            || manifest_body.contains("#EXTM3U");
+        if !is_hls {
+            break;
+        }
+        if let Some(sources) =
+            media::hls_variant_tracks(&manifest_source, &manifest_body, &selected_segments)
+        {
+            hls_track_sources = Some(sources);
+            break;
+        }
+        let Some(variant) = (if is_hls {
+            media::hls_variant(&manifest_source, &manifest_body)
+        } else {
+            None
+        }) else {
+            break;
+        };
+        let response = acquisition_request(&client, &app, &id, &variant)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .error_for_status()
+            .map_err(|error| error.to_string())?;
         manifest_body = response.text().await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
         manifest_source = variant;
     }
-    let is_hls = manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
-    let single_hls_playlist = hls_track_sources.is_none() && is_hls;
+    let is_hls =
+        manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
     let tracks = if let Some(sources) = hls_track_sources {
         let mut tracks = Vec::with_capacity(sources.len());
+        let mut track_has_map = Vec::with_capacity(sources.len());
         for (kind, track_source) in sources {
             let mut source = track_source;
-            let response = acquisition_request(&client, &app, &id, &source).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+            let response = acquisition_request(&client, &app, &id, &source)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .error_for_status()
+                .map_err(|error| error.to_string())?;
             let mut body = response.text().await.map_err(|error| error.to_string())?;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
             for _ in 0..4 {
-                let Some(variant) = media::hls_variant(&source, &body) else { break; };
-                let response = acquisition_request(&client, &app, &id, &variant).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+                let Some(variant) = media::hls_variant(&source, &body) else {
+                    break;
+                };
+                let response = acquisition_request(&client, &app, &id, &variant)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .error_for_status()
+                    .map_err(|error| error.to_string())?;
                 body = response.text().await.map_err(|error| error.to_string())?;
-                if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+                if !transfer_can_continue(&app, &id, generation) {
+                    return Ok(());
+                }
                 source = variant;
             }
-            tracks.push(media::MediaTrack { kind, segments: media::parse_hls(&source, &body)?, segment_base: None });
+            track_has_map.push(body.contains("#EXT-X-MAP"));
+            tracks.push(media::MediaTrack {
+                kind,
+                segments: media::parse_hls(&source, &body)?,
+                segment_base: None
+            });
         }
+        let all_fmp4 = track_has_map.iter().all(|has_map| *has_map);
+        let all_mpeg_ts = track_has_map.iter().all(|has_map| !*has_map);
+        if !all_fmp4 && !all_mpeg_ts {
+            return Err("Mixed HLS MPEG-TS and fragmented-MP4 tracks are not supported".into());
+        }
+        hls_all_mpeg_ts = all_mpeg_ts;
         tracks
-    } else if is_hls { vec![media::MediaTrack { kind: "video".into(), segments: media::parse_hls(&manifest_source, &manifest_body)?, segment_base: None }] } else { media::parse_dash_tracks_for_segments(&manifest_source, &manifest_body, &selected_segments)? };
-    let range_retry_count = app.state::<CoreState>().snapshot.lock().map(|snapshot| if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }).unwrap_or(0);
-    let tracks = materialize_dash_segment_bases(&client, &app, &id, tracks, range_retry_count, generation).await?;
-    // Name the acquisition after its container, not the manifest: suggesting
-    // "vod.m3u8" for MPEG-TS bytes guarantees a doomed FFmpeg remux later.
-    // HLS without an EXT-X-MAP carries MPEG-TS; everything else assembles to MP4.
-    let (container_ext, container_mime) = if single_hls_playlist && !manifest_body.contains("#EXT-X-MAP") { ("ts", "video/mp2t") } else { ("mp4", "video/mp4") };
+    } else if is_hls {
+        hls_all_mpeg_ts = !manifest_body.contains("#EXT-X-MAP");
+        vec![media::MediaTrack {
+            kind: "video".into(),
+            segments: media::parse_hls(&manifest_source, &manifest_body)?,
+            segment_base: None
+        }]
+    } else {
+        media::parse_dash_tracks_for_segments(&manifest_source, &manifest_body, &selected_segments)?
+    };
+    let range_retry_count = app
+        .state::<CoreState>()
+        .snapshot
+        .lock()
+        .map(|snapshot| {
+            if snapshot.settings.retry_automatically {
+                snapshot.settings.max_retries
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    let tracks =
+        materialize_dash_segment_bases(&client, &app, &id, tracks, range_retry_count, generation)
+            .await?;
+    // Name the acquisition after its container, not the manifest: HLS without
+    // an EXT-X-MAP carries MPEG-TS; everything else assembles to fragmented MP4.
+    let single_webm = tracks.len() == 1
+        && tracks[0]
+            .segments
+            .first()
+            .map(|segment| {
+                segment
+                    .url
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .ends_with(".webm")
+            })
+            .unwrap_or(false);
+    let (container_ext, container_mime) = if single_webm {
+        ("webm", "video/webm")
+    } else if is_hls && hls_all_mpeg_ts {
+        ("ts", "video/mp2t")
+    } else {
+        ("mp4", "video/mp4")
+    };
     let track_count = tracks.len();
-    let track_lengths = tracks.iter().map(|track| track.segments.len()).collect::<Vec<_>>();
-    let track_kinds = tracks.iter().map(|track| if track.kind.is_empty() { "media" } else { track.kind.as_str() }).collect::<Vec<_>>().join(" + ");
+    let track_lengths = tracks
+        .iter()
+        .map(|track| track.segments.len())
+        .collect::<Vec<_>>();
+    let track_kinds = tracks
+        .iter()
+        .map(|track| {
+            if track.kind.is_empty() {
+                "media"
+            } else {
+                track.kind.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
     let total_segments = track_lengths.iter().sum::<usize>();
-    if total_segments == 0 { return Err("The manifest did not contain any downloadable segments".into()); }
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+    if total_segments == 0 {
+        return Err("The manifest did not contain any downloadable segments".into());
+    }
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
     let state = app.state::<CoreState>();
-    let (temp_path, max_connections, retry_count, replace_existing, stored_identity) = state.snapshot.lock().map_err(|_| "State unavailable".to_string()).and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.temp_path.clone(), job.max_connections, if snapshot.settings.retry_automatically { snapshot.settings.max_retries } else { 0 }, snapshot.settings.collision_behavior == "replace", job.segments.as_ref().and_then(|segments| segments.identity.clone()))).ok_or_else(|| "Acquisition no longer exists".to_string()))?;
+    let (temp_path, max_connections, retry_count, replace_existing, stored_identity) = state
+        .snapshot
+        .lock()
+        .map_err(|_| "State unavailable".to_string())
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| {
+                    (
+                        job.temp_path.clone(),
+                        job.max_connections,
+                        if snapshot.settings.retry_automatically {
+                            snapshot.settings.max_retries
+                        } else {
+                            0
+                        },
+                        snapshot.settings.collision_behavior == "replace",
+                        job.segments
+                            .as_ref()
+                            .and_then(|segments| segments.identity.clone())
+                    )
+                })
+                .ok_or_else(|| "Acquisition no longer exists".to_string())
+        })?;
     let segment_dir = PathBuf::from(format!("{temp_path}.segments"));
     let identity = segment_identity(&tracks);
     if stored_identity.as_deref() != Some(identity.as_str()) {
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
         cleanup_media_track_files(&temp_path);
     }
-    tokio::fs::create_dir_all(&segment_dir).await.map_err(|error| error.to_string())?;
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+    tokio::fs::create_dir_all(&segment_dir)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
     let total_segments = total_segments as u32;
     let concurrency = max_connections.clamp(1, total_segments) as usize;
     let mut existing_segments: Vec<(usize, usize)> = Vec::new();
     let mut existing_bytes = 0u64;
     for (track, length) in track_lengths.iter().enumerate() {
         if track_count > 1 {
-            tokio::fs::create_dir_all(segment_dir.join(format!("{track:02}"))).await.map_err(|error| error.to_string())?;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            tokio::fs::create_dir_all(segment_dir.join(format!("{track:02}")))
+                .await
+                .map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
         }
         for index in 0..*length {
             let path = manifest_segment_path(&segment_dir, track, index, track_count);
             if let Ok(metadata) = tokio::fs::metadata(path).await {
-                if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-                if metadata.is_file() && metadata.len() > 0 { existing_segments.push((track, index)); existing_bytes = existing_bytes.saturating_add(metadata.len()); }
+                if !transfer_can_continue(&app, &id, generation) {
+                    return Ok(());
+                }
+                if metadata.is_file() && metadata.len() > 0 {
+                    existing_segments.push((track, index));
+                    existing_bytes = existing_bytes.saturating_add(metadata.len());
+                }
             }
         }
     }
     let missing_count = total_segments as usize - existing_segments.len();
     let existing_count = existing_segments.len() as u64;
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.mode = "segments".into(); job.media = true; job.mime = Some(container_mime.to_string()); job.media_tracks = Some(track_count as u32); job.resumable = true; job.downloaded = existing_bytes; job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0; job.speed = 0; job.eta = None; job.connections = concurrency.min(missing_count) as u32; job.segments = Some(SegmentState { completed: existing_segments.len() as u32, total: total_segments, identity: Some(identity.clone()) }); if job.name == source_name(&job.source) { let stem = Path::new(&job.name).file_stem().and_then(|value| value.to_str()).unwrap_or("media"); job.name = format!("{stem}.{container_ext}"); let mut destination = PathBuf::from(&job.destination); destination.set_file_name(&job.name); job.destination = destination.to_string_lossy().into_owned(); } job.events.insert(0, job_event(&format!("Manifest parsed: {total_segments} fragments across {track_kinds}"), Some("success"))); });
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    emit_job(&state, &id, |job| {
+        job.state = "downloading".into();
+        job.mode = "segments".into();
+        job.media = true;
+        job.mime = Some(container_mime.to_string());
+        job.media_tracks = Some(track_count as u32);
+        job.resumable = true;
+        job.downloaded = existing_bytes;
+        job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0;
+        job.speed = 0;
+        job.eta = None;
+        job.connections = concurrency.min(missing_count) as u32;
+        job.segments = Some(SegmentState {
+            completed: existing_segments.len() as u32,
+            total: total_segments,
+            identity: Some(identity.clone())
+        });
+        if job.name == source_name(&job.source) {
+            let stem = Path::new(&job.name)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("media");
+            job.name = format!("{stem}.{container_ext}");
+            let mut destination = PathBuf::from(&job.destination);
+            destination.set_file_name(&job.name);
+            job.destination = destination.to_string_lossy().into_owned();
+        }
+        job.events.insert(
+            0,
+            job_event(
+                &format!("Manifest parsed: {total_segments} fragments across {track_kinds}"),
+                Some("success")
+            )
+        );
+    });
     emit_snapshot(&app, &state);
     let started = std::time::Instant::now();
     let completed = std::sync::Arc::new(AtomicU64::new(existing_segments.len() as u64));
     let downloaded = std::sync::Arc::new(AtomicU64::new(existing_bytes));
     let existing_segments = std::sync::Arc::new(existing_segments);
-    let work: Vec<_> = tracks.into_iter().enumerate().flat_map(|(track, media_track)| media_track.segments.into_iter().enumerate().map(move |(index, fragment)| (track, index, fragment))).filter(|(track, index, _)| !existing_segments.contains(&(*track, *index))).collect();
-    let results = futures_util::stream::iter(work.clone()).map(|(track, index, fragment)| {
-        let client = client.clone();
-        let app = app.clone();
-        let id = id.clone();
-        let segment_path = manifest_segment_path(&segment_dir, track, index, track_count);
-        let segment_temp_path = segment_path.with_extension("part.tmp");
-        let completed = completed.clone();
-        let downloaded = downloaded.clone();
-        async move {
-            acquire_media_segment(&client, &app, &id, &fragment, &segment_path, &segment_temp_path, retry_count, generation, &completed, &downloaded, started, existing_bytes, total_segments, existing_count, concurrency).await
-        }
-    }).buffer_unordered(concurrency).collect::<Vec<_>>().await;
-    let concurrent_error = results.iter().find_map(|result| result.as_ref().err().cloned());
+    let work: Vec<_> = tracks
+        .into_iter()
+        .enumerate()
+        .flat_map(|(track, media_track)| {
+            media_track
+                .segments
+                .into_iter()
+                .enumerate()
+                .map(move |(index, fragment)| (track, index, fragment))
+        })
+        .filter(|(track, index, _)| !existing_segments.contains(&(*track, *index)))
+        .collect();
+    let results = futures_util::stream::iter(work.clone())
+        .map(|(track, index, fragment)| {
+            let client = client.clone();
+            let app = app.clone();
+            let id = id.clone();
+            let segment_path = manifest_segment_path(&segment_dir, track, index, track_count);
+            let segment_temp_path = segment_path.with_extension("part.tmp");
+            let completed = completed.clone();
+            let downloaded = downloaded.clone();
+            async move {
+                acquire_media_segment(
+                    &client,
+                    &app,
+                    &id,
+                    &fragment,
+                    &segment_path,
+                    &segment_temp_path,
+                    retry_count,
+                    generation,
+                    &completed,
+                    &downloaded,
+                    started,
+                    existing_bytes,
+                    total_segments,
+                    existing_count,
+                    concurrency
+                )
+                .await
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let concurrent_error = results
+        .iter()
+        .find_map(|result| result.as_ref().err().cloned());
     if let Some(initial_error) = concurrent_error {
-        if !transfer_is_current(&app, &id, generation) { return Ok(()); }
-        if matches!(job_state(&app, &id).as_deref(), Some("paused")) { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused with completed fragments preserved", Some("warning"))); }); emit_snapshot(&app, &state); return Ok(()); }
-        emit_job(&state, &id, |job| { job.connections = 1; job.speed = 0; job.eta = Some("Retrying sequentially".into()); job.events.insert(0, job_event("Concurrent fragment acquisition failed; retrying sequentially", Some("warning"))); });
+        if !transfer_is_current(&app, &id, generation) {
+            return Ok(());
+        }
+        if matches!(job_state(&app, &id).as_deref(), Some("paused")) {
+            emit_job(&state, &id, |job| {
+                job.connections = 0;
+                job.speed = 0;
+                job.eta = Some("Paused".into());
+                job.events.insert(
+                    0,
+                    job_event("Paused with completed fragments preserved", Some("warning"))
+                );
+            });
+            emit_snapshot(&app, &state);
+            return Ok(());
+        }
+        emit_job(&state, &id, |job| {
+            job.connections = 1;
+            job.speed = 0;
+            job.eta = Some("Retrying sequentially".into());
+            job.events.insert(
+                0,
+                job_event(
+                    "Concurrent fragment acquisition failed; retrying sequentially",
+                    Some("warning")
+                )
+            );
+        });
         emit_snapshot(&app, &state);
         let mut sequential_error = None;
         for (track, index, fragment) in &work {
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
             let segment_path = manifest_segment_path(&segment_dir, *track, *index, track_count);
-            let present = tokio::fs::metadata(&segment_path).await.map(|metadata| metadata.is_file() && metadata.len() > 0).unwrap_or(false);
-            if present { continue; }
+            let present = tokio::fs::metadata(&segment_path)
+                .await
+                .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                .unwrap_or(false);
+            if present {
+                continue;
+            }
             let segment_temp_path = segment_path.with_extension("part.tmp");
-            if let Err(error) = acquire_media_segment(&client, &app, &id, fragment, &segment_path, &segment_temp_path, retry_count.max(1), generation, &completed, &downloaded, started, existing_bytes, total_segments, existing_count, 1).await {
+            if let Err(error) = acquire_media_segment(
+                &client,
+                &app,
+                &id,
+                fragment,
+                &segment_path,
+                &segment_temp_path,
+                retry_count.max(1),
+                generation,
+                &completed,
+                &downloaded,
+                started,
+                existing_bytes,
+                total_segments,
+                existing_count,
+                1
+            )
+            .await
+            {
                 sequential_error = Some(error);
                 break;
             }
         }
         if let Some(error) = sequential_error {
             let error = format!("{initial_error}; sequential fallback failed: {error}");
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.speed = 0; job.events.insert(0, job_event("Media fragment acquisition failed", Some("error"))); });
+            emit_job(&state, &id, |job| {
+                job.state = "failed".into();
+                job.error = Some(error.clone());
+                job.connections = 0;
+                job.speed = 0;
+                job.events.insert(
+                    0,
+                    job_event("Media fragment acquisition failed", Some("error"))
+                );
+            });
             emit_snapshot(&app, &state);
             return Err(error);
         }
     }
-    if !transfer_is_current(&app, &id, generation) { return Ok(()); }
-    if job_state(&app, &id).as_deref() != Some("downloading") {
-        if job_state(&app, &id).as_deref() == Some("paused") { emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); }); emit_snapshot(&app, &state); }
+    if !transfer_is_current(&app, &id, generation) {
         return Ok(());
     }
-    emit_job(&state, &id, |job| { job.state = "finalizing".into(); job.connections = 0; job.events.insert(0, job_event("Assembling ordered media fragments", Some("warning"))); });
+    if job_state(&app, &id).as_deref() != Some("downloading") {
+        if job_state(&app, &id).as_deref() == Some("paused") {
+            emit_job(&state, &id, |job| {
+                job.connections = 0;
+                job.speed = 0;
+                job.eta = Some("Paused".into());
+            });
+            emit_snapshot(&app, &state);
+        }
+        return Ok(());
+    }
+    emit_job(&state, &id, |job| {
+        job.state = "finalizing".into();
+        job.connections = 0;
+        job.events.insert(
+            0,
+            job_event("Assembling ordered media fragments", Some("warning"))
+        );
+    });
     emit_snapshot(&app, &state);
     let mut track_paths = Vec::with_capacity(track_count);
     for (track, length) in track_lengths.iter().enumerate() {
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        let output_path = if track_count == 1 { temp_path.clone() } else { format!("{temp_path}.track-{track:02}") };
-        let mut output = File::create(&output_path).await.map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        let output_path = if track_count == 1 {
+            temp_path.clone()
+        } else {
+            format!("{temp_path}.track-{track:02}")
+        };
+        let mut output = File::create(&output_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
         for index in 0..*length {
             let path = manifest_segment_path(&segment_dir, track, index, track_count);
-            let bytes = tokio::fs::read(&path).await.map_err(|error| error.to_string())?;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-            output.write_all(&bytes).await.map_err(|error| error.to_string())?;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
+            output
+                .write_all(&bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
         }
         drop(output);
         track_paths.push(output_path);
     }
-    if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    let committed = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| (job.provisional != Some(true), job.destination.clone()))
+        })
+        .unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() {
         let final_path = if track_count > 1 {
             let mux_path = format!("{temp_path}.mux.{}", media_extension(&committed.1));
-            mux_media_tracks(&track_paths, &mux_path).await?;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-            mux_path
+            let muxed_path = mux_media_tracks(&track_paths, &mux_path).await?;
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
+            muxed_path
         } else {
             finalize_media(&temp_path, &committed.1).await?;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
             temp_path.clone()
         };
-        if let Some(parent) = PathBuf::from(&committed.1).parent() {
+        let requested_destination = if track_count > 1 {
+            destination_with_output_extension(&committed.1, &final_path)
+        } else {
+            committed.1.clone()
+        };
+        if let Some(parent) = PathBuf::from(&requested_destination).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
-            if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
         }
-        if !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-        let (destination, reserved, reservation) = managed_destination(&committed.1, replace_existing)?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        let (destination, reserved, reservation) =
+            managed_destination(&requested_destination, replace_existing)?;
         if destination != committed.1 || reservation.is_some() {
             let reservation_marker = reservation.clone();
             emit_job(&state, &id, |job| {
                 job.destination = destination.clone();
                 job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != committed.1 { job.name = file_name.to_string(); } }
-                if destination != committed.1 { job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning"))); }
+                if let Some(file_name) = PathBuf::from(&destination)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                {
+                    if destination != committed.1 {
+                        job.name = file_name.to_string();
+                    }
+                }
+                if destination != committed.1 {
+                    job.events.insert(
+                        0,
+                        job_event("Destination renamed to avoid a collision", Some("warning"))
+                    );
+                }
             });
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
-            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
+            if reserved {
+                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+            }
             clear_destination_reservation(&app, &state, &id);
             return Ok(());
         }
-        if let Err(error) = move_completed_file(&final_path, &destination, replace_existing, reservation.as_deref()).await {
+        if let Err(error) = move_completed_file(
+            &final_path,
+            &destination,
+            replace_existing,
+            reservation.as_deref()
+        )
+        .await
+        {
             clear_destination_reservation(&app, &state, &id);
             return Err(error);
         }
@@ -1876,215 +2922,725 @@ async fn acquire_manifest(app: AppHandle, id: String, source: String, body: Stri
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
         cleanup_media_track_files(&temp_path);
     }
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) { return Ok(()); }
-    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event(if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" }, Some("warning"))); } });
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    emit_job(&state, &id, |job| {
+        job.speed = 0;
+        job.connections = 0;
+        if committed.0 {
+            complete_job(job);
+        } else {
+            job.state = "finalizing".into();
+            job.progress = 100.0;
+            job.eta = Some("Ready to save".into());
+            job.events.insert(
+                0,
+                job_event(
+                    if track_count > 1 {
+                        "Tracks assembled; waiting for destination"
+                    } else {
+                        "Fragments assembled; waiting for destination"
+                    },
+                    Some("warning")
+                )
+            );
+        }
+    });
     emit_snapshot(&app, &state);
-    if committed.0 { add_notification(&app, &state, &id, "completed"); }
+    if committed.0 {
+        add_notification(&app, &state, &id, "completed");
+    }
     Ok(())
 }
 
 async fn acquire_once(app: AppHandle, id: String, source: String, generation: u64) -> bool {
     let state = app.state::<CoreState>();
     let client = http_client();
-    let selected_segments = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.selected_segments.clone())).unwrap_or_default();
-    let mut response = match acquisition_request(&client, &app, &id, &source).header(reqwest::header::RANGE, "bytes=0-0").send().await {
+    let selected_segments = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| job.selected_segments.clone())
+        })
+        .unwrap_or_default();
+    let mut response = match acquisition_request(&client, &app, &id, &source)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+    {
         Ok(response) if response.status().is_success() => response,
-        _ => match acquisition_request(&client, &app, &id, &source).send().await {
+        _ => match acquisition_request(&client, &app, &id, &source)
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => response,
             Ok(_response) if _response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {
                 match post_replay_request(&client, &app, &id, &source) {
                     Some(replay) => match replay.send().await {
                         Ok(posted) if posted.status().is_success() => posted,
-                        Ok(posted) => { let retryable = retryable_status(posted.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", posted.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
-                        Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+                        Ok(posted) => {
+                            let retryable = retryable_status(posted.status());
+                            if !transfer_can_continue(&app, &id, generation) {
+                                return false;
+                            }
+                            emit_job(&state, &id, |job| {
+                                job.state = "failed".into();
+                                job.error = Some(format!("Source returned {}", posted.status()));
+                                job.eta = None;
+                                job.events.insert(
+                                    0,
+                                    job_event("Source rejected the acquisition", Some("error"))
+                                );
+                            });
+                            emit_snapshot(&app, &state);
+                            add_notification(&app, &state, &id, "failed");
+                            return retryable;
+                        }
+                        Err(error) => {
+                            if !transfer_can_continue(&app, &id, generation) {
+                                return false;
+                            }
+                            emit_job(&state, &id, |job| {
+                                job.state = "failed".into();
+                                job.error = Some(redact_url_credentials(&error.to_string()));
+                                job.eta = None;
+                                job.events.insert(
+                                    0,
+                                    job_event("Could not connect to source", Some("error"))
+                                );
+                            });
+                            emit_snapshot(&app, &state);
+                            add_notification(&app, &state, &id, "failed");
+                            return true;
+                        }
                     },
-                    None => { let retryable = retryable_status(_response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", _response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
+                    None => {
+                        let retryable = retryable_status(_response.status());
+                        if !transfer_can_continue(&app, &id, generation) {
+                            return false;
+                        }
+                        emit_job(&state, &id, |job| {
+                            job.state = "failed".into();
+                            job.error = Some(format!("Source returned {}", _response.status()));
+                            job.eta = None;
+                            job.events.insert(
+                                0,
+                                job_event("Source rejected the acquisition", Some("error"))
+                            );
+                        });
+                        emit_snapshot(&app, &state);
+                        add_notification(&app, &state, &id, "failed");
+                        return retryable;
+                    }
                 }
             }
-            Ok(response) => { let retryable = retryable_status(response.status()); if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Source returned {}", response.status())); job.eta = None; job.events.insert(0, job_event("Source rejected the acquisition", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return retryable; }
-            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Ok(response) => {
+                let retryable = retryable_status(response.status());
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(format!("Source returned {}", response.status()));
+                    job.eta = None;
+                    job.events.insert(
+                        0,
+                        job_event("Source rejected the acquisition", Some("error"))
+                    );
+                });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+                return retryable;
+            }
+            Err(error) => {
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(redact_url_credentials(&error.to_string()));
+                    job.eta = None;
+                    job.events
+                        .insert(0, job_event("Could not connect to source", Some("error")));
+                });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+                return true;
+            }
         }
     };
-    if !transfer_can_continue(&app, &id, generation) { return false; }
-    let valid_probe = response.status() != reqwest::StatusCode::PARTIAL_CONTENT || content_range(&response).map(|(start, end, total)| start == 0 && end == 0 && total > 0).unwrap_or(false);
+    if !transfer_can_continue(&app, &id, generation) {
+        return false;
+    }
+    let valid_probe = response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        || content_range(&response)
+            .map(|(start, end, total)| start == 0 && end == 0 && total > 0)
+            .unwrap_or(false);
     if !valid_probe {
-        response = match acquisition_request(&client, &app, &id, &source).send().await {
-            Ok(response) if response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT => response,
-            Ok(_response) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("The source returned an invalid partial response".into()); job.eta = None; job.events.insert(0, job_event("Source returned an invalid partial response", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
-            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.eta = None; job.events.insert(0, job_event("Could not connect to source", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+        response = match acquisition_request(&client, &app, &id, &source)
+            .send()
+            .await
+        {
+            Ok(response)
+                if response.status().is_success()
+                    && response.status() != reqwest::StatusCode::PARTIAL_CONTENT =>
+            {
+                response
+            }
+            Ok(_response) => {
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some("The source returned an invalid partial response".into());
+                    job.eta = None;
+                    job.events.insert(
+                        0,
+                        job_event("Source returned an invalid partial response", Some("error"))
+                    );
+                });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+                return false;
+            }
+            Err(error) => {
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(redact_url_credentials(&error.to_string()));
+                    job.eta = None;
+                    job.events
+                        .insert(0, job_event("Could not connect to source", Some("error")));
+                });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+                return true;
+            }
         };
     }
-    if !transfer_can_continue(&app, &id, generation) { return false; }
-    let response_mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string);
+    if !transfer_can_continue(&app, &id, generation) {
+        return false;
+    }
+    let response_mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     if media::is_manifest_source(&source, response_mime.as_deref()) {
-        if !transfer_can_continue(&app, &id, generation) { return false; }
+        if !transfer_can_continue(&app, &id, generation) {
+            return false;
+        }
         let body = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            match acquisition_request(&client, &app, &id, &source).send().await {
-                Ok(full) if full.status().is_success() => full.text().await.map_err(|error| error.to_string()),
+            match acquisition_request(&client, &app, &id, &source)
+                .send()
+                .await
+            {
+                Ok(full) if full.status().is_success() => {
+                    full.text().await.map_err(|error| error.to_string())
+                }
                 Ok(full) => Err(format!("Manifest source returned {}", full.status())),
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err(error.to_string())
             }
         } else {
             response.text().await.map_err(|error| error.to_string())
         };
         let result = match body {
             Ok(body) => {
-                if !transfer_can_continue(&app, &id, generation) { return false; }
-                acquire_manifest(app.clone(), id.clone(), source.clone(), body, response_mime.clone(), selected_segments.clone(), generation).await
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
+                acquire_manifest(
+                    app.clone(),
+                    id.clone(),
+                    source.clone(),
+                    body,
+                    response_mime.clone(),
+                    selected_segments.clone(),
+                    generation
+                )
+                .await
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error)
         };
         if let Err(error) = result {
-            if !transfer_is_current(&app, &id, generation) { return false; }
+            if !transfer_is_current(&app, &id, generation) {
+                return false;
+            }
             if job_state(&app, &id).as_deref() == Some("paused") {
-                emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); });
+                emit_job(&state, &id, |job| {
+                    job.connections = 0;
+                    job.speed = 0;
+                    job.eta = Some("Paused".into());
+                });
                 emit_snapshot(&app, &state);
             } else if job_state(&app, &id).as_deref() != Some("failed") {
-                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.events.insert(0, job_event("Manifest acquisition failed", Some("error"))); });
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(error.clone());
+                    job.connections = 0;
+                    job.events
+                        .insert(0, job_event("Manifest acquisition failed", Some("error")));
+                });
                 emit_snapshot(&app, &state);
                 add_notification(&app, &state, &id, "failed");
             }
         }
         return false;
     }
-    if let Some((start, end, ranged_total)) = content_range(&response) { if response.status() == reqwest::StatusCode::PARTIAL_CONTENT && start == 0 && end == 0 && ranged_total > 1 { if !transfer_can_continue(&app, &id, generation) { return false; } if let Err(error) = acquire_ranges(app.clone(), id.clone(), source.clone(), response, ranged_total, generation).await {
-                if !transfer_is_current(&app, &id, generation) { return false; }
+    if let Some((start, end, ranged_total)) = content_range(&response) {
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && start == 0
+            && end == 0
+            && ranged_total > 1
+        {
+            if !transfer_can_continue(&app, &id, generation) {
+                return false;
+            }
+            if let Err(error) = acquire_ranges(
+                app.clone(),
+                id.clone(),
+                source.clone(),
+                response,
+                ranged_total,
+                generation
+            )
+            .await
+            {
+                if !transfer_is_current(&app, &id, generation) {
+                    return false;
+                }
                 if job_state(&app, &id).as_deref() == Some("paused") {
-                    emit_job(&state, &id, |job| { job.connections = 0; job.speed = 0; job.eta = Some("Paused".into()); });
+                    emit_job(&state, &id, |job| {
+                        job.connections = 0;
+                        job.speed = 0;
+                        job.eta = Some("Paused".into());
+                    });
                     emit_snapshot(&app, &state);
                 } else if job_state(&app, &id).as_deref() != Some("failed") {
-                    emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.connections = 0; job.events.insert(0, job_event("Range acquisition failed", Some("error"))); });
+                    emit_job(&state, &id, |job| {
+                        job.state = "failed".into();
+                        job.error = Some(error.clone());
+                        job.connections = 0;
+                        job.events
+                            .insert(0, job_event("Range acquisition failed", Some("error")));
+                    });
                     emit_snapshot(&app, &state);
                     add_notification(&app, &state, &id, "failed");
                 }
             }
-            return false; } }
+            return false;
+        }
+    }
     let total = response.content_length();
-    let temp_path = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.temp_path.clone()));
-    let Some(temp_path) = temp_path else { return false; };
+    let temp_path = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .map(|job| job.temp_path.clone())
+    });
+    let Some(temp_path) = temp_path else {
+        return false;
+    };
     if let Some(parent) = PathBuf::from(&temp_path).parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            if !transfer_can_continue(&app, &id, generation) { return false; }
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(format!("Could not create the temporary folder: {error}")); job.events.insert(0, job_event("Could not create the temporary folder", Some("error"))); });
+            if !transfer_can_continue(&app, &id, generation) {
+                return false;
+            }
+            emit_job(&state, &id, |job| {
+                job.state = "failed".into();
+                job.error = Some(format!("Could not create the temporary folder: {error}"));
+                job.events.insert(
+                    0,
+                    job_event("Could not create the temporary folder", Some("error"))
+                );
+            });
             emit_snapshot(&app, &state);
             add_notification(&app, &state, &id, "failed");
             return false;
         }
     }
-    if !transfer_can_continue(&app, &id, generation) { return false; }
+    if !transfer_can_continue(&app, &id, generation) {
+        return false;
+    }
     let Ok(mut file) = File::create(&temp_path).await else {
-        if !transfer_can_continue(&app, &id, generation) { return false; }
-        emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some("Could not open the temporary file".into()); job.events.insert(0, job_event("Could not open the temporary file", Some("error"))); });
+        if !transfer_can_continue(&app, &id, generation) {
+            return false;
+        }
+        emit_job(&state, &id, |job| {
+            job.state = "failed".into();
+            job.error = Some("Could not open the temporary file".into());
+            job.events.insert(
+                0,
+                job_event("Could not open the temporary file", Some("error"))
+            );
+        });
         emit_snapshot(&app, &state);
         add_notification(&app, &state, &id, "failed");
         return false;
     };
-    if !transfer_can_continue(&app, &id, generation) { return false; }
-    emit_job(&state, &id, |job| { job.state = "downloading".into(); job.total = total; job.resumable = false; job.connections = 1; job.mode = "single-stream".into(); job.mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string); job.events.insert(0, job_event("First native acquisition is receiving data", Some("success"))); });
+    if !transfer_can_continue(&app, &id, generation) {
+        return false;
+    }
+    emit_job(&state, &id, |job| {
+        job.state = "downloading".into();
+        job.total = total;
+        job.resumable = false;
+        job.connections = 1;
+        job.mode = "single-stream".into();
+        job.mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        job.events.insert(
+            0,
+            job_event(
+                "First native acquisition is receiving data",
+                Some("success")
+            )
+        );
+    });
     emit_snapshot(&app, &state);
     let started = std::time::Instant::now();
     let mut downloaded = 0u64;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        if !transfer_is_downloading(&app, &id, generation) { drop(stream); drop(file); return false; }
+        if !transfer_is_downloading(&app, &id, generation) {
+            drop(stream);
+            drop(file);
+            return false;
+        }
         match chunk {
             Ok(bytes) => {
-                if let Err(error) = file.write_all(&bytes).await { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Could not write temporary data", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return false; }
-                if !transfer_can_continue(&app, &id, generation) { return false; }
+                if let Err(error) = file.write_all(&bytes).await {
+                    if !transfer_can_continue(&app, &id, generation) {
+                        return false;
+                    }
+                    emit_job(&state, &id, |job| {
+                        job.state = "failed".into();
+                        job.error = Some(redact_url_credentials(&error.to_string()));
+                        job.speed = 0;
+                        job.connections = 0;
+                        job.events.insert(
+                            0,
+                            job_event("Could not write temporary data", Some("error"))
+                        );
+                    });
+                    emit_snapshot(&app, &state);
+                    add_notification(&app, &state, &id, "failed");
+                    return false;
+                }
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
                 downloaded += bytes.len() as u64;
                 let speed = (downloaded as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
-                emit_job(&state, &id, |job| { job.downloaded = downloaded; job.speed = speed; job.progress = total.map(|value| downloaded as f64 / value as f64 * 100.0).unwrap_or(0.0); job.eta = total.and_then(|value| if speed > 0 { Some(format!("{}s left", (value.saturating_sub(downloaded) / speed).max(1))) } else { None }); });
+                emit_job(&state, &id, |job| {
+                    job.downloaded = downloaded;
+                    job.speed = speed;
+                    job.progress = total
+                        .map(|value| downloaded as f64 / value as f64 * 100.0)
+                        .unwrap_or(0.0);
+                    job.eta = total.and_then(|value| {
+                        if speed > 0 {
+                            Some(format!(
+                                "{}s left",
+                                (value.saturating_sub(downloaded) / speed).max(1)
+                            ))
+                        } else {
+                            None
+                        }
+                    });
+                });
                 emit_snapshot(&app, &state);
-                if !throttle(&app, &id, bytes.len(), generation).await { drop(stream); drop(file); return false; }
+                if !throttle(&app, &id, bytes.len(), generation).await {
+                    drop(stream);
+                    drop(file);
+                    return false;
+                }
             }
-            Err(error) => { if !transfer_can_continue(&app, &id, generation) { return false; } emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Network stream interrupted", Some("error"))); }); emit_snapshot(&app, &state); add_notification(&app, &state, &id, "failed"); return true; }
+            Err(error) => {
+                if !transfer_can_continue(&app, &id, generation) {
+                    return false;
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(redact_url_credentials(&error.to_string()));
+                    job.speed = 0;
+                    job.connections = 0;
+                    job.events
+                        .insert(0, job_event("Network stream interrupted", Some("error")));
+                });
+                emit_snapshot(&app, &state);
+                add_notification(&app, &state, &id, "failed");
+                return true;
+            }
         }
     }
     drop(file);
-    if !transfer_can_continue(&app, &id, generation) { return false; }
-    let replace_existing = state.snapshot.lock().ok().map(|snapshot| snapshot.settings.collision_behavior == "replace").unwrap_or(false);
-    let committed = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| (job.provisional != Some(true), job.destination.clone()))).unwrap_or((false, String::new()));
+    if !transfer_can_continue(&app, &id, generation) {
+        return false;
+    }
+    let replace_existing = state
+        .snapshot
+        .lock()
+        .ok()
+        .map(|snapshot| snapshot.settings.collision_behavior == "replace")
+        .unwrap_or(false);
+    let committed = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| (job.provisional != Some(true), job.destination.clone()))
+        })
+        .unwrap_or((false, String::new()));
     if committed.0 && !committed.1.is_empty() {
         if let Some(parent) = PathBuf::from(&committed.1).parent() {
             let _ = std::fs::create_dir_all(parent);
-            if !transfer_can_continue(&app, &id, generation) { return false; }
-        }
-        if !transfer_can_continue(&app, &id, generation) { return false; }
-        let (destination, reserved, reservation) = match managed_destination(&committed.1, replace_existing) {
-            Ok(value) => value,
-            Err(error) => {
-                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Could not reserve a unique destination", Some("error"))); });
-                emit_snapshot(&app, &state);
-                add_notification(&app, &state, &id, "failed");
+            if !transfer_can_continue(&app, &id, generation) {
                 return false;
             }
-        };
+        }
+        if !transfer_can_continue(&app, &id, generation) {
+            return false;
+        }
+        let (destination, reserved, reservation) =
+            match managed_destination(&committed.1, replace_existing) {
+                Ok(value) => value,
+                Err(error) => {
+                    emit_job(&state, &id, |job| {
+                        job.state = "failed".into();
+                        job.error = Some(error.clone());
+                        job.events.insert(
+                            0,
+                            job_event("Could not reserve a unique destination", Some("error"))
+                        );
+                    });
+                    emit_snapshot(&app, &state);
+                    add_notification(&app, &state, &id, "failed");
+                    return false;
+                }
+            };
         if destination != committed.1 || reservation.is_some() {
             let reservation_marker = reservation.clone();
             emit_job(&state, &id, |job| {
                 job.destination = destination.clone();
                 job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != committed.1 { job.name = file_name.to_string(); } }
-                if destination != committed.1 { job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning"))); }
+                if let Some(file_name) = PathBuf::from(&destination)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                {
+                    if destination != committed.1 {
+                        job.name = file_name.to_string();
+                    }
+                }
+                if destination != committed.1 {
+                    job.events.insert(
+                        0,
+                        job_event("Destination renamed to avoid a collision", Some("warning"))
+                    );
+                }
             });
             emit_snapshot(&app, &state);
         }
         if !transfer_can_continue(&app, &id, generation) {
-            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
+            if reserved {
+                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+            }
             clear_destination_reservation(&app, &state, &id);
             return false;
         }
-        if let Err(error) = move_completed_file(&temp_path, &destination, replace_existing, reservation.as_deref()).await {
+        if let Err(error) = move_completed_file(
+            &temp_path,
+            &destination,
+            replace_existing,
+            reservation.as_deref()
+        )
+        .await
+        {
             clear_destination_reservation(&app, &state, &id);
-            if !transfer_can_continue(&app, &id, generation) { return false; }
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
+            if !transfer_can_continue(&app, &id, generation) {
+                return false;
+            }
+            emit_job(&state, &id, |job| {
+                job.state = "failed".into();
+                job.error = Some(redact_url_credentials(&error.to_string()));
+                job.events.insert(
+                    0,
+                    job_event("Could not move the completed file", Some("error"))
+                );
+            });
             emit_snapshot(&app, &state);
             add_notification(&app, &state, &id, "failed");
             return false;
         }
         clear_destination_reservation(&app, &state, &id);
     }
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) { return false; }
-    emit_job(&state, &id, |job| { job.speed = 0; job.connections = 0; if committed.0 { complete_job(job); } else { job.state = "finalizing".into(); job.progress = 100.0; job.eta = Some("Ready to save".into()); job.events.insert(0, job_event("Download ready; waiting for destination", Some("warning"))); } });
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
+        return false;
+    }
+    emit_job(&state, &id, |job| {
+        job.speed = 0;
+        job.connections = 0;
+        if committed.0 {
+            complete_job(job);
+        } else {
+            job.state = "finalizing".into();
+            job.progress = 100.0;
+            job.eta = Some("Ready to save".into());
+            job.events.insert(
+                0,
+                job_event("Download ready; waiting for destination", Some("warning"))
+            );
+        }
+    });
     emit_snapshot(&app, &state);
-    if committed.0 { add_notification(&app, &state, &id, "completed"); }
+    if committed.0 {
+        add_notification(&app, &state, &id, "completed");
+    }
     false
 }
 
 async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
-    if !transfer_can_continue(&app, &id, generation) { return; }
+    if !transfer_can_continue(&app, &id, generation) {
+        return;
+    }
     let (automatic, retries) = {
         let state = app.state::<CoreState>();
-        state.snapshot.lock().ok().map(|snapshot| (snapshot.settings.retry_automatically, snapshot.settings.max_retries)).unwrap_or((false, 0))
+        state
+            .snapshot
+            .lock()
+            .ok()
+            .map(|snapshot| {
+                (
+                    snapshot.settings.retry_automatically,
+                    snapshot.settings.max_retries
+                )
+            })
+            .unwrap_or((false, 0))
     };
     for attempt in 0..=retries {
-        if attempt == 0 && !transfer_can_continue(&app, &id, generation) { return; }
+        if attempt == 0 && !transfer_can_continue(&app, &id, generation) {
+            return;
+        }
         if attempt > 0 {
             let state = app.state::<CoreState>();
-            if !transfer_is_current(&app, &id, generation) || job_state(&app, &id).as_deref() != Some("failed") { return; }
-            emit_job(&state, &id, |job| { job.state = "connecting".into(); job.error = None; job.connections = 0; job.events.insert(0, job_event(&format!("Automatic retry {attempt} of {retries}"), Some("warning"))); });
+            if !transfer_is_current(&app, &id, generation)
+                || job_state(&app, &id).as_deref() != Some("failed")
+            {
+                return;
+            }
+            emit_job(&state, &id, |job| {
+                job.state = "connecting".into();
+                job.error = None;
+                job.connections = 0;
+                job.events.insert(
+                    0,
+                    job_event(
+                        &format!("Automatic retry {attempt} of {retries}"),
+                        Some("warning")
+                    )
+                );
+            });
             emit_snapshot(&app, &state);
             sleep(Duration::from_millis((attempt as u64 * 500).min(5000))).await;
-            if !transfer_can_continue(&app, &id, generation) { return; }
+            if !transfer_can_continue(&app, &id, generation) {
+                return;
+            }
         }
         let retryable = acquire_once(app.clone(), id.clone(), source.clone(), generation).await;
-        if !transfer_is_current(&app, &id, generation) || !automatic || !retryable || job_state(&app, &id).as_deref() != Some("failed") || attempt == retries { return; }
+        if !transfer_is_current(&app, &id, generation)
+            || !automatic
+            || !retryable
+            || job_state(&app, &id).as_deref() != Some("failed")
+            || attempt == retries
+        {
+            return;
+        }
     }
 }
 
 #[tauri::command]
-fn get_snapshot(state: State<'_, CoreState>) -> AppSnapshot { state.snapshot.lock().map(|snapshot| snapshot.clone()).unwrap_or_else(|_| AppSnapshot { jobs: vec![], settings: default_settings(), connected: false, aggregate_speed: 0, notifications: vec![] }) }
+fn get_snapshot(state: State<'_, CoreState>) -> AppSnapshot {
+    state
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.clone())
+        .unwrap_or_else(|_| AppSnapshot {
+            jobs: vec![],
+            settings: default_settings(),
+            connected: false,
+            aggregate_speed: 0,
+            notifications: vec![],
+        })
+}
 
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     let path = path.trim();
-    if path.is_empty() { return Err("Path is empty".into()); }
+    if path.is_empty() {
+        return Err("Path is empty".into());
+    }
     #[cfg(windows)]
-    { Command::new("explorer.exe").arg(path).spawn().map(|_| ()).map_err(|error| error.to_string()) }
-    #[cfg(target_os = "macos")]
-    { Command::new("open").arg(path).spawn().map(|_| ()).map_err(|error| error.to_string()) }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    { Command::new("xdg-open").arg(path).spawn().map(|_| ()).map_err(|error| error.to_string()) }
+    {
+        use std::{
+            ffi::{c_void, OsStr},
+            os::windows::ffi::OsStrExt,
+            ptr,
+        };
+        fn wide(value: &OsStr) -> Vec<u16> {
+            value.encode_wide().chain(std::iter::once(0)).collect()
+        }
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut c_void,
+                operation: *const u16,
+                file: *const u16,
+                parameters: *const u16,
+                directory: *const u16,
+                show: i32,
+            ) -> isize;
+        }
+        let operation = wide(OsStr::new("open"));
+        let target = wide(OsStr::new(path));
+        let result = unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+            )
+        };
+        if result > 32 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Windows could not open the path (ShellExecuteW code {result})"
+            ))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Opening paths is only available in the Windows desktop build".into())
+    }
 }
 
 #[tauri::command]
@@ -2097,7 +3653,8 @@ fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
             job.speed = 0;
             job.connections = 0;
             job.eta = Some("Paused".into());
-            job.events.insert(0, job_event("Paused by user", Some("warning")));
+            job.events
+                .insert(0, job_event("Paused by user", Some("warning")));
         }
     });
     emit_snapshot(&app, &state);
@@ -2116,15 +3673,70 @@ fn resume_plan_for_job(provisional: Option<bool>, progress: f64) -> (&'static st
 #[tauri::command]
 fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     let _lifecycle = state.lifecycle.lock().ok();
-    if transfer_is_active(state.inner(), &id) { return; }
-    let Some((source, next_state, should_spawn, connections)) = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str())).map(|job| { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); (job.source.clone(), next_state, should_spawn, connections) })) else { return; };
-    emit_job(&state, &id, |job| { if ["paused", "pending"].contains(&job.state.as_str()) { job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed", Some("success"))); } });
+    if transfer_is_active(state.inner(), &id) {
+        return;
+    }
+    let Some((source, next_state, should_spawn, connections)) =
+        state.snapshot.lock().ok().and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str()))
+                .map(|job| {
+                    let (next_state, should_spawn, connections) =
+                        resume_plan_for_job(job.provisional, job.progress);
+                    (job.source.clone(), next_state, should_spawn, connections)
+                })
+        })
+    else {
+        return;
+    };
+    emit_job(&state, &id, |job| {
+        if ["paused", "pending"].contains(&job.state.as_str()) {
+            job.state = next_state.into();
+            job.connections = connections;
+            job.eta = Some(
+                if should_spawn {
+                    "Resuming"
+                } else {
+                    "Ready to save"
+                }
+                .into(),
+            );
+            job.events.insert(0, job_event("Resumed", Some("success")));
+        }
+    });
     emit_snapshot(&app, &state);
-    if should_spawn && !spawn_transfer(&app, state.inner(), id, source) { return; }
+    if should_spawn && !spawn_transfer(&app, state.inner(), id, source) {
+        return;
+    }
 }
 
 #[tauri::command]
-fn retry_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); if transfer_is_active(state.inner(), &id) { return; } let source = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.source.clone())); emit_job(&state, &id, |job| { job.state = "connecting".into(); job.error = None; job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Retrying source", None)); }); emit_snapshot(&app, &state); if let Some(source) = source { let _ = spawn_transfer(&app, state.inner(), id, source); } }
+fn retry_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    if transfer_is_active(state.inner(), &id) {
+        return;
+    }
+    let source = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .map(|job| job.source.clone())
+    });
+    emit_job(&state, &id, |job| {
+        job.state = "connecting".into();
+        job.error = None;
+        job.speed = 0;
+        job.connections = 0;
+        job.events.insert(0, job_event("Retrying source", None));
+    });
+    emit_snapshot(&app, &state);
+    if let Some(source) = source {
+        let _ = spawn_transfer(&app, state.inner(), id, source);
+    }
+}
 
 #[tauri::command]
 fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
@@ -2142,186 +3754,571 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
 }
 
 #[tauri::command]
-fn cancel_job(app: AppHandle, state: State<'_, CoreState>, id: String) { cancel_job_internal(&app, &state, &id); }
+fn cancel_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+    cancel_job_internal(&app, &state, &id);
+}
 
 #[tauri::command]
-fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let _lifecycle = state.lifecycle.lock().ok(); abort_transfer(state.inner(), &id); let mut temporary = None; let mut track_cleanup = None; if let Ok(mut snapshot) = state.snapshot.lock() { if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id) { track_cleanup = Some(job.temp_path.clone()); if job.state != "completed" { temporary = Some(job.temp_path.clone()); } } snapshot.jobs.retain(|job| job.id != id); } if let Ok(mut buckets) = state.inner().job_bandwidth.lock() { buckets.remove(&id); } if let Some(path) = temporary { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); } if let Some(path) = track_cleanup { cleanup_media_track_files(&path); } emit_snapshot(&app, &state); }
+fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    abort_transfer(state.inner(), &id);
+    let mut temporary = None;
+    let mut track_cleanup = None;
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id) {
+            track_cleanup = Some(job.temp_path.clone());
+            if job.state != "completed" {
+                temporary = Some(job.temp_path.clone());
+            }
+        }
+        snapshot.jobs.retain(|job| job.id != id);
+    }
+    if let Ok(mut buckets) = state.inner().job_bandwidth.lock() {
+        buckets.remove(&id);
+    }
+    if let Some(path) = temporary {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(format!("{path}.segments"));
+    }
+    if let Some(path) = track_cleanup {
+        cleanup_media_track_files(&path);
+    }
+    emit_snapshot(&app, &state);
+}
 
 #[tauri::command]
-fn pause_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(&app, &state); }
-
-#[tauri::command]
-fn resume_all(app: AppHandle, state: State<'_, CoreState>) { let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(&app, &state); for (id, source) in sources { let _ = spawn_transfer(&app, state.inner(), id, source); } }
-
-fn start_provisional(app: AppHandle, state: &CoreState, input: ProvisionalInput, show_window: bool) -> Result<String, String> {
-    let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable")?;
-    let parsed = reqwest::Url::parse(&input.source).map_err(|_| "Use an HTTP or HTTPS URL".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") { return Err("Use an HTTP or HTTPS URL".into()); }
-    if show_window {
-        let target = state.reattach_target.lock().ok().and_then(|mut value| value.take());
-        if let Some(target_id) = target {
-            let accepted = !transfer_is_active(state, &target_id) && state.snapshot.lock().ok().map(|mut snapshot| {
-                let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == target_id && job.provisional != Some(true) && source_compatible(&job.source, &input.source)) else { return false; };
-                job.source = input.source.clone();
-                job.selected_segments = input.selected_segments.clone();
-                job.referrer = input.referrer.clone();
-                job.post_body = input.post_body.clone();
-                job.user_agent = input.user_agent.as_deref().and_then(user_agent_value).map(str::to_string);
-                job.domain = domain(&input.source);
-                job.state = "connecting".into();
-                job.error = None;
+fn pause_all(app: AppHandle, state: State<'_, CoreState>) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    let mut ids = Vec::new();
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        for job in snapshot.jobs.iter_mut() {
+            if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) {
+                ids.push(job.id.clone());
+                job.state = "paused".into();
                 job.speed = 0;
                 job.connections = 0;
-                job.started = Some(now_label());
-                job.events.insert(0, job_event("Source reattached by user", Some("success")));
-                true
-            }).unwrap_or(false);
+                job.eta = Some("Paused".into());
+            }
+        }
+    }
+    for id in ids {
+        abort_transfer(state.inner(), &id);
+    }
+    emit_snapshot(&app, &state);
+}
+
+#[tauri::command]
+fn resume_all(app: AppHandle, state: State<'_, CoreState>) {
+    let _lifecycle = state.lifecycle.lock().ok();
+    let mut sources = Vec::new();
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        for job in snapshot.jobs.iter_mut() {
+            if ["paused", "pending"].contains(&job.state.as_str())
+                && !transfer_is_active(state.inner(), &job.id)
+            {
+                let (next_state, should_spawn, connections) =
+                    resume_plan_for_job(job.provisional, job.progress);
+                job.state = next_state.into();
+                job.connections = connections;
+                job.eta = Some(
+                    if should_spawn {
+                        "Resuming"
+                    } else {
+                        "Ready to save"
+                    }
+                    .into()
+                );
+                if should_spawn {
+                    sources.push((job.id.clone(), job.source.clone()));
+                }
+            }
+        }
+    }
+    emit_snapshot(&app, &state);
+    for (id, source) in sources {
+        let _ = spawn_transfer(&app, state.inner(), id, source);
+    }
+}
+
+fn start_provisional(
+    app: AppHandle,
+    state: &CoreState,
+    input: ProvisionalInput,
+    show_window: bool
+) -> Result<String, String> {
+    let _lifecycle = state
+        .lifecycle
+        .lock()
+        .map_err(|_| "Lifecycle unavailable")?;
+    let parsed =
+        reqwest::Url::parse(&input.source).map_err(|_| "Use an HTTP or HTTPS URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Use an HTTP or HTTPS URL".into());
+    }
+    if show_window {
+        let target = state
+            .reattach_target
+            .lock()
+            .ok()
+            .and_then(|mut value| value.take());
+        if let Some(target_id) = target {
+            let accepted = !transfer_is_active(state, &target_id)
+                && state
+                    .snapshot
+                    .lock()
+                    .ok()
+                    .map(|mut snapshot| {
+                        let Some(job) = snapshot.jobs.iter_mut().find(|job| {
+                            job.id == target_id
+                                && job.provisional != Some(true)
+                                && source_compatible(&job.source, &input.source)
+                        }) else {
+                            return false;
+                        };
+                        job.source = input.source.clone();
+                        job.selected_segments = input.selected_segments.clone();
+                        job.referrer = input.referrer.clone();
+                        job.post_body = input.post_body.clone();
+                        job.user_agent = input
+                            .user_agent
+                            .as_deref()
+                            .and_then(user_agent_value)
+                            .map(str::to_string);
+                        job.domain = domain(&input.source);
+                        job.state = "connecting".into();
+                        job.error = None;
+                        job.speed = 0;
+                        job.connections = 0;
+                        job.started = Some(now_label());
+                        job.events
+                            .insert(0, job_event("Source reattached by user", Some("success")));
+                        true
+                    })
+                    .unwrap_or(false);
             if accepted {
                 emit_snapshot(&app, state);
                 let _ = spawn_transfer(&app, state, target_id.clone(), input.source);
                 return Ok(target_id);
             }
-            if let Ok(mut value) = state.reattach_target.lock() { if value.is_none() { *value = Some(target_id); } }
+            if let Ok(mut value) = state.reattach_target.lock() {
+                if value.is_none() {
+                    *value = Some(target_id);
+                }
+            }
         }
     }
     let id = format!("provisional-{}", Uuid::new_v4());
-    let (name, destination, temp_folder, max_connections) = { let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; let name = input.name.filter(|value| !value.trim().is_empty()).map(|value| safe_filename(&value)).unwrap_or_else(|| source_name(&input.source)); let destination = destination_for_filename(&snapshot.settings.default_folder, &name); let max_connections = clamp_connections(input.max_connections.unwrap_or(snapshot.settings.max_connections)); (name, destination, snapshot.settings.temp_folder.clone(), max_connections) };
-    let job = DownloadJob { id: id.clone(), name, source: input.source.clone(), domain: domain(&input.source), kind: if input.media.unwrap_or(false) { "video".into() } else { "document".into() }, state: "connecting".into(), progress: 0.0, downloaded: 0, total: None, speed: 0, eta: Some("Connecting…".into()), connections: 0, max_connections, bandwidth_limit: input.bandwidth_limit, mode: "single-stream".into(), media: input.media.unwrap_or(false), media_details: None, media_tracks: None, destination, temp_path: Path::new(&temp_folder).join(format!("{id}.part")).to_string_lossy().into_owned(), resumable: false, mime: None, error: None, created: now_label(), started: Some(now_label()), completed: None, provisional: Some(true), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: input.selected_segments, referrer: input.referrer, post_body: input.post_body, user_agent: input.user_agent.as_deref().and_then(user_agent_value).map(str::to_string), events: vec![job_event("Provisional acquisition created", None)] };
-    { let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?; snapshot.jobs.insert(0, job); }
+    let (name, destination, temp_folder, max_connections) = {
+        let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
+        let name = input
+            .name
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| safe_filename(&value))
+            .unwrap_or_else(|| source_name(&input.source));
+        let destination = destination_for_filename(&snapshot.settings.default_folder, &name);
+        let max_connections = clamp_connections(
+            input
+                .max_connections
+                .unwrap_or(snapshot.settings.max_connections)
+        );
+        (
+            name,
+            destination,
+            snapshot.settings.temp_folder.clone(),
+            max_connections
+        )
+    };
+    let job = DownloadJob {
+        id: id.clone(),
+        name,
+        source: input.source.clone(),
+        domain: domain(&input.source),
+        kind: if input.media.unwrap_or(false) {
+            "video".into()
+        } else {
+            "document".into()
+        },
+        state: "connecting".into(),
+        progress: 0.0,
+        downloaded: 0,
+        total: None,
+        speed: 0,
+        eta: Some("Connecting…".into()),
+        connections: 0,
+        max_connections,
+        bandwidth_limit: input.bandwidth_limit,
+        mode: "single-stream".into(),
+        media: input.media.unwrap_or(false),
+        media_details: None,
+        media_tracks: None,
+        destination,
+        temp_path: Path::new(&temp_folder)
+            .join(format!("{id}.part"))
+            .to_string_lossy()
+            .into_owned(),
+        resumable: false,
+        mime: None,
+        error: None,
+        created: now_label(),
+        started: Some(now_label()),
+        completed: None,
+        provisional: Some(true),
+        segments: None,
+        completed_ranges: vec![],
+        resource_identity: None,
+        destination_reservation: None,
+        selected_segments: input.selected_segments,
+        referrer: input.referrer,
+        post_body: input.post_body,
+        user_agent: input
+            .user_agent
+            .as_deref()
+            .and_then(user_agent_value)
+            .map(str::to_string),
+        events: vec![job_event("Provisional acquisition created", None)]
+    };
+    {
+        let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
+        snapshot.jobs.insert(0, job);
+    }
     emit_snapshot(&app, state);
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
     if show_window {
         let label = format!("add-{}", id);
         let url = format!("index.html?window=add&id={id}");
-        if let Ok(window) = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into())).title("Add Download").inner_size(410.0, 560.0).resizable(false).decorations(false).center().build() {
-            let close_handle = app.clone();
-            let close_id = id.clone();
-            let close_window = window.clone();
-            window.on_window_event(move |event| {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let state = close_handle.state::<CoreState>();
-                    let is_provisional = state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == close_id).map(|job| job.provisional == Some(true))).unwrap_or(false);
-                    if is_provisional { cancel_job_internal(&close_handle, &state, &close_id); }
-                    let _ = close_window.destroy();
-                }
-            });
+        let mut add_window = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into()))
+            .title("Add Download")
+            .inner_size(410.0, 560.0)
+            .resizable(false)
+            .decorations(false)
+            .center();
+        #[cfg(windows)]
+        {
+            add_window = add_window.data_directory(app_data_root().join("webview"));
+        }
+        match add_window.build() {
+            Ok(window) => {
+                let close_handle = app.clone();
+                let close_id = id.clone();
+                let close_window = window.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let state = close_handle.state::<CoreState>();
+                        let is_provisional = state
+                            .snapshot
+                            .lock()
+                            .ok()
+                            .and_then(|snapshot| {
+                                snapshot
+                                    .jobs
+                                    .iter()
+                                    .find(|job| job.id == close_id)
+                                    .map(|job| job.provisional == Some(true))
+                            })
+                            .unwrap_or(false);
+                        if is_provisional {
+                            cancel_job_internal(&close_handle, &state, &close_id);
+                        }
+                        let _ = close_window.destroy();
+                    }
+                });
+            }
+            Err(error) => {
+                drop(_lifecycle);
+                cancel_job_internal(&app, state, &id);
+                return Err(format!("Could not open Add Download window: {error}"));
+            }
         }
     }
     Ok(id)
 }
 
 #[tauri::command]
-fn create_provisional(app: AppHandle, state: State<'_, CoreState>, input: ProvisionalInput) -> Result<String, String> {
+fn create_provisional(
+    app: AppHandle,
+    state: State<'_, CoreState>,
+    input: ProvisionalInput,
+) -> Result<String, String> {
     start_provisional(app, state.inner(), input, false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommitDecision { Accept, WaitForIdle, Reject }
-
-fn commit_is_ready(provisional: Option<bool>, state: Option<&str>, progress: f64, transfer_active: bool) -> bool {
-    provisional == Some(true) && !transfer_active && state == Some("finalizing") && progress >= 100.0
+enum CommitDecision {
+    Accept,
+    WaitForIdle,
+    Reject,
 }
 
-fn commit_decision(provisional: Option<bool>, state: Option<&str>, progress: f64, transfer_active: bool) -> CommitDecision {
-    if provisional != Some(true) || state.is_none() || state == Some("failed") { return CommitDecision::Reject; }
-    if progress >= 100.0 && !matches!(state, Some("downloading") | Some("finalizing")) { return CommitDecision::Reject; }
-    let ready = matches!(state, Some("downloading") | Some("finalizing")) && (state == Some("finalizing") || progress >= 100.0);
-    if ready && transfer_active { return CommitDecision::WaitForIdle; }
+fn commit_is_ready(
+    provisional: Option<bool>,
+    state: Option<&str>,
+    progress: f64,
+    transfer_active: bool,
+) -> bool {
+    provisional == Some(true)
+        && !transfer_active
+        && state == Some("finalizing")
+        && progress >= 100.0
+}
+
+fn commit_decision(
+    provisional: Option<bool>,
+    state: Option<&str>,
+    progress: f64,
+    transfer_active: bool,
+) -> CommitDecision {
+    if provisional != Some(true) || state.is_none() || state == Some("failed") {
+        return CommitDecision::Reject;
+    }
+    if progress >= 100.0 && !matches!(state, Some("downloading") | Some("finalizing")) {
+        return CommitDecision::Reject;
+    }
+    let ready = matches!(state, Some("downloading") | Some("finalizing"))
+        && (state == Some("finalizing") || progress >= 100.0);
+    if ready && transfer_active {
+        return CommitDecision::WaitForIdle;
+    }
     CommitDecision::Accept
 }
 
 fn commit_still_owned(state: &CoreState, id: &str) -> bool {
-    state.snapshot.lock().ok().and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0)).unwrap_or(false)
+    state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot.jobs.iter().find(|job| job.id == id).map(|job| {
+                job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0
+            })
+        })
+        .unwrap_or(false)
 }
 
 async fn commit_wait_for_transfer_idle(state: &CoreState, id: &str) -> bool {
     for _ in 0..300 {
-        if !transfer_is_active(state, id) { return true; }
+        if !transfer_is_active(state, id) {
+            return true;
+        }
         sleep(Duration::from_millis(10)).await;
     }
     false
 }
 
 #[tauri::command]
-async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: String, input: CommitInput) -> Result<(), String> {
+async fn commit_provisional(
+    app: AppHandle,
+    state: State<'_, CoreState>,
+    id: String,
+    input: CommitInput
+) -> Result<(), String> {
     let (decision, ready_at_start) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
-        let job = snapshot.jobs.iter().find(|job| job.id == id).ok_or_else(|| "Acquisition no longer exists".to_string())?;
+        let job = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .ok_or_else(|| "Acquisition no longer exists".to_string())?;
         let active = transfer_is_active(state.inner(), &id);
         let ready = job.state == "finalizing" || job.progress >= 100.0;
-        (commit_decision(job.provisional, Some(job.state.as_str()), job.progress, active), ready)
+        (
+            commit_decision(
+                job.provisional,
+                Some(job.state.as_str()),
+                job.progress,
+                active
+            ),
+            ready
+        )
     };
-    if decision == CommitDecision::Reject { return Err("Acquisition is no longer available for commit".into()); }
+    if decision == CommitDecision::Reject {
+        return Err("Acquisition is no longer available for commit".into());
+    }
     if decision == CommitDecision::WaitForIdle {
         if !commit_wait_for_transfer_idle(state.inner(), &id).await {
-            let still_exists = state.snapshot.lock().ok().map(|snapshot| snapshot.jobs.iter().any(|job| job.id == id)).unwrap_or(false);
-            return Err(if still_exists { "Timed out waiting for the active acquisition to finish" } else { "Acquisition was cancelled before it became ready" }.into());
+            let still_exists = state
+                .snapshot
+                .lock()
+                .ok()
+                .map(|snapshot| snapshot.jobs.iter().any(|job| job.id == id))
+                .unwrap_or(false);
+            return Err(if still_exists {
+                "Timed out waiting for the active acquisition to finish"
+            } else {
+                "Acquisition was cancelled before it became ready"
+            }
+            .into());
         }
     }
     let accepted = {
-        let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable")?;
+        let _lifecycle = state
+            .lifecycle
+            .lock()
+            .map_err(|_| "Lifecycle unavailable")?;
         let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let collision = snapshot.settings.collision_behavior.clone();
         let active = transfer_is_active(state.inner(), &id);
-        let job = snapshot.jobs.iter_mut().find(|job| job.id == id).ok_or_else(|| "Acquisition was cancelled before it could be committed".to_string())?;
-        let decision = commit_decision(job.provisional, Some(job.state.as_str()), job.progress, active);
-        if ready_at_start && (decision != CommitDecision::Accept || !commit_is_ready(job.provisional, Some(job.state.as_str()), job.progress, active)) {
+        let job = snapshot
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == id)
+            .ok_or_else(|| "Acquisition was cancelled before it could be committed".to_string())?;
+        let decision = commit_decision(
+            job.provisional,
+            Some(job.state.as_str()),
+            job.progress,
+            active
+        );
+        if ready_at_start
+            && (decision != CommitDecision::Accept
+                || !commit_is_ready(
+                    job.provisional,
+                    Some(job.state.as_str()),
+                    job.progress,
+                    active
+                ))
+        {
             return Err("Acquisition is no longer ready to save".into());
         }
-        if decision == CommitDecision::Reject { return Err("Acquisition is no longer available for commit".into()); }
-        let name = if input.name.trim().is_empty() { job.name.clone() } else { safe_filename(&input.name) };
-        let requested_destination = if input.destination.trim().is_empty() { job.destination.clone() } else { input.destination.trim().to_string() };
+        if decision == CommitDecision::Reject {
+            return Err("Acquisition is no longer available for commit".into());
+        }
+        let name = if input.name.trim().is_empty() {
+            job.name.clone()
+        } else {
+            safe_filename(&input.name)
+        };
+        let requested_destination = if input.destination.trim().is_empty() {
+            job.destination.clone()
+        } else {
+            input.destination.trim().to_string()
+        };
         job.name = name;
         job.destination = collision_destination(&requested_destination, &collision);
         if job.destination != requested_destination {
             // Keep the row title coherent with the actual file on disk.
-            if let Some(file_name) = PathBuf::from(&job.destination).file_name().and_then(|value| value.to_str()) { job.name = file_name.to_string(); }
-            job.events.insert(0, job_event("Destination renamed to avoid an existing file", Some("warning")));
+            if let Some(file_name) = PathBuf::from(&job.destination)
+                .file_name()
+                .and_then(|value| value.to_str())
+            {
+                job.name = file_name.to_string();
+            }
+            job.events.insert(
+                0,
+                job_event(
+                    "Destination renamed to avoid an existing file",
+                    Some("warning")
+                )
+            );
         }
-        if let Some(max_connections) = input.max_connections { job.max_connections = clamp_connections(max_connections); }
+        if let Some(max_connections) = input.max_connections {
+            job.max_connections = clamp_connections(max_connections);
+        }
         // None (absent) = keep the existing cap; Some(None) (explicit null)
         // = clear back to the global setting; Some(n) = set.
-        if let Some(cap) = input.bandwidth_limit { job.bandwidth_limit = cap.filter(|value| *value > 0); }
+        if let Some(cap) = input.bandwidth_limit {
+            job.bandwidth_limit = cap.filter(|value| *value > 0);
+        }
         job.provisional = Some(false);
         // Keep the acquisition mode's verified resumability. Single-stream
         // fallback is intentionally non-resumable until range resume exists.
-        job.events.insert(0, job_event("Accepted as managed download", Some("success")));
-        (ready_at_start, job.temp_path.clone(), job.destination.clone(), collision == "replace", job.mode == "segments", job.media_tracks.unwrap_or(1))
+        job.events.insert(
+            0,
+            job_event("Accepted as managed download", Some("success"))
+        );
+        (
+            ready_at_start,
+            job.temp_path.clone(),
+            job.destination.clone(),
+            collision == "replace",
+            job.mode == "segments",
+            job.media_tracks.unwrap_or(1)
+        )
     };
     emit_snapshot(&app, &state);
-    if !accepted.0 { return Ok(()); }
+    if !accepted.0 {
+        return Ok(());
+    }
     if !commit_still_owned(state.inner(), &id) {
         emit_snapshot(&app, &state);
         return Err("Acquisition was paused or cancelled before finalization".into());
     }
     let final_path = if accepted.4 && accepted.5 > 1 {
-        let track_paths = (0..accepted.5 as usize).map(|track| format!("{}.track-{track:02}", accepted.1)).collect::<Vec<_>>();
+        let track_paths = (0..accepted.5 as usize)
+            .map(|track| format!("{}.track-{track:02}", accepted.1))
+            .collect::<Vec<_>>();
         let mux_path = format!("{}.mux.{}", accepted.1, media_extension(&accepted.2));
-        if let Err(error) = mux_media_tracks(&track_paths, &mux_path).await {
-            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Media finalization failed; downloaded parts were preserved", Some("error"))); });
-            emit_snapshot(&app, &state);
-            return Err(error);
-        }
-        if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
-        mux_path
-    } else {
-        if accepted.4 {
-            if let Err(error) = finalize_media(&accepted.1, &accepted.2).await {
-                if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
-                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Media finalization failed; downloaded parts were preserved", Some("error"))); });
+        let muxed_path = match mux_media_tracks(&track_paths, &mux_path).await {
+            Ok(path) => path,
+            Err(error) => {
+                if !commit_still_owned(state.inner(), &id) {
+                    emit_snapshot(&app, &state);
+                    return Err("Acquisition was paused or cancelled during finalization".into());
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(error.clone());
+                    job.events.insert(
+                        0,
+                        job_event(
+                            "Media finalization failed; downloaded parts were preserved",
+                            Some("error")
+                        )
+                    );
+                });
                 emit_snapshot(&app, &state);
                 return Err(error);
             }
-            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during finalization".into()); }
+        };
+        if !commit_still_owned(state.inner(), &id) {
+            emit_snapshot(&app, &state);
+            return Err("Acquisition was paused or cancelled during finalization".into());
+        }
+        muxed_path
+    } else {
+        if accepted.4 {
+            if let Err(error) = finalize_media(&accepted.1, &accepted.2).await {
+                if !commit_still_owned(state.inner(), &id) {
+                    emit_snapshot(&app, &state);
+                    return Err("Acquisition was paused or cancelled during finalization".into());
+                }
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(error.clone());
+                    job.events.insert(
+                        0,
+                        job_event(
+                            "Media finalization failed; downloaded parts were preserved",
+                            Some("error")
+                        )
+                    );
+                });
+                emit_snapshot(&app, &state);
+                return Err(error);
+            }
+            if !commit_still_owned(state.inner(), &id) {
+                emit_snapshot(&app, &state);
+                return Err("Acquisition was paused or cancelled during finalization".into());
+            }
         }
         accepted.1.clone()
     };
-    if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
-    let mut destination = accepted.2.clone();
-    if let Some(parent) = PathBuf::from(&destination).parent() { let _ = std::fs::create_dir_all(parent); }
-    if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before the file move".into()); }
+    if !commit_still_owned(state.inner(), &id) {
+        emit_snapshot(&app, &state);
+        return Err("Acquisition was paused or cancelled before the file move".into());
+    }
+    let mut destination = if accepted.4 && accepted.5 > 1 {
+        destination_with_output_extension(&accepted.2, &final_path)
+    } else {
+        accepted.2.clone()
+    };
+    if let Some(parent) = PathBuf::from(&destination).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !commit_still_owned(state.inner(), &id) {
+        emit_snapshot(&app, &state);
+        return Err("Acquisition was paused or cancelled before the file move".into());
+    }
     let (reserved, reservation) = if accepted.3 {
         (false, None)
     } else {
@@ -2331,7 +4328,14 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
                 (true, Some(marker))
             }
             Err(error) => {
-                emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(error.clone()); job.events.insert(0, job_event("Could not reserve a unique destination", Some("error"))); });
+                emit_job(&state, &id, |job| {
+                    job.state = "failed".into();
+                    job.error = Some(error.clone());
+                    job.events.insert(
+                        0,
+                        job_event("Could not reserve a unique destination", Some("error"))
+                    );
+                });
                 emit_snapshot(&app, &state);
                 return Err(error);
             }
@@ -2342,30 +4346,78 @@ async fn commit_provisional(app: AppHandle, state: State<'_, CoreState>, id: Str
         emit_job(&state, &id, |job| {
             job.destination = destination.clone();
             job.destination_reservation = reservation_marker;
-            if let Some(file_name) = PathBuf::from(&destination).file_name().and_then(|value| value.to_str()) { if destination != accepted.2 { job.name = file_name.to_string(); } }
-            if destination != accepted.2 { job.events.insert(0, job_event("Destination renamed to avoid a concurrent collision", Some("warning"))); }
+            if let Some(file_name) = PathBuf::from(&destination)
+                .file_name()
+                .and_then(|value| value.to_str())
+            {
+                if destination != accepted.2 {
+                    job.name = file_name.to_string();
+                }
+            }
+            if destination != accepted.2 {
+                job.events.insert(
+                    0,
+                    job_event(
+                        "Destination renamed to avoid a concurrent collision",
+                        Some("warning")
+                    )
+                );
+            }
         });
         emit_snapshot(&app, &state);
     }
     if !commit_still_owned(state.inner(), &id) {
-        if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
+        if reserved {
+            cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+        }
         clear_destination_reservation(&app, &state, &id);
         emit_snapshot(&app, &state);
         return Err("Acquisition was paused or cancelled before the file move".into());
     }
-    match move_completed_file(&final_path, &destination, accepted.3, reservation.as_deref()).await {
+    match move_completed_file(
+        &final_path,
+        &destination,
+        accepted.3,
+        reservation.as_deref()
+    )
+    .await
+    {
         Ok(()) => {
-            if accepted.4 { let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1)); }
+            if accepted.4 {
+                let _ = std::fs::remove_dir_all(format!("{}.segments", accepted.1));
+            }
             cleanup_media_track_files(&accepted.1);
             let mut completed = false;
-            emit_job(&state, &id, |job| { if job.provisional == Some(false) && job.progress >= 100.0 { job.destination_reservation = None; complete_job(job); job.eta = None; completed = true; } });
-            if !completed { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled before completion".into()); }
+            emit_job(&state, &id, |job| {
+                if job.provisional == Some(false) && job.progress >= 100.0 {
+                    job.destination_reservation = None;
+                    complete_job(job);
+                    job.eta = None;
+                    completed = true;
+                }
+            });
+            if !completed {
+                emit_snapshot(&app, &state);
+                return Err("Acquisition was paused or cancelled before completion".into());
+            }
             add_notification(&app, &state, &id, "completed");
         }
         Err(error) => {
-            if reserved { cleanup_reserved_destination(&destination, reservation.as_deref()).await; }
-            if !commit_still_owned(state.inner(), &id) { emit_snapshot(&app, &state); return Err("Acquisition was paused or cancelled during the file move".into()); }
-            emit_job(&state, &id, |job| { job.state = "failed".into(); job.error = Some(redact_url_credentials(&error.to_string())); job.events.insert(0, job_event("Could not move the completed file", Some("error"))); });
+            if reserved {
+                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+            }
+            if !commit_still_owned(state.inner(), &id) {
+                emit_snapshot(&app, &state);
+                return Err("Acquisition was paused or cancelled during the file move".into());
+            }
+            emit_job(&state, &id, |job| {
+                job.state = "failed".into();
+                job.error = Some(redact_url_credentials(&error.to_string()));
+                job.events.insert(
+                    0,
+                    job_event("Could not move the completed file", Some("error"))
+                );
+            });
             emit_snapshot(&app, &state);
             return Err(error.to_string());
         }
@@ -2395,40 +4447,142 @@ fn update_settings_snapshot(state: &CoreState, patch: &Value) -> Result<Option<(
 }
 
 #[tauri::command]
-fn update_settings(app: AppHandle, state: State<'_, CoreState>, patch: Value) -> Result<(), String> {
-    let Some((intercept_downloads, show_media_buttons, start_at_sign_in)) = update_settings_snapshot(state.inner(), &patch)? else { return Ok(()); };
-    write_browser_policy(&browser_policy_root(), &settings_policy(&state.snapshot.lock().map_err(|_| "State unavailable".to_string())?.settings));
+fn update_settings(
+    app: AppHandle,
+    state: State<'_, CoreState>,
+    patch: Value,
+) -> Result<(), String> {
+    let Some((intercept_downloads, show_media_buttons, start_at_sign_in)) =
+        update_settings_snapshot(state.inner(), &patch)?
+    else {
+        return Ok(());
+    };
+    write_browser_policy(
+        &browser_policy_root(),
+        &settings_policy(
+            &state
+                .snapshot
+                .lock()
+                .map_err(|_| "State unavailable".to_string())?
+                .settings,
+        ),
+    );
     sync_tray_checks(&app, intercept_downloads, show_media_buttons);
-    sync_startup(start_at_sign_in);
+    startup::sync(start_at_sign_in)?;
     emit_snapshot_event(&app, &state)
 }
 
 #[tauri::command]
-fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) { let exists = state.snapshot.lock().ok().map(|snapshot| snapshot.jobs.iter().any(|job| job.id == id && job.provisional != Some(true))).unwrap_or(false); if exists { if let Ok(mut target) = state.reattach_target.lock() { *target = Some(id.clone()); } emit_job(&state, &id, |job| { job.state = "pending".into(); job.eta = Some("Waiting for renewed source".into()); job.events.insert(0, job_event("Waiting for a renewed browser source", Some("warning"))); }); emit_snapshot(&app, &state); } }
+fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+    let exists = state
+        .snapshot
+        .lock()
+        .ok()
+        .map(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .any(|job| job.id == id && job.provisional != Some(true))
+        })
+        .unwrap_or(false);
+    if exists {
+        if let Ok(mut target) = state.reattach_target.lock() {
+            *target = Some(id.clone());
+        }
+        emit_job(&state, &id, |job| {
+            job.state = "pending".into();
+            job.eta = Some("Waiting for renewed source".into());
+            job.events.insert(
+                0,
+                job_event("Waiting for a renewed browser source", Some("warning"))
+            );
+        });
+        emit_snapshot(&app, &state);
+    }
+}
 
 fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
     let message_type = message.get("type").and_then(Value::as_str)?;
-    if !matches!(message_type, "capture-acquisition" | "media-capture") { return None; }
+    if !matches!(message_type, "capture-acquisition" | "media-capture") {
+        return None;
+    }
     let payload = message.get("payload").unwrap_or(&message);
-    let source = payload.get("source").or_else(|| payload.get("url")).and_then(Value::as_str)?.trim().to_string();
+    let source = payload
+        .get("source")
+        .or_else(|| payload.get("url"))
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
     let parsed = reqwest::Url::parse(&source).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") { return None; }
-    let name = payload.get("name").and_then(Value::as_str).map(str::to_string);
-    let media = message_type == "media-capture" || payload.get("media").and_then(Value::as_bool).unwrap_or(false);
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let media = message_type == "media-capture"
+        || payload
+            .get("media")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     // Bytes/sec; absent, zero, or non-numeric means no per-job cap.
-    let bandwidth_limit = payload.get("bandwidthLimit").and_then(Value::as_u64).filter(|value| *value > 0);
-    let selected_segments = payload.get("selectedSegments").and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).filter_map(|value| { let parsed = reqwest::Url::parse(value).ok()?; matches!(parsed.scheme(), "http" | "https").then(|| value.to_string()) }).take(8).collect()).unwrap_or_default();
+    let bandwidth_limit = payload
+        .get("bandwidthLimit")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
+    let selected_segments = payload
+        .get("selectedSegments")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|value| {
+                    let parsed = reqwest::Url::parse(value).ok()?;
+                    matches!(parsed.scheme(), "http" | "https").then(|| value.to_string())
+                })
+                .take(8)
+                .collect()
+        })
+        .unwrap_or_default();
     // Request-context replay (SPEC §5.1/§16): the extension forwards the
     // capture page as `referrer` (ordinary-capture and media-capture send
     // `pageUrl`; the downloads-API fallback sends the item referrer).
     // Accept explicit `referrer` first, then `pageUrl`; keep only HTTP(S).
-    let referrer = payload.get("referrer").or_else(|| payload.get("pageUrl")).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).and_then(|value| reqwest::Url::parse(value).ok()).filter(|parsed| matches!(parsed.scheme(), "http" | "https")).map(|parsed| parsed.to_string());
+    let referrer = payload
+        .get("referrer")
+        .or_else(|| payload.get("pageUrl"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .filter(|parsed| matches!(parsed.scheme(), "http" | "https"))
+        .map(|parsed| parsed.to_string());
     // POST replay (SPEC §5.1 method/body): keep a small urlencoded body only.
     // Multipart, raw, empty, and oversized bodies fall back to a safe GET.
     const POST_BODY_MAX: usize = 64 * 1024;
-    let post_body = payload.get("postBody").and_then(Value::as_str).filter(|value| !value.is_empty() && value.len() <= POST_BODY_MAX).map(str::to_string);
-    let user_agent = payload.get("userAgent").and_then(Value::as_str).and_then(user_agent_value).map(str::to_string);
-    Some(ProvisionalInput { source, name, media: Some(media), max_connections: None, bandwidth_limit, selected_segments, referrer, post_body, user_agent })
+    let post_body = payload
+        .get("postBody")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= POST_BODY_MAX)
+        .map(str::to_string);
+    let user_agent = payload
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .and_then(user_agent_value)
+        .map(str::to_string);
+    Some(ProvisionalInput {
+        source,
+        name,
+        media: Some(media),
+        max_connections: None,
+        bandwidth_limit,
+        selected_segments,
+        referrer,
+        post_body,
+        user_agent
+    })
 }
 
 fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {
@@ -2462,43 +4616,106 @@ fn spawn_commit(app: AppHandle, id: String, input: CommitInput) {
     });
 }
 
-fn native_host() {
-    let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout().lock();
-    loop {
-        let mut length = [0u8; 4];
-        if input.read_exact(&mut length).is_err() { break; }
-        let size = u32::from_le_bytes(length) as usize;
-        if size == 0 || size > 1024 * 1024 { break; }
-        let mut bytes = vec![0u8; size];
-        if input.read_exact(&mut bytes).is_err() { break; }
-        let message = match serde_json::from_slice::<Value>(&bytes) { Ok(message) => message, Err(_) => { write_native_response(&mut output, json!({ "ok": false, "error": "invalid message" })); continue; } };
-        let message_type = message.get("type").and_then(Value::as_str);
-        if message_type == Some("get-policy") {
-            let policy = load_browser_policy(&browser_policy_root()).unwrap_or((true, true, Vec::new()));
-            write_native_response(&mut output, json!({ "ok": true, "policy": browser_policy_value(&policy) }));
-            continue;
+fn bridge_json(status: u16, value: Value) -> ipc::Response {
+    let body = if status == 204 {
+        Vec::new()
+    } else {
+        serde_json::to_vec(&value).unwrap_or_else(|_| {
+            b"{\"ok\":false,\"error\":\"response serialization failed\"}".to_vec()
+        })
+    };
+    ipc::Response::new(status, body)
+}
+
+fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
+    if request.method == "OPTIONS" {
+        return bridge_json(204, json!({}));
+    }
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/v1/health") => bridge_json(200, json!({ "ok": true })),
+        ("GET", "/v1/policy") => {
+            let policy = load_browser_policy(&browser_policy_root()).unwrap_or_else(|| {
+                app.state::<CoreState>()
+                    .snapshot
+                    .lock()
+                    .map(|snapshot| settings_policy(&snapshot.settings))
+                    .unwrap_or((true, true, Vec::new()))
+            });
+            bridge_json(
+                200,
+                json!({ "ok": true, "policy": browser_policy_value(&policy) })
+            )
         }
-        if message_type == Some("update-policy") {
-            let Some(policy) = browser_policy_from_value(&message) else { write_native_response(&mut output, json!({ "ok": false, "error": "invalid policy" })); continue; };
-            write_browser_policy(&browser_policy_root(), &policy);
-            let forwarded = std::env::current_exe().ok().and_then(|executable| serde_json::to_string(&message).ok().and_then(|raw| Command::new(executable).arg("--policy").arg(raw).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok())).is_some();
-            write_native_response(&mut output, json!({ "ok": forwarded }));
-            continue;
+        ("POST", "/v1/policy") => {
+            let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
+                return bridge_json(400, json!({ "ok": false, "error": "invalid policy" }));
+            };
+            let Some(policy) = browser_policy_from_value(&message) else {
+                return bridge_json(400, json!({ "ok": false, "error": "invalid policy" }));
+            };
+            let state = app.state::<CoreState>();
+            apply_browser_policy(&app, state.inner(), policy.clone());
+            bridge_json(
+                200,
+                json!({ "ok": true, "policy": browser_policy_value(&policy) })
+            )
         }
-        if !matches!(message_type, Some("open-manager") | Some("capture-acquisition") | Some("media-capture")) { write_native_response(&mut output, json!({ "ok": false, "error": "unsupported message" })); continue; }
-        if matches!(message_type, Some("capture-acquisition") | Some("media-capture")) && provisional_input_from_message(&message).is_none() { write_native_response(&mut output, json!({ "ok": false, "error": "invalid acquisition" })); continue; }
-        let forwarded = std::env::current_exe().ok().and_then(|executable| serde_json::to_string(&message).ok().and_then(|raw| Command::new(executable).arg("--capture").arg(raw).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok())).is_some();
-        write_native_response(&mut output, json!({ "ok": forwarded }));
+        ("POST", "/v1/capture") => {
+            let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
+                return bridge_json(400, json!({ "ok": false, "error": "invalid acquisition" }));
+            };
+            let Some(input) = provisional_input_from_message(&message) else {
+                return bridge_json(400, json!({ "ok": false, "error": "invalid acquisition" }));
+            };
+            let state = app.state::<CoreState>();
+            match start_provisional(app.clone(), state.inner(), input, true) {
+                Ok(id) => bridge_json(200, json!({ "ok": true, "id": id })),
+                Err(error) => bridge_json(500, json!({ "ok": false, "error": error }))
+            }
+        }
+        ("POST", "/v1/manager") => {
+            let Some(window) = app.get_webview_window("main") else {
+                return bridge_json(
+                    500,
+                    json!({ "ok": false, "error": "manager window unavailable" })
+                );
+            };
+            if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+                return bridge_json(500, json!({ "ok": false, "error": error.to_string() }));
+            }
+            bridge_json(200, json!({ "ok": true }))
+        }
+        _ => bridge_json(404, json!({ "ok": false, "error": "unknown bridge route" }))
     }
 }
 
-fn write_native_response(output: &mut impl Write, message: Value) {
-    if let Ok(bytes) = serde_json::to_vec(&message) {
-        let _ = output.write_all(&(bytes.len() as u32).to_le_bytes());
-        let _ = output.write_all(&bytes);
-        let _ = output.flush();
-    }
+fn start_bridge(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(ipc::BRIDGE_ADDR).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("Local browser bridge unavailable: {error}");
+                return;
+            }
+        };
+        let handler = move |request| {
+            let app = app.clone();
+            async move { bridge_request(app, request) }
+        };
+        if let Err(error) = ipc::serve(listener, handler).await {
+            eprintln!("Local browser bridge stopped: {error}");
+        }
+    });
+}
+
+fn background_launch(args: &[String]) -> bool {
+    args.iter().any(|value| {
+        matches!(
+            value.as_str(),
+            "--startup" | "--capture" | "--policy" | "--commit"
+        )
+    })
 }
 
 fn tray_image() -> Image<'static> {
@@ -2512,7 +4729,13 @@ fn tray_image() -> Image<'static> {
             if distance <= 225 {
                 pixels[index..index + 4].copy_from_slice(&[8, 120, 237, 255]);
             }
-            if (x == 15 || x == 16) && (y >= 8 && y <= 20) || (y >= 19 && y <= 21 && x >= 11 && x <= 20 && (x as i32 - 16).abs() <= (y as i32 - 19)) {
+            if (x == 15 || x == 16) && (y >= 8 && y <= 20)
+                || (y >= 19
+                    && y <= 21
+                    && x >= 11
+                    && x <= 20
+                    && (x as i32 - 16).abs() <= (y as i32 - 19))
+            {
                 pixels[index..index + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
         }
@@ -2551,53 +4774,238 @@ fn sync_tray_checks(app: &tauri::AppHandle, intercept_downloads: bool, show_medi
     }
 }
 
-fn install_tray(app: &tauri::AppHandle, intercept_downloads: bool, show_media_buttons: bool) -> tauri::Result<()> {
-    let open_manager = MenuItemBuilder::with_id("open-manager", "Open Download Manager").build(app)?;
+fn install_tray(
+    app: &tauri::AppHandle,
+    intercept_downloads: bool,
+    show_media_buttons: bool,
+) -> tauri::Result<()> {
+    let open_manager =
+        MenuItemBuilder::with_id("open-manager", "Open Download Manager").build(app)?;
     let pause_all = MenuItemBuilder::with_id("pause-all", "Pause All").build(app)?;
     let resume_all = MenuItemBuilder::with_id("resume-all", "Resume All").build(app)?;
-    let browser_integration = CheckMenuItemBuilder::with_id("browser-integration", "Browser Integration").checked(intercept_downloads).build(app)?;
-    let media_buttons = CheckMenuItemBuilder::with_id("media-buttons", "Media Buttons").checked(show_media_buttons).build(app)?;
+    let browser_integration =
+        CheckMenuItemBuilder::with_id("browser-integration", "Browser Integration")
+            .checked(intercept_downloads)
+            .build(app)?;
+    let media_buttons = CheckMenuItemBuilder::with_id("media-buttons", "Media Buttons")
+        .checked(show_media_buttons)
+        .build(app)?;
     let bandwidth = MenuItemBuilder::with_id("bandwidth", "Set Bandwidth Limit").build(app)?;
     let exit = MenuItemBuilder::with_id("exit-manager", "Exit Manager").build(app)?;
-    let menu = MenuBuilder::new(app).items(&[&open_manager, &pause_all, &resume_all]).separator().items(&[&browser_integration, &media_buttons, &bandwidth]).separator().item(&exit).build()?;
-    TrayIconBuilder::with_id("main-tray").icon(tray_image()).menu(&menu).tooltip("Download Manager").on_menu_event(|app, event| {
-        let id = event.id().as_ref();
-        match id {
-            "open-manager" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }
-            "pause-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut ids = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) { ids.push(job.id.clone()); job.state = "paused".into(); job.speed = 0; job.connections = 0; job.eta = Some("Paused".into()); job.events.insert(0, job_event("Paused from the system tray", Some("warning"))); } } } for id in ids { abort_transfer(state.inner(), &id); } emit_snapshot(app, &state); }
-            "resume-all" => { let state = app.state::<CoreState>(); let _lifecycle = state.lifecycle.lock().ok(); let mut sources = Vec::new(); if let Ok(mut snapshot) = state.snapshot.lock() { for job in snapshot.jobs.iter_mut() { if ["paused", "pending"].contains(&job.state.as_str()) && !transfer_is_active(state.inner(), &job.id) { let (next_state, should_spawn, connections) = resume_plan_for_job(job.provisional, job.progress); job.state = next_state.into(); job.connections = connections; job.eta = Some(if should_spawn { "Resuming" } else { "Ready to save" }.into()); job.events.insert(0, job_event("Resumed from the system tray", Some("success"))); if should_spawn { sources.push((job.id.clone(), job.source.clone())); } } } } emit_snapshot(app, &state); for (id, source) in sources { let _ = spawn_transfer(app, state.inner(), id, source); } }
-            "browser-integration" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { let next = tray_toggle_next((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons), "browser-integration"); snapshot.settings.intercept_downloads = next.0; snapshot.settings.show_media_buttons = next.1; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some(next) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
-            "media-buttons" => { let state = app.state::<CoreState>(); let checks = if let Ok(mut snapshot) = state.snapshot.lock() { let next = tray_toggle_next((snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons), "media-buttons"); snapshot.settings.intercept_downloads = next.0; snapshot.settings.show_media_buttons = next.1; write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings)); Some(next) } else { None }; if let Some((intercept, media)) = checks { sync_tray_checks(app, intercept, media); } emit_snapshot(app, &state); }
-            "bandwidth" => { if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); let _ = window.eval("window.location.href = window.location.pathname + '?settings=network'"); } }
-            "exit-manager" => app.exit(0),
-            _ => {}
-        }
-    }).build(app)?;
+    let menu = MenuBuilder::new(app)
+        .items(&[&open_manager, &pause_all, &resume_all])
+        .separator()
+        .items(&[&browser_integration, &media_buttons, &bandwidth])
+        .separator()
+        .item(&exit)
+        .build()?;
+    TrayIconBuilder::with_id("main-tray")
+        .icon(tray_image())
+        .menu(&menu)
+        .tooltip("Download Manager")
+        .on_menu_event(|app, event| {
+            let id = event.id().as_ref();
+            match id {
+                "open-manager" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                "pause-all" => {
+                    let state = app.state::<CoreState>();
+                    let _lifecycle = state.lifecycle.lock().ok();
+                    let mut ids = Vec::new();
+                    if let Ok(mut snapshot) = state.snapshot.lock() {
+                        for job in snapshot.jobs.iter_mut() {
+                            if ["downloading", "connecting", "finalizing"]
+                                .contains(&job.state.as_str())
+                            {
+                                ids.push(job.id.clone());
+                                job.state = "paused".into();
+                                job.speed = 0;
+                                job.connections = 0;
+                                job.eta = Some("Paused".into());
+                                job.events.insert(
+                                    0,
+                                    job_event("Paused from the system tray", Some("warning")),
+                                );
+                            }
+                        }
+                    }
+                    for id in ids {
+                        abort_transfer(state.inner(), &id);
+                    }
+                    emit_snapshot(app, &state);
+                }
+                "resume-all" => {
+                    let state = app.state::<CoreState>();
+                    let _lifecycle = state.lifecycle.lock().ok();
+                    let mut sources = Vec::new();
+                    if let Ok(mut snapshot) = state.snapshot.lock() {
+                        for job in snapshot.jobs.iter_mut() {
+                            if ["paused", "pending"].contains(&job.state.as_str())
+                                && !transfer_is_active(state.inner(), &job.id)
+                            {
+                                let (next_state, should_spawn, connections) =
+                                    resume_plan_for_job(job.provisional, job.progress);
+                                job.state = next_state.into();
+                                job.connections = connections;
+                                job.eta = Some(
+                                    if should_spawn {
+                                        "Resuming"
+                                    } else {
+                                        "Ready to save"
+                                    }
+                                    .into(),
+                                );
+                                job.events.insert(
+                                    0,
+                                    job_event("Resumed from the system tray", Some("success")),
+                                );
+                                if should_spawn {
+                                    sources.push((job.id.clone(), job.source.clone()));
+                                }
+                            }
+                        }
+                    }
+                    emit_snapshot(app, &state);
+                    for (id, source) in sources {
+                        let _ = spawn_transfer(app, state.inner(), id, source);
+                    }
+                }
+                "browser-integration" => {
+                    let state = app.state::<CoreState>();
+                    let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
+                        let next = tray_toggle_next(
+                            (
+                                snapshot.settings.intercept_downloads,
+                                snapshot.settings.show_media_buttons,
+                            ),
+                            "browser-integration",
+                        );
+                        snapshot.settings.intercept_downloads = next.0;
+                        snapshot.settings.show_media_buttons = next.1;
+                        write_browser_policy(
+                            &browser_policy_root(),
+                            &settings_policy(&snapshot.settings),
+                        );
+                        Some(next)
+                    } else {
+                        None
+                    };
+                    if let Some((intercept, media)) = checks {
+                        sync_tray_checks(app, intercept, media);
+                    }
+                    emit_snapshot(app, &state);
+                }
+                "media-buttons" => {
+                    let state = app.state::<CoreState>();
+                    let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
+                        let next = tray_toggle_next(
+                            (
+                                snapshot.settings.intercept_downloads,
+                                snapshot.settings.show_media_buttons,
+                            ),
+                            "media-buttons",
+                        );
+                        snapshot.settings.intercept_downloads = next.0;
+                        snapshot.settings.show_media_buttons = next.1;
+                        write_browser_policy(
+                            &browser_policy_root(),
+                            &settings_policy(&snapshot.settings),
+                        );
+                        Some(next)
+                    } else {
+                        None
+                    };
+                    if let Some((intercept, media)) = checks {
+                        sync_tray_checks(app, intercept, media);
+                    }
+                    emit_snapshot(app, &state);
+                }
+                "bandwidth" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        let _ = window.eval(
+                            "window.location.href = window.location.pathname + '?settings=network'",
+                        );
+                    }
+                }
+                "exit-manager" => app.exit(0),
+                _ => {}
+            }
+        })
+        .build(app)?;
     {
         let state = app.state::<CoreState>();
-        if let Ok(mut checks) = state.tray_checks.lock() { *checks = Some((browser_integration.clone(), media_buttons.clone())); };
+        if let Ok(mut checks) = state.tray_checks.lock() {
+            *checks = Some((browser_integration.clone(), media_buttons.clone()));
+        };
     }
     Ok(())
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|value| value == "--native-host") { native_host(); return; }
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| { if let Some(policy) = policy_from_args(&argv) { let state = app.state::<CoreState>(); apply_browser_policy(app, state.inner(), policy); } else if let Some((id, input)) = commit_from_args(&argv) { spawn_commit(app.clone(), id, input); } else if let Some(input) = capture_input_from_args(&argv) { if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); } let state = app.state::<CoreState>(); let _ = start_provisional(app.clone(), state.inner(), input, true); } else if let Some(window) = app.get_webview_window("main") { let _ = window.show(); let _ = window.set_focus(); } }))
-        .plugin(tauri_plugin_notification::init())
+    configure_portable_webview2();
+    let builder =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(policy) = policy_from_args(&argv) {
+                let state = app.state::<CoreState>();
+                apply_browser_policy(app, state.inner(), policy);
+            } else if let Some((id, input)) = commit_from_args(&argv) {
+                spawn_commit(app.clone(), id, input);
+            } else if let Some(input) = capture_input_from_args(&argv) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                let state = app.state::<CoreState>();
+                let _ = start_provisional(app.clone(), state.inner(), input, true);
+            } else if argv.iter().any(|value| value == "--startup") {
+                let show_manager = app
+                    .state::<CoreState>()
+                    .snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.settings.show_manager_at_sign_in)
+                    .unwrap_or(true);
+                if show_manager {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            } else if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+    #[cfg(not(windows))]
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    builder
         .setup(|app| {
+            let launch_args = std::env::args().collect::<Vec<_>>();
+            let launch_in_background = background_launch(&launch_args);
             let root = app_data_root();
-            std::fs::create_dir_all(&root).ok();
-            register_native_host(&root);
+            std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
             restrict_data_dir(&root);
+            let main_config = app.config().app.windows.iter().find(|window| window.label == "main").ok_or_else(|| "Main window configuration is missing".to_string())?;
+            let mut main_window = WebviewWindowBuilder::from_config(app.handle(), main_config).map_err(|error| error.to_string())?;
+            if launch_in_background {
+                main_window = main_window.visible(false);
+            }
+            #[cfg(windows)]
+            {
+                main_window = main_window.data_directory(app_data_root().join("webview"));
+            }
+            main_window.build().map_err(|error| error.to_string())?;
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             restrict_file(&root.join("download-manager.db"));
             database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
             let mut settings = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0)).ok().map(|payload| settings_from_stored(&payload)).unwrap_or_else(default_settings);
             if let Some(policy) = load_browser_policy(&root) { settings.intercept_downloads = policy.0; settings.show_media_buttons = policy.1; settings.excluded_sites = policy.2; } else { write_browser_policy(&root, &settings_policy(&settings)); }
             let show_manager_at_startup = settings.show_manager_at_sign_in;
-            sync_startup(settings.start_at_sign_in);
+            if let Err(error) = startup::sync(settings.start_at_sign_in) { eprintln!("Startup registration unavailable: {error}"); }
             let initial_snapshot = snapshot_from_database(&database, settings);
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
@@ -2605,6 +5013,7 @@ fn main() {
             app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
+            start_bridge(app.handle());
             if let Some(window) = app.get_webview_window("main") {
                 let close_handle = app.handle().clone();
                 window.on_window_event(move |event| {
@@ -2614,19 +5023,21 @@ fn main() {
                     }
                 });
             }
-            if let Some(policy) = policy_from_args(&std::env::args().collect::<Vec<_>>()) {
+            if let Some(policy) = policy_from_args(&launch_args) {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let state = app.state::<CoreState>();
                 apply_browser_policy(app.handle(), state.inner(), policy);
-            } else if let Some((id, input)) = commit_from_args(&std::env::args().collect::<Vec<_>>()) {
+            } else if let Some((id, input)) = commit_from_args(&launch_args) {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 spawn_commit(app.handle().clone(), id, input);
-            } else if let Some(input) = capture_input_from_args(&std::env::args().collect::<Vec<_>>()) {
+            } else if let Some(input) = capture_input_from_args(&launch_args) {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let state = app.state::<CoreState>();
                 let _ = start_provisional(app.handle().clone(), state.inner(), input, true);
-            } else if std::env::args().any(|value| value == "--startup") && !show_manager_at_startup {
+            } else if launch_args.iter().any(|value| value == "--startup") && !show_manager_at_startup {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
+            } else if launch_args.iter().any(|value| value == "--startup") {
+                if let Some(window) = app.get_webview_window("main") { let _ = window.show(); }
             }
             for (id, source) in recovered { let _ = spawn_transfer(app.handle(), app.state::<CoreState>().inner(), id, source); }
             Ok(())
@@ -2636,15 +5047,48 @@ fn main() {
         .expect("error while running Download Manager");
 }
 
+fn configure_portable_webview2() {
+    #[cfg(windows)]
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let runtime = parent.join("webview2");
+            if runtime.join("msedgewebview2.exe").is_file() {
+                std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", runtime);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod capture_tests {
-    use super::{browser_policy_from_value, browser_policy_value, capture_input_from_args, cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job, provisional_input_from_message, redact_url_credentials, referer_value, restrict_data_dir, restrict_file, source_compatible, tray_status_text, tray_toggle_next, DownloadJob, ProvisionalInput};
+    use super::{
+        browser_policy_from_value, browser_policy_value, capture_input_from_args,
+        cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job,
+        provisional_input_from_message, redact_url_credentials, referer_value, restrict_data_dir,
+        restrict_file, source_compatible, tray_status_text, tray_toggle_next, DownloadJob,
+        ProvisionalInput,
+    };
     use serde_json::json;
 
     #[test]
-    fn native_host_registration_includes_chrome_for_testing() {
-        let browsers = super::native_host_browser_directories();
-        assert!(browsers.contains(&"google-chrome-for-testing"));
+    fn special_launches_start_hidden_but_normal_launches_do_not() {
+        assert!(super::background_launch(&[
+            "download-manager".into(),
+            "--startup".into()
+        ]));
+        assert!(super::background_launch(&[
+            "download-manager".into(),
+            "--capture".into()
+        ]));
+        assert!(super::background_launch(&[
+            "download-manager".into(),
+            "--policy".into()
+        ]));
+        assert!(super::background_launch(&[
+            "download-manager".into(),
+            "--commit".into()
+        ]));
+        assert!(!super::background_launch(&["download-manager".into()]));
     }
 
     #[test]
@@ -2677,16 +5121,24 @@ mod capture_tests {
 
     #[test]
     fn cleanup_orphaned_track_sweep_is_bounded_and_preserves_active_job_tracks() {
-        let root = std::env::temp_dir().join(format!("dm-orphan-track-cleanup-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("dm-orphan-track-cleanup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let stale = root.join("provisional-stale.part");
         let active = root.join("provisional-active.part");
         std::fs::write(format!("{}.track-00", stale.display()), b"stale-video").unwrap();
         std::fs::write(format!("{}.track-01", stale.display()), b"stale-audio").unwrap();
         std::fs::write(format!("{}.track-00", active.display()), b"active-video").unwrap();
-        std::fs::write(root.join("provisional-stale.part.track-xx"), b"not-a-track-index").unwrap();
+        std::fs::write(
+            root.join("provisional-stale.part.track-xx"),
+            b"not-a-track-index",
+        )
+        .unwrap();
         std::fs::write(root.join("job.part.track-00"), b"unrelated").unwrap();
-        cleanup_orphaned_media_track_files(root.to_str().unwrap(), &[active.to_string_lossy().into_owned()]);
+        cleanup_orphaned_media_track_files(
+            root.to_str().unwrap(),
+            &[active.to_string_lossy().into_owned()],
+        );
         assert!(!root.join("provisional-stale.part.track-00").exists());
         assert!(!root.join("provisional-stale.part.track-01").exists());
         assert!(root.join("provisional-active.part.track-00").exists());
@@ -2699,9 +5151,18 @@ mod capture_tests {
     fn tray_tooltip_reports_idle_and_live_state() {
         assert_eq!(tray_status_text(0, 0), "Download Manager — idle");
         assert_eq!(tray_status_text(0, 99999), "Download Manager — idle");
-        assert_eq!(tray_status_text(1, 0), "Download Manager — 1 active download · 0 B/s");
-        assert_eq!(tray_status_text(2, 1536), "Download Manager — 2 active downloads · 1 KB/s");
-        assert_eq!(tray_status_text(3, 5 * 1024 * 1024), "Download Manager — 3 active downloads · 5.0 MB/s");
+        assert_eq!(
+            tray_status_text(1, 0),
+            "Download Manager — 1 active download · 0 B/s"
+        );
+        assert_eq!(
+            tray_status_text(2, 1536),
+            "Download Manager — 2 active downloads · 1 KB/s"
+        );
+        assert_eq!(
+            tray_status_text(3, 5 * 1024 * 1024),
+            "Download Manager — 3 active downloads · 5.0 MB/s"
+        );
     }
 
     #[test]
@@ -2711,9 +5172,19 @@ mod capture_tests {
         let input = provisional_input_from_message(&message).expect("cap accepted");
         assert_eq!(input.bandwidth_limit, Some(524288));
         let plain = serde_json::json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin" } });
-        assert_eq!(provisional_input_from_message(&plain).expect("plain").bandwidth_limit, None);
+        assert_eq!(
+            provisional_input_from_message(&plain)
+                .expect("plain")
+                .bandwidth_limit,
+            None
+        );
         let bad = serde_json::json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin", "bandwidthLimit": "fast" } });
-        assert_eq!(provisional_input_from_message(&bad).expect("bad cap").bandwidth_limit, None);
+        assert_eq!(
+            provisional_input_from_message(&bad)
+                .expect("bad cap")
+                .bandwidth_limit,
+            None
+        );
     }
 
     #[test]
@@ -2722,10 +5193,19 @@ mod capture_tests {
         assert_eq!(effective_rate(None, None), None);
         assert_eq!(effective_rate(Some(1_000_000.0), None), Some(1_000_000.0));
         assert_eq!(effective_rate(None, Some(500_000.0)), Some(500_000.0));
-        assert_eq!(effective_rate(Some(1_000_000.0), Some(500_000.0)), Some(500_000.0));
-        assert_eq!(effective_rate(Some(500_000.0), Some(1_000_000.0)), Some(500_000.0));
+        assert_eq!(
+            effective_rate(Some(1_000_000.0), Some(500_000.0)),
+            Some(500_000.0)
+        );
+        assert_eq!(
+            effective_rate(Some(500_000.0), Some(1_000_000.0)),
+            Some(500_000.0)
+        );
         assert_eq!(effective_rate(Some(0.0), Some(500_000.0)), Some(500_000.0));
-        assert_eq!(effective_rate(Some(1_000_000.0), Some(0.0)), Some(1_000_000.0));
+        assert_eq!(
+            effective_rate(Some(1_000_000.0), Some(0.0)),
+            Some(1_000_000.0)
+        );
     }
 
     #[test]
@@ -2755,19 +5235,31 @@ mod capture_tests {
     fn selected_dash_segments_are_limited_to_http_urls() {
         let message = json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/manifest.mpd", "selectedSegments": ["https://cdn.example.test/vod/one.m4v", "blob:https://cdn.example.test/no", "file:///tmp/no", "http://cdn.example.test/two.m4a"] } });
         let input = provisional_input_from_message(&message).expect("valid media capture");
-        assert_eq!(input.selected_segments, ["https://cdn.example.test/vod/one.m4v", "http://cdn.example.test/two.m4a"]);
+        assert_eq!(
+            input.selected_segments,
+            [
+                "https://cdn.example.test/vod/one.m4v",
+                "http://cdn.example.test/two.m4a"
+            ]
+        );
     }
 
     #[test]
     fn capture_rejects_non_http_wrong_type_and_missing_source() {
         assert!(provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "ftp://cdn.example.test/file.zip" } })).is_none());
         assert!(provisional_input_from_message(&json!({ "type": "open-manager" })).is_none());
-        assert!(provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": {} })).is_none());
-        assert!(provisional_input_from_message(&json!({ "type": "media-capture", "payload": { "source": "blob:https://x.test/abc" } })).is_none());
+        assert!(provisional_input_from_message(
+            &json!({ "type": "capture-acquisition", "payload": {} })
+        )
+        .is_none());
+        assert!(provisional_input_from_message(
+            &json!({ "type": "media-capture", "payload": { "source": "blob:https://x.test/abc" } })
+        )
+        .is_none());
     }
 
     #[test]
-    fn capture_args_parse_forwards_native_host_payload() {
+    fn capture_args_parse_forwards_bridge_payload() {
         let raw = serde_json::to_string(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:8901/range.bin", "name": "range.bin" } })).unwrap();
         let args = vec!["download-manager".to_string(), "--capture".to_string(), raw];
         let input = capture_input_from_args(&args).expect("args capture");
@@ -2778,9 +5270,15 @@ mod capture_tests {
     #[test]
     fn capture_referrer_prefers_explicit_key_then_page_url() {
         let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin", "pageUrl": "http://127.0.0.1:9/page.html" } })).expect("pageUrl fallback");
-        assert_eq!(input.referrer.as_deref(), Some("http://127.0.0.1:9/page.html"));
+        assert_eq!(
+            input.referrer.as_deref(),
+            Some("http://127.0.0.1:9/page.html")
+        );
         let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin", "pageUrl": "http://127.0.0.1:9/page.html", "referrer": "http://127.0.0.1:9/other.html" } })).expect("explicit key");
-        assert_eq!(input.referrer.as_deref(), Some("http://127.0.0.1:9/other.html"));
+        assert_eq!(
+            input.referrer.as_deref(),
+            Some("http://127.0.0.1:9/other.html")
+        );
         let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin", "pageUrl": "not a url" } })).expect("bad pageUrl tolerated");
         assert_eq!(input.referrer, None);
         let input = provisional_input_from_message(&json!({ "type": "capture-acquisition", "payload": { "source": "http://127.0.0.1:9/f.bin" } })).expect("missing referrer tolerated");
@@ -2945,7 +5443,14 @@ mod capture_tests {
         let patched = apply_settings_patch(&default_settings(), &serde_json::json!({"maxConnections": 4, "bandwidthLimit": 1048576}));
         state.snapshot.lock().unwrap().settings = patched;
         save_snapshot(&state).expect("settings snapshot persistence");
-        let payload: String = state.database.lock().unwrap().query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
+        let payload: String = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row("SELECT payload FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         let rebooted = settings_from_stored(&payload);
         assert_eq!(rebooted.max_connections, 4);
         assert_eq!(rebooted.bandwidth_limit, Some(1048576));
@@ -2998,17 +5503,6 @@ mod capture_tests {
         assert!(!commit_is_ready(Some(true), Some("failed"), 100.0, false));
         assert!(!commit_is_ready(None, None, 0.0, false));
         assert!(!commit_is_ready(Some(true), Some("finalizing"), 100.0, true));
-    }
-
-    #[test]
-    fn failed_remux_names_ffmpeg_exit_status() {
-        use super::ffmpeg_remux_failure;
-        use std::os::unix::process::ExitStatusExt;
-        let failed = std::process::ExitStatus::from_raw(1 << 8);
-        let message = ffmpeg_remux_failure(&failed);
-        assert!(message.contains("ffmpeg exit 1"), "{message}");
-        assert!(message.contains("parts were preserved"), "{message}");
-        assert!(super::ffmpeg_missing_failure().contains("FFmpeg is required"));
     }
     #[test]
     fn settings_patch_rejects_blank_folders() {
@@ -3069,6 +5563,21 @@ mod capture_tests {
         assert!(move_needs_fallback(&std::io::Error::from_raw_os_error(18)));
         assert!(move_needs_fallback(&std::io::Error::from_raw_os_error(183)));
         assert!(!move_needs_fallback(&std::io::Error::from_raw_os_error(13)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relocates_segment_directory_with_nested_parts() {
+        use super::relocate_temp_artifact;
+        let root = std::env::temp_dir().join(format!("download-manager-segments-{}", uuid::Uuid::new_v4()));
+        let source = root.join("old.part.segments");
+        let destination = root.join("new.part.segments");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested").join("segment-1"), b"segment").unwrap();
+        assert!(relocate_temp_artifact(&source, &destination));
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination.join("nested").join("segment-1")).unwrap(), b"segment");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3196,8 +5705,16 @@ mod capture_tests {
         assert_eq!(safe_filename("../escape.bin"), "escape.bin");
         assert_eq!(safe_filename(r"C:\\Users\\kaz\\escape.bin"), "escape.bin");
         assert_eq!(safe_filename("  report.pdf  "), "report.pdf");
+        assert_eq!(safe_filename("bad:name?.bin"), "bad_name_.bin");
+        #[cfg(windows)]
+        assert_eq!(safe_filename("CON.txt"), "_CON.txt");
         assert_eq!(safe_filename("../"), "download.bin");
-        assert_eq!(destination_for_filename("/downloads", "../../outside.bin"), "/downloads/outside.bin");
+        assert_eq!(
+            destination_for_filename("/downloads", "../../outside.bin"),
+            std::path::Path::new("/downloads")
+                .join("outside.bin")
+                .to_string_lossy()
+        );
     }
 
     fn ranges(pairs: &[(u64, u64)]) -> Vec<super::ByteRange> {
@@ -3301,7 +5818,11 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         assert!(error.contains("settings locked"), "unexpected settings error: {error}");
         assert_eq!(state.snapshot.lock().unwrap().settings.max_connections, before.settings.max_connections);
         let database = state.database.lock().unwrap();
-        let stored: String = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
+        let stored: String = database
+            .query_row("SELECT payload FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(stored, "old-settings");
     }
 
@@ -3311,44 +5832,47 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         use rusqlite::Connection;
         use std::sync::Mutex;
 
-        let job = |id: &str| serde_json::from_value(serde_json::json!({
-            "id": id,
-            "name": "file.bin",
-            "source": "http://127.0.0.1:9/file.bin",
-            "domain": "127.0.0.1",
-            "kind": "document",
-            "state": "downloading",
-            "progress": 0.0,
-            "downloaded": 0,
-            "total": 1,
-            "speed": 0,
-            "eta": null,
-            "connections": 1,
-            "maxConnections": 1,
-            "bandwidthLimit": null,
-            "mode": "single-stream",
-            "media": false,
-            "mediaDetails": null,
-            "mediaTracks": null,
-            "destination": "/tmp/file.bin",
-            "tempPath": "/tmp/file.part",
-            "resumable": false,
-            "mime": null,
-            "error": null,
-            "created": "now",
-            "started": null,
-            "completed": null,
-            "provisional": false,
-            "segments": null,
-            "completedRanges": [],
-            "resourceIdentity": null,
-            "destinationReservation": null,
-            "selectedSegments": [],
-            "referrer": null,
-            "postBody": null,
-            "userAgent": null,
-            "events": [{"at": "now", "message": "test", "tone": null}]
-        })).unwrap();
+        let job = |id: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "name": "file.bin",
+                "source": "http://127.0.0.1:9/file.bin",
+                "domain": "127.0.0.1",
+                "kind": "document",
+                "state": "downloading",
+                "progress": 0.0,
+                "downloaded": 0,
+                "total": 1,
+                "speed": 0,
+                "eta": null,
+                "connections": 1,
+                "maxConnections": 1,
+                "bandwidthLimit": null,
+                "mode": "single-stream",
+                "media": false,
+                "mediaDetails": null,
+                "mediaTracks": null,
+                "destination": "/tmp/file.bin",
+                "tempPath": "/tmp/file.part",
+                "resumable": false,
+                "mime": null,
+                "error": null,
+                "created": "now",
+                "started": null,
+                "completed": null,
+                "provisional": false,
+                "segments": null,
+                "completedRanges": [],
+                "resourceIdentity": null,
+                "destinationReservation": null,
+                "selectedSegments": [],
+                "referrer": null,
+                "postBody": null,
+                "userAgent": null,
+                "events": [{"at": "now", "message": "test", "tone": null}]
+            }))
+            .unwrap()
+        };
 
         let database = Connection::open_in_memory().unwrap();
         database.execute_batch("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
@@ -3368,9 +5892,17 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         let error = save_snapshot(&state).expect_err("duplicate job ids must fail snapshot persistence");
         assert!(error.contains("same-id"), "unexpected persistence error: {error}");
         let database = state.database.lock().unwrap();
-        let payload: String = database.query_row("SELECT payload FROM jobs WHERE id = 'old-job'", [], |row| row.get(0)).unwrap();
+        let payload: String = database
+            .query_row("SELECT payload FROM jobs WHERE id = 'old-job'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(payload, "old-payload");
-        let settings: String = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get(0)).unwrap();
+        let settings: String = database
+            .query_row("SELECT payload FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(settings, "old-settings");
         let count: i64 = database.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);

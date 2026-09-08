@@ -4,17 +4,20 @@
 //! title/body/icon/sound only; its action types are mobile-only (official
 //! docs: "The Actions API is only available on mobile platforms"). The
 //! action-capable path therefore lives here: on Linux via `notify-rust`
-//! (the same crate the plugin itself uses for desktop delivery), everywhere
-//! else via the plain plugin builder until the Windows delivery pass wires
-//! native WinRT actions.
+//! (the same crate the plugin itself uses for desktop delivery), and on
+//! Windows via its unpackaged-app fallback. Other platforms keep the plain
+//! plugin builder.
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
+#[cfg(any(target_os = "linux", windows))]
+use tauri::{Emitter, Manager};
 
 /// (action id, button label) pairs for a job toast. Pure: unit-covered.
+#[cfg(any(target_os = "linux", windows, test))]
 pub fn actions_for(kind: &str) -> Vec<(&'static str, &'static str)> {
     match kind {
         "completed" => vec![("open", "Open"), ("folder", "Show in folder")],
-        _ => vec![("details", "View details")],
+        _ => vec![("details", "View details")]
     }
 }
 
@@ -26,9 +29,9 @@ pub fn show_job_notification(
     app: &AppHandle,
     title: &str,
     body: &str,
-    kind: &str,
-    job_id: &str,
-    destination: &str,
+    _kind: &str,
+    _job_id: &str,
+    _destination: &str
 ) {
     #[cfg(target_os = "linux")]
     {
@@ -36,20 +39,51 @@ pub fn show_job_notification(
             app.clone(),
             title.to_string(),
             body.to_string(),
-            kind.to_string(),
-            job_id.to_string(),
-            destination.to_string(),
+            _kind.to_string(),
+            _job_id.to_string(),
+            _destination.to_string()
         );
         return;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        // Plain toast until the Windows delivery pass wires native actions.
-        // The in-app notification center already carries Open / Show in
-        // folder / View details there.
+        show_windows(app, title, body, _kind, _job_id, _destination);
+        return;
+    }
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    {
+        // The in-app notification center carries the durable actions.
         use tauri_plugin_notification::NotificationExt;
         let _ = app.notification().builder().title(title).body(body).show();
     }
+}
+
+#[cfg(windows)]
+fn show_windows(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+    kind: &str,
+    job_id: &str,
+    destination: &str
+) {
+    let app = app.clone();
+    let title = title.to_string();
+    let body = body.to_string();
+    let kind = kind.to_string();
+    let job_id = job_id.to_string();
+    let destination = destination.to_string();
+    std::thread::spawn(move || {
+        let mut note = notify_rust::Notification::new();
+        note.summary(&title).body(&body);
+        for (id, label) in actions_for(&kind) {
+            note.action(id, label);
+        }
+        let Ok(handle) = note.show() else { return };
+        handle.wait_for_action(|action| {
+            handle_notification_action(&app, action, &job_id, &destination);
+        });
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -79,7 +113,7 @@ fn show_linux(
 /// Route one toasted action id to the same behavior as the matching in-app
 /// notification control. `""`/`"default"` is the body click: the primary
 /// action. `"__closed"` is dismissal: nothing to do.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, destination: &str) {
     match action {
         "open" | "" | "default" => {
@@ -101,7 +135,7 @@ fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, desti
             }
             let _ = app.emit(
                 "notification-action",
-                serde_json::json!({ "jobId": job_id }),
+                serde_json::json!({ "jobId": job_id })
             );
         }
         _ => {}

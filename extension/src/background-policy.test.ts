@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_POLICY } from './shared';
 
-function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({}), sendNativeMessage: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({})) {
+function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue({})) {
   const event = () => ({ addListener: vi.fn() });
   const onMessage = { addListener: vi.fn() };
   return {
@@ -15,7 +15,6 @@ function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType
     runtime: {
       id: 'extension-test',
       onMessage,
-      sendNativeMessage,
     },
     webRequest: {
       onResponseStarted: event(),
@@ -28,6 +27,14 @@ function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType
     },
     __onMessage: onMessage,
   };
+}
+
+function bridgeMock(payload: unknown = { ok: true }): ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue(payload) });
+}
+
+function bridgeCalls(fetchBridge: ReturnType<typeof vi.fn>, route: string): unknown[][] {
+  return fetchBridge.mock.calls.filter(([url]) => String(url).endsWith(route));
 }
 
 afterEach(() => {
@@ -72,12 +79,42 @@ describe('background policy persistence', () => {
     expect(response.policy).toEqual(DEFAULT_POLICY);
   });
 
+  it('refreshes the cached policy from the resident app on each policy read', async () => {
+    const storageSet = vi.fn().mockResolvedValue(undefined);
+    const chrome = chromeMock(storageSet);
+    const fetchBridge = bridgeMock({
+      ok: true,
+      policy: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] },
+    });
+    vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
+    await import('./background');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
+    expect(listener).toBeTypeOf('function');
+    const response = await new Promise<Record<string, unknown>>((resolve) => {
+      listener({ type: 'get-policy' }, {}, resolve);
+    });
+
+    expect(response).toEqual({
+      ok: true,
+      policy: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] },
+    });
+    expect(bridgeCalls(fetchBridge, '/v1/policy').length).toBeGreaterThanOrEqual(2);
+    expect(storageSet).toHaveBeenCalledWith({
+      ['dm-policy']: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] },
+    });
+  });
+
   it('waits for policy before forwarding capture and honors an excluded page', async () => {
     let resolveStored: (value: unknown) => void = () => undefined;
     const stored = new Promise((resolve) => { resolveStored = resolve; });
     const storageGet = vi.fn().mockReturnValue(stored);
     const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet);
+    const fetchBridge = bridgeMock();
     vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
     await import('./background');
 
     const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
@@ -89,28 +126,23 @@ describe('background policy persistence', () => {
       payload: { source: 'https://cdn.example.test/file.zip', pageUrl: 'https://www.example.test/downloads' },
     }, {}, resolveReply);
     await Promise.resolve();
-    expect(chrome.runtime.sendNativeMessage).not.toHaveBeenCalledWith(
-      'com.downloadmanager.host',
-      expect.objectContaining({ type: 'capture-acquisition' }),
-    );
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
 
     resolveStored({ ["dm-policy"]: { interceptDownloads: true, showMediaButtons: true, excludedSites: ['example.test'] } });
     const response = await reply;
     expect(response.ok).toBe(false);
     expect(response.error).toContain('site excluded');
-    expect(chrome.runtime.sendNativeMessage).not.toHaveBeenCalledWith(
-      'com.downloadmanager.host',
-      expect.objectContaining({ type: 'capture-acquisition' }),
-    );
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
   });
 
   it('waits for policy before forwarding browser fallback and honors an excluded referrer', async () => {
     let resolveStored: (value: unknown) => void = () => undefined;
     const stored = new Promise((resolve) => { resolveStored = resolve; });
     const storageGet = vi.fn().mockReturnValue(stored);
-    const sendNativeMessage = vi.fn().mockResolvedValue({ ok: true });
-    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet, sendNativeMessage);
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet);
+    const fetchBridge = bridgeMock();
     vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
 
     await import('./background');
     const determine = chrome.downloads.onDeterminingFilename.addListener.mock.calls[0]?.[0];
@@ -126,20 +158,21 @@ describe('background policy persistence', () => {
     }, () => { suggestions += 1; });
     expect(result).toBe(true);
     await Promise.resolve();
-    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'capture-acquisition' }));
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
 
     resolveStored({ ["dm-policy"]: { interceptDownloads: true, showMediaButtons: true, excludedSites: ['example.test'] } });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(suggestions).toBe(1);
-    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'capture-acquisition' }));
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
   });
 
   it('waits for policy before forwarding media and keeps media independent from ordinary interception', async () => {
     let resolveStored: (value: unknown) => void = () => undefined;
     const stored = new Promise((resolve) => { resolveStored = resolve; });
-    const sendNativeMessage = vi.fn().mockResolvedValue({ ok: true });
-    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockReturnValue(stored), sendNativeMessage);
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockReturnValue(stored));
+    const fetchBridge = bridgeMock();
     vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
 
     await import('./background');
     const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
@@ -148,27 +181,28 @@ describe('background policy persistence', () => {
     const excludedReply = new Promise<Record<string, unknown>>((resolve) => { resolveReply = resolve; });
     listener({ type: 'media-capture', payload: { source: 'https://cdn.example.test/video.mp4', pageUrl: 'https://www.example.test/watch', media: true } }, { tab: { id: 12 }, frameId: 0 }, resolveReply);
     await Promise.resolve();
-    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
 
     resolveStored({ ['dm-policy']: { interceptDownloads: false, showMediaButtons: true, excludedSites: ['example.test'] } });
     const excluded = await excludedReply;
     expect(excluded.ok).toBe(false);
     expect(excluded.error).toContain('site excluded');
-    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
 
-    sendNativeMessage.mockClear();
+    fetchBridge.mockClear();
     const allowed = await new Promise<Record<string, unknown>>((resolve) => {
       listener({ type: 'media-capture', payload: { source: 'https://cdn.example.test/video.mp4', pageUrl: 'https://other.example.test/watch', media: true } }, { tab: { id: 12 }, frameId: 0 }, resolve);
     });
     expect(allowed.ok).toBe(true);
-    expect(sendNativeMessage).toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(1);
   });
 
   it('rejects media capture when media buttons are disabled', async () => {
-    const sendNativeMessage = vi.fn().mockResolvedValue({ ok: true });
+    const fetchBridge = bridgeMock();
     const storageGet = vi.fn().mockResolvedValue({ ['dm-policy']: { interceptDownloads: true, showMediaButtons: false, excludedSites: [] } });
-    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet, sendNativeMessage);
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), storageGet);
     vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
 
     await import('./background');
     const listener = chrome.__onMessage.addListener.mock.calls.find(([candidate]) => typeof candidate === 'function')?.[0];
@@ -178,15 +212,16 @@ describe('background policy persistence', () => {
     });
     expect(response.ok).toBe(false);
     expect(response.error).toContain('media buttons disabled');
-    expect(sendNativeMessage).not.toHaveBeenCalledWith('com.downloadmanager.host', expect.objectContaining({ type: 'media-capture' }));
+    expect(bridgeCalls(fetchBridge, '/v1/capture')).toHaveLength(0);
   });
 
-  it('still releases the browser download when native forwarding throws synchronously', async () => {
-    const sendNativeMessage = vi.fn(() => {
-      throw new Error('native bridge startup failed');
+  it('still releases the browser download when resident forwarding throws synchronously', async () => {
+    const fetchBridge = vi.fn(() => {
+      throw new Error('resident bridge startup failed');
     });
-    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue({}), sendNativeMessage);
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue({}));
     vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
 
     await import('./background');
     const determine = chrome.downloads.onDeterminingFilename.addListener.mock.calls[0]?.[0];

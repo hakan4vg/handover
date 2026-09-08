@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "description": "Hands browser acquisitions to the resident Download Manager application.",
   "minimum_chrome_version": "116",
-  "permissions": ["storage", "downloads", "webRequest", "nativeMessaging"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": ["storage", "downloads", "webRequest"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1/*"],
   "background": {
     "service_worker": "background.js",
     "type": "module"

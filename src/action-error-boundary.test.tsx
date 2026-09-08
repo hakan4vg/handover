@@ -113,6 +113,22 @@ describe('download action error boundary', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('does not offer reattach for an uncommitted provisional acquisition', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const adapter = { reattachJob: vi.fn(), removeJob: vi.fn() } as unknown as DownloadAdapter;
+
+    act(() => {
+      root.render(<JobContextMenu job={{ ...job, id: 'provisional-action-1', provisional: true, state: 'downloading' }} adapter={adapter} onClose={() => {}} onNotice={() => {}} />);
+    });
+
+    expect(host.textContent).not.toContain('Reattach download');
+    act(() => root.unmount());
+    host.remove();
+  });
+
   it('reports a synchronous adapter throw from an inline row action', async () => {
     const activeJob: DownloadJob = { ...job, id: 'active-action-error-1', name: 'active.bin', state: 'downloading', progress: 25 };
     const snapshot: AppSnapshot = {

@@ -7138,3 +7138,34 @@ change and no site resolver exception:
 - Close-to-tray re-audit no longer needs the blocked inspector. New `/tmp/dm-close-proof.py` (isolated HOME, private Xvfb `:98` + xfwm4): boot visible, capped `/file/slow.bin` capture running, real `xdotool` click on the in-app Close control (computed from CSS: last of 3 44px buttons in the 48px titlebar). Result: window `IsUnMapped`, process alive, transfer grew `24436 -> 521088` bytes while hidden. `CLOSE-TO-TRAY: PASS` (`/tmp/dm-close-proof.log`). No XTEST keys, no inspector.
 - Honest edge found on the way: a WM-level `windowclose` (not the product path — this window is borderless) destroys the window and the app exits 0 with `GdkWindow unexpectedly destroyed`, instead of hiding. The in-app Close control in the same session hides correctly, so the CloseRequested handler works; the WM_DELETE path is recorded for the Windows delivery pass, not fixed here.
 - Gate: Rust `79/79`, Vitest `32` files/`106` tests, `tsc` clean, `cargo build`, fixture compile, `diff --check` all zero (`/tmp/dm-tray-gate-*.log`; no frontend change).
+
+## 2026-09-07 — Portable Windows parity pass
+
+- Replaced native-messaging registration, registry Run keys, command wrappers, and FFmpeg subprocess finalization with one in-process resident bridge, a per-user Startup-folder shortcut, and pure-Rust fragmented-MP4, MPEG-TS, and Matroska media handling. Windows data, temporary files, and WebView2 user data now live beside the executable, and persisted temporary artifacts are relocated when the folder moves.
+- Main and Add Download windows are created with an absolute executable-relative WebView2 data directory instead of Tauri's default LocalData path. Cross-volume folder moves now fall back from rename to copy-and-remove so resumable artifacts keep their job identity.
+- Special launches (`--startup`, capture, policy, and commit) create the main window hidden before initialization, so tray/background launches do not flash the manager; normal launches remain visible.
+- Portable Windows notifications use the unpackaged WinRT fallback through `notify-rust`, avoiding the installed-app AppUserModel registration path while keeping the in-app notification center as the durable action surface. Windows toasts now carry the same Open, Show in folder, and View details actions through the in-process notification handle.
+- The deliverable is one executable plus one `extension` folder, with a colocated fixed WebView2 runtime for clean-machine portability; Tauri bundling/installers are disabled. Verification passed: Rust `84/84`, Vitest `32` files/`106` tests, TypeScript build, frontend/extension builds, release Cargo build, portable packaging, runtime-source audit, and real probes for MPEG-TS and VP9/WebM plus AAC/fMP4 output.
+- Hard platform boundary: Chromium cannot cold-launch an unregistered portable executable from an extension without native messaging, protocol/registry registration, or a helper process. When the resident app is stopped, the extension preserves the browser download where possible and reports managed capture unavailable rather than claiming success.
+
+## 2026-09-08 — Final portable startup and release gate
+
+- The hand-built Windows Startup `.lnk` now ends with the required Shell Link terminal block; a second `--startup` invocation also respects the persisted “show manager at sign-in” setting instead of forcing the window visible.
+- Fault-injection tests use thread-local flags, so the full Rust suite is reliable under the default parallel test runner. Cross-volume temp relocation now handles both files and nested `.part.segments` directories.
+- The extension’s `get-policy` path reconciles its cached policy with the resident app, keeping Browser Integration settings consistent without another state store.
+- Startup links now carry the executable’s file metadata and local volume details, strengthening Windows’ built-in moved-target resolution before the relocated executable has been launched once.
+- The MSVC CRT is statically linked for Windows builds; the packaged executable’s PE imports contain no `VCRUNTIME140` or `api-ms-win-crt` dependency, so a formatted machine does not need a separate VC++ runtime installation.
+- Portable packaging now checks the host EXE’s PE imports and refuses to produce an artifact if machine CRT libraries reappear.
+- Checked-in npm build, test, and packaging scripts now invoke the local tool entry points directly, which also works with this workspace’s dependency layout where `node_modules/.bin` is empty.
+- Final gate passed: Rust `87/87`, release Cargo build, Vitest `32` files/`107` tests, TypeScript build, frontend/extension production builds, portable packaging, runtime-source audit, and `git diff --check`.
+- The packaged folder contains exactly `Download Manager.exe`, `extension`, and `webview2` (`265` files, about `709 MB`); no installer, registry registration, native host, helper, FFmpeg tool, or generated data directory is packaged.
+
+## 2026-09-08 — Close the final acquisition workflow gaps
+
+- Native Add Download commit, cancel, and titlebar-close paths now use the Tauri current-window API; browser/mock mode keeps its existing `window.close()` behavior.
+- Provisional acquisitions no longer expose the native-only Reattach action, and an Add Download window build failure now aborts and removes the provisional acquisition instead of leaving an orphan transfer.
+- The loopback bridge now accepts each connection in its own in-process async task, so a slow Add Download/WebView operation cannot block policy, manager, or later capture requests. A regression test covers the concurrent-request contract.
+- Capture and server-provided filenames now reduce to safe path leaves, replacing Windows-invalid characters and reserved device names while preserving ordinary Unicode names.
+- The Windows Shell Link builder now keeps the network-link offset empty and writes the volume serial in the Volume ID, with a structural regression covering the corrected layout.
+- Current gate passed: Rust `89/89`, Vitest `32` files/`108` tests, TypeScript build, frontend/extension production builds, release Cargo build, portable packaging, forbidden-runtime source audit, and `git diff --check`.
+- The rebuilt executable and packaged executable have matching SHA-256 hashes. The package still contains exactly `Download Manager.exe`, `extension`, and `webview2`; it has `265` files, `709212876` bytes, and no generated `data` directory.

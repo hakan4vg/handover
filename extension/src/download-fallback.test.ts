@@ -29,7 +29,7 @@ describe('restoreBrowserDownload', () => {
 describe('captureNeedsBrowserRestore', () => {
   it('restores only when the worker did not report success', () => {
     expect(captureNeedsBrowserRestore({ ok: true })).toBe(false);
-    expect(captureNeedsBrowserRestore({ ok: false, error: 'native host and browser fallback unavailable' })).toBe(true);
+    expect(captureNeedsBrowserRestore({ ok: false, error: 'Download Manager and browser fallback are unavailable' })).toBe(true);
     expect(captureNeedsBrowserRestore({})).toBe(true);
     expect(captureNeedsBrowserRestore(null)).toBe(true);
     expect(captureNeedsBrowserRestore(undefined)).toBe(true);

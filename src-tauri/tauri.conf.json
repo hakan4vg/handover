@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Download Manager",
         "width": 1180,
         "height": 760,
@@ -26,9 +27,6 @@
     "security": { "csp": null }
   },
   "bundle": {
-    "active": true,
-    "targets": "all",
-    "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon.svg"],
-    "resources": ["../extension/dist"]
+    "active": false
   }
 }

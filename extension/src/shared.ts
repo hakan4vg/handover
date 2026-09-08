@@ -1,4 +1,5 @@
-export const NATIVE_HOST = 'com.downloadmanager.host';
+export const APP_BRIDGE_ORIGIN = 'http://127.0.0.1:38217';
+export const APP_BRIDGE_TIMEOUT_MS = 1500;
 
 export interface BrowserPolicy {
   interceptDownloads: boolean;

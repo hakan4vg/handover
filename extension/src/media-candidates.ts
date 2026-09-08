@@ -115,8 +115,14 @@ export function choosePlayerEvidence(players: MediaPlayerEvidence[], tabId: numb
   })[0];
 }
 
-export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): MediaSelection | undefined {
-  const scoped = candidates.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId));
+function matchesKind(candidate: MediaCandidate, expectedKind?: Exclude<MediaKind, 'unknown'>): boolean {
+  if (!expectedKind) return true;
+  const kind = candidate.kind && candidate.kind !== 'unknown' ? candidate.kind : mediaKindFor(candidate.url);
+  return kind === 'unknown' || kind === expectedKind;
+}
+
+export function chooseMediaSelection(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string, expectedKind?: Exclude<MediaKind, 'unknown'>): MediaSelection | undefined {
+  const scoped = candidates.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId) && matchesKind(item, expectedKind));
   const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
     const newest = [...pool].sort((left, right) => right.at - left.at);
     const manifests = newest.filter((item) => item.role === 'manifest');
@@ -177,8 +183,9 @@ export function chooseWorkerMediaSelection(
   playerKey?: string,
   documentId?: string,
   now = Date.now(),
+  expectedKind?: Exclude<MediaKind, 'unknown'>,
 ): MediaSelection | undefined {
-  const direct = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId);
+  const direct = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId, expectedKind);
   if (direct || frameId === 0 || !playerKey) return direct;
 
   const freshPlayer = players.some((item) =>
@@ -205,11 +212,12 @@ export function chooseWorkerMediaSelection(
     !item.playerKey &&
     now - item.at <= 90_000 &&
     item.at - now <= 5_000 &&
-    isMediaCandidate(item)
+    isMediaCandidate(item) &&
+    matchesKind(item, expectedKind)
   );
   const mediaSources = new Set(workerCandidates.filter((item) => item.role !== 'segment').map((item) => item.url));
   if (mediaSources.size !== 1 || !workerCandidates.some((item) => item.documentId !== documentId)) return undefined;
-  const selection = chooseMediaSelection(workerCandidates, tabId, 0);
+  const selection = chooseMediaSelection(workerCandidates, tabId, 0, undefined, undefined, expectedKind);
   if (!selection) return undefined;
   return workerCandidates.some((item) => item.role === 'manifest' || item.role === 'segment')
     ? selection

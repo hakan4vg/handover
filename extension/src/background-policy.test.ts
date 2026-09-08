@@ -24,6 +24,9 @@ function chromeMock(storageSet: ReturnType<typeof vi.fn>, storageGet: ReturnType
     downloads: {
       onDeterminingFilename: event(),
       download: vi.fn(),
+      pause: vi.fn().mockResolvedValue(undefined),
+      resume: vi.fn().mockResolvedValue(undefined),
+      cancel: vi.fn().mockResolvedValue(undefined),
     },
     __onMessage: onMessage,
   };
@@ -238,5 +241,47 @@ describe('background policy persistence', () => {
     expect(result).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(suggestions).toBe(1);
+  });
+
+  it('pauses the browser item and cancels it only after native takeover succeeds', async () => {
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue({}));
+    const fetchBridge = bridgeMock({ ok: true, id: 'native-7' });
+    vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
+
+    await import('./background');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const determine = chrome.downloads.onDeterminingFilename.addListener.mock.calls[0]?.[0];
+    const suggest = vi.fn();
+    determine({ id: 7, url: 'https://cdn.example.test/file.zip', finalUrl: 'https://cdn.example.test/file.zip', filename: 'file.zip', referrer: 'https://example.test/' }, suggest);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(chrome.downloads.pause).toHaveBeenCalledWith(7);
+    expect(chrome.downloads.cancel).toHaveBeenCalledWith(7);
+    expect(chrome.downloads.resume).not.toHaveBeenCalled();
+    expect(suggest).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back native acquisition and resumes the browser when browser cancellation fails', async () => {
+    const chrome = chromeMock(vi.fn().mockResolvedValue(undefined), vi.fn().mockResolvedValue({}));
+    chrome.downloads.cancel.mockRejectedValue(new Error('browser refused cancellation'));
+    const fetchBridge = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      const message = init?.body ? JSON.parse(String(init.body)) as { type?: string } : {};
+      return { ok: true, json: vi.fn().mockResolvedValue(message.type === 'capture-acquisition' ? { ok: true, id: 'native-8' } : { ok: true }) };
+    });
+    vi.stubGlobal('chrome', chrome);
+    vi.stubGlobal('fetch', fetchBridge);
+
+    await import('./background');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const determine = chrome.downloads.onDeterminingFilename.addListener.mock.calls[0]?.[0];
+    determine({ id: 8, url: 'https://cdn.example.test/file.zip', finalUrl: 'https://cdn.example.test/file.zip', filename: 'file.zip', referrer: 'https://example.test/' }, vi.fn());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(chrome.downloads.resume).toHaveBeenCalledWith(8);
+    const messages = fetchBridge.mock.calls
+      .filter(([, init]) => (init as RequestInit | undefined)?.body)
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { type?: string; payload?: { id?: string } });
+    expect(messages).toContainEqual({ type: 'cancel-acquisition', payload: { id: 'native-8' } });
   });
 });

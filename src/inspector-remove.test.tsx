@@ -57,4 +57,27 @@ describe('Inspector removal feedback', () => {
     expect(host.querySelector('.inspector')).not.toBeNull();
     act(() => root.unmount());
   });
+
+  it('keeps the inspector open so its parent can advance to the next selected job', async () => {
+    const removeJob = vi.fn().mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(<Inspector job={job} adapter={{ removeJob } as unknown as DownloadAdapter} onClose={onClose} />);
+    });
+
+    const remove = Array.from(host.querySelectorAll('button')).find((button) => button.textContent?.includes('Remove'));
+    if (!(remove instanceof HTMLButtonElement)) throw new Error('remove button missing');
+    await act(async () => {
+      remove.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(removeJob).toHaveBeenCalledWith('remove-error-1');
+    expect(onClose).not.toHaveBeenCalled();
+    act(() => root.unmount());
+  });
 });

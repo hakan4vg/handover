@@ -52,6 +52,7 @@ let current: HTMLVideoElement | HTMLAudioElement | null = null;
 let button: HTMLButtonElement | null = null;
 let frame: number | null = null;
 let nextPlayerKey = 1;
+let captureInFlight = false;
 const playerKeys = new WeakMap<HTMLMediaElement, string>();
 const observedPlayers = new WeakSet<HTMLMediaElement>();
 const lastPlayerReports = new WeakMap<HTMLMediaElement, number>();
@@ -381,7 +382,7 @@ function track(): void {
     button = null;
     if (previous) reportPlayer(previous, true);
   }
-  if (current) reportPlayer(current, true);
+  if (current) reportPlayer(current);
   if (current && frame === null) {
     if (!positionButton()) current = null;
     else frame = requestAnimationFrame(loop);
@@ -415,9 +416,11 @@ function captureName(media: HTMLMediaElement, source: string): string | undefine
 }
 
 async function capture(): Promise<void> {
-  if (!current) return;
-  const el = current as HTMLVideoElement;
+  if (!current || captureInFlight) return;
+  const el = current;
   const source = sourceFor(el);
+  captureInFlight = true;
+  if (button) button.disabled = true;
   try {
     const response = (await chrome.runtime.sendMessage({
       type: 'media-capture',
@@ -426,6 +429,7 @@ async function capture(): Promise<void> {
         pageUrl: window.location.href,
         userAgent: navigator.userAgent,
         media: true,
+        playerKind: el instanceof HTMLAudioElement ? 'audio' : 'video',
         playerKey: keyFor(el),
         name: captureName(el, source),
       },
@@ -433,6 +437,9 @@ async function capture(): Promise<void> {
     if (!response?.ok) flashError();
   } catch {
     flashError();
+  } finally {
+    captureInFlight = false;
+    if (button) button.disabled = false;
   }
 }
 
@@ -454,6 +461,14 @@ chrome.storage.onChanged.addListener(() => void refreshPolicy());
 void refreshPolicy().then(() => {
   window.setInterval(track, 500);
   window.setInterval(refreshPolicy, 10_000);
-  new MutationObserver(track).observe(document.documentElement, { childList: true, subtree: true });
+  let queuedTrack: number | null = null;
+  const scheduleTrack = () => {
+    if (queuedTrack !== null) return;
+    queuedTrack = window.setTimeout(() => {
+      queuedTrack = null;
+      track();
+    }, 100);
+  };
+  new MutationObserver(scheduleTrack).observe(document.documentElement, { childList: true, subtree: true });
   track();
 });

@@ -289,8 +289,12 @@ function WindowControls() {
   const native = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
   const run = (action: 'minimize' | 'maximize' | 'close') => {
     if (!native) return;
+    if (action === 'close') {
+      void invoke('close_main_window');
+      return;
+    }
     const current = getCurrentWindow();
-    void (action === 'minimize' ? current.minimize() : action === 'maximize' ? current.toggleMaximize() : current.close());
+    void (action === 'minimize' ? current.minimize() : current.toggleMaximize());
   };
   return <div className="window-controls" aria-label="Window controls"><button aria-label="Minimize" onClick={() => run('minimize')}><span className="minimize-glyph" /></button><button aria-label="Maximize" onClick={() => run('maximize')}><span className="maximize-glyph" /></button><button aria-label="Close" onClick={() => run('close')}><Icon name="close" size={15} /></button></div>;
 }
@@ -490,7 +494,6 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
     setRemoving(true);
     try {
       await adapter.removeJob(job.id);
-      onClose();
     } catch (reason) {
       setRemoveError(errorMessage(reason, 'Could not remove the download.'));
     } finally {
@@ -610,11 +613,25 @@ function FieldHeading({ title, description }: { title: string; description?: str
 }
 
 function PathField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  const browse = async () => {
-    const dir = await pickFolder(value);
-    if (dir) onChange(dir);
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = (candidate: string) => {
+    const next = candidate.trim();
+    if (!next) {
+      setDraft(value);
+      return;
+    }
+    setDraft(next);
+    if (next !== value) onChange(next);
   };
-  return <div className="path-field"><input aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
+  const browse = async () => {
+    const dir = await pickFolder(draft);
+    if (dir) {
+      setDraft(dir);
+      onChange(dir);
+    }
+  };
+  return <div className="path-field"><input aria-label={label} value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={(event) => commit(event.currentTarget.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { setDraft(value); event.currentTarget.value = value; } }} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
 }
 
 function Select({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<[string, string]> }) {
@@ -656,7 +673,10 @@ function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => v
   return <button className="radio" role="radio" aria-checked={checked} onClick={onClick}><span className={checked ? 'checked' : ''} />{label}</button>;
 }
 
-export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void | Promise<void>; onClose: () => void }) {
+export function AddDownloadWindow({ settings, job: liveJob, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void | Promise<void>; onClose: () => void }) {
+  const retainedJob = useRef(liveJob);
+  if (liveJob) retainedJob.current = liveJob;
+  const job = liveJob ?? retainedJob.current;
   const [source, setSource] = useState(job?.source ?? '');
   const [name, setName] = useState(job?.name ?? '');
   const [nameTouched, setNameTouched] = useState(false);
@@ -759,7 +779,7 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const currentJob = snapshot.jobs.find((item) => item.id === createdId);
   const close = () => closeSurface();
   const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit }));
-  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={async (id) => { await adapter.cancelJob(id); close(); }} onClose={close} /></div>;
+  return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={async (id) => { await adapter.cancelJob(id); if (!isTauriRuntime()) close(); }} onClose={close} /></div>;
 }
 
 export function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {

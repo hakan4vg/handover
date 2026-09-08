@@ -18,13 +18,19 @@ function testChrome() {
         onHeadersReceived: on('headers'),
         onBeforeRequest: on('beforeRequest'),
       },
-      downloads: { onDeterminingFilename: on('filename'), download: vi.fn() },
+      downloads: {
+        onDeterminingFilename: on('filename'),
+        download: vi.fn(),
+        pause: vi.fn().mockResolvedValue(undefined),
+        resume: vi.fn().mockResolvedValue(undefined),
+        cancel: vi.fn().mockResolvedValue(undefined),
+      },
     },
   };
 }
 
 function bridge() {
-  return vi.fn().mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ ok: true }) });
+  return vi.fn().mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ ok: true, id: 'native-job' }) });
 }
 
 function capturePayloads(fetchMock: ReturnType<typeof vi.fn>): Array<Record<string, unknown>> {

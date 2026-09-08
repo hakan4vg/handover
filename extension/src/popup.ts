@@ -15,11 +15,13 @@ function paint(): void {
   const excluded = site !== '' && policy.excludedSites.includes(site);
   const siteState = document.getElementById('site-state');
   if (siteState) {
-    siteState.textContent = excluded
+    siteState.textContent = !policy.showMediaButtons
+      ? 'Media buttons are off globally'
+      : excluded
       ? 'Media buttons excluded on this site'
       : 'Media buttons enabled on this site';
     siteState.classList.toggle('excluded-copy', excluded);
-    siteState.classList.toggle('enabled-copy', !excluded);
+    siteState.classList.toggle('enabled-copy', policy.showMediaButtons && !excluded);
   }
   document.getElementById('site-toggle')!.textContent = excluded ? 'Enable on this site' : 'Exclude this site';
 }

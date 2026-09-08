@@ -120,4 +120,32 @@ describe('Add Download pending actions', () => {
     });
     act(() => root.unmount());
   });
+
+  it('keeps captured details stable while cancellation removes the live job', async () => {
+    let resolveCancel: () => void = () => undefined;
+    const onCancel = vi.fn(() => new Promise<void>((resolve) => { resolveCancel = resolve; }));
+    const onClose = vi.fn();
+    const { host, root } = renderWindow({ job, onCancel, onClose });
+    const cancel = host.querySelector('.add-actions .button:not(.primary)');
+    if (!(cancel instanceof HTMLButtonElement)) throw new Error('cancel control missing');
+
+    await act(async () => {
+      cancel.click();
+      await Promise.resolve();
+    });
+    act(() => {
+      root.render(<AddDownloadWindow settings={settings} onCancel={onCancel} onClose={onClose} />);
+    });
+
+    expect(host.querySelector('.add-download-window')?.classList.contains('captured')).toBe(true);
+    expect((host.querySelector('input[aria-label="Source URL"]') as HTMLInputElement).readOnly).toBe(true);
+    expect(host.querySelector('.add-actions .button.primary')?.textContent).toContain('Download');
+
+    await act(async () => {
+      resolveCancel();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => root.unmount());
+  });
 });

@@ -411,12 +411,10 @@ function takeFormBody(url: string, tabId?: number): string | undefined {
   return now - found.at <= FORM_BODY_TTL_MS ? found.body : undefined;
 }
 
-// INTERIM fallback (SPEC §5.1.1): observe-only. Forwards intent so the
-// resident app opens an Add Download window, but never cancels the browser
-// download — destroying a one-use/tokenized transaction to pretend takeover
-// succeeded is worse than a duplicate. `onCreated` exposes only a tentative
-// URL basename for redirected downloads; `onDeterminingFilename` supplies the
-// header-resolved name while still allowing the browser transaction to proceed.
+// Downloads without an interceptable page anchor are handed over
+// transactionally: pause Chromium, create the native provisional job, then
+// cancel Chromium. Any failed step resumes the browser and rolls back the
+// native provisional job so exactly one owner remains.
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   const source = item.finalUrl || item.url || '';
   if (consumeBrowserFallback(item) || consumeBrowserOwnedDownload(item) || item.byExtensionId === chrome.runtime.id || !isHttp(source)) {
@@ -424,9 +422,17 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     return;
   }
   void (async () => {
+    let paused = false;
+    let nativeId: string | undefined;
     try {
       await policyReady;
       if (ordinaryCaptureError(source, item.referrer ?? '')) {
+        return;
+      }
+      try {
+        await chrome.downloads.pause(item.id);
+        paused = true;
+      } catch {
         return;
       }
       // The Downloads API exposes no tab/frame identifier, so do not guess a
@@ -435,7 +441,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       // this URL, so the method rides along and the resident app replays POST
       // first; absent (or already consumed) means a safe GET.
       const postBody = takeFormBody(source);
-      await sendApp({
+      const response = await sendApp({
         type: 'capture-acquisition',
         payload: {
           source,
@@ -444,8 +450,24 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
           referrer: item.referrer,
           ...(postBody === undefined ? {} : { method: 'POST', postBody }),
         },
-      });
+      }) as { ok?: boolean; id?: string };
+      if (!response?.ok || typeof response.id !== 'string') {
+        await chrome.downloads.resume(item.id).catch(() => undefined);
+        paused = false;
+        return;
+      }
+      nativeId = response.id;
+      try {
+        await chrome.downloads.cancel(item.id);
+        paused = false;
+      } catch {
+        await sendApp({ type: 'cancel-acquisition', payload: { id: nativeId } });
+        nativeId = undefined;
+        await chrome.downloads.resume(item.id).catch(() => undefined);
+        paused = false;
+      }
     } finally {
+      if (paused) await chrome.downloads.resume(item.id).catch(() => undefined);
       suggest();
     }
   })();
@@ -505,13 +527,16 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         return;
       }
       const documentId = sender.documentId;
+      const expectedKind = payload.playerKind === 'audio' || payload.playerKind === 'video' ? payload.playerKind : undefined;
       const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey : (sender.tab?.id === undefined ? undefined : activePlayerKey(sender.tab.id, sender.frameId ?? 0, documentId));
       const scope = sender.tab?.id === undefined ? undefined : mediaScope(sender.tab.id, sender.frameId ?? 0, documentId, playerKey);
       let source = typeof payload.source === 'string' ? payload.source : '';
       let selectedSegments: string[] = [];
+      const directKind = isHttp(source) ? mediaKindFor(source) : 'unknown';
+      if (expectedKind && directKind !== 'unknown' && directKind !== expectedKind) source = '';
       if (!isHttp(source) && sender.tab?.id !== undefined) {
         // blob:/MSE player — resolve to the real traffic behind the element.
-        const selection = chooseWorkerMediaSelection(recentMedia, recentPlayers, sender.tab.id, sender.frameId ?? 0, playerKey, documentId);
+        const selection = chooseWorkerMediaSelection(recentMedia, recentPlayers, sender.tab.id, sender.frameId ?? 0, playerKey, documentId, Date.now(), expectedKind);
         source = selection?.source ?? '';
         selectedSegments = selection?.selectedSegments ?? [];
       }

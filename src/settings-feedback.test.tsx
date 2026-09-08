@@ -164,4 +164,33 @@ describe('SettingsView', () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it('commits folder edits after editing finishes instead of on every keystroke', async () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    const updateSettings = vi.fn().mockResolvedValue(undefined);
+    const adapter = { updateSettings } as unknown as DownloadAdapter;
+
+    await act(async () => {
+      root.render(<SettingsView adapter={adapter} settings={settings} page="downloads" onPageChange={() => undefined} />);
+    });
+    const input = host.querySelector('input[aria-label="Temporary / cache folder"]') as HTMLInputElement;
+    await act(async () => {
+      input.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, '/tmp/downloads/.part');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(updateSettings).not.toHaveBeenCalled();
+
+    await act(async () => {
+      input.blur();
+      await Promise.resolve();
+    });
+    expect(updateSettings).toHaveBeenCalledTimes(1);
+    expect(updateSettings).toHaveBeenCalledWith({ tempFolder: '/tmp/downloads/.part' });
+
+    act(() => root.unmount());
+    host.remove();
+  });
 });

@@ -312,4 +312,11 @@ describe('media candidate selection', () => {
       selectedSegments: [],
     });
   });
+
+  it('does not resolve an audio endpoint for a video player', () => {
+    const candidates: MediaCandidate[] = [
+      { url: 'https://www.example.test/s/search/audio/open.mp3', tabId: 4, frameId: 0, at: 100, role: 'unknown', kind: 'audio', playerKey: 'player-a' },
+    ];
+    expect(chooseMediaSelection(candidates, 4, 0, 'player-a', undefined, 'video')).toBeUndefined();
+  });
 });

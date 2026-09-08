@@ -4171,9 +4171,40 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
     emit_snapshot(app, state);
 }
 
+fn close_add_window(app: &AppHandle, id: &str) {
+    let Some(window) = app.get_webview_window(&format!("add-{id}")) else { return; };
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(10)).await;
+        let _ = window.destroy();
+    });
+}
+
 #[tauri::command]
 fn cancel_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     cancel_job_internal(&app, &state, &id);
+    close_add_window(&app, &id);
+}
+
+fn apply_main_window_close(app: &AppHandle, state: &CoreState) -> Result<(), String> {
+    let close_to_tray = state
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.settings.close_behavior == "tray")
+        .unwrap_or(true);
+    if close_to_tray {
+        app.get_webview_window("main")
+            .ok_or_else(|| "Main window unavailable".to_string())?
+            .hide()
+            .map_err(|error| error.to_string())
+    } else {
+        app.exit(0);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn close_main_window(app: AppHandle, state: State<'_, CoreState>) -> Result<(), String> {
+    apply_main_window_close(&app, state.inner())
 }
 
 #[tauri::command]
@@ -4446,6 +4477,7 @@ fn start_provisional(
                         let _ = close_window.destroy();
                     }
                 });
+                let _ = window.show().and_then(|_| window.set_focus());
             }
             Err(error) => {
                 drop(_lifecycle);
@@ -5163,6 +5195,19 @@ fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
             let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
                 return bridge_reject(&request, 400, "invalid acquisition");
             };
+            if message.get("type").and_then(Value::as_str) == Some("cancel-acquisition") {
+                let Some(id) = message
+                    .get("payload")
+                    .and_then(|payload| payload.get("id"))
+                    .and_then(Value::as_str)
+                else {
+                    return bridge_reject(&request, 400, "invalid cancellation");
+                };
+                let state = app.state::<CoreState>();
+                cancel_job_internal(&app, state.inner(), id);
+                close_add_window(&app, id);
+                return bridge_respond(&request, 200, json!({ "ok": true }));
+            }
             let Some(input) = provisional_input_from_message(&message) else {
                 return bridge_reject(&request, 400, "invalid acquisition");
             };
@@ -5552,8 +5597,9 @@ fn main() {
                 let close_handle = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
-                        let close_to_tray = close_handle.state::<CoreState>().snapshot.lock().map(|snapshot| snapshot.settings.close_behavior == "tray").unwrap_or(true);
-                        if close_to_tray { api.prevent_close(); if let Some(main) = close_handle.get_webview_window("main") { let _ = main.hide(); } } else { let exit_handle = close_handle.clone(); tauri::async_runtime::spawn(async move { sleep(Duration::from_millis(100)).await; exit_handle.exit(0); }); }
+                        api.prevent_close();
+                        let state = close_handle.state::<CoreState>();
+                        let _ = apply_main_window_close(&close_handle, state.inner());
                     }
                 });
             }
@@ -5577,7 +5623,7 @@ fn main() {
             for (id, source) in recovered { let _ = spawn_transfer(app.handle(), app.state::<CoreState>().inner(), id, source); }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job])
+        .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, close_main_window])
         .run(tauri::generate_context!())
         .expect("error while running Download Manager");
 }

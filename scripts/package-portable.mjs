@@ -74,7 +74,7 @@ try {
   throw new Error('Portable packaging requires a colocated webview2 runtime');
 }
 
-const allowedEntries = new Set(['Download Manager.exe', 'extension', 'webview2']);
+const allowedEntries = new Set(['Download Manager.exe', 'data', 'extension', 'webview2']);
 const unexpectedEntries = (await readdir(output)).filter((entry) => !allowedEntries.has(entry));
 if (unexpectedEntries.length) {
   throw new Error(`Portable output contains unexpected entries: ${unexpectedEntries.join(', ')}`);

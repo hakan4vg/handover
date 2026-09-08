@@ -7169,3 +7169,18 @@ change and no site resolver exception:
 - The Windows Shell Link builder now keeps the network-link offset empty and writes the volume serial in the Volume ID, with a structural regression covering the corrected layout.
 - Current gate passed: Rust `89/89`, Vitest `32` files/`108` tests, TypeScript build, frontend/extension production builds, release Cargo build, portable packaging, forbidden-runtime source audit, and `git diff --check`.
 - The rebuilt executable and packaged executable have matching SHA-256 hashes. The package still contains exactly `Download Manager.exe`, `extension`, and `webview2`; it has `265` files, `709212876` bytes, and no generated `data` directory.
+
+## 2026-09-08 — Authoritative audit fixes batch 1 (F01–F07, F10–F11)
+
+AUDIT-2026-09-08.md is the authoritative audit; AUDIT-OMPI-2026-09-08.md cross-checks it. Baseline committed before fixes. All items below carry regression tests unless noted.
+
+- F01: loopback bridge now validates Host (loopback only) and Origin (chrome-extension or absent for non-browser local clients) on mutation routes, requires application/json POSTs, reflects CORS only for validated extension origins, bounds concurrent connections (16, 503 beyond), 10 s read deadlines, and surfaces bind failure as `bridgeAvailable: false` in the sidebar footer instead of "Browser integration on".
+- F02: manifest output naming follows the acquired container (stem preserved, destination kept consistent) instead of only correcting auto-derived names; page-title `.mp4` no longer mislabels TS bytes.
+- F03: single-resource finalizer accepts multiplexed fMP4 (structural per-track validation, bytes pass through); WebM-audio + WebM-video fails with a named unsupported-combination error instead of a confusing fMP4 parse error.
+- F04: manifest, variant, and track playlist fetches adopt the effective response URL as the resolution base, including the probe-to-manifest handoff.
+- F05: 404/410 fail fast with a single-use-aware message across range, fallback, and segment paths; no more parallel → one-connection → single-stream grind against dead URLs. Full one-shot ranged preservation (never re-request) remains a documented limitation.
+- F06: observed-POST bodies replay POST first (single stream); HTML pages without file disposition fail as "web page instead of a file" instead of completing as the named download. Extension form cache is per-URL FIFO with tab scope and an explicit method flag.
+- F07: per-scope last-resolved media source with session-storage survival across worker restarts; live traffic still wins so player quality changes follow the new representation.
+- F10: segment identity covers key URI + effective IV; fsync barriers before range claims, segment rename, and probe-byte claims.
+- F11: new protect.rs — DPAPI envelopes (crypt32 FFI, no new deps) for source/referrer/post_body/selected_segments at rest on Windows; legacy rows pass through; foreign-machine envelopes scrub to an honest paused needs-reattach job. Event/notification/stored-error redaction centralized at the boundaries.
+- Gate for this batch: Rust `103/103`, Vitest `34` files/`111` tests, `npx tsc -b` clean.

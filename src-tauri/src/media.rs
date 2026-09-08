@@ -1636,15 +1636,18 @@ fn parse_fragment<'a>(
     })
 }
 
-fn parse_fragmented_track<'a>(
-    data: &'a [u8],
-    track_index: usize,
-) -> Result<ParsedTrack<'a>, String> {
-    let context = format!("Media track {track_index}");
+/// Shared ftyp/moov preamble for fragmented presentations: locates the
+/// initialization and every track box without assuming a track count (F03).
+/// Returns the top-level boxes, the ftyp/moov positions, the moov children,
+/// and every trak box.
+fn fragmented_presentation_parts(
+    data: &[u8],
+    context: &str,
+) -> Result<(Vec<Mp4Box>, usize, usize, Vec<Mp4Box>, Vec<Mp4Box>), String> {
     if data.is_empty() {
         return Err(format!("{context} is empty"));
     }
-    let top = parse_mp4_boxes(data, 0, data.len(), &context)?;
+    let top = parse_mp4_boxes(data, 0, data.len(), context)?;
     let ftyp_index = top
         .iter()
         .position(|item| item.kind == *b"ftyp")
@@ -1656,14 +1659,26 @@ fn parse_fragmented_track<'a>(
     if ftyp_index > moov_index {
         return Err(format!("{context} has ftyp after moov"));
     }
-    let ftyp = box_bytes(data, top[ftyp_index]);
-    let moov = top[moov_index];
-    let moov_children = child_boxes(data, moov, &format!("{context} moov"))?;
+    let moov_children = child_boxes(data, top[moov_index], &format!("{context} moov"))?;
     let trak_boxes = matching_boxes(&moov_children, *b"trak");
+    if trak_boxes.is_empty() {
+        return Err(format!("{context} has no media tracks"));
+    }
+    Ok((top, ftyp_index, moov_index, moov_children, trak_boxes))
+}
+
+fn parse_fragmented_track<'a>(
+    data: &'a [u8],
+    track_index: usize,
+) -> Result<ParsedTrack<'a>, String> {
+    let context = format!("Media track {track_index}");
+    let (top, ftyp_index, moov_index, moov_children, trak_boxes) =
+        fragmented_presentation_parts(data, &context)?;
     if trak_boxes.len() != 1 {
         return Err(format!("{context} must contain exactly one track"));
     }
     let trak = trak_boxes[0];
+    let ftyp = box_bytes(data, top[ftyp_index]);
     let trak_children = child_boxes(data, trak, &format!("{context} trak"))?;
     let tkhd = exactly_one_box(&trak_children, *b"tkhd", &format!("{context} trak"))?;
     let track_id = track_id_from_tkhd(data, tkhd, &format!("{context} tkhd"))?;
@@ -1863,8 +1878,160 @@ fn build_muxed_initialization(tracks: &mut [ParsedTrack<'_>]) -> Result<Vec<u8>,
     wrap_mp4_box(*b"moov", &moov_children, "The merged moov box")
 }
 
+/// A multiplexed fragmented MP4 (audio + video in one initialization, common
+/// in HLS) is already playable: validate every track's structure and every
+/// fragment's pairing, then pass the bytes through untouched. The single-track
+/// parser stays the contract for per-track mux inputs (F03).
+fn validate_multiplexed_fmp4(data: &[u8], context: &str) -> Result<(), String> {
+    let (top, _, moov_index, moov_children, trak_boxes) =
+        fragmented_presentation_parts(data, context)?;
+    let mut track_ids = Vec::with_capacity(trak_boxes.len());
+    for (index, trak) in trak_boxes.iter().enumerate() {
+        let trak_context = format!("{context} trak {index}");
+        let trak_children = child_boxes(data, *trak, &trak_context)?;
+        let tkhd = exactly_one_box(&trak_children, *b"tkhd", &trak_context)?;
+        let track_id = track_id_from_tkhd(data, tkhd, &trak_context)?;
+        if track_id == 0 {
+            return Err(format!("{trak_context} has an invalid zero track ID"));
+        }
+        if track_ids.contains(&track_id) {
+            return Err(format!("{trak_context} reuses track ID {track_id}"));
+        }
+        let mdia = exactly_one_box(&trak_children, *b"mdia", &trak_context)?;
+        let mdia_children = child_boxes(data, mdia, &trak_context)?;
+        let mdhd = exactly_one_box(&mdia_children, *b"mdhd", &trak_context)?;
+        mdhd_timescale(data, mdhd, &trak_context)?;
+        track_ids.push(track_id);
+    }
+    let mvex = matching_boxes(&moov_children, *b"mvex");
+    if mvex.len() != 1 {
+        return Err(format!("{context} is not a fragmented MP4 initialization"));
+    }
+    let mvex_children = child_boxes(data, mvex[0], &format!("{context} mvex"))?;
+    let trex_boxes = matching_boxes(&mvex_children, *b"trex");
+    if trex_boxes.len() != trak_boxes.len() {
+        return Err(format!(
+            "{context} has {} trex boxes for {} tracks",
+            trex_boxes.len(),
+            trak_boxes.len()
+        ));
+    }
+    for trex in &trex_boxes {
+        let (_, _, trex_payload) = full_box_header(data, *trex, &format!("{context} trex"))?;
+        let trex_track_id = read_u32_at(data, trex_payload + 4, &format!("{context} trex"))?;
+        if !track_ids.contains(&trex_track_id) {
+            return Err(format!(
+                "{context} trex references unknown track ID {trex_track_id}"
+            ));
+        }
+    }
+    let mut pending_moof = None;
+    let mut fragments = 0usize;
+    for item in top.iter().skip(moov_index + 1) {
+        match item.kind {
+            [b'm', b'o', b'o', b'f'] => {
+                if pending_moof.is_some() {
+                    return Err(format!("{context} has consecutive moof boxes without mdat"));
+                }
+                pending_moof = Some(*item);
+            }
+            [b'm', b'd', b'a', b't'] => {
+                let moof = pending_moof
+                    .take()
+                    .ok_or_else(|| format!("{context} has mdat without a preceding moof"))?;
+                validate_multiplexed_moof(data, moof, &track_ids, context)?;
+                fragments += 1;
+            }
+            [b'm', b'f', b'r', b'a'] => {
+                if pending_moof.is_some() {
+                    return Err(format!(
+                        "{context} has a fragment without its mdat before mfra"
+                    ));
+                }
+            }
+            [b's', b't', b'y', b'p']
+            | [b's', b'i', b'd', b'x']
+            | [b'e', b'm', b's', b'g']
+            | [b'p', b'r', b'f', b't']
+            | [b'f', b'r', b'e', b'e']
+            | [b's', b'k', b'i', b'p']
+            | [b'w', b'i', b'd', b'e'] => {
+                if pending_moof.is_some() {
+                    return Err(format!("{context} has data between moof and mdat"));
+                }
+            }
+            [b'f', b't', b'y', b'p'] | [b'm', b'o', b'o', b'v'] => {
+                return Err(format!(
+                    "{context} has a duplicate initialization box at top level"
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "{context} contains unsupported top-level box {}",
+                    String::from_utf8_lossy(&item.kind)
+                ))
+            }
+        }
+    }
+    if pending_moof.is_some() {
+        return Err(format!("{context} has a moof without mdat"));
+    }
+    if fragments == 0 {
+        return Err(format!("{context} is not a fragmented MP4 media stream"));
+    }
+    Ok(())
+}
+
+/// Validate one multiplexed moof: every traf references a known track and
+/// every sample run parses. Mirrors the single-track fragment rules without
+/// assuming one track per moof (F03).
+fn validate_multiplexed_moof(
+    data: &[u8],
+    moof: Mp4Box,
+    track_ids: &[u32],
+    context: &str,
+) -> Result<(), String> {
+    let children = child_boxes(data, moof, context)?;
+    exactly_one_box(&children, *b"mfhd", context)?;
+    let trafs = matching_boxes(&children, *b"traf");
+    if trafs.is_empty() {
+        return Err(format!("{context} has no track fragment"));
+    }
+    for (traf_index, traf) in trafs.iter().enumerate() {
+        let traf_context = format!("{context} traf {traf_index}");
+        let traf_children = child_boxes(data, *traf, &traf_context)?;
+        let tfhd = exactly_one_box(&traf_children, *b"tfhd", &traf_context)?;
+        let (fragment_track_id, _) = tfhd_fields(data, tfhd, &traf_context)?;
+        if !track_ids.contains(&fragment_track_id) {
+            return Err(format!(
+                "{traf_context} references unknown track ID {fragment_track_id}"
+            ));
+        }
+        let truns = matching_boxes(&traf_children, *b"trun");
+        if truns.is_empty() {
+            return Err(format!("{traf_context} has no sample run"));
+        }
+        for (trun_index, trun) in truns.iter().enumerate() {
+            validate_trun(data, *trun, &format!("{traf_context} trun {trun_index}"))?;
+        }
+        let tfdt_boxes = matching_boxes(&traf_children, *b"tfdt");
+        if tfdt_boxes.len() > 1 {
+            return Err(format!("{traf_context} contains multiple tfdt boxes"));
+        }
+        if let Some(tfdt) = tfdt_boxes.first() {
+            tfdt_decode_time(data, *tfdt, &traf_context)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn finalize_fmp4(input: &[u8]) -> Result<Vec<u8>, String> {
-    parse_fragmented_track(input, 0)?;
+    let (_, _, _, _, trak_boxes) = fragmented_presentation_parts(input, "Media")?;
+    if trak_boxes.len() == 1 {
+        parse_fragmented_track(input, 0)?;
+    } else {
+        validate_multiplexed_fmp4(input, "Media")?;
+    }
     Ok(input.to_vec())
 }
 
@@ -4357,5 +4524,26 @@ mod tests {
                 expected_track_ids[index]
             );
         }
+    }
+
+    #[test]
+    fn finalizes_multiplexed_fmp4_without_changing_bytes() {
+        // Astra F03: the muxer's own two-track output re-enters as a single
+        // HLS resource. It is already playable; validation must not demand
+        // one track per download.
+        let video = fixture_track(
+            include_bytes!("../../fixtures/media/v-init.mp4"),
+            &[
+                include_bytes!("../../fixtures/media/v-0.m4s"),
+                include_bytes!("../../fixtures/media/v-1.m4s"),
+                include_bytes!("../../fixtures/media/v-2.m4s")
+            ]
+        );
+        let audio = fixture_track(
+            include_bytes!("../../fixtures/media/a-init.mp4"),
+            &[include_bytes!("../../fixtures/media/a-0.m4s")]
+        );
+        let multiplexed = mux_fmp4_tracks(&[video, audio]).expect("muxed fragmented tracks");
+        assert_eq!(finalize_fmp4(&multiplexed).expect("multiplexed fMP4"), multiplexed);
     }
 }

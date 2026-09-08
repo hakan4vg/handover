@@ -225,7 +225,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
           </nav>
           <div className="sidebar-spacer" />
           <SidebarItem icon="settings" label="Settings" active={isSettings} onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }} />
-          <div className="sidebar-footer"><span className="status-dot" /> <span>Connected</span><span className="footer-divider" /><span>Browser integration {snapshot.settings.interceptDownloads ? 'on' : 'off'}</span></div>
+          <div className="sidebar-footer"><span className="status-dot" /> <span>Connected</span><span className="footer-divider" /><span>{snapshot.bridgeAvailable === false ? 'Bridge unavailable' : `Browser integration ${snapshot.settings.interceptDownloads ? 'on' : 'off'}`}</span></div>
         </aside>
         {isSettings ? <SettingsView adapter={adapter} settings={snapshot.settings} page={settingsPage} onPageChange={setSettingsPage} /> : (
           <main className="manager-main">

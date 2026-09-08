@@ -102,6 +102,7 @@ export interface AppSnapshot {
   connected: boolean;
   aggregateSpeed: number;
   notifications: NotificationItem[];
+  bridgeAvailable?: boolean;
 }
 
 export interface DownloadAdapter {

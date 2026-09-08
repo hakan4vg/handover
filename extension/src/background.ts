@@ -14,6 +14,78 @@ const MEDIA_BUFFER_MS = 90_000;
 const PLAYER_BUFFER_MAX = 40;
 const PLAYER_BUFFER_MS = 15_000;
 
+// Last-resolved acquisition source per player scope. The traffic ring above
+// is bounded and shared, so long playback evicts the manifest that a later
+// capture needs (F07). This record keeps the playback's current source for
+// its lifetime and is only a fallback: live traffic that resolves wins, so a
+// quality change in the site player still follows the new representation
+// (SPEC §6.1). Session storage carries the records across service-worker
+// restarts; the ring cannot.
+const RESOLVED_MEDIA_KEY = 'dm-resolved-media';
+const RESOLVED_MEDIA_MAX = 24;
+const RESOLVED_MEDIA_TTL_MS = 15 * 60_000;
+interface ResolvedMedia { scope: string; source: string; selectedSegments: string[]; at: number }
+const resolvedMedia: ResolvedMedia[] = [];
+
+function mediaScope(tabId: number, frameId: number, documentId?: string, playerKey?: string): string {
+  return `${tabId}/${frameId}/${documentId ?? ''}/${playerKey ?? ''}`;
+}
+
+function pruneResolvedMedia(now = Date.now()): void {
+  for (let index = resolvedMedia.length - 1; index >= 0; index -= 1) {
+    if (now - resolvedMedia[index].at > RESOLVED_MEDIA_TTL_MS) resolvedMedia.splice(index, 1);
+  }
+  while (resolvedMedia.length > RESOLVED_MEDIA_MAX) resolvedMedia.shift();
+}
+
+function persistResolvedMedia(): void {
+  try {
+    void chrome.storage.session?.set({ [RESOLVED_MEDIA_KEY]: resolvedMedia });
+  } catch {
+    // Session persistence is best-effort; the in-memory record still serves.
+  }
+}
+
+async function hydrateResolvedMedia(): Promise<void> {
+  try {
+    const stored = await chrome.storage.session?.get(RESOLVED_MEDIA_KEY);
+    const records = stored?.[RESOLVED_MEDIA_KEY];
+    if (!Array.isArray(records)) return;
+    const now = Date.now();
+    for (const record of records) {
+      if (
+        record && typeof record.scope === 'string' && typeof record.source === 'string' &&
+        Array.isArray(record.selectedSegments) && typeof record.at === 'number' &&
+        now - record.at <= RESOLVED_MEDIA_TTL_MS && isHttp(record.source)
+      ) {
+        resolvedMedia.push({ scope: record.scope, source: record.source, selectedSegments: record.selectedSegments.filter((item: unknown): item is string => typeof item === 'string').slice(0, 8), at: record.at });
+      }
+    }
+    pruneResolvedMedia(now);
+  } catch {
+    // Start empty when session storage is unavailable.
+  }
+}
+
+function rememberResolvedMedia(scope: string, source: string, selectedSegments: string[]): void {
+  pruneResolvedMedia();
+  const existing = resolvedMedia.find((item) => item.scope === scope);
+  if (existing) {
+    existing.source = source;
+    existing.selectedSegments = selectedSegments.slice(0, 8);
+    existing.at = Date.now();
+  } else {
+    resolvedMedia.push({ scope, source, selectedSegments: selectedSegments.slice(0, 8), at: Date.now() });
+  }
+  pruneResolvedMedia();
+  persistResolvedMedia();
+}
+
+function takeResolvedMedia(scope: string): ResolvedMedia | undefined {
+  pruneResolvedMedia();
+  return resolvedMedia.find((item) => item.scope === scope);
+}
+
 let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 let policyLoadError = '';
 let policyReady: Promise<void> = Promise.resolve();
@@ -275,14 +347,19 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 // POST-body observation for form-originated downloads (SPEC §5.1: method/
-// body when safely reproducible). Bounded one-shot ring: urlencoded form
-// bodies up to 64 KiB, 60 s TTL, consumed on first matching capture.
-// Multipart/file uploads, raw bodies, and larger forms are left out — the
-// The resident app replays a safe GET for those, exactly as before. Observe-only:
-// no blocking, no modification.
+// body when safely reproducible). Bounded one-shot FIFO: urlencoded form
+// bodies up to 64 KiB, 60 s TTL, consumed oldest-first per URL. Only POST
+// observations are recorded, so an attached body always means the browser
+// POSTed and the resident app replays POST first (F06). Concurrent
+// submissions to one URL queue instead of overwriting each other; tab/frame
+// identity rides along for consumers that know it (the Downloads-API
+// fallback does not, so it takes the oldest match). Multipart/file uploads,
+// raw bodies, and larger forms are left out — the resident app replays a safe
+// GET for those, exactly as before. Observe-only: no blocking, no modification.
 const FORM_BODY_MAX = 64 * 1024;
 const FORM_BODY_TTL_MS = 60_000;
-const recentFormBodies: Array<{ url: string; body: string; at: number }> = [];
+const FORM_BODY_PER_URL = 4;
+const recentFormBodies: Array<{ url: string; body: string; at: number; tabId: number; frameId: number }> = [];
 
 function pruneFormBodies(now = Date.now()): void {
   while (recentFormBodies.length && now - recentFormBodies[0].at > FORM_BODY_TTL_MS) recentFormBodies.shift();
@@ -310,23 +387,25 @@ chrome.webRequest.onBeforeRequest.addListener(
     if (body === undefined) return undefined;
     pruneFormBodies();
     const url = details.url.split('#')[0];
-    const existing = recentFormBodies.find((item) => item.url === url);
-    if (existing) {
-      existing.body = body;
-      existing.at = Date.now();
-      return undefined;
+    const queued = recentFormBodies.filter((item) => item.url === url);
+    if (queued.length >= FORM_BODY_PER_URL) {
+      const oldest = recentFormBodies.findIndex((item) => item.url === url);
+      if (oldest >= 0) recentFormBodies.splice(oldest, 1);
     }
-    recentFormBodies.push({ url, body, at: Date.now() });
+    recentFormBodies.push({ url, body, at: Date.now(), tabId: details.tabId, frameId: details.frameId });
     return undefined;
   },
   { urls: ['<all_urls>'] },
   ['requestBody'],
 );
 
-function takeFormBody(url: string): string | undefined {
+function takeFormBody(url: string, tabId?: number): string | undefined {
   pruneFormBodies();
   const now = Date.now();
-  const index = recentFormBodies.findIndex((item) => item.url === url);
+  let index = tabId !== undefined && tabId >= 0
+    ? recentFormBodies.findIndex((item) => item.url === url && item.tabId === tabId)
+    : -1;
+  if (index < 0) index = recentFormBodies.findIndex((item) => item.url === url);
   if (index < 0) return undefined;
   const [found] = recentFormBodies.splice(index, 1);
   return now - found.at <= FORM_BODY_TTL_MS ? found.body : undefined;
@@ -350,6 +429,12 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       if (ordinaryCaptureError(source, item.referrer ?? '')) {
         return;
       }
+      // The Downloads API exposes no tab/frame identifier, so do not guess a
+      // User-Agent from another document on this fallback path.
+      // One-shot POST replay: a form body was observed on a browser POST for
+      // this URL, so the method rides along and the resident app replays POST
+      // first; absent (or already consumed) means a safe GET.
+      const postBody = takeFormBody(source);
       await sendApp({
         type: 'capture-acquisition',
         payload: {
@@ -357,11 +442,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
           name: cleanFilename(item.filename),
           pageUrl: item.referrer,
           referrer: item.referrer,
-          // The Downloads API exposes no tab/frame identifier, so do not guess a
-          // User-Agent from another document on this fallback path.
-          // One-shot POST replay: a form body observed for this URL rides along;
-          // absent (or already consumed) means the resident app replays a safe GET.
-          postBody: takeFormBody(source),
+          ...(postBody === undefined ? {} : { method: 'POST', postBody }),
         },
       });
     } finally {
@@ -425,6 +506,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       }
       const documentId = sender.documentId;
       const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey : (sender.tab?.id === undefined ? undefined : activePlayerKey(sender.tab.id, sender.frameId ?? 0, documentId));
+      const scope = sender.tab?.id === undefined ? undefined : mediaScope(sender.tab.id, sender.frameId ?? 0, documentId, playerKey);
       let source = typeof payload.source === 'string' ? payload.source : '';
       let selectedSegments: string[] = [];
       if (!isHttp(source) && sender.tab?.id !== undefined) {
@@ -432,6 +514,18 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         const selection = chooseWorkerMediaSelection(recentMedia, recentPlayers, sender.tab.id, sender.frameId ?? 0, playerKey, documentId);
         source = selection?.source ?? '';
         selectedSegments = selection?.selectedSegments ?? [];
+      }
+      if (!isHttp(source) && scope !== undefined) {
+        // The traffic ring lost this playback (long play, cross-tab pressure,
+        // worker restart): reuse the scope's last-resolved source (F07).
+        const remembered = takeResolvedMedia(scope);
+        if (remembered !== undefined) {
+          source = remembered.source;
+          selectedSegments = [...remembered.selectedSegments];
+        }
+      }
+      if (isHttp(source) && scope !== undefined) {
+        rememberResolvedMedia(scope, source, selectedSegments);
       }
       if (!isHttp(source)) {
         reply({ ok: false, error: 'no acquirable source for this media' });
@@ -452,3 +546,4 @@ policyReady = loadPolicy();
 void policyReady
   .then(() => syncPolicyFromResident())
   .catch(() => undefined);
+void hydrateResolvedMedia();

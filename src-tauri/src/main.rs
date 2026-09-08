@@ -4,6 +4,7 @@ mod ipc;
 mod lifecycle;
 mod media;
 mod notify;
+mod protect;
 mod startup;
 
 use futures_util::{future::Abortable, StreamExt};
@@ -135,7 +136,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem> }
+struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool }
 
 struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>> }
 
@@ -506,6 +507,20 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
         if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
             for payload in rows.flatten() {
                 if let Ok(mut job) = serde_json::from_str::<DownloadJob>(&payload) {
+                    if unprotect_job_from_storage(&mut job).is_err() {
+                        // Foreign machine/user or corrupt envelope: bytes on
+                        // disk are intact, but replay context is unusable here.
+                        // Keep the shell, drop the secrets, route through
+                        // Reattach instead of failing or leaking (F11).
+                        job.source.clear();
+                        job.referrer = None;
+                        job.post_body = None;
+                        job.selected_segments.clear();
+                        if job.state != "completed" {
+                            job.state = "paused".into();
+                            job.events.insert(0, job_event("Saved source is unavailable on this machine — the folder may have moved. Use Reattach download.", Some("warning")));
+                        }
+                    }
                     #[cfg(windows)]
                     relocate_job_temp_artifacts(&mut job, &temp_folder);
                     if let Some(marker) = job.destination_reservation.clone() {
@@ -555,7 +570,8 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
         settings,
         connected: true,
         aggregate_speed: 0,
-        notifications: vec![]
+        notifications: vec![],
+        bridge_available: true,
     }
 }
 
@@ -563,7 +579,10 @@ fn save_snapshot(state: &CoreState) -> Result<(), String> {
     let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
     let settings_payload = serde_json::to_string(&snapshot.settings).map_err(|error| format!("Could not serialize settings: {error}"))?;
     let jobs = snapshot.jobs.iter().map(|job| {
-        serde_json::to_string(job)
+        let mut stored = job.clone();
+        protect_job_for_storage(&mut stored);
+        stored.error = stored.error.map(|error| redact_url_credentials(&error));
+        serde_json::to_string(&stored)
             .map(|payload| (job.id.clone(), job.created.clone(), payload))
             .map_err(|error| format!("Could not serialize job {}: {error}", job.id))
     }).collect::<Result<Vec<_>, String>>()?;
@@ -632,7 +651,7 @@ fn refresh_tray(app: &AppHandle, state: &CoreState) {
     }
 }
 
-fn job_event(message: &str, tone: Option<&str>) -> JobEvent { JobEvent { at: now_label(), message: message.into(), tone: tone.map(str::to_string) } }
+fn job_event(message: &str, tone: Option<&str>) -> JobEvent { JobEvent { at: now_label(), message: redact_url_credentials(message), tone: tone.map(str::to_string) } }
 
 fn complete_job(job: &mut DownloadJob) {
     // A finished acquisition knows its size even when the source never
@@ -678,9 +697,44 @@ fn redact_url_credentials(text: &str) -> String {
     out
 }
 
+/// SPEC §16: sources, replay context, and segment URLs are opaque at rest.
+/// The in-memory job keeps plaintext for display and transfer; only the
+/// database payload carries envelopes (F11).
+fn protect_job_for_storage(job: &mut DownloadJob) {
+    job.source = protect::protect_field(&job.source);
+    if let Some(referrer) = job.referrer.take() {
+        job.referrer = Some(protect::protect_field(&referrer));
+    }
+    if let Some(body) = job.post_body.take() {
+        job.post_body = Some(protect::protect_field(&body));
+    }
+    job.selected_segments = job
+        .selected_segments
+        .iter()
+        .map(|segment| protect::protect_field(segment))
+        .collect();
+}
+
+fn unprotect_job_from_storage(job: &mut DownloadJob) -> Result<(), String> {
+    job.source = protect::unprotect_field(&job.source)?;
+    if let Some(referrer) = job.referrer.take() {
+        job.referrer = Some(protect::unprotect_field(&referrer)?);
+    }
+    if let Some(body) = job.post_body.take() {
+        job.post_body = Some(protect::unprotect_field(&body)?);
+    }
+    job.selected_segments = job
+        .selected_segments
+        .iter()
+        .map(|segment| protect::unprotect_field(segment))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(())
+}
+
 /// SPEC §16: the database holds resumable sources and replay context, so
-/// the data dir and database are owner-only on Unix. No-op elsewhere;
-/// Windows ACLs belong to the Windows delivery pass.
+/// the data dir and database are owner-only on Unix. Sources and replay
+/// context are DPAPI-enveloped at rest on Windows (protect.rs); owner-only
+/// Windows ACLs on the folder itself remain deferred.
 fn restrict_data_dir(root: &Path) {
     let _ = std::fs::create_dir_all(root);
     #[cfg(unix)] {
@@ -743,6 +797,26 @@ fn windows_device_name(value: &str) -> bool {
 
 fn destination_for_filename(folder: &str, name: &str) -> String {
     Path::new(folder).join(safe_filename(name)).to_string_lossy().into_owned()
+}
+
+/// Manifest acquisition learns the real container only after parsing, while
+/// the browser supplies a page-title name (usually ending in `.mp4`). The
+/// acquired bytes decide the extension; the user's stem is preserved and the
+/// destination stays consistent with the displayed name (F02).
+fn manifest_output_name(current: &str, container_ext: &str) -> String {
+    let extension = Path::new(current)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if extension.eq_ignore_ascii_case(container_ext) {
+        return current.to_string();
+    }
+    let stem = Path::new(current)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("media");
+    format!("{stem}.{container_ext}")
 }
 
 fn source_name(source: &str) -> String {
@@ -920,7 +994,7 @@ fn add_notification(app: &AppHandle, state: &CoreState, id: &str, kind: &str) {
             let Some(job) = snapshot.jobs.iter().find(|job| job.id == id).cloned() else { return; };
             let enabled = if kind == "completed" { snapshot.settings.completion_notifications } else { snapshot.settings.failure_notifications };
             let destination = job.destination.clone();
-            let item = NotificationItem { id: format!("{kind}-{id}"), notification_type: kind.into(), title: if kind == "completed" { "Download completed".into() } else { "Download failed".into() }, detail: if kind == "completed" { format!("{} · {}", job.name, format_bytes(job.total)) } else { format!("{} · {}", job.name, job.error.unwrap_or_else(|| "The source could not be acquired".into())) }, time: now_label(), job_id: id.into() };
+            let item = NotificationItem { id: format!("{kind}-{id}"), notification_type: kind.into(), title: if kind == "completed" { "Download completed".into() } else { "Download failed".into() }, detail: if kind == "completed" { format!("{} · {}", job.name, format_bytes(job.total)) } else { format!("{} · {}", job.name, redact_url_credentials(&job.error.unwrap_or_else(|| "The source could not be acquired".into()))) }, time: now_label(), job_id: id.into() };
             if enabled && !snapshot.notifications.iter().any(|current| current.id == item.id) { snapshot.notifications.insert(0, item.clone()); snapshot.notifications.truncate(40); }
             (item, enabled, destination)
         }
@@ -989,10 +1063,10 @@ fn acquisition_request(client: &reqwest::Client, app: &AppHandle, id: &str, url:
     }
 }
 
-// POST replay for form-originated captures (SPEC §5.1 method/body). Used
-// only after a plain GET is refused with 405: unconditional POST replay
-// would re-submit forms whose endpoints already answer GET. Same Referer
-// scoping as GET requests.
+// POST replay for form-originated captures (SPEC §5.1 method/body). The
+// extension only records bodies it observed on a browser POST, so a present
+// body is replayed first in acquire_once; the 405 path below stays as the
+// fallback for captures without one. Same Referer scoping as GET requests.
 fn post_replay_request(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Option<reqwest::RequestBuilder> {
     let (referrer, post_body, user_agent) = job_context(app, id);
     let body = post_body?;
@@ -1009,6 +1083,43 @@ fn post_replay_request(client: &reqwest::Client, app: &AppHandle, id: &str, url:
 
 fn retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT || status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// 404/410 mean the URL itself is dead: retrying, degrading, or refetching
+/// cannot revive it. Failing fast also stops the engine grinding through the
+/// parallel → one-connection → single-stream sequence against a URL whose
+/// single redemption the capability probe already consumed (F05).
+fn terminal_source_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE
+}
+
+fn terminal_source_error(status: reqwest::StatusCode) -> String {
+    format!("source is gone (HTTP {status}); the URL may have expired or allow a single use")
+}
+
+fn is_terminal_source_error(error: &str) -> bool {
+    error.starts_with("source is gone (HTTP ")
+}
+
+/// A 200 HTML page without a file disposition is never the named download:
+/// form results, login walls, and soft-error pages must fail honestly instead
+/// of completing as the target file (F06). Filenames that are themselves HTML
+/// stay downloadable.
+fn page_instead_of_file(mime: Option<&str>, disposition: Option<&str>, filename: &str) -> bool {
+    let is_html = mime
+        .map(|value| value.split(';').next().unwrap_or(value).trim())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("text/html"));
+    if !is_html {
+        return false;
+    }
+    let disposition_names_file = disposition
+        .map(|value| value.to_ascii_lowercase().contains("filename"))
+        .unwrap_or(false);
+    if disposition_names_file {
+        return false;
+    }
+    let lower = filename.to_ascii_lowercase();
+    !(lower.ends_with(".html") || lower.ends_with(".htm"))
 }
 
 async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String> {
@@ -1346,6 +1457,13 @@ async fn mux_media_tracks(track_paths: &[String], output_path: &str) -> Result<S
     let mixed_webm = inputs.len() == 2
         && webm_count == 1
         && !inputs.iter().any(|input| looks_like_mpeg_ts(input));
+    // Two WebM inputs (e.g. VP9 video + Opus audio) have no v1 mux path: the
+    // Matroska builder pairs WebM video with AAC/fMP4 audio only (SPEC §9).
+    // Fail with the combination named instead of a confusing fMP4 parse
+    // error; downloaded parts are preserved by the caller (F03).
+    if webm_count > 1 {
+        return Err("Media track finalization failed: WebM audio + WebM video muxing is not supported; downloaded parts were preserved".into());
+    }
     let (merged, actual_output_path) = if inputs.iter().all(|input| looks_like_mpeg_ts(input)) {
         (
             media::mux_mpeg_ts_tracks(&inputs),
@@ -1568,6 +1686,9 @@ async fn fragment_bytes(
                     last_error = "The server returned an incomplete HLS byte range".into();
                 }
             }
+            Ok(response) if terminal_source_status(response.status()) => {
+                return Err(terminal_source_error(response.status()));
+            }
             Ok(response) => last_error = format!("source returned {}", response.status()),
             Err(error) => last_error = error.to_string()
         }
@@ -1616,7 +1737,12 @@ async fn acquire_media_segment(
     };
     if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
-    tokio::fs::write(segment_temp_path, &bytes).await.map_err(|error| error.to_string())?;
+    // Durability barrier: a renamed part file must hold complete bytes, so a
+    // power loss can never leave a trusted-but-torn segment (F10).
+    let mut part = tokio::fs::File::create(segment_temp_path).await.map_err(|error| error.to_string())?;
+    part.write_all(&bytes).await.map_err(|error| error.to_string())?;
+    part.sync_all().await.map_err(|error| error.to_string())?;
+    drop(part);
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
     tokio::fs::rename(segment_temp_path, segment_path).await.map_err(|error| error.to_string())?;
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
@@ -1727,6 +1853,9 @@ async fn range_bytes(
                     continue;
                 }
                 last_error = "The server returned an incomplete byte range".into();
+            }
+            Ok(response) if terminal_source_status(response.status()) => {
+                return Err(terminal_source_error(response.status()));
             }
             Ok(response) => last_error = format!("range request returned {}", response.status()),
             Err(error) => last_error = error.to_string()
@@ -1854,6 +1983,12 @@ async fn acquire_ranges(
             .set_len(total)
             .await
             .map_err(|error| error.to_string())?;
+        // The probe byte is claimed as completed range 0-0 below: make the
+        // fresh file (byte + preallocation) durable first (F10).
+        initial
+            .sync_all()
+            .await
+            .map_err(|error| error.to_string())?;
     } else if !completed_ranges.iter().any(|range| range.start == 0) {
         let mut initial = OpenOptions::new()
             .write(true)
@@ -1877,6 +2012,11 @@ async fn acquire_ranges(
         if !transfer_can_continue(&app, &id, generation) {
             return Ok(());
         }
+        // Same barrier before claiming range 0-0 on the resume path (F10).
+        initial
+            .sync_all()
+            .await
+            .map_err(|error| error.to_string())?;
         completed_ranges = merge_range(&completed_ranges, ByteRange { start: 0, end: 0 });
     }
     let ranges = missing_ranges(total, &completed_ranges, max_connections);
@@ -1957,6 +2097,11 @@ async fn acquire_ranges(
             file.write_all(&bytes)
                 .await
                 .map_err(|error| error.to_string())?;
+            // Durability barrier: completed ranges are trusted after reboot,
+            // so bytes must be durable before the range is claimed (F10).
+            file.sync_all()
+                .await
+                .map_err(|error| error.to_string())?;
             if !transfer_is_downloading(&app, &id, generation) {
                 return Err("paused".to_string());
             }
@@ -2015,6 +2160,11 @@ async fn acquire_ranges(
             emit_snapshot(&app, &state);
             return Ok(());
         }
+        // A dead URL cannot be revived by fewer connections or a new stream:
+        // report it instead of grinding through the fallback stages (F05).
+        if is_terminal_source_error(&initial_error) {
+            return Err(initial_error);
+        }
         let mut fallback_completed = state
             .snapshot
             .lock()
@@ -2070,6 +2220,9 @@ async fn acquire_ranges(
             {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    if is_terminal_source_error(&error) {
+                        return Err(error);
+                    }
                     fallback_error = Some(error);
                     break;
                 }
@@ -2092,6 +2245,11 @@ async fn acquire_ranges(
                 break;
             }
             if let Err(error) = file.write_all(&bytes).await {
+                fallback_error = Some(error.to_string());
+                break;
+            }
+            // Same durability barrier as the parallel path (F10).
+            if let Err(error) = file.sync_all().await {
                 fallback_error = Some(error.to_string());
                 break;
             }
@@ -2305,11 +2463,12 @@ fn manifest_segment_path(directory: &Path, track: usize, index: usize, track_cou
     if track_count == 1 { directory.join(format!("{index:08}.part")) } else { directory.join(format!("{track:02}")).join(format!("{index:08}.part")) }
 }
 
-// Identity of a segmented resource: track kinds plus every segment URL and
-// byte range. Positional part-files are only reusable when this matches;
-// otherwise the directory is wiped and refetched rather than stitching a new
-// manifest onto old bytes (SPEC §8.8: restart when identity cannot be
-// established safely).
+// Identity of a segmented resource: track kinds, every segment URL and byte
+// range, plus each segment's encryption identity (key URI + effective IV).
+// Rotated keys at unchanged URLs must not mix old ciphertext with a new key.
+// Positional part-files are only reusable when this matches; otherwise the
+// directory is wiped and refetched rather than stitching a new manifest onto
+// old bytes (SPEC §8.8: restart when identity cannot be established safely).
 fn segment_identity(tracks: &[media::MediaTrack]) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for track in tracks {
@@ -2332,6 +2491,12 @@ fn segment_identity(tracks: &[media::MediaTrack]) -> String {
             {
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x100000001b3);
+            }
+            if let Some(key) = segment.key.as_ref() {
+                for byte in key.uri.bytes().chain(media::hls_key_iv(key).into_iter()).chain([0xfc]) {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
             }
         }
     }
@@ -2400,17 +2565,19 @@ async fn acquire_manifest(
         }) else {
             break;
         };
-        let response = acquisition_request(&client, &app, &id, &variant)
+        let fetch = acquisition_request(&client, &app, &id, &variant)
             .send()
             .await
             .map_err(|error| error.to_string())?
             .error_for_status()
             .map_err(|error| error.to_string())?;
-        manifest_body = response.text().await.map_err(|error| error.to_string())?;
+        // Redirects change the resolution base: relative segment references
+        // belong to the manifest's effective URL, not the requested one (F04).
+        manifest_source = fetch.url().to_string();
+        manifest_body = fetch.text().await.map_err(|error| error.to_string())?;
         if !transfer_can_continue(&app, &id, generation) {
             return Ok(());
         }
-        manifest_source = variant;
     }
     let is_hls =
         manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
@@ -2419,13 +2586,15 @@ async fn acquire_manifest(
         let mut track_has_map = Vec::with_capacity(sources.len());
         for (kind, track_source) in sources {
             let mut source = track_source;
-            let response = acquisition_request(&client, &app, &id, &source)
+            let fetch = acquisition_request(&client, &app, &id, &source)
                 .send()
                 .await
                 .map_err(|error| error.to_string())?
                 .error_for_status()
                 .map_err(|error| error.to_string())?;
-            let mut body = response.text().await.map_err(|error| error.to_string())?;
+            // Same redirect rule as the variant loop above (F04).
+            source = fetch.url().to_string();
+            let mut body = fetch.text().await.map_err(|error| error.to_string())?;
             if !transfer_can_continue(&app, &id, generation) {
                 return Ok(());
             }
@@ -2433,17 +2602,17 @@ async fn acquire_manifest(
                 let Some(variant) = media::hls_variant(&source, &body) else {
                     break;
                 };
-                let response = acquisition_request(&client, &app, &id, &variant)
+                let fetch = acquisition_request(&client, &app, &id, &variant)
                     .send()
                     .await
                     .map_err(|error| error.to_string())?
                     .error_for_status()
                     .map_err(|error| error.to_string())?;
-                body = response.text().await.map_err(|error| error.to_string())?;
+                source = fetch.url().to_string();
+                body = fetch.text().await.map_err(|error| error.to_string())?;
                 if !transfer_can_continue(&app, &id, generation) {
                     return Ok(());
                 }
-                source = variant;
             }
             track_has_map.push(body.contains("#EXT-X-MAP"));
             tracks.push(media::MediaTrack {
@@ -2620,14 +2789,11 @@ async fn acquire_manifest(
             total: total_segments,
             identity: Some(identity.clone())
         });
-        if job.name == source_name(&job.source) {
-            let stem = Path::new(&job.name)
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("media");
-            job.name = format!("{stem}.{container_ext}");
+        let corrected = manifest_output_name(&job.name, container_ext);
+        if corrected != job.name {
+            job.name = corrected.clone();
             let mut destination = PathBuf::from(&job.destination);
-            destination.set_file_name(&job.name);
+            destination.set_file_name(&corrected);
             job.destination = destination.to_string_lossy().into_owned();
         }
         job.events.insert(
@@ -2707,6 +2873,21 @@ async fn acquire_manifest(
             });
             emit_snapshot(&app, &state);
             return Ok(());
+        }
+        // Dead segment URLs cannot be revived sequentially either (F05).
+        if is_terminal_source_error(&initial_error) {
+            emit_job(&state, &id, |job| {
+                job.state = "failed".into();
+                job.error = Some(initial_error.clone());
+                job.connections = 0;
+                job.speed = 0;
+                job.events.insert(
+                    0,
+                    job_event("Media fragment acquisition failed", Some("error"))
+                );
+            });
+            emit_snapshot(&app, &state);
+            return Err(initial_error);
         }
         emit_job(&state, &id, |job| {
             job.connections = 1;
@@ -2969,11 +3150,39 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 .map(|job| job.selected_segments.clone())
         })
         .unwrap_or_default();
-    let mut response = match acquisition_request(&client, &app, &id, &source)
+    // The extension only records bodies it observed on a browser POST, so a
+    // present body means the browser POSTed: replay it before any GET, or a
+    // form page satisfies the acquisition and the real export is lost (F06).
+    // A POST response carries no range probe, so form captures continue as a
+    // single stream — replayability is unknown, and F05 forbids assuming it.
+    let post_first = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .and_then(|job| job.post_body.clone())
+        });
+    let post_first = match post_first {
+        Some(_) => match post_replay_request(&client, &app, &id, &source) {
+            Some(replay) => match replay.send().await {
+                Ok(posted) if posted.status().is_success() => Some(posted),
+                _ => None,
+            },
+            None => None,
+        },
+        None => None,
+    };
+    let mut response = match post_first {
+        Some(posted) => posted,
+        None => match acquisition_request(&client, &app, &id, &source)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
         .await
-    {
+        {
         Ok(response) if response.status().is_success() => response,
         _ => match acquisition_request(&client, &app, &id, &source)
             .send()
@@ -3074,6 +3283,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 return true;
             }
         }
+        }
     };
     if !transfer_can_continue(&app, &id, generation) {
         return false;
@@ -3130,21 +3340,57 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     if !transfer_can_continue(&app, &id, generation) {
         return false;
     }
+    // The probe follows redirects: segment resolution must use the manifest's
+    // effective URL, not the requested source (F04).
+    let mut manifest_source = response.url().to_string();
     let response_mime = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    if media::is_manifest_source(&source, response_mime.as_deref()) {
+    // A 200 HTML page without a file disposition is a form result, login
+    // wall, or soft-error page — never the named download. Fail honestly
+    // instead of completing it as the target file (F06).
+    let page_disposition = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok());
+    let job_name = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.name.clone())
+        })
+        .unwrap_or_default();
+    if page_instead_of_file(response_mime.as_deref(), page_disposition, &job_name) {
+        if !transfer_can_continue(&app, &id, generation) {
+            return false;
+        }
+        emit_job(&state, &id, |job| {
+            job.state = "failed".into();
+            job.error = Some("The source returned a web page instead of a file; the site may need its login session".into());
+            job.eta = None;
+            job.events.insert(
+                0,
+                job_event("Source returned a web page instead of a file", Some("error"))
+            );
+        });
+        emit_snapshot(&app, &state);
+        add_notification(&app, &state, &id, "failed");
+        return false;
+    }
+    if media::is_manifest_source(&manifest_source, response_mime.as_deref()) {
         if !transfer_can_continue(&app, &id, generation) {
             return false;
         }
         let body = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            match acquisition_request(&client, &app, &id, &source)
+            match acquisition_request(&client, &app, &id, &manifest_source)
                 .send()
                 .await
             {
                 Ok(full) if full.status().is_success() => {
+                    manifest_source = full.url().to_string();
                     full.text().await.map_err(|error| error.to_string())
                 }
                 Ok(full) => Err(format!("Manifest source returned {}", full.status())),
@@ -3161,7 +3407,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 acquire_manifest(
                     app.clone(),
                     id.clone(),
-                    source.clone(),
+                    manifest_source.clone(),
                     body,
                     response_mime.clone(),
                     selected_segments.clone(),
@@ -3587,6 +3833,7 @@ fn get_snapshot(state: State<'_, CoreState>) -> AppSnapshot {
             connected: false,
             aggregate_speed: 0,
             notifications: vec![],
+            bridge_available: false,
         })
 }
 
@@ -4616,6 +4863,55 @@ fn spawn_commit(app: AppHandle, id: String, input: CommitInput) {
     });
 }
 
+/// Loopback hosts the bridge accepts. The listener binds 127.0.0.1, but the
+/// Host header is caller-controlled (DNS rebinding), so it is validated
+/// instead of trusted (F01).
+fn bridge_host_allowed(host: &Option<String>) -> bool {
+    let Some(raw) = host.as_deref() else { return true };
+    let host = raw.trim();
+    let bare = if let Some(stripped) = host.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(stripped)
+    } else if host == "::1" {
+        "::1"
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    matches!(bare.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Browsers always attach Origin to cross-origin fetches and pages cannot
+/// suppress it, so a present non-extension Origin proves a web caller (F01).
+/// Absent Origin means a non-browser local client (fixtures, harnesses);
+/// those stay allowed behind the loopback bind.
+fn bridge_origin_allowed(origin: &Option<String>) -> bool {
+    match origin.as_deref() {
+        None => true,
+        Some(origin) => origin.starts_with("chrome-extension://"),
+    }
+}
+
+fn bridge_caller_allowed(request: &ipc::Request) -> bool {
+    bridge_host_allowed(&request.host) && bridge_origin_allowed(&request.origin)
+}
+
+/// Validated extension origin to reflect in CORS headers, if any (F01).
+fn bridge_allow_origin(request: &ipc::Request) -> Option<String> {
+    match request.origin.as_deref() {
+        Some(origin) if origin.starts_with("chrome-extension://") => Some(origin.to_string()),
+        _ => None,
+    }
+}
+
+fn bridge_json_content(request: &ipc::Request) -> bool {
+    request.content_type.as_deref().is_some_and(|value| {
+        value.split(';').next().unwrap_or(value).trim().eq_ignore_ascii_case("application/json")
+    })
+}
+
+fn bridge_reject(request: &ipc::Request, status: u16, error: &str) -> ipc::Response {
+    bridge_json(status, json!({ "ok": false, "error": error })).with_origin(bridge_allow_origin(request))
+}
+
 fn bridge_json(status: u16, value: Value) -> ipc::Response {
     let body = if status == 204 {
         Vec::new()
@@ -4627,12 +4923,29 @@ fn bridge_json(status: u16, value: Value) -> ipc::Response {
     ipc::Response::new(status, body)
 }
 
+fn bridge_respond(request: &ipc::Request, status: u16, value: Value) -> ipc::Response {
+    bridge_json(status, value).with_origin(bridge_allow_origin(request))
+}
+
 fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
     if request.method == "OPTIONS" {
-        return bridge_json(204, json!({}));
+        if !bridge_origin_allowed(&request.origin) {
+            return bridge_reject(&request, 403, "bridge preflight not from the browser extension");
+        }
+        return bridge_json(204, json!({})).with_origin(bridge_allow_origin(&request));
+    }
+    if !bridge_host_allowed(&request.host) {
+        return bridge_reject(&request, 403, "bridge request host is not loopback");
+    }
+    let mutation = request.method == "POST";
+    if mutation && !bridge_caller_allowed(&request) {
+        return bridge_reject(&request, 403, "bridge request not from the browser extension");
+    }
+    if mutation && !bridge_json_content(&request) {
+        return bridge_reject(&request, 415, "bridge request must be JSON");
     }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/v1/health") => bridge_json(200, json!({ "ok": true })),
+        ("GET", "/v1/health") => bridge_respond(&request, 200, json!({ "ok": true })),
         ("GET", "/v1/policy") => {
             let policy = load_browser_policy(&browser_policy_root()).unwrap_or_else(|| {
                 app.state::<CoreState>()
@@ -4641,51 +4954,54 @@ fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
                     .map(|snapshot| settings_policy(&snapshot.settings))
                     .unwrap_or((true, true, Vec::new()))
             });
-            bridge_json(
+            bridge_respond(
+                &request,
                 200,
                 json!({ "ok": true, "policy": browser_policy_value(&policy) })
             )
         }
         ("POST", "/v1/policy") => {
             let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
-                return bridge_json(400, json!({ "ok": false, "error": "invalid policy" }));
+                return bridge_reject(&request, 400, "invalid policy");
             };
             let Some(policy) = browser_policy_from_value(&message) else {
-                return bridge_json(400, json!({ "ok": false, "error": "invalid policy" }));
+                return bridge_reject(&request, 400, "invalid policy");
             };
             let state = app.state::<CoreState>();
             apply_browser_policy(&app, state.inner(), policy.clone());
-            bridge_json(
+            bridge_respond(
+                &request,
                 200,
                 json!({ "ok": true, "policy": browser_policy_value(&policy) })
             )
         }
         ("POST", "/v1/capture") => {
             let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
-                return bridge_json(400, json!({ "ok": false, "error": "invalid acquisition" }));
+                return bridge_reject(&request, 400, "invalid acquisition");
             };
             let Some(input) = provisional_input_from_message(&message) else {
-                return bridge_json(400, json!({ "ok": false, "error": "invalid acquisition" }));
+                return bridge_reject(&request, 400, "invalid acquisition");
             };
             let state = app.state::<CoreState>();
             match start_provisional(app.clone(), state.inner(), input, true) {
-                Ok(id) => bridge_json(200, json!({ "ok": true, "id": id })),
-                Err(error) => bridge_json(500, json!({ "ok": false, "error": error }))
+                Ok(id) => bridge_respond(&request, 200, json!({ "ok": true, "id": id })),
+                Err(error) => bridge_respond(&request, 500, json!({ "ok": false, "error": error }))
             }
         }
         ("POST", "/v1/manager") => {
             let Some(window) = app.get_webview_window("main") else {
-                return bridge_json(
+                return bridge_respond(
+                    &request,
                     500,
                     json!({ "ok": false, "error": "manager window unavailable" })
                 );
             };
             if let Err(error) = window.show().and_then(|_| window.set_focus()) {
-                return bridge_json(500, json!({ "ok": false, "error": error.to_string() }));
+                return bridge_respond(&request, 500, json!({ "ok": false, "error": error.to_string() }));
             }
-            bridge_json(200, json!({ "ok": true }))
+            bridge_respond(&request, 200, json!({ "ok": true }))
         }
-        _ => bridge_json(404, json!({ "ok": false, "error": "unknown bridge route" }))
+        _ => bridge_reject(&request, 404, "unknown bridge route"),
     }
 }
 
@@ -4696,6 +5012,15 @@ fn start_bridge(app: &AppHandle) {
             Ok(listener) => listener,
             Err(error) => {
                 eprintln!("Local browser bridge unavailable: {error}");
+                // A second per-user instance (or another local holder of the
+                // fixed port) leaves this manager running without a bridge.
+                // Say so in the snapshot instead of showing normal
+                // "Browser integration on" state (F01).
+                let state = app.state::<CoreState>();
+                if let Ok(mut snapshot) = state.snapshot.lock() {
+                    snapshot.bridge_available = false;
+                }
+                let _ = emit_snapshot_event(&app, &state);
                 return;
             }
         };
@@ -5062,12 +5387,16 @@ fn configure_portable_webview2() {
 #[cfg(test)]
 mod capture_tests {
     use super::{
+        bridge_host_allowed, bridge_json_content, bridge_origin_allowed,
         browser_policy_from_value, browser_policy_value, capture_input_from_args,
-        cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job,
-        provisional_input_from_message, redact_url_credentials, referer_value, restrict_data_dir,
-        restrict_file, source_compatible, tray_status_text, tray_toggle_next, DownloadJob,
-        ProvisionalInput,
+        cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job, manifest_output_name,
+        provisional_input_from_message, protect_job_for_storage, redact_url_credentials,
+        referer_value, restrict_data_dir, restrict_file, retryable_status, segment_identity,
+        source_compatible, terminal_source_error, terminal_source_status, is_terminal_source_error,
+        page_instead_of_file, tray_status_text, tray_toggle_next, unprotect_job_from_storage,
+        DownloadJob, ProvisionalInput,
     };
+    use super::ipc;
     use serde_json::json;
 
     #[test]
@@ -5299,6 +5628,89 @@ mod capture_tests {
     }
 
     #[test]
+    fn bridge_rejects_web_origins_and_foreign_hosts() {
+        // Astra F01 reproduction: text/plain + https Origin must not reach a
+        // mutation route. Absent Origin (non-browser local clients) stays
+        // allowed behind the loopback bind.
+        assert!(bridge_origin_allowed(&None));
+        assert!(bridge_origin_allowed(&Some("chrome-extension://abc".into())));
+        assert!(!bridge_origin_allowed(&Some("https://untrusted.example".into())));
+        assert!(!bridge_origin_allowed(&Some("http://127.0.0.1:38217".into())));
+        assert!(bridge_host_allowed(&None));
+        assert!(bridge_host_allowed(&Some("127.0.0.1:38217".into())));
+        assert!(bridge_host_allowed(&Some("localhost".into())));
+        assert!(bridge_host_allowed(&Some("[::1]:38217".into())));
+        assert!(!bridge_host_allowed(&Some("evil.example:38217".into())));
+        assert!(!bridge_host_allowed(&Some("127.0.0.1.evil.example".into())));
+        let json = Some("application/json".to_string());
+        let json_charset = Some("application/json; charset=utf-8".to_string());
+        let plain = Some("text/plain".to_string());
+        assert!(bridge_json_content(&ipc::Request { method: "POST".into(), path: "/v1/capture".into(), body: vec![], host: None, origin: None, content_type: json }));
+        assert!(bridge_json_content(&ipc::Request { method: "POST".into(), path: "/v1/capture".into(), body: vec![], host: None, origin: None, content_type: json_charset }));
+        assert!(!bridge_json_content(&ipc::Request { method: "POST".into(), path: "/v1/capture".into(), body: vec![], host: None, origin: None, content_type: plain }));
+        assert!(!bridge_json_content(&ipc::Request { method: "POST".into(), path: "/v1/capture".into(), body: vec![], host: None, origin: None, content_type: None }));
+    }
+
+    #[test]
+    fn dead_source_urls_fail_fast_without_retry() {
+        // Astra F05: 404/410 end the acquisition at the failing stage; the
+        // engine must not grind through degrade/fallback sequences.
+        assert!(terminal_source_status(reqwest::StatusCode::GONE));
+        assert!(terminal_source_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!terminal_source_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(!terminal_source_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!retryable_status(reqwest::StatusCode::GONE));
+        let error = terminal_source_error(reqwest::StatusCode::GONE);
+        assert!(is_terminal_source_error(&error));
+        assert!(!is_terminal_source_error("range request returned 503 Service Unavailable"));
+    }
+
+    #[test]
+    fn html_pages_are_not_completed_as_named_files() {
+        // Astra F06: a form/login/soft-error page must fail, never complete
+        // as export.zip. Disposition-named files and real HTML names pass.
+        assert!(page_instead_of_file(Some("text/html"), None, "export.zip"));
+        assert!(page_instead_of_file(Some("text/html; charset=utf-8"), None, "export.zip"));
+        assert!(!page_instead_of_file(Some("text/html"), Some("attachment; filename=\"export.zip\""), "export.zip"));
+        assert!(!page_instead_of_file(Some("text/html"), Some("inline; filename=\"doc.html\""), "doc.html"));
+        assert!(!page_instead_of_file(Some("text/html"), None, "page.html"));
+        assert!(!page_instead_of_file(Some("text/html"), None, "page.HTM"));
+        assert!(!page_instead_of_file(Some("application/zip"), None, "export.zip"));
+        assert!(!page_instead_of_file(None, None, "export.zip"));
+    }
+
+    #[test]
+    fn segment_identity_covers_encryption_identity() {
+        // Astra F10: rotated keys at unchanged URLs must not reuse old parts.
+        let track = |segments: Vec<super::media::Segment>| super::media::MediaTrack {
+            kind: "video".into(),
+            segments,
+            segment_base: None,
+        };
+        let plain = || super::media::Segment { url: "https://cdn.example.test/seg-0.m4s".into(), range: None, key: None };
+        let key = |uri: &str| super::media::HlsKey { uri: uri.into(), iv: None, sequence: 3 };
+        let keyed = |uri: &str| super::media::Segment { url: "https://cdn.example.test/seg-0.m4s".into(), range: None, key: Some(key(uri)) };
+        assert_eq!(segment_identity(&[track(vec![plain()])]), segment_identity(&[track(vec![plain()])]));
+        assert_ne!(segment_identity(&[track(vec![plain()])]), segment_identity(&[track(vec![keyed("https://cdn.example.test/k1")])]));
+        assert_ne!(
+            segment_identity(&[track(vec![keyed("https://cdn.example.test/k1")])]),
+            segment_identity(&[track(vec![keyed("https://cdn.example.test/k2")])])
+        );
+    }
+
+    #[test]
+    fn manifest_output_name_follows_acquired_container() {
+        // Astra F02: a page-title `.mp4` name must not mislabel TS bytes.
+        // The stem is preserved; the acquired container decides the suffix.
+        assert_eq!(manifest_output_name("Player title.mp4", "ts"), "Player title.ts");
+        assert_eq!(manifest_output_name("real-ts.ts", "ts"), "real-ts.ts");
+        assert_eq!(manifest_output_name("Clip.MP4", "ts"), "Clip.ts");
+        assert_eq!(manifest_output_name("vod", "mp4"), "vod.mp4");
+        assert_eq!(manifest_output_name("show.mp4", "mp4"), "show.mp4");
+        assert_eq!(manifest_output_name("track.m4s", "mp4"), "track.mp4");
+    }
+
+    #[test]
     fn provisional_input_accepts_page_url_alias() {
         // The Tauri command path deserializes this struct directly, so it
         // must accept the extension's pageUrl key (the gated-media E2E
@@ -5437,7 +5849,7 @@ mod capture_tests {
         use std::sync::Mutex;
         let database = Connection::open_in_memory().unwrap();
         database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
-        let state = CoreState { snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![] }), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) };
+        let state = CoreState { snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![], bridge_available: true }), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None) };
         // Simulate a live patch, then a restart: the patched values must
         // come back through the same SQL row and boot parser the app uses.
         let patched = apply_settings_patch(&default_settings(), &serde_json::json!({"maxConnections": 4, "bandwidthLimit": 1048576}));
@@ -5771,7 +6183,7 @@ mod capture_tests {
     #[test]
     fn commit_idle_wait_observes_active_owner_release() {
         let state = std::sync::Arc::new(super::CoreState {
-            snapshot: std::sync::Mutex::new(super::AppSnapshot { jobs: Vec::new(), settings: super::default_settings(), connected: false, aggregate_speed: 0, notifications: Vec::new() }),
+            snapshot: std::sync::Mutex::new(super::AppSnapshot { jobs: Vec::new(), settings: super::default_settings(), connected: false, aggregate_speed: 0, notifications: Vec::new(), bridge_available: false }),
             database: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
             reattach_target: std::sync::Mutex::new(None),
             bandwidth: std::sync::Mutex::new(super::BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
@@ -5804,7 +6216,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         database.execute("INSERT INTO settings (id, payload) VALUES (1, ?1)", rusqlite::params!["old-settings"]).unwrap();
         database.execute_batch("CREATE TRIGGER reject_settings BEFORE INSERT ON settings BEGIN SELECT RAISE(ABORT, 'settings locked'); END;").unwrap();
         let state = CoreState {
-            snapshot: Mutex::new(AppSnapshot { jobs: Vec::new(), settings: default_settings(), connected: true, aggregate_speed: 0, notifications: Vec::new() }),
+            snapshot: Mutex::new(AppSnapshot { jobs: Vec::new(), settings: default_settings(), connected: true, aggregate_speed: 0, notifications: Vec::new(), bridge_available: true }),
             database: Mutex::new(database),
             reattach_target: Mutex::new(None),
             bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
@@ -5879,7 +6291,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         database.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", rusqlite::params!["old-job", "old", "old-payload"]).unwrap();
         database.execute("INSERT INTO settings (id, payload) VALUES (1, ?1)", rusqlite::params!["old-settings"]).unwrap();
         let state = CoreState {
-            snapshot: Mutex::new(AppSnapshot { jobs: vec![job("same-id"), job("same-id")], settings: super::default_settings(), connected: true, aggregate_speed: 0, notifications: vec![] }),
+            snapshot: Mutex::new(AppSnapshot { jobs: vec![job("same-id"), job("same-id")], settings: super::default_settings(), connected: true, aggregate_speed: 0, notifications: vec![], bridge_available: true }),
             database: Mutex::new(database),
             reattach_target: Mutex::new(None),
             bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
@@ -5920,6 +6332,20 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         assert_eq!(job.referrer, None, "capture-page URL must not outlive the job");
         assert_eq!(job.post_body, None, "form body must not outlive the job");
         assert_eq!(job.user_agent, None, "browser UA must not outlive the job");
+    }
+
+    #[test]
+    fn stored_job_hides_signed_source_and_restores_it() {
+        // F11: the database payload must not contain the signed query, but
+        // the live job keeps working after a save/load cycle on this machine.
+        let mut job = finished_job_with_context();
+        let source = job.source.clone();
+        protect_job_for_storage(&mut job);
+        let payload = serde_json::to_string(&job).expect("stored job serializes");
+        assert!(!payload.contains("token=abc"), "signed query at rest: {payload}");
+        let mut loaded: DownloadJob = serde_json::from_str(&payload).expect("stored job loads");
+        unprotect_job_from_storage(&mut loaded).expect("own envelopes open here");
+        assert_eq!(loaded.source, source);
     }
 
     #[test]

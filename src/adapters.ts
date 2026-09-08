@@ -180,6 +180,7 @@ class MockAdapter implements DownloadAdapter {
       { id: 'notice-1', type: 'completed', title: 'Download completed', detail: 'Nature Documentary (4K).mkv · 2.85 GB', time: '11:03 AM', jobId: 'job-4' },
       { id: 'notice-2', type: 'failed', title: 'Download failed', detail: 'old-archive.tar.xz · Network error: Connection reset by peer', time: '11:05 AM', jobId: 'job-6' },
     ],
+    bridgeAvailable: true,
   };
 
   private listeners = new Set<(snapshot: AppSnapshot) => void>();

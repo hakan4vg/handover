@@ -307,7 +307,9 @@ button:disabled { cursor: default; opacity: .56; }
 }
 
 @media (max-width: 840px) {
-  .workspace-columns { grid-template-columns: minmax(0, 1fr); }.inspector, .inspector-reopen { display: none; }.toolbar { padding-left: 14px; }.settings-main { grid-template-columns: 190px minmax(0, 1fr); }.settings-content { padding-left: 20px; padding-right: 20px; }.network-grid { grid-template-columns: 1fr; }.usage-card { display: none; }
+  .workspace-columns { position: relative; grid-template-columns: minmax(0, 1fr); }.toolbar { padding-left: 14px; }.settings-main { grid-template-columns: 190px minmax(0, 1fr); }.settings-content { padding-left: 20px; padding-right: 20px; }.network-grid { grid-template-columns: 1fr; }.usage-card { display: none; }
+  .inspector-reopen { display: flex; position: absolute; right: 0; top: 0; bottom: 0; width: 38px; z-index: 5; }
+  .inspector { display: flex; position: absolute; right: 0; top: 0; bottom: 0; width: min(300px, 88%); z-index: 8; border-left: 1px solid var(--border); box-shadow: -12px 0 28px rgba(26, 38, 52, .16); }
 }
 
 .list-header-actions, .toolbar-menu-wrap { position: relative; display: flex; align-items: center; }

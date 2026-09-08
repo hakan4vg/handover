@@ -17,6 +17,7 @@
   "dependencies": {
     "@fluentui/react-icons": "^2.0.310",
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },

@@ -75,13 +75,28 @@ fn show_windows(
     let destination = destination.to_string();
     std::thread::spawn(move || {
         let mut note = notify_rust::Notification::new();
+        // A dedicated product identity, not the dependency's PowerShell
+        // fallback: attribution and notification settings belong to the
+        // manager itself even when unpackaged (F16).
+        note.appname("Download Manager");
+        note.app_id("com.downloadmanager.app");
         note.summary(&title).body(&body);
         for (id, label) in actions_for(&kind) {
             note.action(id, label);
         }
         let Ok(handle) = note.show() else { return };
-        handle.wait_for_action(|action| {
-            handle_notification_action(&app, action, &job_id, &destination);
+        let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
+            // Buttons arrive by id; a body click arrives as Default and maps
+            // to the primary action; dismissal is ignored (F16).
+            match response {
+                notify_rust::NotificationResponse::Default => {
+                    handle_notification_action(&app, primary_action_for(&kind), &job_id, &destination)
+                }
+                notify_rust::NotificationResponse::Action(id) => {
+                    handle_notification_action(&app, id.as_str(), &job_id, &destination)
+                }
+                _ => {}
+            }
         });
     });
 }
@@ -104,19 +119,38 @@ fn show_linux(
         // No notification daemon on headless boxes: stay silent, the in-app
         // center already recorded this notification.
         let Ok(handle) = note.show() else { return };
-        handle.wait_for_action(|action| {
-            handle_notification_action(&app, action, &job_id, &destination);
+        let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
+            match response {
+                notify_rust::NotificationResponse::Default => {
+                    handle_notification_action(&app, primary_action_for(&kind), &job_id, &destination)
+                }
+                notify_rust::NotificationResponse::Action(id) => {
+                    handle_notification_action(&app, id.as_str(), &job_id, &destination)
+                }
+                _ => {}
+            }
         });
     });
 }
 
+/// The body click's primary action mirrors the in-app card: completed opens
+/// the file, failed shows details. Pure: unit-covered (F16).
+#[cfg(any(target_os = "linux", windows, test))]
+pub fn primary_action_for(kind: &str) -> &'static str {
+    if kind == "completed" {
+        "open"
+    } else {
+        "details"
+    }
+}
+
+
 /// Route one toasted action id to the same behavior as the matching in-app
-/// notification control. `""`/`"default"` is the body click: the primary
-/// action. `"__closed"` is dismissal: nothing to do.
+/// notification control. `"__closed"` is dismissal: nothing to do.
 #[cfg(any(target_os = "linux", windows))]
 fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, destination: &str) {
     match action {
-        "open" | "" | "default" => {
+        "open" => {
             let _ = crate::open_path(destination.to_string());
         }
         "folder" => {
@@ -144,7 +178,7 @@ fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, desti
 
 #[cfg(test)]
 mod tests {
-    use super::actions_for;
+    use super::{actions_for, primary_action_for};
 
     #[test]
     fn completed_toast_offers_open_and_folder() {
@@ -157,5 +191,11 @@ mod tests {
     #[test]
     fn failed_toast_offers_view_details() {
         assert_eq!(actions_for("failed"), vec![("details", "View details")]);
+    }
+
+    #[test]
+    fn body_click_routes_to_the_primary_action() {
+        assert_eq!(primary_action_for("completed"), "open");
+        assert_eq!(primary_action_for("failed"), "details");
     }
 }

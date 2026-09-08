@@ -57,7 +57,7 @@ describe('extension popup', () => {
     await import('./popup');
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(document.getElementById('intercept')?.getAttribute('aria-pressed')).toBe('true');
-    expect(document.getElementById('media')?.getAttribute('aria-pressed')).toBe('true');
+    expect(document.getElementById('intercept')?.getAttribute('aria-checked')).toBe('true');
+    expect(document.getElementById('media')?.getAttribute('aria-checked')).toBe('true');
   });
 });

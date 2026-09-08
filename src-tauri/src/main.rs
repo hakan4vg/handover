@@ -262,7 +262,33 @@ where
     Option::<u64>::deserialize(deserializer).map(Some)
 }
 
-fn now_label() -> String { "Just now".to_string() }
+/// Machine timestamps (F15): every created/started/completed/event stamp is a
+/// real UTC ISO-8601 instant. The UI formats it local; created_at ordering
+/// stays chronological across restarts.
+fn now_label() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    utc_iso_label(secs)
+}
+
+fn utc_iso_label(secs: i64) -> String {
+    // Days-from-civil, proleptic Gregorian.
+    let days = secs.div_euclid(86_400);
+    let time = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    year += if month <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, time / 3600, time % 3600 / 60, time % 60)
+}
 
 fn default_collision_behavior() -> String { "rename".into() }
 
@@ -386,9 +412,13 @@ fn browser_policy_from_value(value: &Value) -> Option<BrowserPolicy> {
     Some((intercept, media, excluded))
 }
 
-fn write_browser_policy(root: &Path, policy: &BrowserPolicy) {
-    let _ = std::fs::create_dir_all(root);
-    if let Ok(contents) = serde_json::to_string(&browser_policy_value(policy)) { let _ = std::fs::write(root.join("browser-policy.json"), contents); }
+fn write_browser_policy(root: &Path, policy: &BrowserPolicy) -> Result<(), String> {
+    // The JSON file is a coherence cache for the browser side, never a second
+    // authority: failures propagate so callers roll back instead of diverging
+    // silently (F14).
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let contents = serde_json::to_string(&browser_policy_value(policy)).map_err(|error| error.to_string())?;
+    std::fs::write(root.join("browser-policy.json"), contents).map_err(|error| error.to_string())
 }
 
 fn load_browser_policy(root: &Path) -> Option<BrowserPolicy> {
@@ -470,15 +500,18 @@ fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
     serde_json::from_value(merged).unwrap_or_else(|_| current.clone())
 }
 
-fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolicy) {
+fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolicy) -> Result<(), String> {
+    // File first: a cache write failure leaves the in-memory authority
+    // untouched instead of diverging from it (F14).
+    write_browser_policy(&browser_policy_root(), &policy)?;
     if let Ok(mut snapshot) = state.snapshot.lock() {
         snapshot.settings.intercept_downloads = policy.0;
         snapshot.settings.show_media_buttons = policy.1;
         snapshot.settings.excluded_sites = policy.2;
-        write_browser_policy(&browser_policy_root(), &settings_policy(&snapshot.settings));
         sync_tray_checks(app, policy.0, policy.1);
     }
     emit_snapshot(app, state);
+    Ok(())
 }
 
 fn cleanup_media_track_files(temp_path: &str) {
@@ -664,7 +697,7 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
         settings,
         connected: true,
         aggregate_speed: 0,
-        notifications: vec![],
+        notifications: load_notifications(database),
         bridge_available: true,
     }
 }
@@ -1055,6 +1088,11 @@ fn valid_range_identity(response: &reqwest::Response, expected: &ResourceIdentit
     expected.etag.as_ref().map_or(true, |value| etag.as_ref() == Some(value)) && expected.last_modified.as_ref().map_or(true, |value| last_modified.as_ref() == Some(value))
 }
 
+fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) {
+    // The job log is a bounded human-readable history (newest first), never a
+    // debug dump: every mutation path funnels through here (F15).
+    if let Ok(mut snapshot) = state.snapshot.lock() { if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { update(job); job.events.truncate(50); snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == "downloading").map(|item| item.speed).sum(); } }
+}
 fn missing_ranges(total: u64, completed: &[ByteRange], target_workers: u32) -> Vec<(u64, u64)> {
     if total == 0 { return Vec::new(); }
     let chunk = (total / u64::from(target_workers.clamp(1, 32).saturating_mul(4))).max(1024 * 1024).min(16 * 1024 * 1024);
@@ -1075,11 +1113,59 @@ fn missing_ranges(total: u64, completed: &[ByteRange], target_workers: u32) -> V
             cursor = next + 1;
         }
     }
+
     chunks
 }
 
-fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) {
-    if let Ok(mut snapshot) = state.snapshot.lock() { if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { update(job); snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == "downloading").map(|item| item.speed).sum(); } }
+
+/// The in-app notification center is durable, unlike the OS toast: persist
+/// the bounded center so restarts keep it (F16). Failures only log — a
+/// missing center table must never break the toast itself.
+fn persist_notifications(state: &CoreState) {
+    let items = state
+        .snapshot
+        .lock()
+        .ok()
+        .map(|snapshot| snapshot.notifications.clone())
+        .unwrap_or_default();
+    let mut database = match state.database.lock() {
+        Ok(database) => database,
+        Err(_) => return,
+    };
+    if database
+        .execute_batch("CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT)")
+        .is_err()
+    {
+        return;
+    }
+    let result = (|| {
+        let transaction = database.transaction().map_err(|error| error.to_string())?;
+        transaction.execute("DELETE FROM notifications", []).map_err(|error| error.to_string())?;
+        for item in &items {
+            let payload = serde_json::to_string(item).map_err(|error| error.to_string())?;
+            transaction
+                .execute("INSERT INTO notifications (id, payload) VALUES (?1, ?2)", params![item.id, payload])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        eprintln!("Notification center unavailable: {error}");
+    }
+}
+
+fn load_notifications(database: &Connection) -> Vec<NotificationItem> {
+    let mut items = Vec::new();
+    if let Ok(mut statement) = database.prepare("SELECT payload FROM notifications ORDER BY rowid DESC LIMIT 40") {
+        if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
+            for payload in rows.flatten() {
+                if let Ok(item) = serde_json::from_str::<NotificationItem>(&payload) {
+                    items.push(item);
+                }
+            }
+        }
+    }
+    items
 }
 
 fn add_notification(app: &AppHandle, state: &CoreState, id: &str, kind: &str) {
@@ -1094,6 +1180,7 @@ fn add_notification(app: &AppHandle, state: &CoreState, id: &str, kind: &str) {
         }
         Err(_) => return,
     };
+    persist_notifications(state);
     emit_snapshot(app, state);
     if enabled { notify::show_job_notification(app, &item.title, &item.detail, kind, &item.job_id, &destination); }
 }
@@ -4762,7 +4849,7 @@ async fn commit_provisional(
     Ok(())
 }
 
-fn update_settings_snapshot(state: &CoreState, patch: &Value) -> Result<Option<(bool, bool, bool)>, String> {
+fn update_settings_snapshot(state: &CoreState, patch: &Value) -> Result<Option<(bool, (bool, bool, bool))>, String> {
     let _lifecycle = state.lifecycle.lock().map_err(|_| "Lifecycle unavailable".to_string())?;
     let (previous, checks) = {
         let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
@@ -4779,7 +4866,7 @@ fn update_settings_snapshot(state: &CoreState, patch: &Value) -> Result<Option<(
         if let Ok(mut snapshot) = state.snapshot.lock() { *snapshot = previous; }
         return Err(error);
     }
-    Ok(Some(checks))
+    Ok(Some((previous.settings.start_at_sign_in, checks)))
 }
 
 #[tauri::command]
@@ -4788,7 +4875,7 @@ fn update_settings(
     state: State<'_, CoreState>,
     patch: Value,
 ) -> Result<(), String> {
-    let Some((intercept_downloads, show_media_buttons, start_at_sign_in)) =
+    let Some((previous_startup, (intercept_downloads, show_media_buttons, start_at_sign_in))) =
         update_settings_snapshot(state.inner(), &patch)?
     else {
         return Ok(());
@@ -4802,9 +4889,13 @@ fn update_settings(
                 .map_err(|_| "State unavailable".to_string())?
                 .settings,
         ),
-    );
+    )?;
     sync_tray_checks(&app, intercept_downloads, show_media_buttons);
-    startup::sync(start_at_sign_in)?;
+    // Touch the OS startup entry only when its setting changed: theme tweaks
+    // and folder keystrokes must not rewrite system state (F14).
+    if previous_startup != start_at_sign_in {
+        startup::sync(start_at_sign_in)?;
+    }
     emit_snapshot_event(&app, &state)
 }
 
@@ -5036,13 +5127,15 @@ fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/health") => bridge_respond(&request, 200, json!({ "ok": true })),
         ("GET", "/v1/policy") => {
-            let policy = load_browser_policy(&browser_policy_root()).unwrap_or_else(|| {
-                app.state::<CoreState>()
-                    .snapshot
-                    .lock()
-                    .map(|snapshot| settings_policy(&snapshot.settings))
-                    .unwrap_or((true, true, Vec::new()))
-            });
+            // The SQLite-backed snapshot is the single authority while
+            // running; the JSON cache is only a fallback (F14).
+            let policy = app.state::<CoreState>()
+                .snapshot
+                .lock()
+                .map(|snapshot| settings_policy(&snapshot.settings))
+                .unwrap_or_else(|_| {
+                    load_browser_policy(&browser_policy_root()).unwrap_or((true, true, Vec::new()))
+                });
             bridge_respond(
                 &request,
                 200,
@@ -5057,7 +5150,9 @@ fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
                 return bridge_reject(&request, 400, "invalid policy");
             };
             let state = app.state::<CoreState>();
-            apply_browser_policy(&app, state.inner(), policy.clone());
+            if let Err(error) = apply_browser_policy(&app, state.inner(), policy.clone()) {
+                return bridge_reject(&request, 500, &format!("could not persist policy: {error}"));
+            }
             bridge_respond(
                 &request,
                 200,
@@ -5198,7 +5293,7 @@ fn install_tray(
     let pause_all = MenuItemBuilder::with_id("pause-all", "Pause All").build(app)?;
     let resume_all = MenuItemBuilder::with_id("resume-all", "Resume All").build(app)?;
     let browser_integration =
-        CheckMenuItemBuilder::with_id("browser-integration", "Browser Integration")
+        CheckMenuItemBuilder::with_id("browser-integration", "Intercept browser downloads")
             .checked(intercept_downloads)
             .build(app)?;
     let media_buttons = CheckMenuItemBuilder::with_id("media-buttons", "Media Buttons")
@@ -5291,20 +5386,26 @@ fn install_tray(
                 "browser-integration" => {
                     let state = app.state::<CoreState>();
                     let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
-                        let next = tray_toggle_next(
-                            (
-                                snapshot.settings.intercept_downloads,
-                                snapshot.settings.show_media_buttons,
-                            ),
-                            "browser-integration",
+                        let previous = (
+                            snapshot.settings.intercept_downloads,
+                            snapshot.settings.show_media_buttons,
                         );
+                        let next = tray_toggle_next(previous, "browser-integration");
                         snapshot.settings.intercept_downloads = next.0;
                         snapshot.settings.show_media_buttons = next.1;
-                        write_browser_policy(
+                        // A cache write failure rolls the toggle back: the menu
+                        // must never disagree with durable state (F14).
+                        if let Err(error) = write_browser_policy(
                             &browser_policy_root(),
                             &settings_policy(&snapshot.settings),
-                        );
-                        Some(next)
+                        ) {
+                            eprintln!("Browser policy cache unavailable: {error}");
+                            snapshot.settings.intercept_downloads = previous.0;
+                            snapshot.settings.show_media_buttons = previous.1;
+                            None
+                        } else {
+                            Some(next)
+                        }
                     } else {
                         None
                     };
@@ -5316,20 +5417,24 @@ fn install_tray(
                 "media-buttons" => {
                     let state = app.state::<CoreState>();
                     let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
-                        let next = tray_toggle_next(
-                            (
-                                snapshot.settings.intercept_downloads,
-                                snapshot.settings.show_media_buttons,
-                            ),
-                            "media-buttons",
+                        let previous = (
+                            snapshot.settings.intercept_downloads,
+                            snapshot.settings.show_media_buttons,
                         );
+                        let next = tray_toggle_next(previous, "media-buttons");
                         snapshot.settings.intercept_downloads = next.0;
                         snapshot.settings.show_media_buttons = next.1;
-                        write_browser_policy(
+                        if let Err(error) = write_browser_policy(
                             &browser_policy_root(),
                             &settings_policy(&snapshot.settings),
-                        );
-                        Some(next)
+                        ) {
+                            eprintln!("Browser policy cache unavailable: {error}");
+                            snapshot.settings.intercept_downloads = previous.0;
+                            snapshot.settings.show_media_buttons = previous.1;
+                            None
+                        } else {
+                            Some(next)
+                        }
                     } else {
                         None
                     };
@@ -5363,11 +5468,14 @@ fn install_tray(
 
 fn main() {
     configure_portable_webview2();
-    let builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(policy) = policy_from_args(&argv) {
                 let state = app.state::<CoreState>();
-                apply_browser_policy(app, state.inner(), policy);
+                if let Err(error) = apply_browser_policy(app, state.inner(), policy) {
+                    eprintln!("Browser policy update unavailable: {error}");
+                }
             } else if let Some((id, input)) = commit_from_args(&argv) {
                 spawn_commit(app.clone(), id, input);
             } else if let Some(input) = capture_input_from_args(&argv) {
@@ -5415,9 +5523,21 @@ fn main() {
             main_window.build().map_err(|error| error.to_string())?;
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             restrict_file(&root.join("download-manager.db"));
-            database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
-            let mut settings = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0)).ok().map(|payload| settings_from_stored(&payload)).unwrap_or_else(default_settings);
-            if let Some(policy) = load_browser_policy(&root) { settings.intercept_downloads = policy.0; settings.show_media_buttons = policy.1; settings.excluded_sites = policy.2; } else { write_browser_policy(&root, &settings_policy(&settings)); }
+            database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT);").map_err(|error| error.to_string())?;
+            let stored_settings: Result<String, _> = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0));
+            let mut settings = stored_settings.as_deref().map(settings_from_stored).unwrap_or_else(|_| default_settings());
+            if stored_settings.is_err() {
+                // Fresh database (first boot, portable move): the JSON cache
+                // seeds policy once. Afterwards SQLite is the authority and
+                // the cache is rewritten from it, never the reverse (F14).
+                if let Some(policy) = load_browser_policy(&root) {
+                    settings.intercept_downloads = policy.0;
+                    settings.show_media_buttons = policy.1;
+                    settings.excluded_sites = policy.2;
+                }
+            } else if let Err(error) = write_browser_policy(&root, &settings_policy(&settings)) {
+                eprintln!("Browser policy cache unavailable: {error}");
+            }
             let show_manager_at_startup = settings.show_manager_at_sign_in;
             if let Err(error) = startup::sync(settings.start_at_sign_in) { eprintln!("Startup registration unavailable: {error}"); }
             let initial_snapshot = snapshot_from_database(&database, settings);
@@ -5438,9 +5558,10 @@ fn main() {
                 });
             }
             if let Some(policy) = policy_from_args(&launch_args) {
-                if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let state = app.state::<CoreState>();
-                apply_browser_policy(app.handle(), state.inner(), policy);
+                if let Err(error) = apply_browser_policy(app.handle(), state.inner(), policy) {
+                    eprintln!("Browser policy update unavailable: {error}");
+                }
             } else if let Some((id, input)) = commit_from_args(&launch_args) {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 spawn_commit(app.handle().clone(), id, input);
@@ -5482,8 +5603,10 @@ mod capture_tests {
         provisional_input_from_message, protect_job_for_storage, redact_url_credentials,
         referer_value, restrict_data_dir, restrict_file, retryable_status, segment_identity,
         source_compatible, terminal_source_error, terminal_source_status, is_terminal_source_error,
-        page_instead_of_file, persist_dirty_jobs, persist_job, tray_status_text, tray_toggle_next,
-        unprotect_job_from_storage, DownloadJob, ProgressThrottle, ProvisionalInput,
+        page_instead_of_file, load_notifications, persist_dirty_jobs, persist_job, persist_notifications,
+        tray_status_text, tray_toggle_next,
+        unprotect_job_from_storage, update_settings_snapshot, utc_iso_label, write_browser_policy,
+        DownloadJob, ProgressThrottle, ProvisionalInput, now_label,
     };
     use super::ipc;
     use serde_json::json;
@@ -5766,6 +5889,18 @@ mod capture_tests {
         assert!(!page_instead_of_file(Some("text/html"), None, "page.HTM"));
         assert!(!page_instead_of_file(Some("application/zip"), None, "export.zip"));
         assert!(!page_instead_of_file(None, None, "export.zip"));
+    }
+
+    #[test]
+    fn timestamps_are_real_chronological_instants() {
+        // F15: stamps sort as text and parse as UTC instants.
+        assert_eq!(super::utc_iso_label(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::utc_iso_label(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(super::utc_iso_label(-1), "1969-12-31T23:59:59Z");
+        let now = super::now_label();
+        assert_eq!(now.len(), 20, "unexpected stamp: {now}");
+        assert!(now.ends_with('Z'));
+        assert!(now > super::utc_iso_label(1_700_000_000), "stamp is not current: {now}");
     }
 
     #[test]
@@ -6330,6 +6465,44 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
     }
 
     #[test]
+    fn settings_update_reports_startup_flag_changes() {
+        // F14: the command must only touch the OS startup entry when its
+        // setting changed. The snapshot layer reports both sides.
+        use super::{default_settings, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
+        use rusqlite::Connection;
+        use serde_json::json;
+        use std::sync::Mutex;
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        let state = CoreState {
+            snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![], bridge_available: true }),
+            database: Mutex::new(database),
+            reattach_target: Mutex::new(None),
+            bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
+            transfer_controls: TransferRegistry::default(),
+            job_bandwidth: Mutex::new(std::collections::HashMap::new()),
+            lifecycle: Mutex::new(()),
+            tray_checks: Mutex::new(None),
+            progress: Mutex::new(ProgressThrottle::default()),
+        };
+        assert!(state.snapshot.lock().unwrap().settings.start_at_sign_in);
+        let (previous, checks) = update_settings_snapshot(&state, &json!({ "theme": "dark" })).expect("theme patch").expect("object patch");
+        assert_eq!(previous, checks.2, "theme-only patch must not flag a startup change");
+        let (previous, checks) = update_settings_snapshot(&state, &json!({ "startAtSignIn": false })).expect("startup patch").expect("object patch");
+        assert_ne!(previous, checks.2, "startup toggle must flag a startup change");
+    }
+
+    #[test]
+    fn browser_policy_cache_failure_propagates() {
+        // F14: cache failures reach the caller for rollback, never silence.
+        let probe = std::env::temp_dir().join(format!("dm-policy-probe-{}", std::process::id()));
+        std::fs::write(&probe, b"not a dir").unwrap();
+        let result = write_browser_policy(&probe.join("child"), &(true, true, Vec::new()));
+        let _ = std::fs::remove_file(&probe);
+        assert!(result.is_err(), "file-as-directory must fail loudly");
+    }
+
+    #[test]
     fn snapshot_persistence_is_atomic_when_job_write_fails() {
         use super::{save_snapshot, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
         use rusqlite::Connection;
@@ -6477,6 +6650,33 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
         let database = state.database.lock().unwrap();
         let second_payload: String = database.query_row("SELECT payload FROM jobs WHERE id = 'done-2'", [], |row| row.get(0)).unwrap();
         assert!(second_payload.contains("4096"), "dirty job missing: {second_payload}");
+    }
+
+    #[test]
+    fn notification_center_survives_a_restart() {
+        // F16: the durable in-app center reloads; the OS toast is only a shortcut.
+        use super::{default_settings, load_notifications, persist_notifications, AppSnapshot, BandwidthBucket, CoreState, TransferRegistry};
+        use rusqlite::Connection;
+        use std::sync::Mutex;
+        let database = Connection::open_in_memory().unwrap();
+        database.execute_batch("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE notifications (id TEXT PRIMARY KEY, payload TEXT);").unwrap();
+        let state = CoreState {
+            snapshot: Mutex::new(AppSnapshot { jobs: vec![], settings: default_settings(), connected: true, aggregate_speed: 0, notifications: vec![super::NotificationItem { id: "completed-done-1".into(), notification_type: "completed".into(), title: "Download completed".into(), detail: "archive.zip".into(), time: "2026-09-08T05:00:00Z".into(), job_id: "done-1".into() }], bridge_available: true }),
+            database: Mutex::new(database),
+            reattach_target: Mutex::new(None),
+            bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }),
+            transfer_controls: TransferRegistry::default(),
+            job_bandwidth: Mutex::new(std::collections::HashMap::new()),
+            lifecycle: Mutex::new(()),
+            tray_checks: Mutex::new(None),
+            progress: Mutex::new(ProgressThrottle::default()),
+        };
+        persist_notifications(&state);
+        let database = state.database.lock().unwrap();
+        let loaded = load_notifications(&database);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "completed-done-1");
+        assert_eq!(loaded[0].detail, "archive.zip");
     }
 
     #[test]

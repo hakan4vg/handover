@@ -7184,3 +7184,21 @@ AUDIT-2026-09-08.md is the authoritative audit; AUDIT-OMPI-2026-09-08.md cross-c
 - F10: segment identity covers key URI + effective IV; fsync barriers before range claims, segment rename, and probe-byte claims.
 - F11: new protect.rs — DPAPI envelopes (crypt32 FFI, no new deps) for source/referrer/post_body/selected_segments at rest on Windows; legacy rows pass through; foreign-machine envelopes scrub to an honest paused needs-reattach job. Event/notification/stored-error redaction centralized at the boundaries.
 - Gate for this batch: Rust `103/103`, Vitest `34` files/`111` tests, `npx tsc -b` clean.
+
+## 2026-09-08 — F17 product decision: Linux file-open stays stubbed
+
+`open_path` returns "Opening paths is only available in the Windows desktop build" off Windows. History: greenfield used `xdg-open`/`open` via `Command::spawn`; the portable pass replaced it with `ShellExecuteW` + the stub. Decision: keep the stub. SPEC §§2.1/2.2 (Windows-only v1, no child processes, Linux port a non-goal) is the canonical contract and outranks the STATUS "don't break Linux" directive for platform integrations. Restoring `xdg-open`-spawn would reintroduce the exact helper-process shape the portable boundary removed. Linux file-open (via portals, not spawns) belongs to the future Linux port. The stub message is explicit; toast open-actions degrade to silent no-ops off Windows by the same token.
+
+## 2026-09-08 — Authoritative audit fixes batch 2 (F09, F08, F12–F17, minors, matrix)
+
+- F09: hot-loop progress marks dirty jobs instead of rewriting the whole DB; UI emits ≤4 Hz shared, dirty rows upsert (INSERT .. ON CONFLICT) ≤ every 2 s; removals delete explicitly; terminal transitions keep full saves. Manager default sort no longer indexOf-scans per comparison.
+- F08: one shared HTTP client per range job (pool/TLS reuse); AES-128 decrypts in place; single-resource finalization validates without cloning the file. Mux-output file streaming stays a documented residual for >RAM presentations.
+- F12: Save-to tracks Filename until manually edited (commit sends the shown path); captured URLs read-only; failed captures show the reason and disable Download; Resumable is Yes/No/Checking… by known state; Finalizing replaces Merging. Native folder picker via tauri-plugin-dialog (Browse in Add + Settings paths, Tauri-only).
+- F13: ≤840 px keeps the inspector as an overlay drawer + reopen rail instead of hiding both.
+- F14: SQLite snapshot is the single policy authority; JSON cache write failures propagate (bridge 500, tray rollback, fresh-install seeding only); startup::sync runs only when its flag changes.
+- F15: real UTC ISO stamps everywhere (created/started/completed/events/notifications), local Today/Yesterday rendering in UI, 50-event cap at the emit choke point.
+- F16: Windows toasts use the product AppUserModelID (no PowerShell fallback); body click routes via wait_for_response to the primary action (Open / View details); in-app center persists in a notifications table and reloads.
+- F17: decision — Linux file-open stays stubbed; SPEC Windows-only/no-spawn governs, portal-based open belongs to the future Linux port.
+- Minors: dead pending FilterKey removed, tray toggles use SPEC wording, switch roles, Add dialog role + Escape, PE gate covers msvcp/vccorlib/concrt.
+- Re-proof matrix (audit/2026-09-09-matrix, real hidden app + stdlib fixtures): 13/13 — hostile bridge 403 with no wildcard CORS, byte-identical range, TS-as-.ts playable (ffprobe mpeg2video/mp2), muxed H.264+AAC playable, redirect base, POST export bytes (not the form), page-as-zip refused, one-use 410 in 0.3 s with single-use message, center persisted (8 rows), seeded-500 throughput 15 vs 23 MiB/s unseeded (no collapse; single-run variance noted).
+- Release gate: Rust `109/109`, Vitest `36` files/`121` tests, `tsc` clean, frontend/extension builds, release Cargo build warning-free, portable packaging (exe + extension + webview2, hashes match), packaged-exe smoke (hidden boot healthy, hostile 403).

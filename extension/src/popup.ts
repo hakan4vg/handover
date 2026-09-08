@@ -7,7 +7,7 @@ function paint(): void {
   const setSwitch = (id: string, on: boolean) => {
     const element = document.getElementById(id);
     element?.classList.toggle('on', on);
-    element?.setAttribute('aria-pressed', String(on));
+    element?.setAttribute('aria-checked', String(on));
   };
   setSwitch('intercept', policy.interceptDownloads);
   setSwitch('media', policy.showMediaButtons);

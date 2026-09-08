@@ -52,7 +52,7 @@ function importedDlls(bytes) {
 }
 
 const hostImports = importedDlls(await readFile(executable));
-const machineRuntimeImports = hostImports.filter((name) => /^(?:vcruntime|ucrtbase|api-ms-win-crt)/i.test(name));
+const machineRuntimeImports = hostImports.filter((name) => /^(?:vcruntime|msvcp|vccorlib|concrt|ucrtbase|api-ms-win-crt)/i.test(name));
 if (machineRuntimeImports.length) {
   throw new Error(`Portable host still imports machine CRT libraries: ${machineRuntimeImports.join(', ')}`);
 }

@@ -8,7 +8,7 @@ export type DownloadState =
   | 'failed';
 
 export type TransferMode = 'whole-object' | 'segments' | 'single-stream';
-export type FilterKey = 'all' | 'active' | 'paused' | 'pending' | 'completed' | 'failed' | 'media';
+export type FilterKey = 'all' | 'active' | 'paused' | 'completed' | 'failed' | 'media';
 export type SettingsPage = 'general' | 'downloads' | 'browser' | 'network' | 'notifications' | 'appearance';
 
 export interface JobEvent {

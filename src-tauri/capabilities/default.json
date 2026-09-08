@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Permissions for the Download Manager desktop window",
   "windows": ["main", "add-*"],
-  "permissions": ["core:default", "core:window:default", "notification:default"]
+  "permissions": ["core:default", "core:window:default", "dialog:default", "notification:default"]
 }

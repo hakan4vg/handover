@@ -3,6 +3,7 @@ import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
 import { createAdapter, formatBytes, formatSpeed } from './adapters';
 import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
 import { Icon, type IconName } from './icons';
@@ -410,7 +411,7 @@ export function DownloadRow({ job, selected, menuOpen = false, onSelect, onPause
 }
 
 function stateText(state: DownloadState) {
-  return ({ connecting: 'Connecting', downloading: 'Downloading', paused: 'Paused', pending: 'Waiting', finalizing: 'Merging', completed: 'Completed', failed: 'Failed' })[state];
+  return ({ connecting: 'Connecting', downloading: 'Downloading', paused: 'Paused', pending: 'Waiting', finalizing: 'Finalizing', completed: 'Completed', failed: 'Failed' })[state];
 }
 
 function stateTone(state: DownloadState) {
@@ -419,6 +420,25 @@ function stateTone(state: DownloadState) {
   if (state === 'finalizing') return 'accent';
   if (state === 'completed') return 'success';
   return 'active';
+}
+
+// Backend stamps are UTC ISO instants (F15); legacy rows and mock data carry
+// display strings. Parseable values render local, everything else passes
+// through untouched.
+export function formatTime(value: string): string {
+  const time = Date.parse(value);
+  if (Number.isNaN(time)) return value;
+  const date = new Date(time);
+  const now = new Date();
+  const timePart = date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  if (date.toDateString() === now.toDateString()) return `Today, ${timePart}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return `Yesterday, ${timePart}`;
+  if (date.getFullYear() === now.getFullYear()) {
+    return `${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${timePart}`;
+  }
+  return `${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}, ${timePart}`;
 }
 
 function FileIcon({ kind }: { kind: DownloadJob['kind'] }) {
@@ -485,7 +505,7 @@ function DetailGrid({ items }: { items: Array<{ label: string; value: string; to
 }
 
 function Overview({ job, onOpen }: { job: DownloadJob; onOpen: () => void }) {
-  return <><div className="inspector-status"><span className={`status-pill ${stateTone(job.state)}`}><span className="status-dot" />{stateText(job.state)}</span><span className="inspector-progress">{Math.round(job.progress)}%</span></div><div className="inspector-progress-track"><span className={`progress-fill ${stateTone(job.state)}`} style={{ width: `${job.progress}%` }} /></div><DetailGrid items={[{ label: 'Status', value: job.error ?? (job.state === 'finalizing' ? job.eta ?? 'Finalizing' : stateText(job.state)), tone: stateTone(job.state) }, { label: 'Save to', value: job.destination, }, { label: 'File size', value: formatBytes(job.total) }, { label: 'Downloaded', value: `${formatBytes(job.downloaded)}${job.total ? ` (${Math.round(job.progress)}%)` : ''}` }, { label: 'Speed', value: formatSpeed(job.speed) }, { label: 'ETA', value: job.eta ?? '—' }, { label: 'Connections', value: `${job.connections} of ${job.maxConnections}` }, { label: 'Created', value: job.created }, { label: 'Started', value: job.started ?? 'Not started' }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} />{job.state === 'completed' && <button className="text-link" onClick={onOpen}><Icon name="folder" size={14} /> Open containing folder</button>}</>;
+  return <><div className="inspector-status"><span className={`status-pill ${stateTone(job.state)}`}><span className="status-dot" />{stateText(job.state)}</span><span className="inspector-progress">{Math.round(job.progress)}%</span></div><div className="inspector-progress-track"><span className={`progress-fill ${stateTone(job.state)}`} style={{ width: `${job.progress}%` }} /></div><DetailGrid items={[{ label: 'Status', value: job.error ?? (job.state === 'finalizing' ? job.eta ?? 'Finalizing' : stateText(job.state)), tone: stateTone(job.state) }, { label: 'Save to', value: job.destination, }, { label: 'File size', value: formatBytes(job.total) }, { label: 'Downloaded', value: `${formatBytes(job.downloaded)}${job.total ? ` (${Math.round(job.progress)}%)` : ''}` }, { label: 'Speed', value: formatSpeed(job.speed) }, { label: 'ETA', value: job.eta ?? '—' }, { label: 'Connections', value: `${job.connections} of ${job.maxConnections}` }, { label: 'Created', value: formatTime(job.created) }, { label: 'Started', value: job.started ? formatTime(job.started) : 'Not started' }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} />{job.state === 'completed' && <button className="text-link" onClick={onOpen}><Icon name="folder" size={14} /> Open containing folder</button>}</>;
 }
 
 function NetworkDetails({ job }: { job: DownloadJob }) {
@@ -501,7 +521,7 @@ function FileDetails({ job }: { job: DownloadJob }) {
 }
 
 function JobLog({ job }: { job: DownloadJob }) {
-  return <div className="job-log">{job.events.slice(0, 8).map((item, index) => <div className="log-item" key={`${item.at}-${index}`}><span>{item.at}</span><strong className={item.tone ?? ''}>{item.message}</strong></div>)}</div>;
+  return <div className="job-log">{job.events.slice(0, 8).map((item, index) => <div className="log-item" key={`${item.at}-${index}`}><span>{formatTime(item.at)}</span><strong className={item.tone ?? ''}>{item.message}</strong></div>)}</div>;
 }
 
 function SectionTitle({ icon, title }: { icon: IconName; title: string }) {
@@ -543,7 +563,7 @@ function SettingToggle({ icon, title, description, checked, onChange }: { icon?:
 }
 
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  return <button aria-label={label} aria-pressed={checked} className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}><span /></button>;
+  return <button role="switch" aria-checked={checked} aria-label={label} className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}><span /></button>;
 }
 
 function SettingCard({ children, className = '' }: { children: ReactNode; className?: string }) {
@@ -590,11 +610,46 @@ function FieldHeading({ title, description }: { title: string; description?: str
 }
 
 function PathField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  return <div className="path-field"><input aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} /></div>;
+  const browse = async () => {
+    const dir = await pickFolder(value);
+    if (dir) onChange(dir);
+  };
+  return <div className="path-field"><input aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
 }
 
 function Select({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<[string, string]> }) {
   return <label className="select-wrap"><select aria-label={label} value={value} onChange={(event) => onChange(event.target.value)}>{options.map(([optionValue, label]) => <option key={optionValue} value={optionValue}>{label}</option>)}</select><Icon name="chevron-down" size={14} /></label>;
+}
+
+function isTauriRuntime(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+async function pickFolder(startingAt?: string): Promise<string | null> {
+  try {
+    if (!isTauriRuntime()) return null;
+    const selected = await openFolderDialog({ directory: true, multiple: false, defaultPath: startingAt });
+    return typeof selected === 'string' ? selected : null;
+  } catch {
+    return null;
+  }
+}
+
+// The Save-to field must never disagree with the Filename field: the commit
+// sends one consistent path (F12). Until the user edits the path directly,
+// it tracks the filename — replacing a stale basename or appending to a bare
+// directory. `initialDir` covers dotted directory names, which a bare
+// basename heuristic would mistake for files.
+export function effectiveDestination(destination: string, name: string, destTouched: boolean, initialDir?: string): string {
+  if (destTouched || !name) return destination;
+  const sep = destination.includes('\\') ? '\\' : '/';
+  if (destination.endsWith(`${sep}${name}`)) return destination;
+  if (initialDir !== undefined && destination === initialDir) {
+    return `${destination.endsWith(sep) ? destination : destination + sep}${name}`;
+  }
+  const base = destination.slice(destination.lastIndexOf(sep) + 1);
+  if (base.includes('.')) return `${destination.slice(0, destination.length - base.length)}${name}`;
+  return `${destination.endsWith(sep) ? destination : destination + sep}${name}`;
 }
 
 function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => void; label: string }) {
@@ -607,6 +662,8 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
   const [nameTouched, setNameTouched] = useState(false);
   const [destination, setDestination] = useState(job?.destination ?? settings.defaultFolder);
   const [destTouched, setDestTouched] = useState(false);
+  const initialDir = useRef(settings.defaultFolder);
+  const shownDestination = effectiveDestination(destination, name, destTouched, initialDir.current);
   const [advanced, setAdvanced] = useState(false);
   const busyRef = useRef(false);
   const [busyAction, setBusyAction] = useState<'create' | 'commit' | 'cancel' | null>(null);
@@ -628,7 +685,7 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
       setFormError('');
       let waitingForCommit = false;
       try {
-        const result = onCommit(job.id, name, destination, maxConnections, bandwidthLimit);
+        const result = onCommit(job.id, name, shownDestination, maxConnections, bandwidthLimit);
         if (result && typeof result.then === 'function') {
           waitingForCommit = true;
           setBusyAction('commit');
@@ -678,7 +735,15 @@ export function AddDownloadWindow({ settings, job, onCreate, onCommit, onCancel,
     }
     onClose();
   };
-  return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} aria-label="Add Download" aria-busy={busy}><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" disabled={busy} onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input aria-label="Source URL" autoFocus={!job} value={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input aria-label="Filename" value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input aria-label="Save destination" value={destination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} /></div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : 'Checking…'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input aria-label="Per-download maximum connections" className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row" role="radiogroup" aria-label="Per-download bandwidth cap"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input aria-label="Per-download bandwidth limit" className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select label="Per-download bandwidth unit" value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim())} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busyAction === 'create' ? 'Starting…' : busyAction === 'commit' ? 'Adding…' : job ? 'Download' : 'Start Download'}</button><button className="button" disabled={busy} onClick={cancel}>{busyAction === 'cancel' ? 'Cancelling…' : 'Cancel'}</button></div></div></section>;
+  const browseDestination = async () => {
+    const dir = await pickFolder(shownDestination);
+    if (!dir) return;
+    const sep = dir.includes('\\') ? '\\' : '/';
+    const clean = dir.endsWith(sep) ? dir.slice(0, -1) : dir;
+    setDestination(name ? `${clean}${sep}${name}` : clean);
+    setDestTouched(true);
+  };
+  return <section className={`add-download-window ${job ? 'captured' : 'manual'}`} role="dialog" aria-label="Add Download" aria-busy={busy} onKeyDown={(event) => { if (event.key === 'Escape' && !busy) void cancel(); }}><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" disabled={busy} onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><label className="form-field"><span>URL</span><input aria-label="Source URL" autoFocus={!job} value={source} readOnly={job !== undefined} title={job !== undefined ? 'The captured source cannot be changed' : undefined} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}{job?.state === 'failed' && job.error && <div className="form-error" role="alert"><Icon name="error" size={14} />{job.error}</div>}<label className="form-field"><span>Filename</span><div className="input-with-detail"><input aria-label="Filename" value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /><em>{job?.total ? formatBytes(job.total) : 'Detecting size'}</em></div></label><label className="form-field"><span>Save to</span><div className="path-field"><input aria-label="Save destination" value={shownDestination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} />{isTauriRuntime() && <button className="button" onClick={() => void browseDestination()} aria-label="Browse for folder">Browse</button>}</div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={stateText(job.state)} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : job.state === 'finalizing' ? 'Ready' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : job.state === 'connecting' ? 'Checking…' : 'No'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input aria-label="Per-download maximum connections" className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row" role="radiogroup" aria-label="Per-download bandwidth cap"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input aria-label="Per-download bandwidth limit" className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select label="Per-download bandwidth unit" value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}<div className="add-actions"><button className="button primary" disabled={busy || (!job && !source.trim()) || job?.state === 'failed'} onClick={() => void submit()}><Icon name={job ? 'check' : 'download'} size={16} />{busyAction === 'create' ? 'Starting…' : busyAction === 'commit' ? 'Adding…' : job ? 'Download' : 'Start Download'}</button><button className="button" disabled={busy} onClick={cancel}>{busyAction === 'cancel' ? 'Cancelling…' : 'Cancel'}</button></div></div></section>;
 }
 
 function Metric({ icon, label, value, tone }: { icon: IconName; label: string; value: string; tone?: string }) {
@@ -753,7 +818,7 @@ export function TrayMenu({ adapter, snapshot }: { adapter: DownloadAdapter; snap
     <TrayAction icon="window" label="Open Download Manager" onClick={openManagerSurface} />
     <TrayAction icon={paused ? 'play' : 'pause'} label={paused ? 'Resume All' : 'Pause All'} onClick={toggleAll} />
     <div className="tray-divider" />
-    <TrayToggle icon="globe" label="Browser Integration" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} />
+    <TrayToggle icon="globe" label="Intercept browser downloads" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} />
     <TrayToggle icon="media" label="Media Buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} />
     <TrayAction icon="network" label="Set Bandwidth Limit" chevron onClick={() => { window.location.href = `${window.location.pathname}?settings=network`; }} />
     <div className="tray-divider" />
@@ -789,7 +854,7 @@ export function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {
 function NotificationCard({ item, job, onDismiss, onOpen }: { item: AppSnapshot['notifications'][number]; job?: DownloadJob; onDismiss: () => void; onOpen: (path: string) => void }) {
   const completed = item.type === 'completed';
   const folder = job?.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <article className={`notification-card ${completed ? 'completed' : 'failed'}`}><div className="notification-icon"><Icon name={completed ? 'check' : 'error'} size={20} /></div><div className="notification-copy"><div><strong>{item.title}</strong><span>{item.time}</span></div><p>{item.detail}</p><div className="notification-actions"><button className="button" onClick={() => completed && job ? onOpen(job.destination) : openManagerSurface(item.jobId)}>{completed ? 'Open' : 'View details'}</button><button className="button" onClick={() => completed && folder ? onOpen(folder) : openManagerSurface(item.jobId)}>{completed ? 'Show in folder' : 'Open Manager'}</button></div></div><button className="notification-close" aria-label={`Dismiss ${item.title}: ${item.detail}`} onClick={onDismiss}><Icon name="close" size={15} /></button></article>;
+  return <article className={`notification-card ${completed ? 'completed' : 'failed'}`}><div className="notification-icon"><Icon name={completed ? 'check' : 'error'} size={20} /></div><div className="notification-copy"><div><strong>{item.title}</strong><span>{formatTime(item.time)}</span></div><p>{item.detail}</p><div className="notification-actions"><button className="button" onClick={() => completed && job ? onOpen(job.destination) : openManagerSurface(item.jobId)}>{completed ? 'Open' : 'View details'}</button><button className="button" onClick={() => completed && folder ? onOpen(folder) : openManagerSurface(item.jobId)}>{completed ? 'Show in folder' : 'Open Manager'}</button></div></div><button className="notification-close" aria-label={`Dismiss ${item.title}: ${item.detail}`} onClick={onDismiss}><Icon name="close" size={15} /></button></article>;
 }
 
 export default App;

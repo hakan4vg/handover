@@ -92,7 +92,7 @@ describe('transient menu semantics', () => {
     const menu = host.querySelector('.context-menu');
     expect(menu?.getAttribute('role')).toBe('menu');
     expect(menu?.getAttribute('aria-label')).toBe('Actions for project-assets.zip');
-    expect(menu?.querySelectorAll('[role="menuitem"]')).toHaveLength(5);
+    expect(menu?.querySelectorAll('[role="menuitem"]')).toHaveLength(6);
     act(() => root.unmount());
   });
 
@@ -108,9 +108,10 @@ describe('transient menu semantics', () => {
     expect(tablist?.getAttribute('role')).toBe('tablist');
     expect(tablist?.getAttribute('aria-label')).toBe('Download details');
     const tabs = Array.from(tablist?.querySelectorAll('[role="tab"]') ?? []);
-    expect(tabs.map((tab) => tab.textContent)).toEqual(['Overview', 'Network', 'Files', 'Log']);
-    expect(tabs.map((tab) => tab.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false', 'false']);
-    expect(tabs.map((tab) => tab.getAttribute('tabindex'))).toEqual(['0', '-1', '-1', '-1']);
+    expect(tabs.map((tab) => tab.textContent)).toEqual(['Overview', 'Network', 'Media', 'Files', 'Log']);
+    expect(tabs.map((tab) => tab.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false', 'false', 'false']);
+    expect(tabs.map((tab) => tab.getAttribute('tabindex'))).toEqual(['0', '-1', '-1', '-1', '-1']);
+    expect((tabs[2] as HTMLButtonElement).disabled).toBe(true);
     const panel = host.querySelector('.inspector-scroll');
     expect(panel?.getAttribute('role')).toBe('tabpanel');
     expect(panel?.getAttribute('aria-labelledby')).toBe(tabs[0]?.id);

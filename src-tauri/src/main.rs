@@ -23,7 +23,7 @@ use std::{
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{webview::PageLoadEvent, AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::time::{sleep, Duration};
 use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
 use uuid::Uuid;
@@ -76,6 +76,14 @@ struct DownloadJob {
     destination_reservation: Option<String>,
     #[serde(default)]
     selected_segments: Vec<String>,
+    /// The player track requested by the capture. Old jobs omit this and
+    /// retain the historical video default for media acquisitions.
+    #[serde(default)]
+    player_kind: Option<String>,
+    /// Explicit direct companion audio URL supplied by the extension.
+    /// Selected manifest hints must never be interpreted as this field.
+    #[serde(default)]
+    companion_audio: Option<String>,
     /// Capture-page URL replayed as Referer (SPEC §5.1/§16, scoped per
     /// request by referer_value). Serde default keeps old DBs loadable.
     #[serde(default)]
@@ -245,7 +253,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -803,6 +811,7 @@ fn complete_job(job: &mut DownloadJob) {
     job.referrer = None;
     job.post_body = None;
     job.user_agent = None;
+    job.companion_audio = None;
     job.events.insert(0, job_event("Download completed", Some("success")));
 }
 
@@ -846,6 +855,9 @@ fn protect_job_for_storage(job: &mut DownloadJob) {
         .iter()
         .map(|segment| protect::protect_field(segment))
         .collect();
+    if let Some(companion_audio) = job.companion_audio.take() {
+        job.companion_audio = Some(protect::protect_field(&companion_audio));
+    }
 }
 
 fn unprotect_job_from_storage(job: &mut DownloadJob) -> Result<(), String> {
@@ -861,6 +873,9 @@ fn unprotect_job_from_storage(job: &mut DownloadJob) -> Result<(), String> {
         .iter()
         .map(|segment| protect::unprotect_field(segment))
         .collect::<Result<Vec<_>, String>>()?;
+    if let Some(companion_audio) = job.companion_audio.take() {
+        job.companion_audio = Some(protect::unprotect_field(&companion_audio)?);
+    }
     Ok(())
 }
 
@@ -1097,7 +1112,16 @@ fn valid_range_identity(response: &reqwest::Response, expected: &ResourceIdentit
 fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) {
     // The job log is a bounded human-readable history (newest first), never a
     // debug dump: every mutation path funnels through here (F15).
-    if let Ok(mut snapshot) = state.snapshot.lock() { if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { update(job); job.events.truncate(50); snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == "downloading").map(|item| item.speed).sum(); } }
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) {
+            update(job);
+            if job.state != "downloading" {
+                job.speed = 0;
+            }
+            job.events.truncate(50);
+            snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == "downloading").map(|item| item.speed).sum();
+        }
+    }
 }
 fn missing_ranges(total: u64, completed: &[ByteRange], target_workers: u32) -> Vec<(u64, u64)> {
     if total == 0 { return Vec::new(); }
@@ -1221,6 +1245,20 @@ fn user_agent_value(value: &str) -> Option<&str> {
     (!value.is_empty() && value.len() <= 512 && !value.contains(['\r', '\n'])).then_some(value)
 }
 
+fn player_kind_value(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "video" => Some("video".into()),
+        "audio" => Some("audio".into()),
+        _ => None,
+    }
+}
+
+fn validated_http_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    let parsed = reqwest::Url::parse(value).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
 fn job_context(app: &AppHandle, id: &str) -> (Option<String>, Option<String>, Option<String>) {
     app.state::<CoreState>()
         .snapshot
@@ -1307,6 +1345,129 @@ fn page_instead_of_file(mime: Option<&str>, disposition: Option<&str>, filename:
     }
     let lower = filename.to_ascii_lowercase();
     !(lower.ends_with(".html") || lower.ends_with(".htm"))
+}
+
+fn manifest_mime(mime: Option<&str>) -> bool {
+    mime.map(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("mpegurl") || value.contains("dash+xml")
+    }).unwrap_or(false)
+}
+
+fn media_mime_kind(mime: Option<&str>) -> Option<&'static str> {
+    let value = mime?.split(';').next()?.trim().to_ascii_lowercase();
+    if value.starts_with("audio/") && !value.contains("mpegurl") {
+        Some("audio")
+    } else if value.starts_with("video/") && !value.contains("mpegurl") {
+        Some("video")
+    } else {
+        None
+    }
+}
+
+fn mime_conflicts_player_kind(expected: Option<&str>, mime: Option<&str>) -> bool {
+    matches!((expected, media_mime_kind(mime)), (Some("video"), Some("audio")) | (Some("audio"), Some("video")))
+}
+
+fn partial_response_is_complete(response: &reqwest::Response) -> Result<Option<u64>, String> {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(response.content_length());
+    }
+    let Some((start, end, total)) = content_range(response) else {
+        return Err("The source returned a partial response without a valid Content-Range".into());
+    };
+    let Some(length) = response.content_length() else {
+        return Err("The source returned a partial response without a content length".into());
+    };
+    let complete = start == 0
+        && end >= start
+        && end.checked_add(1) == Some(total)
+        && length == total;
+    if complete {
+        Ok(Some(total))
+    } else {
+        Err("The source returned a partial response instead of the complete object".into())
+    }
+}
+
+fn supports_safe_initial_ranges(response: &reqwest::Response, total: Option<u64>, mime: Option<&str>) -> bool {
+    let Some(total) = total else { return false; };
+    if total <= 1 || response.status() != reqwest::StatusCode::OK || manifest_mime(mime) {
+        return false;
+    }
+    let Some(accept_ranges) = response.headers().get(reqwest::header::ACCEPT_RANGES).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    if !accept_ranges.split(',').any(|value| value.trim().eq_ignore_ascii_case("bytes")) {
+        return false;
+    }
+    true
+}
+
+const BODY_SNIFF_LIMIT: usize = 8192;
+
+fn looks_like_mpeg_audio_header(header: &[u8]) -> bool {
+    if header.len() < 4 || header[0] != 0xff || header[1] & 0xe0 != 0xe0 {
+        return false;
+    }
+    let version = (header[1] >> 3) & 0x03;
+    let layer = (header[1] >> 1) & 0x03;
+    let bitrate = (header[2] >> 4) & 0x0f;
+    let sample_rate = (header[2] >> 2) & 0x03;
+    version != 1 && layer != 0 && bitrate != 0 && bitrate != 0x0f && sample_rate != 0x03
+}
+
+fn body_looks_like_audio(body: &[u8]) -> bool {
+    if body.starts_with(b"ID3") || body.starts_with(b"fLaC") {
+        return true;
+    }
+    if body.len() >= 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WAVE" {
+        return true;
+    }
+    if body.starts_with(b"OggS")
+        && (body.windows(8).any(|window| window == b"OpusHead")
+            || body.windows(6).any(|window| window == b"vorbis"))
+    {
+        return true;
+    }
+    if !looks_like_mpeg_audio_header(body) || (body[1] >> 1) & 3 != 1 {
+        return false;
+    }
+    let version = (body[1] >> 3) & 3;
+    let bitrates = if version == 3 {
+        [0usize, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+    } else {
+        [0usize, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+    };
+    let sample_rate = [44100usize, 48000, 32000][((body[2] >> 2) & 3) as usize]
+        / if version == 3 { 1 } else if version == 2 { 2 } else { 4 };
+    let frame_length = if version == 3 { 144 } else { 72 }
+        * bitrates[(body[2] >> 4) as usize] * 1000 / sample_rate
+        + ((body[2] >> 1) & 1) as usize;
+    body.get(frame_length..).is_some_and(|next| {
+        looks_like_mpeg_audio_header(next)
+            && next[1] & 0xfe == body[1] & 0xfe
+            && next[2] & 0x0c == body[2] & 0x0c
+    })
+}
+
+fn body_looks_like_html(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+    text.starts_with("<!doctype html") || text.starts_with("<html") || text.starts_with("<head")
+}
+
+fn mark_acquisition_failed(app: &AppHandle, state: &CoreState, id: &str, error: String, event: &str) {
+    emit_job(state, id, |job| {
+        job.state = "failed".into();
+        job.error = Some(redact_url_credentials(&error));
+        job.connections = 0;
+        job.speed = 0;
+        job.eta = None;
+        job.events.insert(0, job_event(event, Some("error")));
+    });
+    emit_snapshot(app, state);
+    add_notification(app, state, id, "failed");
 }
 
 async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String> {
@@ -1631,18 +1792,15 @@ async fn mux_media_tracks(track_paths: &[String], output_path: &str) -> Result<S
     let mixed_webm = inputs.len() == 2
         && webm_count == 1
         && !inputs.iter().any(|input| looks_like_mpeg_ts(input));
-    // Two WebM inputs (e.g. VP9 video + Opus audio) have no v1 mux path: the
-    // Matroska builder pairs WebM video with AAC/fMP4 audio only (SPEC §9).
-    // Fail with the combination named instead of a confusing fMP4 parse
-    // error; downloaded parts are preserved by the caller (F03).
-    if webm_count > 1 {
-        return Err("Media track finalization failed: WebM audio + WebM video muxing is not supported; downloaded parts were preserved".into());
-    }
     let (merged, actual_output_path) = if inputs.iter().all(|input| looks_like_mpeg_ts(input)) {
         (
             media::mux_mpeg_ts_tracks(&inputs),
             PathBuf::from(output_path)
         )
+    } else if inputs.len() == 2 && webm_count == 2 {
+        let mut path = PathBuf::from(output_path);
+        path.set_extension("mkv");
+        (media::mux_webm_webm_tracks(&inputs), path)
     } else if mixed_webm {
         let mut path = PathBuf::from(output_path);
         path.set_extension("mkv");
@@ -2074,12 +2232,24 @@ async fn acquire_ranges(
                 .ok_or_else(|| "Acquisition no longer exists".to_string())
         })?;
     let identity = identity_from_response(&response, total);
-    let first = response.bytes().await.map_err(|error| error.to_string())?;
+    let first_target = total.min(1024 * 1024) as usize;
+    let mut first = Vec::with_capacity(first_target);
+    let mut first_stream = response.bytes_stream();
+    while first.len() < first_target {
+        let Some(chunk) = first_stream.next().await else { break; };
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        let remaining = first_target.saturating_sub(first.len());
+        first.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.is_empty() {
+            break;
+        }
+    }
+    drop(first_stream);
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
-    if first.len() != 1 {
-        return Err("The range probe returned an unexpected payload".into());
+    if first.len() as u64 != first_target as u64 {
+        return Err("The initial range response ended before the advertised object length".into());
     }
     let Some(parent) = PathBuf::from(&temp_path).parent().map(PathBuf::from) else {
         return Err("Temporary path is invalid".into());
@@ -2136,7 +2306,7 @@ async fn acquire_ranges(
         }
     }
     if !can_resume {
-        completed_ranges = vec![ByteRange { start: 0, end: 0 }];
+        completed_ranges = vec![ByteRange { start: 0, end: first.len() as u64 - 1 }];
         if !transfer_can_continue(&app, &id, generation) {
             return Ok(());
         }
@@ -2157,13 +2327,13 @@ async fn acquire_ranges(
             .set_len(total)
             .await
             .map_err(|error| error.to_string())?;
-        // The probe byte is claimed as completed range 0-0 below: make the
-        // fresh file (byte + preallocation) durable first (F10).
+        // The initial useful response is claimed as a completed range only
+        // after the bytes and preallocation are durable (F10).
         initial
             .sync_all()
             .await
             .map_err(|error| error.to_string())?;
-    } else if !completed_ranges.iter().any(|range| range.start == 0) {
+    } else if !completed_ranges.iter().any(|range| range.start == 0 && range.end >= first.len() as u64 - 1) {
         let mut initial = OpenOptions::new()
             .write(true)
             .open(&temp_path)
@@ -2186,12 +2356,15 @@ async fn acquire_ranges(
         if !transfer_can_continue(&app, &id, generation) {
             return Ok(());
         }
-        // Same barrier before claiming range 0-0 on the resume path (F10).
+        // Same barrier before claiming the initial range on the resume path.
         initial
             .sync_all()
             .await
             .map_err(|error| error.to_string())?;
-        completed_ranges = merge_range(&completed_ranges, ByteRange { start: 0, end: 0 });
+        completed_ranges = merge_range(
+            &completed_ranges,
+            ByteRange { start: 0, end: first.len() as u64 - 1 },
+        );
     }
     let ranges = missing_ranges(total, &completed_ranges, max_connections);
     let worker_count = max_connections.clamp(1, 32).min(ranges.len().max(1) as u32) as usize;
@@ -2712,6 +2885,7 @@ async fn acquire_manifest(
     source: String,
     body: String,
     _mime: Option<String>,
+    expected_kind: Option<String>,
     selected_segments: Vec<String>,
     generation: u64
 ) -> Result<(), String> {
@@ -2808,7 +2982,7 @@ async fn acquire_manifest(
     } else if is_hls {
         hls_all_mpeg_ts = !manifest_body.contains("#EXT-X-MAP");
         vec![media::MediaTrack {
-            kind: "video".into(),
+            kind: expected_kind.unwrap_or_else(|| "video".into()),
             segments: media::parse_hls(&manifest_source, &manifest_body)?,
             segment_base: None
         }]
@@ -3148,6 +3322,7 @@ async fn acquire_manifest(
     }
     emit_job(&state, &id, |job| {
         job.state = "finalizing".into();
+        job.total = Some(job.downloaded);
         job.connections = 0;
         job.events.insert(
             0,
@@ -3312,6 +3487,303 @@ async fn acquire_manifest(
     Ok(())
 }
 
+async fn download_track_to_file(
+    app: &AppHandle,
+    id: &str,
+    target_path: &Path,
+    generation: u64,
+    downloaded_atomic: &std::sync::Arc<AtomicU64>,
+    combined_total: Option<u64>,
+    started: std::time::Instant,
+    response: reqwest::Response,
+    expected_kind: Option<&str>,
+) -> Result<(), String> {
+    let state = app.state::<CoreState>();
+    if !response.status().is_success() {
+        return Err(format!("track source returned {}", response.status()));
+    }
+    let expected = partial_response_is_complete(&response)?;
+
+    let mut stream = response.bytes_stream();
+    let mut prefix_chunks = Vec::new();
+    let mut prefix_len = 0usize;
+    while prefix_len < BODY_SNIFF_LIMIT {
+        match stream.next().await {
+            Some(Ok(bytes)) => {
+                prefix_len = prefix_len.saturating_add(bytes.len());
+                let empty = bytes.is_empty();
+                prefix_chunks.push(bytes);
+                if empty {
+                    break;
+                }
+            }
+            Some(Err(error)) => return Err(error.to_string()),
+            None => break,
+        }
+    }
+    let mut sniff_prefix = Vec::with_capacity(prefix_len.min(BODY_SNIFF_LIMIT));
+    for chunk in &prefix_chunks {
+        let remaining = BODY_SNIFF_LIMIT.saturating_sub(sniff_prefix.len());
+        if remaining == 0 {
+            break;
+        }
+        sniff_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    if expected_kind == Some("video") && body_looks_like_audio(&sniff_prefix) {
+        return Err("The source returned audio data for the requested video track".into());
+    }
+    let mut stream = futures_util::stream::iter(
+        prefix_chunks
+            .into_iter()
+            .map(Ok::<_, reqwest::Error>)
+    )
+    .chain(stream);
+    let mut file = File::create(target_path).await.map_err(|e| e.to_string())?;
+    let mut track_downloaded = 0u64;
+    while let Some(chunk) = stream.next().await {
+        if !transfer_can_continue(app, id, generation) {
+            return Err("paused".into());
+        }
+        let bytes = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&bytes).await.map_err(|e| e.to_string())?;
+        track_downloaded = track_downloaded.saturating_add(bytes.len() as u64);
+        downloaded_atomic.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let so_far = downloaded_atomic.load(Ordering::Relaxed);
+        let speed = (so_far as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
+        emit_job(&state, id, |job| {
+            job.downloaded = so_far;
+            job.speed = speed;
+            if let Some(total) = combined_total {
+                job.progress = (so_far as f64 / total as f64 * 100.0).min(100.0);
+                if speed > 0 {
+                    job.eta = Some(format!("{}s left", (total.saturating_sub(so_far) / speed).max(1)));
+                }
+            }
+        });
+        emit_progress(app, &state, id);
+        if !throttle(app, id, bytes.len(), generation).await {
+            return Err("paused".into());
+        }
+    }
+    if expected.is_some_and(|total| track_downloaded != total) {
+        return Err(format!("track stream ended after {track_downloaded} bytes; expected {expected:?}"));
+    }
+    file.sync_all().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn acquire_dual_track(
+    app: AppHandle,
+    id: String,
+    video_response: reqwest::Response,
+    audio_source: String,
+    generation: u64,
+) -> Result<(), String> {
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+    let state = app.state::<CoreState>();
+    let client = http_client();
+    let (temp_path, replace_existing) = state
+        .snapshot
+        .lock()
+        .map_err(|_| "State unavailable".to_string())
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| (job.temp_path.clone(), snapshot.settings.collision_behavior == "replace"))
+                .ok_or_else(|| "Acquisition no longer exists".to_string())
+        })?;
+
+    if let Some(parent) = PathBuf::from(&temp_path).parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+    }
+
+    let video_total = partial_response_is_complete(&video_response)?;
+    let audio_response = acquisition_request(&client, &app, &id, &audio_source)
+        .send()
+        .await
+        .map_err(|error| redact_url_credentials(&error.to_string()))?;
+    if !audio_response.status().is_success() {
+        return Err(format!("audio source returned {}", audio_response.status()));
+    }
+    if media_mime_kind(header_string(&audio_response, reqwest::header::CONTENT_TYPE).as_deref()) == Some("video") {
+        return Err("The companion source returned video data instead of audio".into());
+    }
+    let audio_total = partial_response_is_complete(&audio_response)?;
+
+    let combined_total = match (video_total, audio_total) {
+        (Some(v), Some(a)) => v.checked_add(a),
+        _ => None,
+    };
+
+    emit_job(&state, &id, |job| {
+        job.state = "downloading".into();
+        job.mode = "dual-track".into();
+        job.media = true;
+        job.media_tracks = Some(2);
+        job.total = combined_total;
+        job.downloaded = 0;
+        job.progress = 0.0;
+        job.speed = 0;
+        job.connections = 2;
+        job.events.insert(
+            0,
+            job_event("Acquiring separate video and audio streams", Some("success")),
+        );
+    });
+    emit_snapshot(&app, &state);
+
+    let started = std::time::Instant::now();
+    let downloaded = std::sync::Arc::new(AtomicU64::new(0));
+
+    let track0_path = format!("{temp_path}.track-00");
+    let track1_path = format!("{temp_path}.track-01");
+
+    let video_task = download_track_to_file(
+        &app,
+        &id,
+        Path::new(&track0_path),
+        generation,
+        &downloaded,
+        combined_total,
+        started,
+        video_response,
+        Some("video"),
+    );
+
+    let audio_task = download_track_to_file(
+        &app,
+        &id,
+        Path::new(&track1_path),
+        generation,
+        &downloaded,
+        combined_total,
+        started,
+        audio_response,
+        Some("audio"),
+    );
+
+    futures_util::try_join!(video_task, audio_task)?;
+
+    if !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+
+    emit_job(&state, &id, |job| {
+        job.state = "finalizing".into();
+        job.total = Some(job.downloaded);
+        job.connections = 0;
+        job.speed = 0;
+        job.eta = Some("Assembling media".into());
+        job.events.insert(
+            0,
+            job_event("Muxing video and audio tracks", Some("warning")),
+        );
+    });
+    emit_snapshot(&app, &state);
+
+    let committed = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| (job.provisional != Some(true), job.destination.clone()))
+        })
+        .unwrap_or((false, String::new()));
+
+    if committed.0 && !committed.1.is_empty() {
+        let track_paths = vec![track0_path, track1_path];
+        let mux_path = format!("{temp_path}.mux.{}", media_extension(&committed.1));
+        let muxed_path = mux_media_tracks(&track_paths, &mux_path).await?;
+        if !transfer_can_continue(&app, &id, generation) {
+            return Ok(());
+        }
+        let requested_destination = destination_with_output_extension(&committed.1, &muxed_path);
+        if let Some(parent) = PathBuf::from(&requested_destination).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+            if !transfer_can_continue(&app, &id, generation) {
+                return Ok(());
+            }
+        }
+        let (destination, reserved, reservation) =
+            managed_destination(&requested_destination, replace_existing)?;
+        if destination != committed.1 || reservation.is_some() {
+            let reservation_marker = reservation.clone();
+            emit_job(&state, &id, |job| {
+                job.destination = destination.clone();
+                job.destination_reservation = reservation_marker;
+                if let Some(file_name) = PathBuf::from(&destination)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                {
+                    if destination != committed.1 {
+                        job.name = file_name.to_string();
+                    }
+                }
+                if destination != committed.1 {
+                    job.events.insert(
+                        0,
+                        job_event("Destination renamed to avoid a collision", Some("warning")),
+                    );
+                }
+            });
+            emit_snapshot(&app, &state);
+        }
+        if !transfer_can_continue(&app, &id, generation) {
+            if reserved {
+                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+            }
+            clear_destination_reservation(&app, &state, &id);
+            return Ok(());
+        }
+        if let Err(error) = move_completed_file(
+            &muxed_path,
+            &destination,
+            replace_existing,
+            reservation.as_deref(),
+        )
+        .await
+        {
+            clear_destination_reservation(&app, &state, &id);
+            return Err(error);
+        }
+        clear_destination_reservation(&app, &state, &id);
+        cleanup_media_track_files(&temp_path);
+    }
+
+    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
+        return Ok(());
+    }
+
+    emit_job(&state, &id, |job| {
+        job.speed = 0;
+        job.connections = 0;
+        if committed.0 {
+            complete_job(job);
+        } else {
+            job.state = "finalizing".into();
+            job.progress = 100.0;
+            job.eta = Some("Ready to save".into());
+            job.events.insert(
+                0,
+                job_event("Tracks downloaded; waiting for destination", Some("warning")),
+            );
+        }
+    });
+    emit_snapshot(&app, &state);
+    if committed.0 {
+        add_notification(&app, &state, &id, "completed");
+    }
+    Ok(())
+}
+
 async fn acquire_once(app: AppHandle, id: String, source: String, generation: u64) -> bool {
     let state = app.state::<CoreState>();
     let client = http_client();
@@ -3353,10 +3825,9 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         },
         None => None,
     };
-    let mut response = match post_first {
+    let response = match post_first {
         Some(posted) => posted,
         None => match acquisition_request(&client, &app, &id, &source)
-        .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
         .await
         {
@@ -3465,182 +3936,78 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     if !transfer_can_continue(&app, &id, generation) {
         return false;
     }
-    let valid_probe = response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-        || content_range(&response)
-            .map(|(start, end, total)| start == 0 && end == 0 && total > 0)
-            .unwrap_or(false);
-    if !valid_probe {
-        response = match acquisition_request(&client, &app, &id, &source)
-            .send()
-            .await
-        {
-            Ok(response)
-                if response.status().is_success()
-                    && response.status() != reqwest::StatusCode::PARTIAL_CONTENT =>
-            {
-                response
-            }
-            Ok(_response) => {
-                if !transfer_can_continue(&app, &id, generation) {
-                    return false;
-                }
-                emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
-                    job.error = Some("The source returned an invalid partial response".into());
-                    job.eta = None;
-                    job.events.insert(
-                        0,
-                        job_event("Source returned an invalid partial response", Some("error"))
-                    );
-                });
-                emit_snapshot(&app, &state);
-                add_notification(&app, &state, &id, "failed");
-                return false;
-            }
-            Err(error) => {
-                if !transfer_can_continue(&app, &id, generation) {
-                    return false;
-                }
-                emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
-                    job.error = Some(redact_url_credentials(&error.to_string()));
-                    job.eta = None;
-                    job.events
-                        .insert(0, job_event("Could not connect to source", Some("error")));
-                });
-                emit_snapshot(&app, &state);
-                add_notification(&app, &state, &id, "failed");
-                return true;
-            }
-        };
-    }
-    if !transfer_can_continue(&app, &id, generation) {
-        return false;
-    }
-    // The probe follows redirects: segment resolution must use the manifest's
-    // effective URL, not the requested source (F04).
-    let mut manifest_source = response.url().to_string();
+    let manifest_source = response.url().to_string();
     let response_mime = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    // A 200 HTML page without a file disposition is a form result, login
-    // wall, or soft-error page — never the named download. Fail honestly
-    // instead of completing it as the target file (F06).
     let page_disposition = response
         .headers()
         .get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|value| value.to_str().ok());
-    let job_name = state
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let (expected_kind, companion_audio_url, job_name) = state
         .snapshot
         .lock()
         .ok()
         .and_then(|snapshot| {
-            snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.name.clone())
+            snapshot.jobs.iter().find(|job| job.id == id).map(|job| (
+                job.media.then(|| job.player_kind.clone().unwrap_or_else(|| "video".into())),
+                job.companion_audio.clone(),
+                job.name.clone(),
+            ))
         })
-        .unwrap_or_default();
-    if page_instead_of_file(response_mime.as_deref(), page_disposition, &job_name) {
-        if !transfer_can_continue(&app, &id, generation) {
+        .unwrap_or((None, None, String::new()));
+    let total = match partial_response_is_complete(&response) {
+        Ok(total) => total,
+        Err(error) => {
+            if transfer_can_continue(&app, &id, generation) {
+                mark_acquisition_failed(&app, &state, &id, error, "Source returned an incomplete object");
+            }
             return false;
         }
-        emit_job(&state, &id, |job| {
-            job.state = "failed".into();
-            job.error = Some("The source returned a web page instead of a file; the site may need its login session".into());
-            job.eta = None;
-            job.events.insert(
-                0,
-                job_event("Source returned a web page instead of a file", Some("error"))
-            );
-        });
-        emit_snapshot(&app, &state);
-        add_notification(&app, &state, &id, "failed");
+    };
+    if mime_conflicts_player_kind(expected_kind.as_deref(), response_mime.as_deref()) {
+        mark_acquisition_failed(
+            &app,
+            &state,
+            &id,
+            format!("The source MIME type is not compatible with the expected {} track", expected_kind.as_deref().unwrap_or("media")),
+            "Source media type did not match the requested player track",
+        );
         return false;
     }
-    if media::is_manifest_source(&manifest_source, response_mime.as_deref()) {
-        if !transfer_can_continue(&app, &id, generation) {
-            return false;
-        }
-        let body = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            match acquisition_request(&client, &app, &id, &manifest_source)
-                .send()
-                .await
-            {
-                Ok(full) if full.status().is_success() => {
-                    manifest_source = full.url().to_string();
-                    full.text().await.map_err(|error| error.to_string())
-                }
-                Ok(full) => Err(format!("Manifest source returned {}", full.status())),
-                Err(error) => Err(error.to_string())
-            }
-        } else {
-            response.text().await.map_err(|error| error.to_string())
-        };
+    if page_instead_of_file(response_mime.as_deref(), page_disposition.as_deref(), &job_name) {
+        mark_acquisition_failed(
+            &app,
+            &state,
+            &id,
+            "The source returned a web page instead of a file; the site may need its login session".into(),
+            "Source returned a web page instead of a file",
+        );
+        return false;
+    }
+    let known_manifest = media::is_manifest_source(&manifest_source, response_mime.as_deref())
+        || manifest_mime(response_mime.as_deref());
+    if known_manifest {
+        let body = response.text().await.map_err(|error| error.to_string());
         let result = match body {
-            Ok(body) => {
-                if !transfer_can_continue(&app, &id, generation) {
-                    return false;
-                }
-                acquire_manifest(
-                    app.clone(),
-                    id.clone(),
-                    manifest_source.clone(),
-                    body,
-                    response_mime.clone(),
-                    selected_segments.clone(),
-                    generation
-                )
-                .await
-            }
-            Err(error) => Err(error)
-        };
-        if let Err(error) = result {
-            if !transfer_is_current(&app, &id, generation) {
-                return false;
-            }
-            if job_state(&app, &id).as_deref() == Some("paused") {
-                emit_job(&state, &id, |job| {
-                    job.connections = 0;
-                    job.speed = 0;
-                    job.eta = Some("Paused".into());
-                });
-                emit_snapshot(&app, &state);
-            } else if job_state(&app, &id).as_deref() != Some("failed") {
-                emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
-                    job.error = Some(error.clone());
-                    job.connections = 0;
-                    job.events
-                        .insert(0, job_event("Manifest acquisition failed", Some("error")));
-                });
-                emit_snapshot(&app, &state);
-                add_notification(&app, &state, &id, "failed");
-            }
-        }
-        return false;
-    }
-    if let Some((start, end, ranged_total)) = content_range(&response) {
-        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT
-            && start == 0
-            && end == 0
-            && ranged_total > 1
-        {
-            if !transfer_can_continue(&app, &id, generation) {
-                return false;
-            }
-            if let Err(error) = acquire_ranges(
+            Ok(body) => acquire_manifest(
                 app.clone(),
                 id.clone(),
-                source.clone(),
-                response,
-                ranged_total,
-                generation
+                manifest_source.clone(),
+                body,
+                response_mime.clone(),
+                expected_kind.clone(),
+                selected_segments.clone(),
+                generation,
             )
-            .await
-            {
-                if !transfer_is_current(&app, &id, generation) {
-                    return false;
-                }
+            .await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            if transfer_is_current(&app, &id, generation) {
                 if job_state(&app, &id).as_deref() == Some("paused") {
                     emit_job(&state, &id, |job| {
                         job.connections = 0;
@@ -3649,21 +4016,180 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                     });
                     emit_snapshot(&app, &state);
                 } else if job_state(&app, &id).as_deref() != Some("failed") {
+                    mark_acquisition_failed(&app, &state, &id, error, "Manifest acquisition failed");
+                }
+            }
+        }
+        return false;
+    }
+    if let Some(audio_source) = companion_audio_url {
+        if expected_kind.as_deref() != Some("video") {
+            mark_acquisition_failed(&app, &state, &id, "Companion audio requires a video source".into(), "Invalid companion audio metadata");
+            return false;
+        }
+        if let Err(error) = acquire_dual_track(
+            app.clone(),
+            id.clone(),
+            response,
+            audio_source,
+            generation,
+        )
+        .await
+        {
+            if transfer_is_current(&app, &id, generation) {
+                if job_state(&app, &id).as_deref() == Some("paused") {
                     emit_job(&state, &id, |job| {
-                        job.state = "failed".into();
-                        job.error = Some(error.clone());
                         job.connections = 0;
-                        job.events
-                            .insert(0, job_event("Range acquisition failed", Some("error")));
+                        job.speed = 0;
+                        job.eta = Some("Paused".into());
                     });
                     emit_snapshot(&app, &state);
-                    add_notification(&app, &state, &id, "failed");
+                } else if job_state(&app, &id).as_deref() != Some("failed") {
+                    mark_acquisition_failed(&app, &state, &id, error, "Dual-track media acquisition failed");
+                }
+            }
+        }
+        return false;
+    }
+    let safe_ranges = supports_safe_initial_ranges(&response, total, response_mime.as_deref());
+    let mut stream = response.bytes_stream();
+    // Keep a bounded prefix together while sniffing so a manifest marker
+    // split across response chunks is still recognized without losing bytes.
+    let mut prefix_chunks = Vec::new();
+    let mut prefix_len = 0usize;
+    while prefix_len < BODY_SNIFF_LIMIT {
+        match stream.next().await {
+            Some(Ok(bytes)) => {
+                prefix_len = prefix_len.saturating_add(bytes.len());
+                let empty = bytes.is_empty();
+                prefix_chunks.push(bytes);
+                if empty {
+                    break;
+                }
+            }
+            Some(Err(error)) => {
+                mark_acquisition_failed(&app, &state, &id, error.to_string(), "Network stream interrupted");
+                return false;
+            }
+            None => break,
+        }
+    }
+    let mut sniff_prefix = Vec::with_capacity(prefix_len.min(BODY_SNIFF_LIMIT));
+    for chunk in &prefix_chunks {
+        let remaining = BODY_SNIFF_LIMIT.saturating_sub(sniff_prefix.len());
+        if remaining == 0 {
+            break;
+        }
+        sniff_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    if media::is_manifest_body(&sniff_prefix) {
+        let mut body = prefix_chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => body.extend_from_slice(&bytes),
+                Err(error) => {
+                    mark_acquisition_failed(&app, &state, &id, error.to_string(), "Manifest stream interrupted");
+                    return false;
+                }
+            }
+        }
+        let result = acquire_manifest(
+            app.clone(),
+            id.clone(),
+            manifest_source,
+            String::from_utf8_lossy(&body).into_owned(),
+            response_mime.clone(),
+            expected_kind.clone(),
+            selected_segments.clone(),
+            generation,
+        )
+        .await;
+        if let Err(error) = result {
+            if transfer_is_current(&app, &id, generation) {
+                mark_acquisition_failed(&app, &state, &id, error, "Manifest acquisition failed");
+            }
+        }
+        return false;
+    }
+    if (body_looks_like_html(&sniff_prefix)
+        && !page_disposition.as_deref().map(|value| value.to_ascii_lowercase().contains("filename")).unwrap_or(false)
+        && !job_name.to_ascii_lowercase().ends_with(".html")
+        && !job_name.to_ascii_lowercase().ends_with(".htm"))
+        || page_instead_of_file(response_mime.as_deref(), page_disposition.as_deref(), &job_name)
+    {
+        mark_acquisition_failed(
+            &app,
+            &state,
+            &id,
+            "The source returned a web page instead of a file; the site may need its login session".into(),
+            "Source returned a web page instead of a file",
+        );
+        return false;
+    }
+    if expected_kind.as_deref() == Some("video") && body_looks_like_audio(&sniff_prefix) {
+        mark_acquisition_failed(
+            &app,
+            &state,
+            &id,
+            "The source returned audio data for the requested video track".into(),
+            "Source media bytes did not match the requested video track",
+        );
+        return false;
+    }
+    if safe_ranges {
+        let probe_end = total
+            .expect("safe range response has a total")
+            .min(1024 * 1024)
+            .saturating_sub(1);
+        let probe = acquisition_request(&client, &app, &id, &manifest_source)
+            .header(reqwest::header::RANGE, format!("bytes=0-{probe_end}"))
+            .send()
+            .await;
+        let valid_probe = match probe {
+            Ok(probe) if probe.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                content_range(&probe)
+                    .map(|(start, end, advertised)| {
+                        start == 0
+                            && end == probe_end
+                            && advertised == total.expect("safe range response has a total")
+                            && probe.content_length() == Some(probe_end + 1)
+                    })
+                    .unwrap_or(false)
+                    .then_some(probe)
+            }
+            _ => None,
+        };
+        if let Some(probe) = valid_probe {
+            drop(stream);
+            if let Err(error) = acquire_ranges(
+                app.clone(),
+                id.clone(),
+                source.clone(),
+                probe,
+                total.expect("safe range response has a total"),
+                generation,
+            )
+            .await
+            {
+                if transfer_is_current(&app, &id, generation) {
+                    if job_state(&app, &id).as_deref() == Some("paused") {
+                        emit_job(&state, &id, |job| {
+                            job.connections = 0;
+                            job.speed = 0;
+                            job.eta = Some("Paused".into());
+                        });
+                        emit_snapshot(&app, &state);
+                    } else if job_state(&app, &id).as_deref() != Some("failed") {
+                        mark_acquisition_failed(&app, &state, &id, error, "Range acquisition failed");
+                    }
                 }
             }
             return false;
         }
     }
-    let total = response.content_length();
     let temp_path = state.snapshot.lock().ok().and_then(|snapshot| {
         snapshot
             .jobs
@@ -3720,11 +4246,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         job.resumable = false;
         job.connections = 1;
         job.mode = "single-stream".into();
-        job.mime = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
+        job.mime = response_mime.clone();
         job.events.insert(
             0,
             job_event(
@@ -3736,7 +4258,12 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     emit_snapshot(&app, &state);
     let started = std::time::Instant::now();
     let mut downloaded = 0u64;
-    let mut stream = response.bytes_stream();
+    let mut stream = futures_util::stream::iter(
+        prefix_chunks
+            .into_iter()
+            .map(Ok::<_, reqwest::Error>)
+    )
+        .chain(stream);
     while let Some(chunk) = stream.next().await {
         if !transfer_is_downloading(&app, &id, generation) {
             drop(stream);
@@ -3811,6 +4338,16 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         }
     }
     drop(file);
+    if total.is_some_and(|expected| downloaded != expected) {
+        mark_acquisition_failed(
+            &app,
+            &state,
+            &id,
+            format!("The source ended after {downloaded} bytes; expected {total:?}"),
+            "Network stream ended before the complete object",
+        );
+        return false;
+    }
     if !transfer_can_continue(&app, &id, generation) {
         return false;
     }
@@ -4239,16 +4776,20 @@ fn start_window_drag(app: AppHandle, label: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
+fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_file: Option<bool>) {
     let _lifecycle = state.lifecycle.lock().ok();
     abort_transfer(state.inner(), &id);
     let mut temporary = None;
     let mut track_cleanup = None;
+    let mut destination_to_delete = None;
     if let Ok(mut snapshot) = state.snapshot.lock() {
         if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id) {
             track_cleanup = Some(job.temp_path.clone());
             if job.state != "completed" {
                 temporary = Some(job.temp_path.clone());
+            }
+            if delete_file.unwrap_or(false) {
+                destination_to_delete = Some(job.destination.clone());
             }
         }
         snapshot.jobs.retain(|job| job.id != id);
@@ -4267,6 +4808,9 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     }
     if let Some(path) = track_cleanup {
         cleanup_media_track_files(&path);
+    }
+    if let Some(dest) = destination_to_delete {
+        let _ = std::fs::remove_file(&dest);
     }
     emit_snapshot(&app, &state);
 }
@@ -4340,6 +4884,27 @@ fn start_provisional(
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("Use an HTTP or HTTPS URL".into());
     }
+    let media = input.media.unwrap_or(false);
+    let player_kind = if media {
+        Some(
+            player_kind_value(input.player_kind.as_deref().unwrap_or("video"))
+                .ok_or_else(|| "Player kind must be video or audio".to_string())?,
+        )
+    } else {
+        if input.player_kind.is_some() || input.companion_audio.is_some() {
+            return Err("Player metadata requires a media acquisition".into());
+        }
+        None
+    };
+    let companion_audio = input.companion_audio.as_deref().map(|value| {
+        validated_http_url(value).ok_or_else(|| "Companion audio must be an HTTP or HTTPS URL".to_string())
+    }).transpose()?;
+    if companion_audio.is_some() && player_kind.as_deref() != Some("video") {
+        return Err("Companion audio requires a video acquisition".into());
+    }
+    if companion_audio.as_deref() == Some(input.source.as_str()) {
+        return Err("Companion audio must be different from the video source".into());
+    }
     if show_window {
         let target = state
             .reattach_target
@@ -4362,6 +4927,9 @@ fn start_provisional(
                         };
                         job.source = input.source.clone();
                         job.selected_segments = input.selected_segments.clone();
+                        job.kind = player_kind.clone().unwrap_or_else(|| "document".into());
+                        job.player_kind = player_kind.clone();
+                        job.companion_audio = companion_audio.clone();
                         job.referrer = input.referrer.clone();
                         job.post_body = input.post_body.clone();
                         job.user_agent = input
@@ -4418,11 +4986,7 @@ fn start_provisional(
         name,
         source: input.source.clone(),
         domain: domain(&input.source),
-        kind: if input.media.unwrap_or(false) {
-            "video".into()
-        } else {
-            "document".into()
-        },
+        kind: player_kind.clone().unwrap_or_else(|| "document".into()),
         state: "connecting".into(),
         progress: 0.0,
         downloaded: 0,
@@ -4433,7 +4997,7 @@ fn start_provisional(
         max_connections,
         bandwidth_limit: input.bandwidth_limit,
         mode: "single-stream".into(),
-        media: input.media.unwrap_or(false),
+        media,
         media_details: None,
         media_tracks: None,
         destination,
@@ -4453,6 +5017,8 @@ fn start_provisional(
         resource_identity: None,
         destination_reservation: None,
         selected_segments: input.selected_segments,
+        player_kind,
+        companion_audio,
         referrer: input.referrer,
         post_body: input.post_body,
         user_agent: input
@@ -4473,9 +5039,16 @@ fn start_provisional(
         let url = format!("index.html?window=add&id={id}");
         let mut add_window = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into()))
             .title("Add Download")
-            .inner_size(410.0, 560.0)
+            .inner_size(440.0, 500.0)
             .resizable(false)
             .decorations(false)
+            .shadow(true)
+            .visible(false)
+            .on_page_load(|window, payload| {
+                if payload.event() == PageLoadEvent::Finished {
+                    let _ = window.show().and_then(|_| window.set_focus());
+                }
+            })
             .center();
         #[cfg(windows)]
         {
@@ -4485,10 +5058,8 @@ fn start_provisional(
             Ok(window) => {
                 let close_handle = app.clone();
                 let close_id = id.clone();
-                let close_window = window.clone();
                 window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
+                    if let WindowEvent::CloseRequested { .. } = event {
                         let state = close_handle.state::<CoreState>();
                         let is_provisional = state
                             .snapshot
@@ -4505,10 +5076,8 @@ fn start_provisional(
                         if is_provisional {
                             cancel_job_internal(&close_handle, &state, &close_id);
                         }
-                        let _ = close_window.destroy();
                     }
                 });
-                let _ = window.show().and_then(|_| window.set_focus());
             }
             Err(error) => {
                 drop(_lifecycle);
@@ -4628,12 +5197,9 @@ async fn commit_provisional(
                 .ok()
                 .map(|snapshot| snapshot.jobs.iter().any(|job| job.id == id))
                 .unwrap_or(false);
-            return Err(if still_exists {
-                "Timed out waiting for the active acquisition to finish"
-            } else {
-                "Acquisition was cancelled before it became ready"
+            if !still_exists {
+                return Err("Acquisition was cancelled before it became ready".into());
             }
-            .into());
         }
     }
     let accepted = {
@@ -4656,6 +5222,7 @@ async fn commit_provisional(
             active
         );
         if ready_at_start
+            && !active
             && (decision != CommitDecision::Accept
                 || !commit_is_ready(
                     job.provisional,
@@ -4713,16 +5280,17 @@ async fn commit_provisional(
             job_event("Accepted as managed download", Some("success"))
         );
         (
-            ready_at_start,
+            ready_at_start && !active,
             job.temp_path.clone(),
             job.destination.clone(),
             collision == "replace",
-            job.mode == "segments",
+            job.mode == "segments" || job.mode == "dual-track",
             job.media_tracks.unwrap_or(1)
         )
     };
     emit_snapshot(&app, &state);
     if !accepted.0 {
+        close_add_window(&app, &id);
         return Ok(());
     }
     if !commit_still_owned(state.inner(), &id) {
@@ -4909,6 +5477,7 @@ async fn commit_provisional(
         }
     }
     emit_snapshot(&app, &state);
+    close_add_window(&app, &id);
     Ok(())
 }
 
@@ -5016,6 +5585,22 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
             .get("media")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    let player_kind = match payload.get("playerKind") {
+        None => None,
+        Some(Value::String(value)) => Some(player_kind_value(value)?),
+        Some(_) => return None,
+    };
+    let companion_audio = match payload.get("companionAudio") {
+        None => None,
+        Some(Value::String(value)) => Some(validated_http_url(value)?),
+        Some(_) => return None,
+    };
+    if companion_audio.is_some() && player_kind.as_deref().unwrap_or("video") != "video" {
+        return None;
+    }
+    if companion_audio.as_deref() == Some(source.as_str()) {
+        return None;
+    }
     // Bytes/sec; absent, zero, or non-numeric means no per-job cap.
     let bandwidth_limit = payload
         .get("bandwidthLimit")
@@ -5069,6 +5654,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         max_connections: None,
         bandwidth_limit,
         selected_segments,
+        player_kind,
+        companion_audio,
         referrer,
         post_body,
         user_agent
@@ -5840,6 +6427,36 @@ mod capture_tests {
         let message = json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/index.m3u8" } });
         let input = provisional_input_from_message(&message).expect("valid media capture");
         assert_eq!(input.media, Some(true));
+        assert_eq!(input.player_kind.as_deref(), None);
+    }
+
+    #[test]
+    fn media_capture_preserves_explicit_player_kind_and_companion_audio() {
+        let message = json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/video.mp4", "playerKind": "video", "companionAudio": "https://cdn.example.test/vod/audio.m4a", "selectedSegments": ["https://cdn.example.test/vod/audio.m4a"] } });
+        let input = provisional_input_from_message(&message).expect("valid dual-track capture");
+        assert_eq!(input.player_kind.as_deref(), Some("video"));
+        assert_eq!(input.companion_audio.as_deref(), Some("https://cdn.example.test/vod/audio.m4a"));
+        assert_eq!(input.selected_segments, ["https://cdn.example.test/vod/audio.m4a"]);
+    }
+
+    #[test]
+    fn media_capture_rejects_invalid_player_metadata() {
+        assert!(provisional_input_from_message(&json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/video.mp4", "playerKind": "document" } })).is_none());
+        assert!(provisional_input_from_message(&json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/video.mp4", "playerKind": "audio", "companionAudio": "https://cdn.example.test/vod/audio.m4a" } })).is_none());
+        assert!(provisional_input_from_message(&json!({ "type": "media-capture", "payload": { "source": "https://cdn.example.test/vod/video.mp4", "companionAudio": "file:///tmp/audio.m4a" } })).is_none());
+    }
+
+    #[test]
+    fn unknown_media_bytes_reject_unambiguous_audio_signatures() {
+        let mut mpeg = vec![0u8; 834];
+        mpeg[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+        mpeg[417..421].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+        assert!(super::body_looks_like_audio(b"ID3\x04\0\0"));
+        assert!(super::body_looks_like_audio(b"fLaC\0\0\0\x22"));
+        assert!(super::body_looks_like_audio(b"RIFF\0\0\0\0WAVE"));
+        assert!(super::body_looks_like_audio(b"OggS\0\0\0\0OpusHead"));
+        assert!(super::body_looks_like_audio(&mpeg));
+        assert!(!super::body_looks_like_audio(b"\0\0\0\x18ftypmp42"));
     }
 
     #[test]
@@ -6663,7 +7280,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
     }
 
     fn finished_job_with_context() -> DownloadJob {
-        DownloadJob { id: "done-1".into(), name: "archive.zip".into(), source: "https://cdn.example.test/archive.zip?token=abc".into(), domain: "cdn.example.test".into(), kind: "archive".into(), state: "downloading".into(), progress: 100.0, downloaded: 1024, total: Some(1024), speed: 0, eta: None, connections: 1, max_connections: 8, bandwidth_limit: None, mode: "whole-object".into(), media: false, media_details: None, media_tracks: None, destination: "/tmp/archive.zip".into(), temp_path: "/tmp/done-1.part".into(), resumable: true, mime: None, error: None, created: "now".into(), started: Some("now".into()), completed: None, provisional: Some(false), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: vec![], referrer: Some("https://example.test/page?session=s3cr3t".into()), post_body: Some("fixture=renewed".into()), user_agent: Some("Mozilla/5.0".into()), events: vec![] }
+        DownloadJob { id: "done-1".into(), name: "archive.zip".into(), source: "https://cdn.example.test/archive.zip?token=abc".into(), domain: "cdn.example.test".into(), kind: "archive".into(), state: "downloading".into(), progress: 100.0, downloaded: 1024, total: Some(1024), speed: 0, eta: None, connections: 1, max_connections: 8, bandwidth_limit: None, mode: "whole-object".into(), media: false, media_details: None, media_tracks: None, destination: "/tmp/archive.zip".into(), temp_path: "/tmp/done-1.part".into(), resumable: true, mime: None, error: None, created: "now".into(), started: Some("now".into()), completed: None, provisional: Some(false), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: vec![], player_kind: None, companion_audio: None, referrer: Some("https://example.test/page?session=s3cr3t".into()), post_body: Some("fixture=renewed".into()), user_agent: Some("Mozilla/5.0".into()), events: vec![] }
     }
 
     #[test]

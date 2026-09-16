@@ -5,9 +5,11 @@ import {
   chooseMediaSelection,
   choosePlayerEvidence,
   chooseWorkerMediaSelection,
+  isLikelyRepresentation,
   isMediaCandidate,
   isSubtitlePlaylist,
   mediaKindFor,
+  normalizeChunkUrl,
   roleFor,
   type MediaCandidate,
   type MediaPlayerEvidence,
@@ -125,12 +127,12 @@ describe('media candidate selection', () => {
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-b')).toBe('https://cdn.test/b/manifest.mpd');
   });
 
-  it('allows a manifest observed before player evidence when that player owns the segments', () => {
+  it('refuses an unowned manifest even when another owned player segment exists', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/vod/index.m3u8', tabId: 4, frameId: 0, at: 1, role: 'manifest' },
       { url: 'https://cdn.test/vod/segment-1.ts', tabId: 4, frameId: 0, at: 2, role: 'segment', playerKey: 'player-a' },
     ];
-    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/vod/index.m3u8');
+    expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBeUndefined();
   });
 
   it('keeps a multivariant master when a newer alternate audio playlist arrives', () => {
@@ -172,7 +174,7 @@ describe('media candidate selection', () => {
     expect(chooseMediaCandidate(candidates, 4, 0, 'player-a')).toBe('https://cdn.test/subtitles.m3u8');
   });
 
-  it('returns recent browser segment hints with the selected manifest', () => {
+  it('does not send raw browser segments as manifest selection hints', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/vod/manifest.mpd', tabId: 4, frameId: 0, at: 1, role: 'manifest', playerKey: 'player-a' },
       { url: 'https://cdn.test/vod/old-1.m4s', tabId: 4, frameId: 0, at: 2, role: 'segment', playerKey: 'player-a' },
@@ -181,7 +183,7 @@ describe('media candidate selection', () => {
     const selection: MediaSelection | undefined = chooseMediaSelection(candidates, 4, 0, 'player-a');
     expect(selection).toEqual({
       source: 'https://cdn.test/vod/manifest.mpd',
-      selectedSegments: ['https://cdn.test/vod/new-1.m4s', 'https://cdn.test/vod/old-1.m4s'],
+      selectedSegments: [],
     });
   });
 
@@ -225,8 +227,6 @@ describe('media candidate selection', () => {
         'https://cdn.test/vod/audio/en.m3u8',
         'https://cdn.test/vod/active.m3u8',
         'https://cdn.test/vod/high.m3u8',
-        'https://cdn.test/vod/segment-active.ts',
-        'https://cdn.test/vod/segment-high.ts',
       ],
     });
   });
@@ -318,5 +318,117 @@ describe('media candidate selection', () => {
       { url: 'https://www.example.test/s/search/audio/open.mp3', tabId: 4, frameId: 0, at: 100, role: 'unknown', kind: 'audio', playerKey: 'player-a' },
     ];
     expect(chooseMediaSelection(candidates, 4, 0, 'player-a', undefined, 'video')).toBeUndefined();
+  });
+
+  it('normalizes chunk URLs by stripping the range parameter', () => {
+    const chunkUrl = 'https://rr1---sn-4g5ednle.googlevideo.com/videoplayback?expire=123&sparams=expire%2Cid&id=abc&range=1048576-2097151&rn=1';
+    const normalized = normalizeChunkUrl(chunkUrl);
+    expect(normalized).toBe('https://rr1---sn-4g5ednle.googlevideo.com/videoplayback?expire=123&sparams=expire%2Cid&id=abc&rn=1');
+    expect(normalizeChunkUrl('https://example.com/video.mp4')).toBe('https://example.com/video.mp4');
+  });
+
+  it('detects representation tracks and kinds from query parameters and Content-Type', () => {
+    const ytVideoUrl = 'https://rr1---sn-4g5ednle.googlevideo.com/videoplayback?expire=123&mime=video%2Fwebm&itag=248';
+    const ytAudioUrl = 'https://rr1---sn-4g5ednle.googlevideo.com/videoplayback?expire=123&mime=audio%2Fwebm&itag=251';
+    const extensionlessUrl = 'https://stream.example.com/stream/track-1002';
+
+    expect(isLikelyRepresentation(ytVideoUrl)).toBe(true);
+    expect(mediaKindFor(ytVideoUrl)).toBe('video');
+    expect(isLikelyRepresentation(ytAudioUrl)).toBe(true);
+    expect(mediaKindFor(ytAudioUrl)).toBe('audio');
+
+    expect(isLikelyRepresentation(extensionlessUrl, 'video/mp4; codecs="avc1"')).toBe(true);
+    expect(mediaKindFor(extensionlessUrl, 'video/mp4; codecs="avc1"')).toBe('video');
+    expect(isLikelyRepresentation(extensionlessUrl, 'audio/webm; codecs="opus"')).toBe(true);
+    expect(mediaKindFor(extensionlessUrl, 'audio/webm; codecs="opus"')).toBe('audio');
+  });
+
+  it('pairs video and companion audio into dual-track selection with normalized URLs', () => {
+    const candidates: MediaCandidate[] = [
+      {
+        url: 'https://rr.googlevideo.com/videoplayback?id=yt1&mime=video%2Fwebm&range=0-1000',
+        tabId: 4,
+        frameId: 0,
+        at: 100,
+        role: 'unknown',
+        kind: 'video',
+        playerKey: 'player-a',
+      },
+      {
+        url: 'https://rr.googlevideo.com/videoplayback?id=yt1&mime=audio%2Fwebm&range=0-500',
+        tabId: 4,
+        frameId: 0,
+        at: 101,
+        role: 'unknown',
+        kind: 'audio',
+        playerKey: 'player-a',
+      },
+    ];
+
+    const selection = chooseMediaSelection(candidates, 4, 0, 'player-a', undefined, 'video');
+    expect(selection).toEqual({
+      source: 'https://rr.googlevideo.com/videoplayback?id=yt1&mime=video%2Fwebm',
+      selectedSegments: [],
+      companionAudio: 'https://rr.googlevideo.com/videoplayback?id=yt1&mime=audio%2Fwebm',
+    });
+  });
+
+  it('strictly isolates dual-track media by playerKey when multiple players exist on the same page', () => {
+    const candidates: MediaCandidate[] = [
+      // Player A video + audio
+      {
+        url: 'https://cdn.example.com/stream-a-video?range=0-1000',
+        tabId: 4,
+        frameId: 0,
+        at: 100,
+        role: 'unknown',
+        kind: 'video',
+        playerKey: 'player-a',
+      },
+      {
+        url: 'https://cdn.example.com/stream-a-audio?range=0-500',
+        tabId: 4,
+        frameId: 0,
+        at: 101,
+        role: 'unknown',
+        kind: 'audio',
+        playerKey: 'player-a',
+      },
+      // Player B video + audio
+      {
+        url: 'https://cdn.example.com/stream-b-video?range=0-2000',
+        tabId: 4,
+        frameId: 0,
+        at: 102,
+        role: 'unknown',
+        kind: 'video',
+        playerKey: 'player-b',
+      },
+      {
+        url: 'https://cdn.example.com/stream-b-audio?range=0-800',
+        tabId: 4,
+        frameId: 0,
+        at: 103,
+        role: 'unknown',
+        kind: 'audio',
+        playerKey: 'player-b',
+      },
+    ];
+
+    // Selecting Player A must yield only Player A's streams:
+    const selectionA = chooseMediaSelection(candidates, 4, 0, 'player-a', undefined, 'video');
+    expect(selectionA).toEqual({
+      source: 'https://cdn.example.com/stream-a-video',
+      selectedSegments: [],
+      companionAudio: 'https://cdn.example.com/stream-a-audio',
+    });
+
+    // Selecting Player B must yield only Player B's streams:
+    const selectionB = chooseMediaSelection(candidates, 4, 0, 'player-b', undefined, 'video');
+    expect(selectionB).toEqual({
+      source: 'https://cdn.example.com/stream-b-video',
+      selectedSegments: [],
+      companionAudio: 'https://cdn.example.com/stream-b-audio',
+    });
   });
 });

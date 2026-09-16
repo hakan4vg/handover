@@ -83,6 +83,6 @@ describe('resolved media retention', () => {
         resolve as (response: unknown) => void,
       );
     });
-    expect(third).toMatchObject({ ok: false, error: 'no acquirable source for this media' });
+    expect(third).toMatchObject({ ok: false, error: 'no exact media evidence for this player' });
   });
 });

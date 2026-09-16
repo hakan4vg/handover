@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "add-window-layout",
+  "description": "Fit Add Download windows to their visible contents and monitor work area",
+  "windows": ["add-*"],
+  "permissions": ["core:window:allow-set-size", "core:window:allow-set-position", "core:window:allow-current-monitor", "core:window:allow-outer-position"]
+}

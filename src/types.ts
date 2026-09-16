@@ -112,7 +112,7 @@ export interface DownloadAdapter {
   resumeJob(id: string): Promise<void>;
   retryJob(id: string): Promise<void>;
   cancelJob(id: string): Promise<void>;
-  removeJob(id: string): Promise<void>;
+  removeJob(id: string, deleteFile?: boolean): Promise<void>;
   pauseAll(): Promise<void>;
   resumeAll(): Promise<void>;
   createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }): Promise<string>;

@@ -235,8 +235,8 @@ mod tests {
     fn tampered_envelope_fails() {
         let stored = protect_field("https://cdn.example.test/file.bin?token=abc");
         let mut tampered = stored.clone();
-        tampered.pop();
-        tampered.push('0');
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
         assert!(unprotect_field(&tampered).is_err());
     }
 }

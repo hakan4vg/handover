@@ -252,7 +252,7 @@ class MockAdapter implements DownloadAdapter {
     this.update(id, (job) => ({ ...job, state: 'failed', speed: 0, connections: 0, error: 'Cancelled by user', events: [event('Provisional acquisition cancelled', 'warning'), ...job.events] }));
   }
 
-  async removeJob(id: string) {
+  async removeJob(id: string, _deleteFile?: boolean) {
     this.snapshot.jobs = this.snapshot.jobs.filter((job) => job.id !== id);
     this.emit();
   }
@@ -353,7 +353,7 @@ class NativeAdapter implements DownloadAdapter {
   resumeJob(id: string) { return this.command<void>('resume_job', { id }); }
   retryJob(id: string) { return this.command<void>('retry_job', { id }); }
   cancelJob(id: string) { return this.command<void>('cancel_job', { id }); }
-  removeJob(id: string) { return this.command<void>('remove_job', { id }); }
+  removeJob(id: string, deleteFile?: boolean) { return this.command<void>('remove_job', { id, deleteFile: deleteFile ?? false }); }
   pauseAll() { return this.command<void>('pause_all'); }
   resumeAll() { return this.command<void>('resume_all'); }
   createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<string>('create_provisional', { input }); }

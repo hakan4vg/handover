@@ -80,4 +80,48 @@ describe('Inspector removal feedback', () => {
     expect(onClose).not.toHaveBeenCalled();
     act(() => root.unmount());
   });
+
+  it('calls adapter.removeJob with deleteFile=true when Delete file is clicked', async () => {
+    const removeJob = vi.fn().mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(<Inspector job={job} adapter={{ removeJob } as unknown as DownloadAdapter} onClose={onClose} />);
+    });
+
+    const deleteFileBtn = Array.from(host.querySelectorAll('button')).find((button) => button.textContent?.includes('Delete file'));
+    if (!(deleteFileBtn instanceof HTMLButtonElement)) throw new Error('delete file button missing');
+    await act(async () => {
+      deleteFileBtn.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(removeJob).toHaveBeenCalledWith('remove-error-1', true);
+    act(() => root.unmount());
+  });
+
+  it('shows a visible error when delete file from disk fails', async () => {
+    const removeJob = vi.fn().mockRejectedValue(new Error('Permission denied'));
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(<Inspector job={job} adapter={{ removeJob } as unknown as DownloadAdapter} onClose={() => undefined} />);
+    });
+
+    const deleteFileBtn = Array.from(host.querySelectorAll('button')).find((button) => button.textContent?.includes('Delete file'));
+    if (!(deleteFileBtn instanceof HTMLButtonElement)) throw new Error('delete file button missing');
+    await act(async () => {
+      deleteFileBtn.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(removeJob).toHaveBeenCalledWith('remove-error-1', true);
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Permission denied');
+    act(() => root.unmount());
+  });
 });

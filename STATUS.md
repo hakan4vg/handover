@@ -7210,3 +7210,13 @@ AUDIT-2026-09-08.md is the authoritative audit; AUDIT-OMPI-2026-09-08.md cross-c
 - Browser Integration settings now synchronize in both directions while the app runs. The popup refreshes while open, app-side changes reach extension storage through the bounded reconciliation path, and extension-originated changes wait for the resident update. The resident `apply_browser_policy` path now uses the durable SQLite settings transaction and rolls the JSON coherence cache back if that transaction fails.
 - The manager now has one browser-integration indicator: green when interception is on, gray when off, and red when the bridge is unavailable. The transfer footer retains only active-count and speed information. The Notifications information callout now shares the settings cards' `694px` width and centered alignment.
 - Focused policy/media/popup checks passed `46/46`; frontend and extension production builds, Rust `cargo check`, optimized release compilation, and portable packaging completed. The rebuilt portable executable is `16560128` bytes with SHA-256 `D83FAE16420F039AD6A0C1E962707AFC05CD054AD5D49D1B6E4C9C6FE2E6AB9A`.
+
+
+## 2026-09-09 — Player evidence and acquisition correction
+
+- Added an early MAIN-world fetch/XHR/SourceBuffer observer. Captures query fresh evidence for the clicked media source; requests are no longer assigned to whichever player is hovered. Separate direct audio uses explicit `companionAudio`; manifest hints retain their own role.
+- Linked observed HLS children back to their master, kept current per-buffer URLs across chunk/quality changes, preserved attached-source evidence after blob revocation, and removed stale click-evidence caching.
+- Native acquisition retains the first full response while testing range support and falls back to that response when the additional request is rejected. Incomplete partial objects, unexpected audio, and playlist bodies are no longer accepted as ordinary requested video files in the corrected paths.
+- Fixed dynamic media discovery, overlay stylesheet leakage, Add-window show/focus churn, and Settings rerenders/draft persistence.
+- Verification: integrated Rust suite 114/114; JavaScript suite 132/134 initially, with both failures corrected and their focused rerun 2/2; frontend and extension production builds pass. No new browser harness was added.
+- Live provider verification is outstanding. Worker-owned/transmuxed buffers without observable provenance and browser-session-dependent sources remain limitations; this entry does not claim universal capture or verified YouTube/X/Reddit success. Reload the extension and refresh existing media tabs once to install the new early observer.

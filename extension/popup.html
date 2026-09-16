@@ -35,6 +35,17 @@
           <span id="site-state" class="enabled-copy"></span>
           <button class="button" id="site-toggle" type="button"></button>
         </div>
+        <section class="popup-filters" aria-labelledby="media-filter-heading">
+          <span class="eyebrow" id="media-filter-heading">Media filters</span>
+          <label class="filter-label" for="minimum-size">Minimum media size</label>
+          <div class="filter-input-row">
+            <input id="minimum-size" class="filter-input filter-number" type="number" min="0" step="0.1" inputmode="decimal" value="0" aria-describedby="media-filter-help" />
+            <span class="filter-unit" aria-hidden="true">MB</span>
+          </div>
+          <label class="filter-label" for="excluded-types">Excluded file types (comma-separated)</label>
+          <input id="excluded-types" class="filter-input" type="text" value="gif" placeholder="gif, webp, webm" autocomplete="off" aria-describedby="media-filter-help" />
+          <span class="filter-help" id="media-filter-help">0 disables the size limit. Unknown-size streams remain eligible. GIF matches actual GIF responses; MP4-served animations stay MP4.</span>
+        </section>
         <button class="popup-manager-button" id="open" type="button"><span>Open Manager</span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" aria-hidden="true"><path d="M7 17.5h10a2 2 0 0 0 2-2V9.8" /><path d="M12 5h7v7M19 5l-8 8" /></svg></button>
       </div>
     </div>

@@ -135,9 +135,9 @@ describe('AddDownloadWindow field honesty', () => {
     expect(determined.textContent).toContain('No');
   });
 
-  it('labels finalizing work Finalizing', () => {
+  it('labels a fully acquired provisional Ready to save', () => {
     const host = renderWindow(job({ state: 'finalizing' }), { onCommit: () => {}, onCancel: () => {} });
-    expect(host.textContent).toContain('Finalizing');
+    expect(host.textContent).toContain('Ready to save');
     expect(host.textContent).not.toContain('Merging');
   });
 });

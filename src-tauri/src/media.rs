@@ -78,6 +78,17 @@ pub fn is_manifest_source(source: &str, mime: Option<&str>) -> bool {
             .unwrap_or(false)
 }
 
+pub fn is_manifest_body(body: &[u8]) -> bool {
+    let body = String::from_utf8_lossy(body);
+    let body = body.trim_start_matches('\u{feff}').trim_start();
+    let lower = body.get(..body.len().min(8192)).unwrap_or(body).to_ascii_lowercase();
+    lower.starts_with("#extm3u")
+        || lower.contains("#ext-x-stream-inf")
+        || lower.contains("#ext-x-targetduration")
+        || lower.contains("<mpd")
+        || lower.contains("<?xml") && lower.contains("<mpd")
+}
+
 pub fn hls_variant(source: &str, body: &str) -> Option<String> {
     let mut variant = false;
     let mut selected = None;
@@ -2929,6 +2940,22 @@ struct Fmp4AudioTrack {
     samples: Vec<TimedMediaSample>
 }
 
+struct WebmAudioTrack {
+    codec_id: String,
+    codec_private: Vec<u8>,
+    sample_rate: u32,
+    channels: u16,
+    samples: Vec<TimedMediaSample>,
+}
+
+struct AudioTrackInfo {
+    codec_id: String,
+    codec_private: Vec<u8>,
+    sample_rate: u32,
+    channels: u16,
+    samples: Vec<TimedMediaSample>,
+}
+
 fn ebml_child(
     data: &[u8],
     start: usize,
@@ -3165,6 +3192,173 @@ fn parse_webm_video(data: &[u8], track_index: usize) -> Result<WebmVideoTrack, S
         height,
         samples
     })
+}
+
+fn parse_webm_audio(data: &[u8], track_index: usize) -> Result<WebmAudioTrack, String> {
+    let context = format!("WebM audio input {track_index}");
+    if data.len() < 4 || &data[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
+        return Err(format!("{context} is not an EBML/WebM file"));
+    }
+    let top = ebml_children(data, 0, data.len())?;
+    let (_, segment_start, segment_end) = top
+        .iter()
+        .find(|(id, _, _)| *id == 0x1853_8067)
+        .copied()
+        .ok_or_else(|| format!("{context} is missing a Segment element"))?;
+    let segment_children = ebml_children(data, segment_start, segment_end)?;
+    let timecode_scale = if let Some((_, info_start, info_end)) = segment_children
+        .iter()
+        .find(|(id, _, _)| *id == 0x1549_a966)
+        .copied()
+    {
+        ebml_child_uint(data, info_start, info_end, 0x2ad7_b1)?.unwrap_or(1_000_000)
+    } else {
+        1_000_000
+    };
+    if timecode_scale == 0 {
+        return Err(format!("{context} has a zero timecode scale"));
+    }
+    let (_, tracks_start, tracks_end) = segment_children
+        .iter()
+        .find(|(id, _, _)| *id == 0x1654_ae6b)
+        .copied()
+        .ok_or_else(|| format!("{context} is missing Tracks"))?;
+    let track_entry = ebml_children(data, tracks_start, tracks_end)?
+        .into_iter()
+        .filter(|(id, _, _)| *id == 0xae)
+        .find_map(|(_, start, end)| {
+            let track_type = ebml_child_uint(data, start, end, 0x83).ok().flatten();
+            (track_type == Some(2)).then_some((start, end))
+        })
+        .ok_or_else(|| format!("{context} contains no audio TrackEntry"))?;
+    let (entry_start, entry_end) = track_entry;
+    let track_number = ebml_child_uint(data, entry_start, entry_end, 0xd7)?
+        .ok_or_else(|| format!("{context} audio TrackEntry has no track number"))?;
+    if track_number == 0 {
+        return Err(format!("{context} audio TrackEntry has an invalid track number"));
+    }
+    let codec_id = ebml_child_text(
+        data,
+        entry_start,
+        entry_end,
+        0x86,
+        &format!("{context} TrackEntry"),
+    )?
+    .ok_or_else(|| format!("{context} audio TrackEntry has no codec ID"))?;
+    if !codec_id.starts_with("A_") {
+        return Err(format!("{context} uses unsupported audio codec {codec_id}"));
+    }
+    let codec_private = ebml_child_bytes(data, entry_start, entry_end, 0x63a2)?.unwrap_or_default();
+    let default_duration = ebml_child_uint(data, entry_start, entry_end, 0x23e383)?;
+    let (sample_rate, channels) = if let Some((_, audio_start, audio_end)) = ebml_children(data, entry_start, entry_end)?
+        .into_iter()
+        .find(|(id, _, _)| *id == 0xe1)
+    {
+        let rate = if let Some((child_start, child_end)) = ebml_child(data, audio_start, audio_end, 0xb5)? {
+            let len = child_end - child_start;
+            if len == 4 {
+                let bytes: [u8; 4] = data[child_start..child_end].try_into().unwrap_or([0; 4]);
+                f32::from_be_bytes(bytes) as u32
+            } else if len == 8 {
+                let bytes: [u8; 8] = data[child_start..child_end].try_into().unwrap_or([0; 8]);
+                f64::from_be_bytes(bytes) as u32
+            } else {
+                ebml_uint(data, child_start, child_end).unwrap_or(48000) as u32
+            }
+        } else {
+            48000
+        };
+        let ch = ebml_child_uint(data, audio_start, audio_end, 0x9f)?.unwrap_or(2) as u16;
+        (rate.max(1), ch.max(1))
+    } else {
+        (48000, 2)
+    };
+
+    let mut samples = Vec::new();
+    for (_, cluster_start, cluster_end) in segment_children
+        .iter()
+        .filter(|(id, _, _)| *id == 0x1f43_b675)
+    {
+        let cluster_timecode =
+            ebml_child_uint(data, *cluster_start, *cluster_end, 0xe7)?.unwrap_or(0);
+        for (id, child_start, child_end) in ebml_children(data, *cluster_start, *cluster_end)? {
+            if id == 0xa3 {
+                let block = &data[child_start..child_end];
+                let (block_track, _) = ebml_vint(block, 0)?;
+                if block_track == Some(track_number) {
+                    let sample_index = samples.len();
+                    samples.push(parse_webm_block(
+                        block,
+                        cluster_timecode,
+                        timecode_scale,
+                        track_number,
+                        false,
+                        default_duration,
+                        &format!("{context} SimpleBlock {sample_index}"),
+                    )?);
+                }
+            } else if id == 0xa0 {
+                let group = ebml_children(data, child_start, child_end)?;
+                if let Some((_, block_start, block_end)) = group
+                    .iter()
+                    .find(|(child_id, _, _)| *child_id == 0xa1)
+                    .copied()
+                {
+                    let block = &data[block_start..block_end];
+                    let (block_track, _) = ebml_vint(block, 0)?;
+                    if block_track == Some(track_number) {
+                        samples.push(parse_webm_block(
+                            block,
+                            cluster_timecode,
+                            timecode_scale,
+                            track_number,
+                            false,
+                            default_duration,
+                            &format!("{context} BlockGroup {}", samples.len()),
+                        )?);
+                    }
+                }
+            }
+        }
+    }
+    fill_sample_durations(
+        &mut samples,
+        default_duration.unwrap_or(20_000_000),
+        &context,
+    )?;
+    Ok(WebmAudioTrack {
+        codec_id,
+        codec_private,
+        sample_rate,
+        channels,
+        samples,
+    })
+}
+
+fn webm_track_type(data: &[u8]) -> Result<u64, String> {
+    if data.len() < 4 || &data[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
+        return Err("Not an EBML/WebM file".into());
+    }
+    let top = ebml_children(data, 0, data.len())?;
+    let (_, segment_start, segment_end) = top
+        .iter()
+        .find(|(id, _, _)| *id == 0x1853_8067)
+        .copied()
+        .ok_or_else(|| "Missing Segment element in WebM".to_string())?;
+    let segment_children = ebml_children(data, segment_start, segment_end)?;
+    let (_, tracks_start, tracks_end) = segment_children
+        .iter()
+        .find(|(id, _, _)| *id == 0x1654_ae6b)
+        .copied()
+        .ok_or_else(|| "Missing Tracks element in WebM".to_string())?;
+    for (id, start, end) in ebml_children(data, tracks_start, tracks_end)? {
+        if id == 0xae {
+            if let Some(track_type) = ebml_child_uint(data, start, end, 0x83)? {
+                return Ok(track_type);
+            }
+        }
+    }
+    Err("No TrackEntry found in WebM".into())
 }
 
 fn mp4_descriptor_length(
@@ -3667,7 +3861,7 @@ fn matroska_track_entry(
     ebml_element(&[0xae], &children.concat())
 }
 
-fn build_matroska_vp9_aac(video: WebmVideoTrack, audio: Fmp4AudioTrack) -> Result<Vec<u8>, String> {
+fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8>, String> {
     let first_timestamp = video
         .samples
         .iter()
@@ -3773,7 +3967,7 @@ fn build_matroska_vp9_aac(video: WebmVideoTrack, audio: Fmp4AudioTrack) -> Resul
         matroska_track_entry(
             2,
             2,
-            "A_AAC",
+            &audio.codec_id,
             &audio.codec_private,
             audio_default_duration,
             None,
@@ -3818,10 +4012,48 @@ pub fn mux_webm_fmp4_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, Str
     } else {
         return Err("Mixed media inputs contain no WebM track".into());
     };
-    Ok(build_matroska_vp9_aac(
-        parse_webm_video(webm, 0)?,
-        parse_fmp4_audio(fmp4, 1)?
-    )?)
+    let video = parse_webm_video(webm, 0)?;
+    let audio = parse_fmp4_audio(fmp4, 1)?;
+    build_matroska(
+        video,
+        AudioTrackInfo {
+            codec_id: "A_AAC".into(),
+            codec_private: audio.codec_private,
+            sample_rate: audio.sample_rate,
+            channels: audio.channels,
+            samples: audio.samples,
+        },
+    )
+}
+
+/// Mux one VP9/WebM video track and one WebM audio track (e.g. Opus) without external tools.
+pub fn mux_webm_webm_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> {
+    if inputs.len() != 2 {
+        return Err("WebM/WebM muxing requires exactly two tracks".into());
+    }
+    let first = inputs[0].as_ref();
+    let second = inputs[1].as_ref();
+    let first_type = webm_track_type(first)?;
+    let second_type = webm_track_type(second)?;
+    let (video_bytes, audio_bytes) = if first_type == 1 && second_type == 2 {
+        (first, second)
+    } else if first_type == 2 && second_type == 1 {
+        (second, first)
+    } else {
+        return Err("WebM tracks must contain one video track and one audio track".into());
+    };
+    let video = parse_webm_video(video_bytes, 0)?;
+    let audio = parse_webm_audio(audio_bytes, 1)?;
+    build_matroska(
+        video,
+        AudioTrackInfo {
+            codec_id: audio.codec_id,
+            codec_private: audio.codec_private,
+            sample_rate: audio.sample_rate,
+            channels: audio.channels,
+            samples: audio.samples,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -4549,5 +4781,94 @@ mod tests {
         );
         let multiplexed = mux_fmp4_tracks(&[video, audio]).expect("muxed fragmented tracks");
         finalize_fmp4(&multiplexed).expect("multiplexed fMP4 validates");
+    }
+
+    #[test]
+    fn muxes_webm_video_and_webm_opus_audio_tracks() {
+        let video_ebml_header = [
+            ebml_uint_element(&[0x42, 0x86], 1).unwrap(),
+            ebml_uint_element(&[0x42, 0xf7], 1).unwrap(),
+            ebml_uint_element(&[0x42, 0xf2], 4).unwrap(),
+            ebml_uint_element(&[0x42, 0xf3], 8).unwrap(),
+            ebml_text_element(&[0x42, 0x82], "webm").unwrap(),
+            ebml_uint_element(&[0x42, 0x87], 2).unwrap(),
+            ebml_uint_element(&[0x42, 0x85], 2).unwrap(),
+        ]
+        .concat();
+        let video_info = ebml_uint_element(&[0x2a, 0xd7, 0xb1], 1_000_000).unwrap();
+        let video_track_entry = matroska_track_entry(
+            1,
+            1,
+            "V_VP9",
+            &[],
+            33_333_333,
+            Some((1920, 1080)),
+            None,
+        )
+        .unwrap();
+
+        let mut video_block = ebml_track_number(1).unwrap();
+        video_block.extend_from_slice(&(0i16).to_be_bytes());
+        video_block.push(0x80);
+        video_block.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let video_cluster = [
+            ebml_uint_element(&[0xe7], 0).unwrap(),
+            ebml_element(&[0xa3], &video_block).unwrap(),
+        ]
+        .concat();
+
+        let video_segment_payload = [
+            ebml_element(&[0x15, 0x49, 0xa9, 0x66], &video_info).unwrap(),
+            ebml_element(&[0x16, 0x54, 0xae, 0x6b], &video_track_entry).unwrap(),
+            ebml_element(&[0x1f, 0x43, 0xb6, 0x75], &video_cluster).unwrap(),
+        ]
+        .concat();
+        let video_bytes = [
+            ebml_element(&[0x1a, 0x45, 0xdf, 0xa3], &video_ebml_header).unwrap(),
+            ebml_element(&[0x18, 0x53, 0x80, 0x67], &video_segment_payload).unwrap(),
+        ]
+        .concat();
+
+        let audio_track_entry = matroska_track_entry(
+            1,
+            2,
+            "A_OPUS",
+            b"OpusHead12345678",
+            20_000_000,
+            None,
+            Some((48000, 2)),
+        )
+        .unwrap();
+        let mut audio_block = ebml_track_number(1).unwrap();
+        audio_block.extend_from_slice(&(0i16).to_be_bytes());
+        audio_block.push(0x00);
+        audio_block.extend_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+        let audio_cluster = [
+            ebml_uint_element(&[0xe7], 0).unwrap(),
+            ebml_element(&[0xa3], &audio_block).unwrap(),
+        ]
+        .concat();
+        let audio_segment_payload = [
+            ebml_element(&[0x15, 0x49, 0xa9, 0x66], &video_info).unwrap(),
+            ebml_element(&[0x16, 0x54, 0xae, 0x6b], &audio_track_entry).unwrap(),
+            ebml_element(&[0x1f, 0x43, 0xb6, 0x75], &audio_cluster).unwrap(),
+        ]
+        .concat();
+        let audio_bytes = [
+            ebml_element(&[0x1a, 0x45, 0xdf, 0xa3], &video_ebml_header).unwrap(),
+            ebml_element(&[0x18, 0x53, 0x80, 0x67], &audio_segment_payload).unwrap(),
+        ]
+        .concat();
+
+        let muxed = mux_webm_webm_tracks(&[video_bytes, audio_bytes]).expect("muxed webm+webm tracks");
+        assert!(muxed.len() > 100);
+        assert_eq!(&muxed[..4], [0x1a, 0x45, 0xdf, 0xa3]);
+    }
+
+    #[test]
+    fn recognizes_extensionless_manifest_bodies() {
+        assert!(is_manifest_body(b"\xEF\xBB\xBF #EXTM3U\n#EXT-X-TARGETDURATION:4"));
+        assert!(is_manifest_body(b"<?xml version=\"1.0\"?><MPD type=\"static\"></MPD>"));
+        assert!(!is_manifest_body(b"\x00\x00\x00\x18ftypmp42"));
     }
 }

@@ -24,11 +24,6 @@ jobs:
     runs-on: windows-latest
     env:
       VITE_DATA_MODE: native
-      # The portable release must not need a VC++ redistributable. .cargo/config.toml
-      # declares this too, but it did not take effect on the runner, so set it here
-      # explicitly rather than depend on config-file discovery. RUSTFLAGS has the
-      # highest precedence of Cargo's flag sources.
-      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
 
@@ -131,6 +126,18 @@ jobs:
             Write-Host ("CRTSCAN {0}: dynamic-crt-imports={1}" -f (Split-Path $p -Leaf), $t.Contains('api-ms-win-crt'))
           }
           Show-Crt (Join-Path $probe 'target\release\crtprobe.exe')
+
+          # The bundled SQLite C code is compiled by the cc crate, which picks /MT vs
+          # /MD from the target features Cargo reports to build scripts. If it ended up
+          # dynamic it drags api-ms-win-crt-* imports into the final link.
+          $sqlite = Get-ChildItem -Path 'src-tauri\target\release\build' -Recurse -Filter 'sqlite3.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sqlite) {
+            $t2 = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($sqlite.FullName))
+            Write-Host ("CRTSCAN {0}: dynamic-crt-refs={1}" -f $sqlite.Name, $t2.Contains('api-ms-win-crt'))
+          } else {
+            Write-Host 'CRTSCAN sqlite3.lib not found'
+          }
+
           Show-Crt 'src-tauri\target\release\download-manager.exe'
 
       - name: Package portable release

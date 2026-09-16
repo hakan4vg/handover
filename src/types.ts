@@ -4,6 +4,9 @@ export type DownloadState =
   | 'paused'
   | 'pending'
   | 'finalizing'
+  /** Bytes are acquired; the job is a provisional waiting for the user to save
+   *  it or cancel it. Nothing is transferring, so it is never "active". */
+  | 'ready'
   | 'completed'
   | 'failed';
 
@@ -69,7 +72,6 @@ export interface AppSettings {
   showManagerAtSignIn: boolean;
   closeBehavior: 'tray' | 'exit';
   defaultFolder: string;
-  tempFolder: string;
   collisionBehavior: 'rename' | 'replace';
   interceptDownloads: boolean;
   showMediaButtons: boolean;

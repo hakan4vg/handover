@@ -173,6 +173,7 @@ mod tests {
             );
         }
         for state in [
+            Some("ready"),
             Some("paused"),
             Some("cancelled"),
             Some("completed"),

@@ -9,7 +9,6 @@ import type { AppSettings, DownloadJob } from './types';
 
 const settings = {
   defaultFolder: '/tmp/downloads',
-  tempFolder: '/tmp/downloads/.parts',
   maxConnections: 8,
   perDownloadOverrides: false,
   theme: 'light',
@@ -109,7 +108,7 @@ describe('Add Download pending actions', () => {
     expect(commit).toHaveBeenCalledTimes(1);
     expect(host.querySelector('.add-download-window')?.getAttribute('aria-busy')).toBe('true');
     expect(download.disabled).toBe(true);
-    expect(download.textContent).toContain('Adding…');
+    expect(download.textContent).toContain('Saving…');
     expect(cancel.disabled).toBe(true);
     expect(close.disabled).toBe(true);
     await act(async () => {
@@ -121,31 +120,22 @@ describe('Add Download pending actions', () => {
     act(() => root.unmount());
   });
 
-  it('keeps captured details stable while cancellation removes the live job', async () => {
-    let resolveCancel: () => void = () => undefined;
-    const onCancel = vi.fn(() => new Promise<void>((resolve) => { resolveCancel = resolve; }));
+  it('stays in capture form without showing a job the store no longer has', async () => {
+    const onCancel = vi.fn();
     const onClose = vi.fn();
-    const { host, root } = renderWindow({ job, onCancel, onClose });
-    const cancel = host.querySelector('.add-actions .button:not(.primary)');
-    if (!(cancel instanceof HTMLButtonElement)) throw new Error('cancel control missing');
+    const { host, root } = renderWindow({ job, captured: true, onCancel, onClose });
+    expect(host.querySelector('.add-download-window')?.classList.contains('captured')).toBe(true);
+    expect(host.querySelector('.provisional-panel')).not.toBeNull();
 
-    await act(async () => {
-      cancel.click();
-      await Promise.resolve();
-    });
     act(() => {
-      root.render(<AddDownloadWindow settings={settings} onCancel={onCancel} onClose={onClose} />);
+      root.render(<AddDownloadWindow settings={settings} captured onCancel={onCancel} onClose={onClose} />);
     });
 
     expect(host.querySelector('.add-download-window')?.classList.contains('captured')).toBe(true);
     expect((host.querySelector('input[aria-label="Source URL"]') as HTMLInputElement).readOnly).toBe(true);
-    expect(host.querySelector('.add-actions .button.primary')?.textContent).toContain('Download');
+    expect(host.querySelector('.add-actions .button.primary')?.textContent).toContain('Save');
+    expect(host.querySelector('.provisional-panel')).toBeNull();
 
-    await act(async () => {
-      resolveCancel();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
     act(() => root.unmount());
   });
 });

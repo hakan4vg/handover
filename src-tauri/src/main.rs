@@ -119,7 +119,6 @@ struct AppSettings {
     show_manager_at_sign_in: bool,
     close_behavior: String,
     default_folder: String,
-    temp_folder: String,
     #[serde(default = "default_collision_behavior")]
     collision_behavior: String,
     intercept_downloads: bool,
@@ -336,26 +335,22 @@ fn app_data_root() -> PathBuf {
     }
 }
 
+/// Job temporary data lives in the portable application data folder, beside the
+/// database and the WebView2 profile, so moving or renaming the product folder
+/// moves all of its state together. It is deliberately not a setting: a portable
+/// product must not scatter parts of a download into the user profile.
+fn temp_root() -> PathBuf {
+    app_data_root().join("tmp")
+}
+
 fn default_settings() -> AppSettings {
     let home = home_dir();
-    #[cfg(windows)]
-    let (default_folder, temp_folder) = (home.join("Downloads"), app_data_root().join("tmp"));
-    #[cfg(not(windows))]
-    let (default_folder, temp_folder) = (
-        home.join("Downloads"),
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".cache"))
-            .join("download-manager")
-            .join("tmp")
-    );
+    let default_folder = home.join("Downloads");
     AppSettings {
         start_at_sign_in: true,
         show_manager_at_sign_in: true,
         close_behavior: "tray".into(),
         default_folder: default_folder.to_string_lossy().into_owned(),
-        temp_folder: temp_folder.to_string_lossy().into_owned(),
         collision_behavior: default_collision_behavior(),
         intercept_downloads: true,
         show_media_buttons: true,
@@ -452,23 +447,7 @@ fn settings_from_stored(stored: &str) -> AppSettings {
     if settings.default_folder.trim().is_empty() {
         settings.default_folder = defaults.default_folder.clone();
     }
-    if settings.temp_folder.trim().is_empty() {
-        settings.temp_folder = defaults.temp_folder.clone();
-    }
-    #[cfg(windows)]
-    normalize_portable_temp_folder(&mut settings);
     settings
-}
-
-#[cfg(windows)]
-fn normalize_portable_temp_folder(settings: &mut AppSettings) {
-    let configured = Path::new(&settings.temp_folder);
-    let normalized = settings.temp_folder.replace('/', "\\").to_ascii_lowercase();
-    let is_known_default =
-        normalized.ends_with("\\data\\tmp") || normalized.ends_with("\\download manager\\temp");
-    if is_known_default || !configured.is_absolute() {
-        settings.temp_folder = app_data_root().join("tmp").to_string_lossy().into_owned();
-    }
 }
 
 // Per-key patch application shared by boot recovery and the live
@@ -497,7 +476,7 @@ fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
     let mut merged = serde_json::to_value(current).unwrap_or(Value::Null);
     for (key, value) in entries {
         if !valid_setting_value(key, value) { continue; }
-        if (key == "defaultFolder" || key == "tempFolder") && value.as_str().is_some_and(|text| text.trim().is_empty()) { continue; }
+        if key == "defaultFolder" && value.as_str().is_some_and(|text| text.trim().is_empty()) { continue; }
         let previous = if let Value::Object(ref mut base) = merged { base.insert(key.clone(), value.clone()) } else { break; };
         if serde_json::from_value::<AppSettings>(merged.clone()).is_err() {
             if let Value::Object(ref mut base) = merged {
@@ -542,24 +521,39 @@ fn cleanup_media_track_files(temp_path: &str) {
     }
 }
 
-fn is_orphaned_media_track_name(name: &str) -> bool {
-    let Some((primary, index)) = name.split_once(".part.track-") else { return false; };
-    primary.starts_with("provisional-") && !index.is_empty() && index.chars().all(|value| value.is_ascii_digit())
-}
-
-fn cleanup_orphaned_media_track_files(temp_folder: &str, preserved_temp_paths: &[String]) {
-    let root = Path::new(temp_folder);
-    let Ok(entries) = std::fs::read_dir(root) else { return; };
+/// The temp root holds exactly one class of data: artifacts of the jobs in the
+/// store, each named after the job id (`<id>.part`, plus its `.segments`
+/// directory, `.track-NN` files, and `.mux.*` outputs). Boot is the only moment
+/// guaranteed to be free of live transfers, so anything else found there is
+/// debris — a crashed transfer, an aborted provisional, or an older layout — and
+/// is removed. Artifacts of non-completed jobs are kept: pause and resume depend
+/// on them.
+fn sweep_temp_root(temp_root: &Path, jobs: &[DownloadJob]) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else { return; };
+    let prefixes = jobs
+        .iter()
+        .filter_map(|job| {
+            Path::new(&job.temp_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
     for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue; };
-        if !file_type.is_file() { continue; }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue; };
-        if !is_orphaned_media_track_name(name) { continue; }
-        let Some((primary, _)) = name.split_once(".part.track-") else { continue; };
-        let primary_path = root.join(format!("{primary}.part"));
-        if preserved_temp_paths.iter().any(|path| Path::new(path) == primary_path) { continue; }
-        let _ = std::fs::remove_file(entry.path());
+        let belongs = prefixes
+            .iter()
+            .any(|prefix| name == prefix || name.starts_with(&format!("{prefix}.")));
+        if belongs {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
     }
 }
 
@@ -640,13 +634,13 @@ fn relocate_job_temp_artifacts(job: &mut DownloadJob, temp_folder: &Path) {
 
 fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSnapshot {
     let mut jobs = Vec::new();
-    let mut preserved_temp_paths = Vec::new();
+    let mut unlistable = Vec::new();
     #[cfg(windows)]
-    let temp_folder = PathBuf::from(&settings.temp_folder);
-    if let Ok(mut statement) = database.prepare("SELECT payload FROM jobs ORDER BY created_at DESC")
+    let temp_folder = temp_root();
+    if let Ok(mut statement) = database.prepare("SELECT id, payload FROM jobs ORDER BY created_at DESC")
     {
-        if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
-            for payload in rows.flatten() {
+        if let Ok(rows) = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+            for (id, payload) in rows.flatten() {
                 if let Ok(mut job) = serde_json::from_str::<DownloadJob>(&payload) {
                     if unprotect_job_from_storage(&mut job).is_err() {
                         // Foreign machine/user or corrupt envelope: bytes on
@@ -695,23 +689,38 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
                         let _ = std::fs::remove_file(&job.temp_path);
                         let _ = std::fs::remove_dir_all(format!("{}.segments", job.temp_path));
                         cleanup_media_track_files(&job.temp_path);
+                        unlistable.push(id);
                         continue;
                     }
-                    if ["connecting", "downloading", "finalizing"].contains(&job.state.as_str()) {
-                        preserved_temp_paths.push(job.temp_path.clone());
-                    }
                     jobs.push(job);
+                } else {
+                    eprintln!("Dropping stored job {id}: payload is not a readable job");
+                    unlistable.push(id);
                 }
             }
         }
     }
-    cleanup_orphaned_media_track_files(&settings.temp_folder, &preserved_temp_paths);
+    // The list and the store must describe the same downloads. A row that cannot
+    // be listed — unreadable, or an unaccepted provisional, which is explicitly
+    // not durable — is removed here rather than lingering invisibly until the
+    // next full rewrite.
+    for id in unlistable {
+        if let Err(error) = database.execute("DELETE FROM jobs WHERE id = ?1", params![id]) {
+            eprintln!("Could not drop unlistable job {id}: {error}");
+        }
+    }
+    sweep_temp_root(&temp_root(), &jobs);
+    // Invariant: a notification always describes a job in the list (see
+    // add_notification). Boot re-establishes it, because provisional rows are
+    // dropped above and the center must not survive them.
+    let mut notifications = load_notifications(database);
+    notifications.retain(|item| jobs.iter().any(|job| job.id == item.job_id));
     AppSnapshot {
         jobs,
         settings,
         connected: true,
         aggregate_speed: 0,
-        notifications: load_notifications(database),
+        notifications,
         bridge_available: true,
     }
 }
@@ -813,6 +822,19 @@ fn complete_job(job: &mut DownloadJob) {
     job.user_agent = None;
     job.companion_audio = None;
     job.events.insert(0, job_event("Download completed", Some("success")));
+}
+
+/// The bytes are acquired, but the job is still a provisional the user has not
+/// accepted. It waits for that decision instead of reporting transfer progress:
+/// nothing is moving, so nothing can be paused, and the Add Download surface is
+/// where the user either saves it or cancels it.
+fn mark_ready_for_confirmation(job: &mut DownloadJob, event: &str) {
+    job.state = "ready".into();
+    job.progress = 100.0;
+    job.speed = 0;
+    job.connections = 0;
+    job.eta = None;
+    job.events.insert(0, job_event(event, Some("warning")));
 }
 
 /// SPEC §16: transport errors embed the request URL, which may carry
@@ -1085,22 +1107,65 @@ fn identity_from_response(response: &reqwest::Response, length: u64) -> Resource
     ResourceIdentity { length, etag: header_string(response, reqwest::header::ETAG), last_modified: header_string(response, reqwest::header::LAST_MODIFIED) }
 }
 
-fn identities_match(existing: Option<&ResourceIdentity>, current: &ResourceIdentity) -> bool {
-    let Some(existing) = existing else { return false; };
-    let etag_match = match (&existing.etag, &current.etag) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => true,
-        _ => false,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeEvidence {
+    /// Validators both sides expose agree, so the stored bytes belong to this
+    /// resource.
+    Trusted,
+    /// No validator can vouch for the resource. The stored bytes have to prove
+    /// themselves against what the source sends now.
+    Sampled,
+    /// The evidence contradicts the stored state: start over.
+    Rejected,
+}
+
+/// SPEC §8.8: never merge partial data because a filename or URL matches. The
+/// final length and every validator both sides expose must agree; what remains
+/// is either strong evidence (agreed validators) or sampled evidence (the bytes
+/// already on disk, checked against a fresh response).
+fn resume_evidence(
+    existing: Option<&ResourceIdentity>,
+    current: &ResourceIdentity,
+) -> ResumeEvidence {
+    let Some(existing) = existing else {
+        return ResumeEvidence::Rejected;
     };
-    let last_modified_match = match (&existing.last_modified, &current.last_modified) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => true,
-        _ => false,
+    if existing.length != current.length {
+        return ResumeEvidence::Rejected;
+    }
+    let mut validator_seen = false;
+    for (stored, fresh) in [
+        (existing.etag.as_ref(), current.etag.as_ref()),
+        (existing.last_modified.as_ref(), current.last_modified.as_ref()),
+    ] {
+        match (stored, fresh) {
+            (Some(stored), Some(fresh)) => {
+                if stored != fresh {
+                    return ResumeEvidence::Rejected;
+                }
+                validator_seen = true;
+            }
+            // A validator only one side exposes cannot confirm anything, and a
+            // validator that disappeared must not be read as agreement.
+            (Some(_), None) | (None, Some(_)) | (None, None) => {}
+        }
+    }
+    if validator_seen {
+        ResumeEvidence::Trusted
+    } else {
+        ResumeEvidence::Sampled
+    }
+}
+
+/// Sampled evidence: the leading bytes a fresh response just delivered must be
+/// byte-identical to what the partial file already holds. Anything else means
+/// the source is not the resource that was paused.
+async fn temp_prefix_matches(temp_path: &str, fresh: &[u8]) -> bool {
+    let Ok(mut file) = File::open(temp_path).await else {
+        return false;
     };
-    existing.length == current.length
-        && (existing.etag.is_some() || existing.last_modified.is_some())
-        && etag_match
-        && last_modified_match
+    let mut existing = vec![0u8; fresh.len()];
+    file.read_exact(&mut existing).await.is_ok() && existing == fresh
 }
 
 fn valid_range_identity(response: &reqwest::Response, expected: &ResourceIdentity) -> bool {
@@ -1185,8 +1250,10 @@ fn persist_notifications(state: &CoreState) {
 }
 
 fn load_notifications(database: &Connection) -> Vec<NotificationItem> {
+    // The table is rewritten wholesale on every change, newest item first, so
+    // insertion order is the order to read back (DESC returned the oldest first).
     let mut items = Vec::new();
-    if let Ok(mut statement) = database.prepare("SELECT payload FROM notifications ORDER BY rowid DESC LIMIT 40") {
+    if let Ok(mut statement) = database.prepare("SELECT payload FROM notifications ORDER BY rowid ASC LIMIT 40") {
         if let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) {
             for payload in rows.flatten() {
                 if let Ok(item) = serde_json::from_str::<NotificationItem>(&payload) {
@@ -1202,6 +1269,11 @@ fn add_notification(app: &AppHandle, state: &CoreState, id: &str, kind: &str) {
     let (item, enabled, destination) = match state.snapshot.lock() {
         Ok(mut snapshot) => {
             let Some(job) = snapshot.jobs.iter().find(|job| job.id == id).cloned() else { return; };
+            // The center describes managed downloads. A provisional the user has
+            // not accepted is announced by its Add Download window instead, and
+            // cancelling or removing a job drops its notifications with it, so
+            // the center never describes something the list does not contain.
+            if job.provisional == Some(true) { return; }
             let enabled = if kind == "completed" { snapshot.settings.completion_notifications } else { snapshot.settings.failure_notifications };
             let destination = job.destination.clone();
             let item = NotificationItem { id: format!("{kind}-{id}"), notification_type: kind.into(), title: if kind == "completed" { "Download completed".into() } else { "Download failed".into() }, detail: if kind == "completed" { format!("{} · {}", job.name, format_bytes(job.total)) } else { format!("{} · {}", job.name, redact_url_credentials(&job.error.unwrap_or_else(|| "The source could not be acquired".into()))) }, time: now_label(), job_id: id.into() };
@@ -2267,11 +2339,13 @@ async fn acquire_ranges(
             .find(|job| job.id == id)
             .map(|job| (job.resource_identity.clone(), job.completed_ranges.clone()))
     });
+    let evidence = resume_evidence(
+        existing.as_ref().and_then(|(stored_identity, _)| stored_identity.as_ref()),
+        &identity,
+    );
     let mut completed_ranges = existing
         .as_ref()
-        .filter(|(stored_identity, ranges)| {
-            identities_match(stored_identity.as_ref(), &identity) && !ranges.is_empty()
-        })
+        .filter(|(_, ranges)| evidence != ResumeEvidence::Rejected && !ranges.is_empty())
         .map(|(_, ranges)| {
             ranges
                 .iter()
@@ -2291,16 +2365,8 @@ async fn acquire_ranges(
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
-    if can_resume {
-        let mut existing_file = File::open(&temp_path)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) {
-            return Ok(());
-        }
-        let mut existing_first = [0u8; 1];
-        can_resume = existing_file.read_exact(&mut existing_first).await.is_ok()
-            && existing_first[0] == first[0];
+    if can_resume && evidence == ResumeEvidence::Sampled {
+        can_resume = temp_prefix_matches(&temp_path, &first).await;
         if !transfer_can_continue(&app, &id, generation) {
             return Ok(());
         }
@@ -2788,18 +2854,10 @@ async fn acquire_ranges(
         return Ok(());
     }
     emit_job(&state, &id, |job| {
-        job.speed = 0;
-        job.connections = 0;
         if committed.0 {
             complete_job(job);
         } else {
-            job.state = "finalizing".into();
-            job.progress = 100.0;
-            job.eta = Some("Ready to save".into());
-            job.events.insert(
-                0,
-                job_event("Download ready; waiting for destination", Some("warning"))
-            );
+            mark_ready_for_confirmation(job, "Download ready; waiting for destination");
         }
     });
     emit_snapshot(&app, &state);
@@ -3459,24 +3517,16 @@ async fn acquire_manifest(
         return Ok(());
     }
     emit_job(&state, &id, |job| {
-        job.speed = 0;
-        job.connections = 0;
         if committed.0 {
             complete_job(job);
         } else {
-            job.state = "finalizing".into();
-            job.progress = 100.0;
-            job.eta = Some("Ready to save".into());
-            job.events.insert(
-                0,
-                job_event(
-                    if track_count > 1 {
-                        "Tracks assembled; waiting for destination"
-                    } else {
-                        "Fragments assembled; waiting for destination"
-                    },
-                    Some("warning")
-                )
+            mark_ready_for_confirmation(
+                job,
+                if track_count > 1 {
+                    "Tracks assembled; waiting for destination"
+                } else {
+                    "Fragments assembled; waiting for destination"
+                }
             );
         }
     });
@@ -3763,18 +3813,10 @@ async fn acquire_dual_track(
     }
 
     emit_job(&state, &id, |job| {
-        job.speed = 0;
-        job.connections = 0;
         if committed.0 {
             complete_job(job);
         } else {
-            job.state = "finalizing".into();
-            job.progress = 100.0;
-            job.eta = Some("Ready to save".into());
-            job.events.insert(
-                0,
-                job_event("Tracks downloaded; waiting for destination", Some("warning")),
-            );
+            mark_ready_for_confirmation(job, "Tracks downloaded; waiting for destination");
         }
     });
     emit_snapshot(&app, &state);
@@ -4455,18 +4497,10 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         return false;
     }
     emit_job(&state, &id, |job| {
-        job.speed = 0;
-        job.connections = 0;
         if committed.0 {
             complete_job(job);
         } else {
-            job.state = "finalizing".into();
-            job.progress = 100.0;
-            job.eta = Some("Ready to save".into());
-            job.events.insert(
-                0,
-                job_event("Download ready; waiting for destination", Some("warning"))
-            );
+            mark_ready_for_confirmation(job, "Download ready; waiting for destination");
         }
     });
     emit_snapshot(&app, &state);
@@ -4621,14 +4655,28 @@ fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     emit_snapshot(&app, &state);
 }
 
-fn resume_all_plan(provisional: Option<bool>, progress: f64) -> (&'static str, bool) {
-    let ready = provisional == Some(true) && progress >= 100.0;
-    (if ready { "finalizing" } else { "downloading" }, !ready)
-}
-
-fn resume_plan_for_job(provisional: Option<bool>, progress: f64) -> (&'static str, bool, u32) {
-    let (next_state, should_spawn) = resume_all_plan(provisional, progress);
-    (next_state, should_spawn, if should_spawn { 1 } else { 0 })
+/// Flip every paused/pending job back to transferring and return the
+/// (id, source) pairs that need a transfer task. Shared by the manager's
+/// Resume All and the tray's, so both surfaces behave identically.
+/// A provisional waiting for the user's confirmation is not paused and is not
+/// resumed here: accepting it is the user's decision, not a resume.
+fn plan_resume_all(
+    snapshot: &mut AppSnapshot,
+    event: &str,
+    transfer_active: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut sources = Vec::new();
+    for job in snapshot.jobs.iter_mut() {
+        if !["paused", "pending"].contains(&job.state.as_str()) || transfer_active(&job.id) {
+            continue;
+        }
+        job.state = "downloading".into();
+        job.connections = 1;
+        job.eta = Some("Resuming".into());
+        job.events.insert(0, job_event(event, Some("success")));
+        sources.push((job.id.clone(), job.source.clone()));
+    }
+    sources
 }
 
 #[tauri::command]
@@ -4637,38 +4685,26 @@ fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     if transfer_is_active(state.inner(), &id) {
         return;
     }
-    let Some((source, next_state, should_spawn, connections)) =
-        state.snapshot.lock().ok().and_then(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str()))
-                .map(|job| {
-                    let (next_state, should_spawn, connections) =
-                        resume_plan_for_job(job.provisional, job.progress);
-                    (job.source.clone(), next_state, should_spawn, connections)
-                })
-        })
+    let Some(source) = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str()))
+            .map(|job| job.source.clone())
+    })
     else {
         return;
     };
     emit_job(&state, &id, |job| {
         if ["paused", "pending"].contains(&job.state.as_str()) {
-            job.state = next_state.into();
-            job.connections = connections;
-            job.eta = Some(
-                if should_spawn {
-                    "Resuming"
-                } else {
-                    "Ready to save"
-                }
-                .into(),
-            );
+            job.state = "downloading".into();
+            job.connections = 1;
+            job.eta = Some("Resuming".into());
             job.events.insert(0, job_event("Resumed", Some("success")));
         }
     });
     emit_snapshot(&app, &state);
-    if should_spawn && !spawn_transfer(&app, state.inner(), id, source) {
+    if !spawn_transfer(&app, state.inner(), id, source) {
         return;
     }
 }
@@ -4707,6 +4743,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
     if let Ok(mut snapshot) = state.snapshot.lock() {
         if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id && job.provisional == Some(true)) { temp_path = Some(job.temp_path.clone()); }
         snapshot.jobs.retain(|job| !(job.id == id && job.provisional == Some(true)));
+        snapshot.notifications.retain(|item| item.job_id != id);
         if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { job.state = "failed".into(); job.error = Some("Cancelled by user".into()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Cancelled by user", Some("warning"))); }
     }
     if let Some(path) = temp_path { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); cleanup_media_track_files(&path); }
@@ -4793,6 +4830,7 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
             }
         }
         snapshot.jobs.retain(|job| job.id != id);
+        snapshot.notifications.retain(|item| item.job_id != id);
     }
     if let Ok(mut buckets) = state.inner().job_bandwidth.lock() {
         buckets.remove(&id);
@@ -4839,30 +4877,16 @@ fn pause_all(app: AppHandle, state: State<'_, CoreState>) {
 #[tauri::command]
 fn resume_all(app: AppHandle, state: State<'_, CoreState>) {
     let _lifecycle = state.lifecycle.lock().ok();
-    let mut sources = Vec::new();
-    if let Ok(mut snapshot) = state.snapshot.lock() {
-        for job in snapshot.jobs.iter_mut() {
-            if ["paused", "pending"].contains(&job.state.as_str())
-                && !transfer_is_active(state.inner(), &job.id)
-            {
-                let (next_state, should_spawn, connections) =
-                    resume_plan_for_job(job.provisional, job.progress);
-                job.state = next_state.into();
-                job.connections = connections;
-                job.eta = Some(
-                    if should_spawn {
-                        "Resuming"
-                    } else {
-                        "Ready to save"
-                    }
-                    .into()
-                );
-                if should_spawn {
-                    sources.push((job.id.clone(), job.source.clone()));
-                }
-            }
-        }
-    }
+    let sources = state
+        .snapshot
+        .lock()
+        .ok()
+        .map(|mut snapshot| {
+            plan_resume_all(&mut snapshot, "Resumed", |id| {
+                transfer_is_active(state.inner(), id)
+            })
+        })
+        .unwrap_or_default();
     emit_snapshot(&app, &state);
     for (id, source) in sources {
         let _ = spawn_transfer(&app, state.inner(), id, source);
@@ -4977,7 +5001,7 @@ fn start_provisional(
         (
             name,
             destination,
-            snapshot.settings.temp_folder.clone(),
+            temp_root().to_string_lossy().into_owned(),
             max_connections
         )
     };
@@ -5113,9 +5137,21 @@ fn commit_is_ready(
 ) -> bool {
     provisional == Some(true)
         && !transfer_active
-        && state == Some("finalizing")
+        && state == Some("ready")
         && progress >= 100.0
 }
+
+/// States a provisional acquisition can be accepted from. Accepting a paused or
+/// waiting acquisition is legitimate — the user is turning it into a managed job
+/// — which is why only failure blocks the decision.
+const COMMITTABLE_STATES: [&str; 6] = [
+    "connecting",
+    "downloading",
+    "paused",
+    "pending",
+    "finalizing",
+    "ready",
+];
 
 fn commit_decision(
     provisional: Option<bool>,
@@ -5123,15 +5159,18 @@ fn commit_decision(
     progress: f64,
     transfer_active: bool,
 ) -> CommitDecision {
-    if provisional != Some(true) || state.is_none() || state == Some("failed") {
+    let Some(state) = state else {
+        return CommitDecision::Reject;
+    };
+    if provisional != Some(true) || !COMMITTABLE_STATES.contains(&state) {
         return CommitDecision::Reject;
     }
-    if progress >= 100.0 && !matches!(state, Some("downloading") | Some("finalizing")) {
-        return CommitDecision::Reject;
-    }
-    let ready = matches!(state, Some("downloading") | Some("finalizing"))
-        && (state == Some("finalizing") || progress >= 100.0);
-    if ready && transfer_active {
+    // A settled acquisition (finished, or assembling its containers) accepts as
+    // soon as it stops moving bytes, because this command then owns putting the
+    // file in place. A job still moving bytes accepts immediately and keeps
+    // transferring straight into the destination.
+    let settled = state == "ready" || progress >= 100.0;
+    if settled && transfer_active {
         return CommitDecision::WaitForIdle;
     }
     CommitDecision::Accept
@@ -5175,7 +5214,7 @@ async fn commit_provisional(
             .find(|job| job.id == id)
             .ok_or_else(|| "Acquisition no longer exists".to_string())?;
         let active = transfer_is_active(state.inner(), &id);
-        let ready = job.state == "finalizing" || job.progress >= 100.0;
+        let ready = job.state == "ready" || job.progress >= 100.0;
         (
             commit_decision(
                 job.provisional,
@@ -5273,6 +5312,13 @@ async fn commit_provisional(
             job.bandwidth_limit = cap.filter(|value| *value > 0);
         }
         job.provisional = Some(false);
+        // The job is a managed download now. A transfer that had already
+        // finished its bytes re-enters finalization, because moving the file
+        // into place is exactly the work that is left.
+        if job.state == "ready" {
+            job.state = "finalizing".into();
+            job.eta = None;
+        }
         // Keep the acquisition mode's verified resumability. Single-stream
         // fallback is intentionally non-resumable until range resume exists.
         job.events.insert(
@@ -6013,34 +6059,18 @@ fn install_tray(
                 "resume-all" => {
                     let state = app.state::<CoreState>();
                     let _lifecycle = state.lifecycle.lock().ok();
-                    let mut sources = Vec::new();
-                    if let Ok(mut snapshot) = state.snapshot.lock() {
-                        for job in snapshot.jobs.iter_mut() {
-                            if ["paused", "pending"].contains(&job.state.as_str())
-                                && !transfer_is_active(state.inner(), &job.id)
-                            {
-                                let (next_state, should_spawn, connections) =
-                                    resume_plan_for_job(job.provisional, job.progress);
-                                job.state = next_state.into();
-                                job.connections = connections;
-                                job.eta = Some(
-                                    if should_spawn {
-                                        "Resuming"
-                                    } else {
-                                        "Ready to save"
-                                    }
-                                    .into(),
-                                );
-                                job.events.insert(
-                                    0,
-                                    job_event("Resumed from the system tray", Some("success")),
-                                );
-                                if should_spawn {
-                                    sources.push((job.id.clone(), job.source.clone()));
-                                }
-                            }
-                        }
-                    }
+                    let sources = state
+                        .snapshot
+                        .lock()
+                        .ok()
+                        .map(|mut snapshot| {
+                            plan_resume_all(
+                                &mut snapshot,
+                                "Resumed from the system tray",
+                                |id| transfer_is_active(state.inner(), id),
+                            )
+                        })
+                        .unwrap_or_default();
                     emit_snapshot(app, &state);
                     for (id, source) in sources {
                         let _ = spawn_transfer(app, state.inner(), id, source);
@@ -6263,15 +6293,17 @@ mod capture_tests {
     use super::{
         bridge_host_allowed, bridge_json_content, bridge_origin_allowed,
         browser_policy_from_value, browser_policy_value, capture_input_from_args,
-        cleanup_media_track_files, cleanup_orphaned_media_track_files, complete_job, manifest_output_name,
+        cleanup_media_track_files, complete_job, default_settings, manifest_output_name,
+        mark_ready_for_confirmation, snapshot_from_database, sweep_temp_root,
         provisional_input_from_message, protect_job_for_storage, redact_url_credentials,
         referer_value, restrict_data_dir, restrict_file, retryable_status, segment_identity,
         source_compatible, terminal_source_error, terminal_source_status, is_terminal_source_error,
-        page_instead_of_file, load_notifications, persist_dirty_jobs, persist_job, persist_notifications,
+        page_instead_of_file, persist_dirty_jobs, persist_job,
         tray_status_text, tray_toggle_next,
-        unprotect_job_from_storage, update_settings_snapshot, utc_iso_label, write_browser_policy,
-        DownloadJob, ProgressThrottle, ProvisionalInput, now_label,
+        unprotect_job_from_storage, update_settings_snapshot, write_browser_policy,
+        DownloadJob, NotificationItem, ProgressThrottle, ProvisionalInput,
     };
+    use rusqlite::Connection;
     use super::ipc;
     use serde_json::json;
 
@@ -6321,34 +6353,6 @@ mod capture_tests {
         assert!(temp.exists());
         assert!(!root.join("job.part.track-00").exists());
         assert!(!root.join("job.part.track-01").exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cleanup_orphaned_track_sweep_is_bounded_and_preserves_active_job_tracks() {
-        let root =
-            std::env::temp_dir().join(format!("dm-orphan-track-cleanup-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let stale = root.join("provisional-stale.part");
-        let active = root.join("provisional-active.part");
-        std::fs::write(format!("{}.track-00", stale.display()), b"stale-video").unwrap();
-        std::fs::write(format!("{}.track-01", stale.display()), b"stale-audio").unwrap();
-        std::fs::write(format!("{}.track-00", active.display()), b"active-video").unwrap();
-        std::fs::write(
-            root.join("provisional-stale.part.track-xx"),
-            b"not-a-track-index",
-        )
-        .unwrap();
-        std::fs::write(root.join("job.part.track-00"), b"unrelated").unwrap();
-        cleanup_orphaned_media_track_files(
-            root.to_str().unwrap(),
-            &[active.to_string_lossy().into_owned()],
-        );
-        assert!(!root.join("provisional-stale.part.track-00").exists());
-        assert!(!root.join("provisional-stale.part.track-01").exists());
-        assert!(root.join("provisional-active.part.track-00").exists());
-        assert!(root.join("provisional-stale.part.track-xx").exists());
-        assert!(root.join("job.part.track-00").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6681,10 +6685,23 @@ mod capture_tests {
     }
 
     #[test]
-    fn resource_identity_requires_a_validator_when_resuming() {
-        use super::{identities_match, ResourceIdentity};
-        let current = ResourceIdentity { length: 123, etag: None, last_modified: None };
-        assert!(!identities_match(Some(&current), &current));
+    fn resume_evidence_trusts_validators_and_samples_bytes_otherwise() {
+        use super::{resume_evidence, ResumeEvidence, ResourceIdentity};
+        let bare = ResourceIdentity { length: 123, etag: None, last_modified: None };
+        // No validator on either side: the stored bytes must prove themselves.
+        assert_eq!(resume_evidence(Some(&bare), &bare), ResumeEvidence::Sampled);
+        assert_eq!(resume_evidence(None, &bare), ResumeEvidence::Rejected);
+        let longer = ResourceIdentity { length: 124, etag: None, last_modified: None };
+        assert_eq!(resume_evidence(Some(&bare), &longer), ResumeEvidence::Rejected);
+        let tagged = ResourceIdentity { length: 123, etag: Some("\"v1\"".into()), last_modified: None };
+        assert_eq!(resume_evidence(Some(&tagged), &tagged), ResumeEvidence::Trusted);
+        let retagged = ResourceIdentity { length: 123, etag: Some("\"v2\"".into()), last_modified: None };
+        assert_eq!(resume_evidence(Some(&tagged), &retagged), ResumeEvidence::Rejected);
+        // A validator that disappeared cannot be read as agreement.
+        assert_eq!(resume_evidence(Some(&tagged), &bare), ResumeEvidence::Sampled);
+        let dated = ResourceIdentity { length: 123, etag: None, last_modified: Some("Mon".into()) };
+        let redated = ResourceIdentity { length: 123, etag: None, last_modified: Some("Tue".into()) };
+        assert_eq!(resume_evidence(Some(&dated), &redated), ResumeEvidence::Rejected);
     }
 
     #[test]
@@ -6814,61 +6831,70 @@ mod capture_tests {
     }
 
     #[test]
-    fn commit_during_active_acquisition_requires_idle_then_finalizing_recheck() {
+    fn commit_during_active_acquisition_requires_idle_then_recheck() {
         use super::{commit_decision, CommitDecision};
-        assert_eq!(commit_decision(Some(true), Some("finalizing"), 100.0, true), CommitDecision::WaitForIdle);
-        assert_eq!(commit_decision(Some(true), Some("finalizing"), 100.0, false), CommitDecision::Accept);
+        assert_eq!(commit_decision(Some(true), Some("ready"), 100.0, true), CommitDecision::WaitForIdle);
+        assert_eq!(commit_decision(Some(true), Some("ready"), 100.0, false), CommitDecision::Accept);
         assert_eq!(commit_decision(Some(true), Some("downloading"), 48.0, true), CommitDecision::Accept);
         assert_eq!(commit_decision(Some(true), Some("paused"), 48.0, false), CommitDecision::Accept);
-        assert_eq!(commit_decision(Some(true), Some("paused"), 100.0, false), CommitDecision::Reject);
-        assert_eq!(commit_decision(Some(false), Some("finalizing"), 100.0, false), CommitDecision::Reject);
+        assert_eq!(commit_decision(Some(true), Some("paused"), 100.0, false), CommitDecision::Accept);
+        assert_eq!(commit_decision(Some(true), Some("completed"), 100.0, false), CommitDecision::Reject);
+        assert_eq!(commit_decision(Some(false), Some("ready"), 100.0, false), CommitDecision::Reject);
         assert_eq!(commit_decision(None, None, 0.0, false), CommitDecision::Reject);
     }
 
     #[test]
     fn commit_post_wait_recheck_rejects_cancellation_and_non_finalizing_states() {
         use super::commit_is_ready;
-        assert!(commit_is_ready(Some(true), Some("finalizing"), 100.0, false));
+        assert!(commit_is_ready(Some(true), Some("ready"), 100.0, false));
+        assert!(!commit_is_ready(Some(true), Some("ready"), 100.0, true));
         assert!(!commit_is_ready(Some(true), Some("paused"), 100.0, false));
         assert!(!commit_is_ready(Some(true), Some("failed"), 100.0, false));
         assert!(!commit_is_ready(None, None, 0.0, false));
-        assert!(!commit_is_ready(Some(true), Some("finalizing"), 100.0, true));
     }
     #[test]
-    fn settings_patch_rejects_blank_folders() {
+    fn settings_patch_rejects_blank_folder_paths() {
         use super::{apply_settings_patch, default_settings, settings_from_stored};
         let mut current = default_settings();
         current.default_folder = String::from("/dl");
-        current.temp_folder = String::from("/tmp-parts");
-        let patch = serde_json::json!({"defaultFolder": "   ", "tempFolder": "", "maxConnections": 6});
+        let patch = serde_json::json!({"defaultFolder": "   ", "maxConnections": 6});
         let next = apply_settings_patch(&current, &patch);
         assert_eq!(next.default_folder, "/dl");
-        assert_eq!(next.temp_folder, "/tmp-parts");
         assert_eq!(next.max_connections, 6);
         let patch = serde_json::json!({"defaultFolder": "/new-dl"});
         let next = apply_settings_patch(&current, &patch);
         assert_eq!(next.default_folder, "/new-dl");
-        let stored = serde_json::json!({"defaultFolder": "", "tempFolder": "  "}).to_string();
+        let stored = serde_json::json!({"defaultFolder": ""}).to_string();
         let rebooted = settings_from_stored(&stored);
         assert!(!rebooted.default_folder.trim().is_empty());
-        assert!(!rebooted.temp_folder.trim().is_empty());
     }
 
     #[test]
-    fn tray_resume_all_uses_provisional_plan() {
-        use super::resume_plan_for_job;
-        assert_eq!(resume_plan_for_job(Some(true), 100.0), ("finalizing", false, 0));
-        assert_eq!(resume_plan_for_job(Some(true), 99.9), ("downloading", true, 1));
-        assert_eq!(resume_plan_for_job(Some(false), 100.0), ("downloading", true, 1));
-    }
-
-    #[test]
-    fn resume_all_preserves_ready_provisionals_without_respawning() {
-        use super::resume_all_plan;
-        assert_eq!(resume_all_plan(Some(true), 100.0), ("finalizing", false));
-        assert_eq!(resume_all_plan(Some(true), 99.9), ("downloading", true));
-        assert_eq!(resume_all_plan(Some(false), 100.0), ("downloading", true));
-        assert_eq!(resume_all_plan(None, 0.0), ("downloading", true));
+    fn resume_all_flips_unfinished_jobs_and_leaves_confirmation_gates_alone() {
+        use super::{plan_resume_all, AppSnapshot};
+        let job = |id: &str, state: &str| provisional_job(id, state);
+        let mut snapshot = AppSnapshot {
+            jobs: vec![
+                job("paused-1", "paused"),
+                job("pending-1", "pending"),
+                job("ready-1", "ready"),
+                job("downloading-1", "downloading"),
+            ],
+            settings: super::default_settings(),
+            connected: true,
+            aggregate_speed: 0,
+            notifications: vec![],
+            bridge_available: true,
+        };
+        let sources = plan_resume_all(&mut snapshot, "Resumed", |_| false);
+        assert_eq!(
+            sources.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["paused-1", "pending-1"]
+        );
+        assert_eq!(snapshot.jobs[0].state, "downloading");
+        assert_eq!(snapshot.jobs[1].state, "downloading");
+        assert_eq!(snapshot.jobs[2].state, "ready");
+        assert_eq!(snapshot.jobs[3].state, "downloading");
     }
 
     #[test]
@@ -7281,6 +7307,115 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
 
     fn finished_job_with_context() -> DownloadJob {
         DownloadJob { id: "done-1".into(), name: "archive.zip".into(), source: "https://cdn.example.test/archive.zip?token=abc".into(), domain: "cdn.example.test".into(), kind: "archive".into(), state: "downloading".into(), progress: 100.0, downloaded: 1024, total: Some(1024), speed: 0, eta: None, connections: 1, max_connections: 8, bandwidth_limit: None, mode: "whole-object".into(), media: false, media_details: None, media_tracks: None, destination: "/tmp/archive.zip".into(), temp_path: "/tmp/done-1.part".into(), resumable: true, mime: None, error: None, created: "now".into(), started: Some("now".into()), completed: None, provisional: Some(false), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: vec![], player_kind: None, companion_audio: None, referrer: Some("https://example.test/page?session=s3cr3t".into()), post_body: Some("fixture=renewed".into()), user_agent: Some("Mozilla/5.0".into()), events: vec![] }
+    }
+
+    fn provisional_job(id: &str, state: &str) -> DownloadJob {
+        let mut job = finished_job_with_context();
+        job.id = id.into();
+        job.name = format!("{id}.bin");
+        job.state = state.into();
+        job.progress = 0.0;
+        job.downloaded = 0;
+        job.temp_path = format!("/tmp/{id}.part");
+        job.provisional = Some(true);
+        job.events.clear();
+        job
+    }
+
+    #[test]
+    fn ready_for_confirmation_is_a_gate_not_a_transfer() {
+        let mut job = provisional_job("provisional-1", "downloading");
+        job.progress = 40.0;
+        job.speed = 1024;
+        job.connections = 4;
+        mark_ready_for_confirmation(&mut job, "Download ready; waiting for destination");
+        assert_eq!(job.state, "ready");
+        assert_eq!(job.progress, 100.0);
+        assert_eq!(job.speed, 0);
+        assert_eq!(job.connections, 0);
+        assert_eq!(job.eta, None);
+        assert_eq!(job.events[0].message, "Download ready; waiting for destination");
+        assert_eq!(job.provisional, Some(true), "the user still owns the decision");
+    }
+
+    #[test]
+    fn boot_keeps_the_list_and_the_store_in_agreement() {
+        let database = Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL);
+                 CREATE TABLE notifications (id TEXT PRIMARY KEY, payload TEXT);",
+            )
+            .unwrap();
+        let durable = finished_job_with_context();
+        // An unaccepted provisional is explicitly not durable, and a payload that
+        // cannot be read is not a download either: neither may linger in the
+        // store where the list cannot show it.
+        let provisional = provisional_job("provisional-ghost", "completed");
+        for job in [&durable, &provisional] {
+            database
+                .execute(
+                    "INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![job.id, job.created, serde_json::to_string(job).unwrap()],
+                )
+                .unwrap();
+        }
+        database
+            .execute(
+                "INSERT INTO jobs (id, created_at, payload) VALUES ('broken-1', 'now', 'not json')",
+                [],
+            )
+            .unwrap();
+        let notification = NotificationItem {
+            id: format!("completed-{}", provisional.id),
+            notification_type: "completed".into(),
+            title: "Download completed".into(),
+            detail: "provisional-ghost.bin".into(),
+            time: "now".into(),
+            job_id: provisional.id.clone(),
+        };
+        database
+            .execute(
+                "INSERT INTO notifications (id, payload) VALUES (?1, ?2)",
+                rusqlite::params![notification.id, serde_json::to_string(&notification).unwrap()],
+            )
+            .unwrap();
+
+        let snapshot = snapshot_from_database(&database, default_settings());
+
+        let listed = snapshot.jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(listed, vec![durable.id.as_str()], "only durable downloads are listed");
+        let stored: i64 = database
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, 1, "the store keeps exactly what the list shows");
+        assert!(
+            snapshot.notifications.is_empty(),
+            "a job that leaves the list takes its notifications with it"
+        );
+    }
+
+    #[test]
+    fn sweep_temp_root_keeps_job_artifacts_and_removes_the_rest() {
+        let root = std::env::temp_dir().join(format!("download-manager-sweep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("job-1.part.segments")).unwrap();
+        std::fs::write(root.join("job-1.part"), b"partial").unwrap();
+        std::fs::write(root.join("job-1.part.track-01"), b"track").unwrap();
+        std::fs::write(root.join("job-2.part"), b"crashed transfer").unwrap();
+        std::fs::write(root.join("job-2.part.track-00"), b"crashed track").unwrap();
+        std::fs::write(root.join("job.part.track-00"), b"unrelated").unwrap();
+        std::fs::write(root.join("scratch.tmp"), b"debris").unwrap();
+        std::fs::create_dir_all(root.join("orphan-dir")).unwrap();
+        sweep_temp_root(&root, &[provisional_job("job-1", "paused")]);
+        assert!(root.join("job-1.part").exists());
+        assert!(root.join("job-1.part.segments").exists());
+        assert!(root.join("job-1.part.track-01").exists());
+        assert!(!root.join("job-2.part").exists());
+        assert!(!root.join("job-2.part.track-00").exists());
+        assert!(!root.join("job.part.track-00").exists());
+        assert!(!root.join("scratch.tmp").exists());
+        assert!(!root.join("orphan-dir").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

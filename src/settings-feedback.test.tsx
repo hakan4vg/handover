@@ -12,7 +12,6 @@ const settings: AppSettings = {
   showManagerAtSignIn: false,
   closeBehavior: 'tray',
   defaultFolder: '/tmp/downloads',
-  tempFolder: '/tmp/downloads/.parts',
   collisionBehavior: 'rename',
   interceptDownloads: true,
   showMediaButtons: true,
@@ -143,7 +142,6 @@ describe('SettingsView', () => {
     await renderPage('downloads');
     expect(Array.from(host.querySelectorAll('.path-field input')).map((input) => input.getAttribute('aria-label'))).toEqual([
       'Default download folder',
-      'Temporary / cache folder',
     ]);
     expect(host.querySelector('select')?.getAttribute('aria-label')).toBe('File name collisions');
 
@@ -175,10 +173,10 @@ describe('SettingsView', () => {
     await act(async () => {
       root.render(<SettingsView adapter={adapter} settings={settings} page="downloads" onPageChange={() => undefined} />);
     });
-    const input = host.querySelector('input[aria-label="Temporary / cache folder"]') as HTMLInputElement;
+    const input = host.querySelector('input[aria-label="Default download folder"]') as HTMLInputElement;
     await act(async () => {
       input.focus();
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, '/tmp/downloads/.part');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, '/tmp/other-downloads');
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     expect(updateSettings).not.toHaveBeenCalled();
@@ -188,7 +186,7 @@ describe('SettingsView', () => {
       await Promise.resolve();
     });
     expect(updateSettings).toHaveBeenCalledTimes(1);
-    expect(updateSettings).toHaveBeenCalledWith({ tempFolder: '/tmp/downloads/.part' });
+    expect(updateSettings).toHaveBeenCalledWith({ defaultFolder: '/tmp/other-downloads' });
 
     act(() => root.unmount());
     host.remove();

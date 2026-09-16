@@ -7220,3 +7220,61 @@ AUDIT-2026-09-08.md is the authoritative audit; AUDIT-OMPI-2026-09-08.md cross-c
 - Fixed dynamic media discovery, overlay stylesheet leakage, Add-window show/focus churn, and Settings rerenders/draft persistence.
 - Verification: integrated Rust suite 114/114; JavaScript suite 132/134 initially, with both failures corrected and their focused rerun 2/2; frontend and extension production builds pass. No new browser harness was added.
 - Live provider verification is outstanding. Worker-owned/transmuxed buffers without observable provenance and browser-session-dependent sources remain limitations; this entry does not claim universal capture or verified YouTube/X/Reddit success. Reload the extension and refresh existing media tabs once to install the new early observer.
+
+## 2026-09-17 — Dogfooding pass: the add/save journey, resume honesty, portable temp
+
+A full dogfooding run of the portable build (manager UI driven over UI Automation, a throwaway
+Chromium with the unpacked extension over CDP, fixture server as the source, artifacts verified by
+hash and `ffprobe`) produced a findings list — `AUDIT-DOGFOOD-2026-09-17.md`, kept private like the
+other internal records. The engine held up (byte-exact range and resume, ordered HLS assembly, a
+real DASH remux that decodes clean, honest live/503 failures, browser takeover leaving
+`chrome.downloads` empty). This entry is the fix pass over what did not.
+
+- **A finished provisional is a decision, not a transfer.** `finalizing` used to mean two different
+  things: real container work for a committed job, and "waiting for the user" for a provisional.
+  They are now separate states — `ready` means the bytes are complete and the user has not saved it
+  yet. A `ready` job is not Active, is not listed under Active, is not pausable (no row control, no
+  context action, no Pause All membership), and saving it moves it to `finalizing` (the file is put
+  in place) and then to `completed`. Pause/resume/resume-all lost their provisional special cases:
+  `resume_all_plan`/`resume_plan_for_job` are replaced by one shared `plan_resume_all` used by the
+  manager and the tray, and the duplicated resume arms in both surfaces are gone.
+- **The confirm action is `Save`, not `Download`.** Both the in-manager panel and the standalone
+  capture window used the same word for "start the acquisition" (`Start Download`) and "keep it",
+  which reads as "download it again" once the transfer is already over. Busy state is `Saving…`;
+  SPEC §7.1/§7.2 now name Save and define it.
+- **The Add window is bound to an acquisition, not to a job lookup.** It renders the acquisition it
+  was opened for (`captured` prop) instead of falling back to a retained job when the snapshot has
+  not arrived or no longer contains the id — the stale-`retainedJob` path that could show a
+  previous acquisition's metrics under a fresh, empty manual form. Manual mode shows no size or
+  progress indicator at all before submission ("Detecting size" was a claim about a request that had
+  not been made), and a captured job reports size → `Detecting size` → `Unknown` in that order only.
+- **Resume evidence is a decision, not a validator check.** `identities_match` required an
+  ETag/Last-Modified, so any validator-less source silently restarted from scratch on resume — 3.0 MB
+  reported as 1.0 MB, and 3 MB of verified work refetched. `resume_evidence` now returns trusted
+  (validators agree), sampled (no validator can vouch; the on-disk prefix must match the fresh
+  response byte for byte, which the engine already fetched), or rejected (length or a validator
+  disagrees → restart). SPEC §8.8 documents the three outcomes and the rule that reported progress
+  never goes backwards unless the work was genuinely discarded.
+- **Notifications describe managed downloads.** A provisional that fails no longer notifies (its Add
+  window is its surface), cancelling or removing a job drops its notifications with it, and boot
+  drops entries whose job is gone. The store also read the notification center back in the wrong
+  order (`ORDER BY rowid DESC` over a newest-first rewrite), so a restart reversed it.
+- **Temporary data is portable and swept.** `tempFolder` is no longer a setting: it is always the
+  `tmp` folder inside the application data root, so moving the product folder moves a paused
+  transfer's parts with it. A legacy stored `%LOCALAPPDATA%\Temp` value is simply ignored rather
+  than migrated (the previous normalize/allow-list path is gone). Boot now sweeps the temp root of
+  everything that is not an artifact of a job in the store — the old track-file-only sweep left
+  crashed `.part`, `.segments`, and `.mux.*` files behind.
+- **Boot reconciles the store with the list.** A row that cannot be listed — unreadable, or an
+  unaccepted provisional, which is explicitly not durable — is deleted at load instead of lingering
+  invisibly until the next full rewrite, and a notification whose job is gone goes with it. This is
+  the invariant the dogfooding run could not explain: the first render listed a download
+  (`X (1).mp4`) that the store did not contain, and no trace of it survived its disappearance.
+- Row controls now derive icon, label, and behaviour from one decision per state, and every control
+  in the manager and the extension popup was audited for an accessible name (the unnamed nodes seen
+  during dogfooding were foreign Chromium elements in the observation tree, not app controls).
+- `src/App.tsx` contained a raw `0x85` byte (a Windows-1252 ellipsis inside `'Removing…'`), so the
+  file was not valid UTF-8 and no UTF-8 tool could read it; it is now proper UTF-8.
+- Gate: Rust `115/115`, Vitest `37` files/`138` tests, `npx tsc -b` clean, frontend and extension
+  production builds, release Cargo build, portable packaging, and a boot smoke of the rebuilt
+  executable.

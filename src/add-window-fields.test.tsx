@@ -135,9 +135,13 @@ describe('AddDownloadWindow field honesty', () => {
     expect(determined.textContent).toContain('No');
   });
 
-  it('labels a fully acquired provisional Ready to save', () => {
-    const host = renderWindow(job({ state: 'finalizing' }), { onCommit: () => {}, onCancel: () => {} });
-    expect(host.textContent).toContain('Ready to save');
-    expect(host.textContent).not.toContain('Merging');
+  it('shows a finished provisional as ready to save, not as finalizing', () => {
+    const ready = renderWindow(job({ state: 'ready' }), { onCommit: () => {}, onCancel: () => {} });
+    expect(ready.textContent).toContain('Ready to save');
+    expect(ready.textContent).not.toContain('Merging');
+    document.body.innerHTML = '';
+    // Assembling containers is still finalization, and still says so.
+    const assembling = renderWindow(job({ state: 'finalizing', media: true }), { onCommit: () => {}, onCancel: () => {} });
+    expect(assembling.textContent).toContain('Finalizing');
   });
 });

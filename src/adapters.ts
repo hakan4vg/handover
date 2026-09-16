@@ -17,13 +17,14 @@ const timeLabel = (date = now()) => date.toLocaleTimeString([], { hour: 'numeric
 const mockPlatform = typeof navigator === 'undefined' ? '' : `${navigator.userAgent} ${navigator.platform}`.toLowerCase();
 const isWindowsMock = mockPlatform.includes('windows');
 const mockDefaultFolder = isWindowsMock ? 'C:\\Users\\mroth\\Downloads' : '~/Downloads';
-const mockTempFolder = isWindowsMock ? 'C:\\Users\\mroth\\AppData\\Local\\DM\\Temp' : '~/.cache/download-manager/tmp';
+// Job temporary data lives beside the executable's data folder, so the mock
+// mirrors that layout rather than a per-user cache directory.
+const mockTempRoot = isWindowsMock ? 'C:\\Users\\mroth\\Downloads\\Download Manager\\data\\tmp' : '~/.local/share/com.downloadmanager.app/tmp';
 
 function platformPath(value: string) {
   if (isWindowsMock) return value;
   return value
-    .replace('C:\\Users\\mroth\\Downloads', mockDefaultFolder)
-    .replace('C:\\Users\\mroth\\AppData\\Local\\DM\\Temp', mockTempFolder)
+    .replace('C:\\Users\\mroth\\Downloads\\Download Manager\\data\\tmp', mockTempRoot)
     .replaceAll('\\', '/');
 }
 
@@ -32,7 +33,6 @@ const defaults: AppSettings = {
   showManagerAtSignIn: true,
   closeBehavior: 'tray',
   defaultFolder: mockDefaultFolder,
-  tempFolder: mockTempFolder,
   collisionBehavior: 'rename',
   interceptDownloads: true,
   showMediaButtons: true,
@@ -77,7 +77,6 @@ function persistSettings(settings: AppSettings) {
 export function sanitizeSettingsPatch(patch: Partial<AppSettings>): Partial<AppSettings> {
   const next = { ...patch };
   if (typeof next.defaultFolder === 'string' && next.defaultFolder.trim().length === 0) delete next.defaultFolder;
-  if (typeof next.tempFolder === 'string' && next.tempFolder.trim().length === 0) delete next.tempFolder;
   if (next.closeBehavior !== undefined && !['tray', 'exit'].includes(next.closeBehavior)) delete next.closeBehavior;
   if (next.collisionBehavior !== undefined && !['rename', 'replace'].includes(next.collisionBehavior)) delete next.collisionBehavior;
   if (next.bandwidthLimit !== undefined && next.bandwidthLimit !== null && (!Number.isInteger(next.bandwidthLimit) || next.bandwidthLimit <= 0)) delete next.bandwidthLimit;
@@ -87,11 +86,6 @@ export function sanitizeSettingsPatch(patch: Partial<AppSettings>): Partial<AppS
   if (next.theme !== undefined && !['system', 'light', 'dark'].includes(next.theme)) delete next.theme;
   if (next.density !== undefined && !['comfortable', 'compact'].includes(next.density)) delete next.density;
   return next;
-}
-
-export function resumePlan(provisional: DownloadJob['provisional'], progress: number): { state: 'finalizing' | 'downloading'; shouldStart: boolean } {
-  const ready = provisional === true && progress >= 100;
-  return ready ? { state: 'finalizing', shouldStart: false } : { state: 'downloading', shouldStart: true };
 }
 
 function event(message: string, tone: JobEvent['tone'] = 'normal'): JobEvent {
@@ -239,7 +233,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async resumeJob(id: string) {
-    this.update(id, (job) => { const plan = resumePlan(job.provisional, job.progress); return job.state === 'paused' || job.state === 'pending' ? { ...job, state: plan.state, speed: plan.shouldStart ? (job.speed || 12.4 * 1024 ** 2) : 0, connections: plan.shouldStart ? Math.min(job.maxConnections, 4) : 0, started: job.started ?? 'Just now', eta: plan.shouldStart ? (job.total ? `${Math.max(1, Math.ceil((job.total - job.downloaded) / (job.speed || 1)))}s left` : 'Connecting…') : 'Ready to save', events: [event('Resumed', 'success'), ...job.events] } : job; });
+    this.update(id, (job) => job.state === 'paused' || job.state === 'pending' ? { ...job, state: 'downloading', speed: job.speed || 12.4 * 1024 ** 2, connections: Math.min(job.maxConnections, 4), started: job.started ?? 'Just now', eta: job.total ? `${Math.max(1, Math.ceil((job.total - job.downloaded) / (job.speed || 1)))}s left` : 'Connecting…', events: [event('Resumed', 'success'), ...job.events] } : job);
   }
 
   async retryJob(id: string) {
@@ -263,7 +257,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async resumeAll() {
-    this.snapshot.jobs = this.snapshot.jobs.map((job) => { const plan = resumePlan(job.provisional, job.progress); return ['paused', 'pending'].includes(job.state) ? { ...job, state: plan.state, speed: plan.shouldStart ? 11.2 * 1024 ** 2 : 0, connections: plan.shouldStart ? Math.min(job.maxConnections, 3) : 0, eta: plan.shouldStart ? (job.total ? '1m left' : 'Connecting…') : 'Ready to save', events: [event('Resumed with Resume All', 'success'), ...job.events] } : job; });
+    this.snapshot.jobs = this.snapshot.jobs.map((job) => ['paused', 'pending'].includes(job.state) ? { ...job, state: 'downloading' as const, speed: 11.2 * 1024 ** 2, connections: Math.min(job.maxConnections, 3), eta: job.total ? '1m left' : 'Connecting…', events: [event('Resumed with Resume All', 'success'), ...job.events] } : job);
     this.emit();
   }
 
@@ -290,7 +284,7 @@ class MockAdapter implements DownloadAdapter {
       media,
       mediaDetails: media ? 'Detecting current media…' : undefined,
       destination: platformPath(`${this.snapshot.settings.defaultFolder}\\${name}`),
-      tempPath: platformPath(`${this.snapshot.settings.tempFolder}\\${id}.part`),
+      tempPath: platformPath(`${mockTempRoot}\\${id}.part`),
       resumable: false,
       created: 'Just now',
       provisional: true,
@@ -301,11 +295,25 @@ class MockAdapter implements DownloadAdapter {
     window.setTimeout(() => {
       this.update(id, (current) => ({ ...current, state: 'downloading', started: current.started ?? 'Just now', total: media ? 768 * 1024 ** 2 : 1.25 * 1024 ** 3, downloaded: 6.5 * 1024 ** 2, progress: media ? 0.85 : 0.5, speed: media ? 7.2 * 1024 ** 2 : 14.8 * 1024 ** 2, connections: media ? 2 : 1, mode: media ? 'segments' : 'whole-object', resumable: true, eta: media ? '1m 47s left' : '1m 24s left', mediaDetails: media ? '1080p · source selected from playback' : undefined, events: [event('Source metadata received', 'success'), ...current.events] }));
     }, 700);
+    // The acquisition finishes on its own; saving it is a separate decision, so
+    // the mock reaches the same "ready" gate the native core reports.
+    window.setTimeout(() => {
+      this.update(id, (current) => current.provisional === true && current.state === 'downloading'
+        ? { ...current, state: 'ready', progress: 100, downloaded: current.total ?? current.downloaded, speed: 0, connections: 0, eta: undefined, events: [event('Download ready; waiting for destination', 'warning'), ...current.events] }
+        : current);
+    }, 2400);
     return id;
   }
 
   async commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) {
-    this.update(id, (job) => ({ ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), bandwidthLimit: input.bandwidthLimit === undefined ? job.bandwidthLimit : sanitizeCapBps(input.bandwidthLimit) ?? null, provisional: false, resumable: true, state: job.state === 'connecting' ? 'downloading' : job.state, speed: job.speed || 9.4 * 1024 ** 2, connections: job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] }));
+    let finishing = false;
+    this.update(id, (job) => {
+      finishing = job.state === 'ready';
+      return { ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), bandwidthLimit: input.bandwidthLimit === undefined ? job.bandwidthLimit : sanitizeCapBps(input.bandwidthLimit) ?? null, provisional: false, resumable: true, state: finishing ? 'finalizing' : job.state === 'connecting' ? 'downloading' : job.state, speed: finishing ? 0 : job.speed || 9.4 * 1024 ** 2, connections: finishing ? 0 : job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] };
+    });
+    if (finishing) {
+      window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'completed', progress: 100, speed: 0, connections: 0, eta: undefined, completed: 'Just now', events: [event('Download completed', 'success'), ...job.events] })), 900);
+    }
   }
 
   async updateSettings(patch: Partial<AppSettings>) {

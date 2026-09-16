@@ -134,7 +134,7 @@ describe('download action error boundary', () => {
     const snapshot: AppSnapshot = {
       jobs: [activeJob],
       settings: {
-        startAtSignIn: false, showManagerAtSignIn: false, closeBehavior: 'tray', defaultFolder: '/tmp/downloads', tempFolder: '/tmp/downloads/.parts',
+        startAtSignIn: false, showManagerAtSignIn: false, closeBehavior: 'tray', defaultFolder: '/tmp/downloads',
         collisionBehavior: 'rename', interceptDownloads: true, showMediaButtons: true, excludedSites: [], bandwidthLimit: null, bandwidthUnit: 'MB/s',
         maxConnections: 8, perDownloadOverrides: true, retryAutomatically: true, maxRetries: 3, completionNotifications: true, failureNotifications: true,
         theme: 'light', accent: '#0878ed', density: 'comfortable',

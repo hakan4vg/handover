@@ -70,7 +70,7 @@ describe('AddDownloadWindow captured commit wiring', () => {
   it('commits the captured job id with the shown name and destination', () => {
     const onCommit = vi.fn();
     const host = renderCaptured({ onCommit, onCancel: () => {} });
-    expect(primaryButton(host).textContent).toContain('Download');
+    expect(primaryButton(host).textContent).toContain('Save');
     act(() => {
       primaryButton(host).click();
     });

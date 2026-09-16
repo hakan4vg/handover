@@ -14,7 +14,6 @@ const settings: AppSettings = {
   showManagerAtSignIn: false,
   closeBehavior: 'tray',
   defaultFolder: '/tmp/downloads',
-  tempFolder: '/tmp/downloads/.parts',
   collisionBehavior: 'rename',
   interceptDownloads: true,
   showMediaButtons: true,

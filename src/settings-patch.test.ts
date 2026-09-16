@@ -3,7 +3,7 @@ import { sanitizeSettingsPatch } from './adapters';
 
 describe('sanitizeSettingsPatch', () => {
   it('strips blank folder paths but keeps the good keys around them', () => {
-    expect(sanitizeSettingsPatch({ defaultFolder: '   ', tempFolder: '', maxConnections: 6 })).toEqual({ maxConnections: 6 });
+    expect(sanitizeSettingsPatch({ defaultFolder: '   ', maxConnections: 6 })).toEqual({ maxConnections: 6 });
   });
 
   it('keeps non-blank folders', () => {

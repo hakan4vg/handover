@@ -10,7 +10,6 @@ import type { AppSnapshot, DownloadJob } from './types';
 const harness = vi.hoisted(() => {
   const settings = {
     defaultFolder: '/tmp/dm-test-downloads',
-    tempFolder: '/tmp/dm-test-downloads/.parts',
     maxConnections: 8,
     perDownloadOverrides: false,
     theme: 'light',

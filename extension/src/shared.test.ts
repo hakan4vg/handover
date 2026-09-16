@@ -4,7 +4,7 @@ import {
   chooseMediaCandidate,
   chooseMediaSelection,
   choosePlayerEvidence,
-  chooseWorkerMediaSelection,
+  planMediaCapture,
   isLikelyRepresentation,
   isMediaCandidate,
   isSubtitlePlaylist,
@@ -263,20 +263,40 @@ describe('media candidate selection', () => {
     expect(choosePlayerEvidence(players, 4, 0, 1000, 'doc-new')?.playerKey).toBe('new');
   });
 
-  it('uses one unowned frame-zero worker source for a sole child player', () => {
+  it('attributes tab traffic to the sole playing player, whatever realm fetched it', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
     ];
     const players: MediaPlayerEvidence[] = [
       { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, active: true, hovered: false, playing: true, visible: true },
     ];
-    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 100)).toEqual({
+    expect(planMediaCapture(candidates, players, 4, 3, 'child-player', 'child-doc', 100)).toEqual({
       source: 'https://cdn.test/vod/xgplayer-demo.mp4',
       selectedSegments: [],
+      alternatives: [],
     });
   });
 
-  it('refuses frame-zero worker fallback when another player is active', () => {
+  it('attributes frame-zero traffic to a top-level player whose bytes came from elsewhere', () => {
+    // The x.com-class case: a blob/MSE player at the top level, whose manifest
+    // was fetched by a realm no content script can see. The tab's own traffic is
+    // the only evidence, and a sole playing player makes it attributable.
+    const candidates: MediaCandidate[] = [
+      { url: 'https://cdn.test/vod/master.m3u8', tabId: 4, frameId: 0, documentId: 'worker-doc', at: 100, role: 'manifest' },
+      { url: 'https://cdn.test/vod/720.m3u8', tabId: 4, frameId: 0, documentId: 'worker-doc', at: 100, role: 'manifest' },
+      { url: 'https://cdn.test/vod/seg-1.m4s', tabId: 4, frameId: 0, documentId: 'worker-doc', at: 100, role: 'segment' },
+    ];
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'player-1', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, active: true, hovered: true, playing: true, visible: true },
+    ];
+    expect(planMediaCapture(candidates, players, 4, 0, 'player-1', 'top-doc', 100)).toEqual({
+      source: 'https://cdn.test/vod/master.m3u8',
+      selectedSegments: [],
+      alternatives: ['https://cdn.test/vod/720.m3u8'],
+    });
+  });
+
+  it('refuses attribution when another player is also playing', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
     ];
@@ -284,21 +304,20 @@ describe('media candidate selection', () => {
       { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, active: true, hovered: false, playing: true, visible: true },
       { playerKey: 'other-player', tabId: 4, frameId: 5, documentId: 'other-doc', at: 100, active: false, hovered: false, playing: true, visible: true },
     ];
-    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 100)).toBeUndefined();
+    expect(planMediaCapture(candidates, players, 4, 3, 'child-player', 'child-doc', 100)).toBeUndefined();
   });
 
-  it('refuses frame-zero worker fallback when several unowned sources exist', () => {
+  it('refuses attribution when the player never reported playback', () => {
     const candidates: MediaCandidate[] = [
-      { url: 'https://cdn.test/vod/one.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
-      { url: 'https://cdn.test/vod/two.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 101, role: 'unknown' },
+      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
     ];
     const players: MediaPlayerEvidence[] = [
-      { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 101, active: true, hovered: false, playing: true, visible: true },
+      { playerKey: 'player-1', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, active: true, hovered: true, playing: false, visible: true },
     ];
-    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 101)).toBeUndefined();
+    expect(planMediaCapture(candidates, players, 4, 0, 'player-1', 'top-doc', 100)).toBeUndefined();
   });
 
-  it('ignores unclassified worker page assets when selecting a progressive media source', () => {
+  it('ignores unclassified tab assets when attributing traffic', () => {
     const candidates: MediaCandidate[] = [
       { url: 'https://cdn.test/assets/player.js', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
       { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 101, role: 'unknown', kind: 'video' },
@@ -307,9 +326,10 @@ describe('media candidate selection', () => {
     const players: MediaPlayerEvidence[] = [
       { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 102, active: true, hovered: false, playing: true, visible: true },
     ];
-    expect(chooseWorkerMediaSelection(candidates, players, 4, 3, 'child-player', 'child-doc', 102)).toEqual({
+    expect(planMediaCapture(candidates, players, 4, 3, 'child-player', 'child-doc', 102)).toEqual({
       source: 'https://cdn.test/vod/xgplayer-demo.mp4',
       selectedSegments: [],
+      alternatives: [],
     });
   });
 

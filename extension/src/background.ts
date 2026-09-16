@@ -1,5 +1,5 @@
 import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
-import { chooseWorkerMediaSelection, isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
+import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
@@ -752,11 +752,25 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         : mediaKindFor(source);
       if (expectedKind && directKind !== 'unknown' && directKind !== expectedKind && roleFor(source) !== 'manifest') source = '';
       if (isHttp(source) && roleFor(source) === 'unknown') source = normalizeChunkUrl(source);
+      let candidates: string[] = [];
       if (!isHttp(source) && sender.tab?.id !== undefined) {
-        const selection = chooseWorkerMediaSelection(recentMedia, recentPlayers, sender.tab.id, sender.frameId ?? 0, playerKey, documentId, Date.now(), expectedKind);
-        source = selection?.source ?? '';
-        selectedSegments = selection?.selectedSegments ?? [];
-        companionAudio = selection?.companionAudio;
+        // Exact page evidence did not name a source. Ask the tab's observed
+        // traffic instead: while exactly one player is playing, that traffic is
+        // its media, whatever realm fetched it.
+        const plan = planMediaCapture(
+          recentMedia,
+          recentPlayers,
+          sender.tab.id,
+          sender.frameId ?? 0,
+          playerKey,
+          documentId,
+          Date.now(),
+          expectedKind,
+        );
+        source = plan?.source ?? '';
+        selectedSegments = plan?.selectedSegments ?? [];
+        companionAudio = plan?.companionAudio;
+        candidates = plan?.alternatives ?? [];
       }
       if (!isHttp(source) && scope !== undefined) {
         const remembered = takeResolvedMedia(scope);
@@ -770,7 +784,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         rememberResolvedMedia(scope, source, selectedSegments, companionAudio);
       }
       if (!isHttp(source)) {
-        reply({ ok: false, error: 'no exact media evidence for this player' });
+        reply({ ok: false, error: 'no downloadable media found for this player' });
         return;
       }
       const filterResult = mediaFilterDecision(source, sender.tab?.id, sender.frameId ?? 0, documentId, '', companionAudio);
@@ -782,6 +796,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const outboundPayload: Record<string, unknown> = {
         source,
         selectedSegments,
+        candidates,
         pageUrl,
         referrer: pageUrl,
         userAgent,

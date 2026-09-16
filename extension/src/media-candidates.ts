@@ -41,6 +41,12 @@ export interface MediaSelection {
   companionAudio?: string;
 }
 
+/** What to acquire for one player: the best source, the ordered alternatives
+ *  the resident may fall back to, and the hints that help it resolve variants. */
+export interface MediaCapturePlan extends MediaSelection {
+  alternatives: string[];
+}
+
 export function roleFor(url: string, contentType = ''): MediaRole {
   const hint = `${contentType} ${url}`.toLowerCase();
   if (hint.includes('mpegurl') || hint.includes('dash+xml') || /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url)) return 'manifest';
@@ -217,7 +223,81 @@ export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number
   return chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId)?.source;
 }
 
-export function chooseWorkerMediaSelection(
+/**
+ * Media this player plausibly owns, ranked best-first.
+ *
+ * A player whose bytes arrive through MSE/blob gives us no URL of its own, and
+ * the requests that produced those bytes may have been issued by a realm no
+ * content script can instrument (a worker, a cache-backed service worker, a
+ * player library). What is always observable is the network traffic of the tab,
+ * so ownership is decided by elimination: while exactly one player in the tab is
+ * playing and visible, the media fetched for that tab is that player's media.
+ *
+ * Ranking prefers the player's own document, then manifests (a manifest is the
+ * only thing that can rebuild an ordered presentation), then representations by
+ * recency. Subtitles and segments are never handed over as the source.
+ */
+export function rankedMediaCandidates(
+  candidates: MediaCandidate[],
+  tabId: number,
+  frameId: number,
+  documentId?: string,
+  expectedKind?: Exclude<MediaKind, 'unknown'>,
+  now = Date.now(),
+  limit = 6,
+): string[] {
+  const pool = candidates.filter((item) =>
+    item.tabId === tabId &&
+    (item.frameId === frameId || item.frameId === 0) &&
+    now - item.at <= 90_000 &&
+    item.role !== 'segment' &&
+    matchesKind(item, expectedKind),
+  );
+  const own = pool.filter((item) => !documentId || item.documentId === documentId);
+  const ordered = (items: MediaCandidate[]) => [...items].sort((left, right) => right.at - left.at);
+  const manifests = (items: MediaCandidate[]) => {
+    const found = ordered(items.filter((item) => item.role === 'manifest'));
+    const media = found.filter((item) => !isSubtitlePlaylist(item.url));
+    return [...media.filter((item) => isLikelyMasterManifest(item.url)), ...media.filter((item) => !isLikelyMasterManifest(item.url)), ...found];
+  };
+  const representations = (items: MediaCandidate[]) => ordered(items.filter((item) =>
+    item.role === 'unknown' && isLikelyRepresentation(item.url, item.contentType)));
+
+  const ranked = [
+    ...manifests(own),
+    ...representations(own),
+    ...manifests(pool.filter((item) => !own.includes(item))),
+    ...representations(pool.filter((item) => !own.includes(item))),
+  ];
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const item of ranked) {
+    const url = normalizeChunkUrl(item.url);
+    if (seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+    if (urls.length >= limit) break;
+  }
+  return urls;
+}
+
+/** Whether the given player is the only thing playing and visible in the tab,
+ *  which is what makes tab-wide network traffic attributable to it. */
+export function isSolePlayingPlayer(players: MediaPlayerEvidence[], tabId: number, frameId: number, playerKey: string, documentId?: string, now = Date.now()): boolean {
+  const playing = players.filter((item) =>
+    item.tabId === tabId && now - item.at <= 15_000 && item.playing && item.visible);
+  if (playing.length !== 1) return false;
+  const only = playing[0];
+  return only.playerKey === playerKey && only.frameId === frameId && (!documentId || only.documentId === documentId);
+}
+
+/**
+ * The capture plan for one player: exact/owned evidence first, then the
+ * ownership-by-elimination fallback for players whose bytes the page pipeline
+ * cannot see. Both paths come from the same ranking, so the source, the
+ * alternatives and the hints can never disagree.
+ */
+export function planMediaCapture(
   candidates: MediaCandidate[],
   players: MediaPlayerEvidence[],
   tabId: number,
@@ -226,47 +306,23 @@ export function chooseWorkerMediaSelection(
   documentId?: string,
   now = Date.now(),
   expectedKind?: Exclude<MediaKind, 'unknown'>,
-): MediaSelection | undefined {
-  const direct = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId, expectedKind);
-  if (direct || frameId === 0 || !playerKey) return direct;
-
-  const freshPlayer = players.some((item) =>
-    item.tabId === tabId &&
-    item.frameId === frameId &&
-    item.playerKey === playerKey &&
-    (!documentId || item.documentId === documentId) &&
-    now - item.at <= 15_000 &&
-    item.playing &&
-    item.visible,
-  );
-  if (!freshPlayer) return undefined;
-
-  const activeKeys = new Set(
-    players
-      .filter((item) => item.tabId === tabId && now - item.at <= 15_000 && item.playing && item.visible)
-      .map((item) => item.playerKey),
-  );
-  if (activeKeys.size !== 1 || !activeKeys.has(playerKey)) return undefined;
-
-  const workerCandidates = candidates.filter((item) =>
-    item.tabId === tabId &&
-    item.frameId === 0 &&
-    !item.playerKey &&
-    now - item.at <= 90_000 &&
-    item.at - now <= 5_000 &&
-    isMediaCandidate(item) &&
-    matchesKind(item, expectedKind),
-  );
-  const mediaSources = new Set(workerCandidates.filter((item) => item.role !== 'segment').map((item) => normalizeChunkUrl(item.url)));
-  if (mediaSources.size < 1 || mediaSources.size > 2 || !workerCandidates.some((item) => item.documentId !== documentId)) return undefined;
-  if (mediaSources.size === 2) {
-    const hasVideo = workerCandidates.some((item) => item.kind === 'video' || (item.kind !== 'audio' && mediaKindFor(item.url, item.contentType) === 'video'));
-    const hasAudio = workerCandidates.some((item) => item.kind === 'audio' || mediaKindFor(item.url, item.contentType) === 'audio');
-    if (!hasVideo || !hasAudio) return undefined;
+): MediaCapturePlan | undefined {
+  const exact = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId, expectedKind);
+  if (exact?.source) {
+    const alternatives = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now)
+      .filter((url) => url !== normalizeChunkUrl(exact.source));
+    return { ...exact, alternatives: alternatives.slice(0, 5) };
   }
-  const selection = chooseMediaSelection(workerCandidates, tabId, 0, undefined, undefined, expectedKind);
-  if (!selection) return undefined;
-  return workerCandidates.some((item) => item.role === 'manifest' || item.role === 'segment')
-    ? selection
-    : { ...selection, selectedSegments: [] };
+  if (!playerKey || !isSolePlayingPlayer(players, tabId, frameId, playerKey, documentId, now)) return undefined;
+  const ranked = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now);
+  if (!ranked.length) return undefined;
+  // The pool's own ordering already put manifests before representations, so the
+  // head is the source and the tail is what the resident may try next.
+  const [source, ...rest] = ranked;
+  // Hints steer variant choice, so they only apply to a manifest source; a
+  // progressive source is acquired exactly as handed over.
+  const hints = roleFor(source) === 'manifest'
+    ? rest.filter((url) => roleFor(url) === 'unknown' && isLikelyRepresentation(url)).slice(0, 8)
+    : [];
+  return { source, selectedSegments: hints, alternatives: rest.slice(0, 5) };
 }

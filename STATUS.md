@@ -7278,3 +7278,47 @@ real DASH remux that decodes clean, honest live/503 failures, browser takeover l
 - Gate: Rust `115/115`, Vitest `37` files/`138` tests, `npx tsc -b` clean, frontend and extension
   production builds, release Cargo build, portable packaging, and a boot smoke of the rebuilt
   executable.
+
+## 2026-09-17 — Provider-agnostic capture: evidence, attribution, and the handoff
+
+Dogfooding on real tabs (STATUS above) surfaced the class worth fixing rather than a site: on x.com
+the media button appeared, the click did nothing, and the extension's own tooltip said `no exact
+media evidence for this player`. The mechanism demanded an exact, player-owned source and gave up
+otherwise — which cannot hold for players whose bytes arrive through a realm no content script can
+instrument (dedicated workers, cache-backed service workers, `WebCodecs`, buffers cloned across a
+`postMessage` boundary). Fixing that with a site rule would have moved the same failure to whatever
+provider was tested next.
+
+- **Attribution by elimination, not by exact ownership.** When nothing names the media, the tab's
+  own observed traffic is attributed to the clicked player **if it is the only thing playing and
+  visible in that tab**, and refused when another player is also playing. This is the rule that makes
+  worker/MSE-fed players work without knowing anything about the site, and it replaces the previous
+  subframe-only worker fallback (`chooseWorkerMediaSelection`): attribution is now decided the same
+  way for top-level and nested players, and the source, its ranked alternatives, and the variant
+  hints all come from one ranking (`planMediaCapture` in `media-candidates.ts`).
+- **Uncertainty is carried to the resident, not thrown away.** A capture whose page evidence is not
+  exact now hands over an ordered candidate list. The resident probes candidates in order — bounded
+  to four sources, an 8 s timeout and an 8 KiB prefix each — and acquires the first that behaves like
+  finite media (manifest body, `video/*` or `audio/*` response, or a URL that names its own
+  container). The job's source, domain, and event log follow the decision; alternates are cleared
+  either way, and a capture with no candidates costs zero extra requests, so existing providers keep
+  the exact path untouched.
+- **The page reports hints it can actually see.** `page-media.ts` now falls back to the page's
+  resource-timing entries when the hook chain found no `MediaSource` provenance, as hint-only
+  evidence: it names plausible media URLs without claiming a player. The background decides
+  ownership, the resident verifies what it fetches.
+- **Honest wording.** The failure string is now `no downloadable media found for this player` — it is
+  reached only after the candidates have been considered, not because an exact match was missing.
+- **Regression fixture for the class.** `fixtures/worker_mse_chromium_probe.py` drives a real
+  Chromium + the built extension + the resident against a page whose MediaSource is fed entirely by a
+  Web Worker (`/page/worker-mse.html`), and asserts the handoff reaches the confirmation gate and
+  that cancel leaves no job, no temp data and no notification. The same probe has a `--page
+  progressive` case pinning the ordinary fast path (`single-stream`, 34524 bytes) so the fallback
+  cannot quietly take over normal captures. Both pass.
+- Gate: Rust `117/117` (two new: URL-evidence ranking, candidate validation/bounding), Vitest `37`
+  files/`139` tests (worker-fallback tests rewritten to the attribution rule), `npx tsc -b` clean,
+  extension and release builds, portable packaging, and the two probe cases above.
+
+What this does not claim: a player whose media the tab never fetched (pure `WebCodecs` from
+in-memory data, or streams assembled from sources the browser got from a prior page) still fails
+honestly. Live rejection, DRM, and cookie-vaulted sources are unchanged.

@@ -401,6 +401,70 @@ class Handler(BaseHTTPRequestHandler):
                 "</script></body></html>"
             )
             return self._send_bytes(body.encode(), 200, {"Content-Type": "text/html"})
+        if path == "/page/worker-mse.html":
+            # The media bytes never pass through the page: a Web Worker fetches
+            # the manifest and every segment and posts them back as buffers to
+            # append to MediaSource. Nothing a content script can observe names
+            # the media, which is the class x.com-class players belong to
+            # (blob/MSE fed from a realm no extension can instrument).
+            body = """<!doctype html><html><body style='margin:40px;background:#222'>
+<video id='v' width='640' height='360' controls autoplay muted></video>
+<script>
+const video = document.getElementById('v');
+const media = new MediaSource();
+video.src = URL.createObjectURL(media);
+const workerSource = `
+self.onmessage = async (event) => {
+  const base = new URL('/dash/', event.data.page);
+  const text = await (await fetch(event.data.manifest)).text();
+  const urls = [...new Set([...text.matchAll(/(?:sourceURL|media)="([^"]+)"/g)].map((match) => new URL(match[1], base).href))];
+  for (const url of urls) {
+    const buffer = await (await fetch(url)).arrayBuffer();
+    self.postMessage({ url, buffer }, [buffer]);
+  }
+  self.postMessage({ done: true });
+};
+`;
+const worker = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' })));
+worker.onerror = (event) => { window.__mseError = String(event.message || 'worker error'); };
+let videoSource = null;
+let audioSource = null;
+const pending = [];
+let flushing = false;
+function flush() {
+  if (flushing) return;
+  const next = pending.shift();
+  if (!next || !next.target) return;
+  flushing = true;
+  next.target.addEventListener('updateend', function done() {
+    next.target.removeEventListener('updateend', done);
+    flushing = false;
+    flush();
+  });
+  try {
+    next.target.appendBuffer(next.buffer);
+  } catch (error) {
+    window.__mseError = 'appendBuffer: ' + error.message;
+  }
+}
+media.addEventListener('sourceopen', () => {
+  try {
+    videoSource = media.addSourceBuffer('video/mp4; codecs="avc1.64000c"');
+    audioSource = media.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+  } catch (error) {
+    window.__mseError = 'addSourceBuffer: ' + error.message;
+    return;
+  }
+  worker.postMessage({ manifest: new URL('/dash/manifest.mpd', location.href).href, page: location.href });
+});
+worker.onmessage = (event) => {
+  const data = event.data;
+  if (data.done) return;
+  pending.push({ target: data.url.includes('/a-') ? audioSource : videoSource, buffer: data.buffer });
+  flush();
+};
+</script></body></html>"""
+            return self._send_bytes(body.encode(), 200, {"Content-Type": "text/html"})
         if path == "/hls/gated-fmp4.m3u8":
             # fMP4 HLS variant of the gated VOD with real media bytes, so a
             # genuine player can actually play it (same gate as gated.m3u8).

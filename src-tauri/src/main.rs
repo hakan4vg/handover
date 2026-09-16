@@ -97,6 +97,11 @@ struct DownloadJob {
     /// default through serde default.
     #[serde(default)]
     user_agent: Option<String>,
+    /// Alternate sources a capture handed over when the page could not prove
+    /// which one feeds the player (SPEC §6.2). Resolved and cleared on the first
+    /// acquisition attempt, so it never lingers in the store.
+    #[serde(default)]
+    candidates: Vec<String>,
     events: Vec<JobEvent>,
 }
 
@@ -252,7 +257,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -821,6 +826,7 @@ fn complete_job(job: &mut DownloadJob) {
     job.post_body = None;
     job.user_agent = None;
     job.companion_audio = None;
+    job.candidates.clear();
     job.events.insert(0, job_event("Download completed", Some("success")));
 }
 
@@ -4510,7 +4516,163 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     false
 }
 
+/// How many capture sources may be probed. Every probe is a real request, so the
+/// bound is what keeps a capture the page could not resolve cheap.
+const MAX_SOURCE_PROBES: usize = 4;
+/// Prefix size for classification: enough for a manifest, a container header,
+/// and the content type that arrives with the first chunk.
+const SOURCE_PROBE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateVerdict {
+    Media,
+    NotMedia,
+    Unknown,
+}
+
+/// URL-level evidence that a source is media, cheap enough to skip a probe.
+fn url_implies_media(url: &str) -> bool {
+    if media::is_manifest_source(url, None) {
+        return true;
+    }
+    const MEDIA_EXTENSIONS: [&str; 14] = [
+        ".mp4", ".m4s", ".m4a", ".m4v", ".ts", ".webm", ".mkv", ".mov", ".mp3", ".aac", ".ogg",
+        ".oga", ".opus", ".flac",
+    ];
+    let path = reqwest::Url::parse(url)
+        .map(|parsed| parsed.path().to_ascii_lowercase())
+        .unwrap_or_default();
+    MEDIA_EXTENSIONS
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
+/// Classify one candidate source by what it actually returns. A page that could
+/// not tell which URL feeds its player usually still observed several plausible
+/// ones; this is what turns that list into one answer.
+async fn classify_candidate(
+    client: &reqwest::Client,
+    url: &str,
+    referrer: Option<&str>,
+    user_agent: Option<&str>,
+) -> CandidateVerdict {
+    if url_implies_media(url) {
+        return CandidateVerdict::Media;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return CandidateVerdict::NotMedia;
+    };
+    let mut request = client
+        .get(parsed)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", SOURCE_PROBE_BYTES - 1),
+        )
+        .timeout(Duration::from_secs(8));
+    if let Some(agent) = user_agent {
+        request = request.header(reqwest::header::USER_AGENT, agent);
+    }
+    if let Some(value) = referrer.and_then(|value| referer_value(value, url)) {
+        request = request.header(reqwest::header::REFERER, value);
+    }
+    let Ok(response) = request.send().await else {
+        return CandidateVerdict::Unknown;
+    };
+    if !response.status().is_success() {
+        return CandidateVerdict::NotMedia;
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while body.len() < 8192 {
+        let Some(chunk) = stream.next().await else { break };
+        let Ok(chunk) = chunk else { break };
+        let take = chunk.len().min(8192 - body.len());
+        body.extend_from_slice(&chunk[..take]);
+    }
+    if media::is_manifest_body(&body) {
+        return CandidateVerdict::Media;
+    }
+    if content_type.starts_with("video/") || content_type.starts_with("audio/") {
+        return CandidateVerdict::Media;
+    }
+    if content_type.is_empty() || content_type == "application/octet-stream" {
+        // Neither the URL nor the response says what this is. Not evidence.
+        return CandidateVerdict::Unknown;
+    }
+    CandidateVerdict::NotMedia
+}
+
+/// A capture can hand over alternates when the page could not prove which
+/// resource feeds the player (SPEC §6.2): blob/MSE players whose bytes arrive
+/// from a realm nothing can instrument. Deciding is the resident's job, because
+/// deciding means fetching. The first source that behaves like finite media
+/// becomes the job's source, the job's log records the swap, and the alternates
+/// are consumed either way so nothing lingers in the store.
+async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> String {
+    let candidates = app
+        .state::<CoreState>()
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| job.candidates.clone())
+        })
+        .unwrap_or_default();
+    if candidates.is_empty() {
+        return source;
+    }
+    let (referrer, _, user_agent) = job_context(app, id);
+    let mut chosen = source.clone();
+    if !url_implies_media(&source) {
+        let client = http_client();
+        let pool = std::iter::once(source.clone()).chain(candidates.iter().cloned());
+        for url in pool.take(MAX_SOURCE_PROBES) {
+            if classify_candidate(&client, &url, referrer.as_deref(), user_agent.as_deref()).await
+                == CandidateVerdict::Media
+            {
+                chosen = url;
+                break;
+            }
+        }
+    }
+    let state = app.state::<CoreState>();
+    emit_job(&state, id, |job| {
+        job.candidates.clear();
+        if job.source != chosen {
+            job.domain = domain(&chosen);
+            job.source = chosen.clone();
+            job.events.insert(
+                0,
+                job_event(
+                    "Capture alternates checked; acquiring the verified source",
+                    Some("success"),
+                ),
+            );
+        }
+    });
+    emit_snapshot(app, &state);
+    chosen
+}
+
 async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
+    if !transfer_can_continue(&app, &id, generation) {
+        return;
+    }
+    let source = resolve_job_source(&app, &id, source).await;
     if !transfer_can_continue(&app, &id, generation) {
         return;
     }
@@ -5050,6 +5212,7 @@ fn start_provisional(
             .as_deref()
             .and_then(user_agent_value)
             .map(str::to_string),
+        candidates: input.candidates,
         events: vec![job_event("Provisional acquisition created", None)]
     };
     {
@@ -5667,6 +5830,23 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
                 .collect()
         })
         .unwrap_or_default();
+    // Alternates for a capture that could not prove which resource feeds the
+    // player: same validation as selected segments, minus the primary.
+    let candidates = payload
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(|values| {
+            let mut urls: Vec<String> = Vec::new();
+            for value in values.iter().filter_map(Value::as_str) {
+                let Ok(parsed) = reqwest::Url::parse(value) else { continue };
+                if !matches!(parsed.scheme(), "http" | "https") { continue }
+                let url = parsed.to_string();
+                if url != source && !urls.contains(&url) { urls.push(url); }
+                if urls.len() >= 6 { break; }
+            }
+            urls
+        })
+        .unwrap_or_default();
     // Request-context replay (SPEC §5.1/§16): the extension forwards the
     // capture page as `referrer` (ordinary-capture and media-capture send
     // `pageUrl`; the downloads-API fallback sends the item referrer).
@@ -5700,6 +5880,7 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         max_connections: None,
         bandwidth_limit,
         selected_segments,
+        candidates,
         player_kind,
         companion_audio,
         referrer,
@@ -6538,6 +6719,73 @@ mod capture_tests {
     }
 
     #[test]
+    fn capture_sources_are_ranked_by_url_evidence_before_fetching() {
+        use super::url_implies_media;
+        // A URL that names its own container never needs a probe.
+        for media in [
+            "https://cdn.test/vod/master.m3u8",
+            "https://cdn.test/vod/manifest.mpd",
+            "https://cdn.test/v/clip.mp4",
+            "https://cdn.test/s/0001.m4s",
+            "https://cdn.test/a/track.m4a?tag=1",
+        ] {
+            assert!(url_implies_media(media), "{media} should not need a probe");
+        }
+        // A page URL proves nothing, so it must be probed (or rejected).
+        for page in [
+            "https://cdn.test/watch/abc",
+            "https://cdn.test/graphql/xyz",
+            "https://cdn.test/page.html",
+            "not a url",
+        ] {
+            assert!(!url_implies_media(page), "{page} must not be trusted as media");
+        }
+    }
+
+    #[test]
+    fn capture_candidates_are_validated_deduplicated_and_bounded() {
+        use super::provisional_input_from_message;
+        let message = json!({
+            "type": "media-capture",
+            "payload": {
+                "source": "https://cdn.test/a.mp4",
+                "candidates": [
+                    "https://cdn.test/a.mp4",
+                    "blob:https://cdn.test/9f0a",
+                    "https://cdn.test/b.m3u8",
+                    "https://cdn.test/b.m3u8",
+                    "https://cdn.test/c.mp4",
+                    "https://cdn.test/d.mp4",
+                    "https://cdn.test/e.mp4",
+                    "https://cdn.test/f.mp4",
+                    "https://cdn.test/g.mp4",
+                    "https://cdn.test/h.mp4",
+                ],
+            },
+        });
+        let input = provisional_input_from_message(&message).expect("valid capture");
+        assert_eq!(
+            input.candidates,
+            vec![
+                "https://cdn.test/b.m3u8",
+                "https://cdn.test/c.mp4",
+                "https://cdn.test/d.mp4",
+                "https://cdn.test/e.mp4",
+                "https://cdn.test/f.mp4",
+                "https://cdn.test/g.mp4",
+            ],
+            "alternates drop the primary, non-http entries, duplicates, and everything past the cap"
+        );
+        // A capture without alternates keeps working exactly as before.
+        let plain = provisional_input_from_message(&json!({
+            "type": "media-capture",
+            "payload": { "source": "https://cdn.test/a.mp4" },
+        }))
+        .expect("valid capture");
+        assert!(plain.candidates.is_empty());
+    }
+
+    #[test]
     fn bridge_rejects_web_origins_and_foreign_hosts() {
         // Astra F01 reproduction: text/plain + https Origin must not reach a
         // mutation route. Absent Origin (non-browser local clients) stays
@@ -7306,7 +7554,7 @@ CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);").unwrap(
     }
 
     fn finished_job_with_context() -> DownloadJob {
-        DownloadJob { id: "done-1".into(), name: "archive.zip".into(), source: "https://cdn.example.test/archive.zip?token=abc".into(), domain: "cdn.example.test".into(), kind: "archive".into(), state: "downloading".into(), progress: 100.0, downloaded: 1024, total: Some(1024), speed: 0, eta: None, connections: 1, max_connections: 8, bandwidth_limit: None, mode: "whole-object".into(), media: false, media_details: None, media_tracks: None, destination: "/tmp/archive.zip".into(), temp_path: "/tmp/done-1.part".into(), resumable: true, mime: None, error: None, created: "now".into(), started: Some("now".into()), completed: None, provisional: Some(false), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: vec![], player_kind: None, companion_audio: None, referrer: Some("https://example.test/page?session=s3cr3t".into()), post_body: Some("fixture=renewed".into()), user_agent: Some("Mozilla/5.0".into()), events: vec![] }
+        DownloadJob { id: "done-1".into(), name: "archive.zip".into(), source: "https://cdn.example.test/archive.zip?token=abc".into(), domain: "cdn.example.test".into(), kind: "archive".into(), state: "downloading".into(), progress: 100.0, downloaded: 1024, total: Some(1024), speed: 0, eta: None, connections: 1, max_connections: 8, bandwidth_limit: None, mode: "whole-object".into(), media: false, media_details: None, media_tracks: None, destination: "/tmp/archive.zip".into(), temp_path: "/tmp/done-1.part".into(), resumable: true, mime: None, error: None, created: "now".into(), started: Some("now".into()), completed: None, provisional: Some(false), segments: None, completed_ranges: vec![], resource_identity: None, destination_reservation: None, selected_segments: vec![], player_kind: None, companion_audio: None, referrer: Some("https://example.test/page?session=s3cr3t".into()), post_body: Some("fixture=renewed".into()), user_agent: Some("Mozilla/5.0".into()), candidates: vec![], events: vec![] }
     }
 
     fn provisional_job(id: &str, state: &str) -> DownloadJob {

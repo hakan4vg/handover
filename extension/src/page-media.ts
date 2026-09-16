@@ -338,6 +338,33 @@ function uniqueSources(observations: MediaObservation[], kind: Exclude<MediaKind
   return result;
 }
 
+// Resource timing is the page's own record of everything it loaded, including
+// requests made before this observer was installed or through a path we do not
+// patch. It names no player, so it is only ever used as a hint list: the
+// background decides ownership, and the resident verifies what it fetches.
+const RESOURCE_HINT_PATTERN = /\.(?:m3u8|mpd|mp4|m4s|m4a|m4v|ts|webm|mkv|mp3|aac|ogg|oga|opus|flac|mov)(?:$|[?#])/i;
+
+function resourceHintSources(limit = 8): string[] {
+  try {
+    const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
+    const media = entries
+      .filter((entry) => RESOURCE_HINT_PATTERN.test(entry.name) && entry.name.startsWith('http'))
+      .sort((left, right) => right.startTime - left.startTime)
+      .slice(0, limit)
+      .map((entry) => entry.name);
+    return [...new Set(media)];
+  } catch {
+    return [];
+  }
+}
+
+/** Evidence that names plausible sources without claiming exact identity. */
+function hintEvidence(currentSrc: string, kind: Exclude<MediaKind, 'unknown'>, sourceIdentity: string): MediaEvidence | undefined {
+  const hints = resourceHintSources();
+  if (!hints.length) return undefined;
+  return { currentSrc, sourceIdentity, playerKind: kind, selectedSegments: hints };
+}
+
 function evidenceForSource(currentSrc: string, kind: Exclude<MediaKind, 'unknown'>, sourceIdentity: string): MediaEvidence | undefined {
   if (!currentSrc) return undefined;
   if (currentSrc.startsWith('http')) {
@@ -352,7 +379,7 @@ function evidenceForSource(currentSrc: string, kind: Exclude<MediaKind, 'unknown
   }
   if (!currentSrc.startsWith('blob:')) return undefined;
   const sourceState = mediaSourceByBlob.get(currentSrc);
-  if (!sourceState) return undefined;
+  if (!sourceState) return hintEvidence(currentSrc, kind, sourceIdentity);
   const observations = activeObservations(sourceState);
   const kindObservations = observations.filter((observation) => observation.kind === kind || observation.kind === 'unknown');
   const manifest = matchingManifest(kindObservations);
@@ -384,7 +411,7 @@ function evidenceForSource(currentSrc: string, kind: Exclude<MediaKind, 'unknown
     };
   }
   const primary = uniqueSources(observations, kind);
-  if (primary.length !== 1) return undefined;
+  if (primary.length !== 1) return hintEvidence(currentSrc, kind, sourceIdentity);
   const result: MediaEvidence = {
     currentSrc,
     sourceIdentity,

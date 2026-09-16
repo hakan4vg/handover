@@ -1,0 +1,120 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      webview2_version:
+        description: 'WebView2 Fixed Version runtime to bundle (blank = latest offered)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      VITE_DATA_MODE: native
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      # The catalog is what the official WebView2 download page itself reads. It is
+      # undocumented, so a pinned version can be supplied through workflow_dispatch.
+      - name: Resolve WebView2 Fixed Version runtime
+        id: wv2
+        shell: pwsh
+        run: |
+          $pinned = '${{ inputs.webview2_version }}'
+          $catalog = Invoke-RestMethod -Uri 'https://developer.microsoft.com/microsoft-edge/api/webview2'
+          if ($pinned) {
+            $entry = $catalog | Where-Object { $_.version -eq $pinned } | Select-Object -First 1
+            if (-not $entry) { throw "WebView2 fixed version '$pinned' is not offered by the catalog" }
+          } else {
+            $entry = $catalog | Sort-Object { [version]$_.version } -Descending | Select-Object -First 1
+          }
+          $build = $entry.builds | Where-Object { $_.architecture -eq 'x64' } | Select-Object -First 1
+          if (-not $build) { throw "No x64 build for WebView2 $($entry.version)" }
+          "version=$($entry.version)" >> $env:GITHUB_OUTPUT
+          "url=$($build.url)" >> $env:GITHUB_OUTPUT
+          Write-Host "WebView2 Fixed Version runtime: $($entry.version)"
+
+      # Cache the cab, not the extracted tree: one ~300 MB file beats thousands of
+      # entries, and extraction only takes a minute.
+      - name: Cache WebView2 installer
+        id: wv2cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\wv2.cab
+          key: webview2-cab-${{ steps.wv2.outputs.version }}-x64
+
+      - name: Download WebView2 runtime
+        if: steps.wv2cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri '${{ steps.wv2.outputs.url }}' -OutFile "$env:RUNNER_TEMP\wv2.cab"
+          if (-not (Test-Path "$env:RUNNER_TEMP\wv2.cab")) { throw 'WebView2 cab download produced no file' }
+
+      - name: Extract WebView2 runtime
+        shell: pwsh
+        run: |
+          $dest = "$env:RUNNER_TEMP\webview2"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          expand.exe "$env:RUNNER_TEMP\wv2.cab" -F:* $dest | Out-Null
+          $exe = Get-ChildItem -Path $dest -Filter msedgewebview2.exe -Recurse -File | Select-Object -First 1
+          if (-not $exe) { throw 'WebView2 extraction produced no msedgewebview2.exe' }
+          "WEBVIEW2_FIXED_RUNTIME=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Bundled runtime: $($exe.DirectoryName)"
+
+      # beforeBuildCommand in tauri.conf.json already runs build:all, so this
+      # produces dist/ and extension/dist/ as well as the release executable.
+      - name: Build desktop application
+        run: npm run tauri build
+
+      - name: Package portable release
+        run: npm run package:portable
+
+      - name: Upload extension
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: extension/dist
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload portable release
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-manager-portable
+          path: portable/
+          if-no-files-found: error
+          retention-days: 14

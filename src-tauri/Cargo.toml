@@ -2,7 +2,8 @@
 name = "download-manager"
 version = "0.1.0"
 description = "A resident Windows download manager with browser integration"
-authors = ["Download Manager"]
+authors = ["hakan4vg"]
+license = "MIT"
 edition = "2021"
 
 [build-dependencies]

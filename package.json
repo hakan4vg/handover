@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "author": "hakan4vg",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hakan4vg/handover.git"
+  },
   "scripts": {
     "dev": "node node_modules/vite/bin/vite.js --mode mock",
     "dev:native": "node node_modules/vite/bin/vite.js --mode native",

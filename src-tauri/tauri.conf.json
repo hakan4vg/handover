@@ -27,6 +27,7 @@
     "security": { "csp": null }
   },
   "bundle": {
-    "active": false
+    "active": false,
+    "publisher": "hakan4vg"
   }
 }

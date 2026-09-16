@@ -24,6 +24,11 @@ jobs:
     runs-on: windows-latest
     env:
       VITE_DATA_MODE: native
+      # The portable release must not need a VC++ redistributable. .cargo/config.toml
+      # declares this too, but it did not take effect on the runner, so set it here
+      # explicitly rather than depend on config-file discovery. RUSTFLAGS has the
+      # highest precedence of Cargo's flag sources.
+      RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
 

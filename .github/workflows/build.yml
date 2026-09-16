@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -12,8 +13,10 @@ on:
         required: false
         default: ''
 
+# Write access is needed only to attach assets to a release, which happens for tag
+# pushes; branch and pull-request runs never publish anything.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-${{ github.ref }}
@@ -138,3 +141,54 @@ jobs:
           path: portable/
           if-no-files-found: error
           retention-days: 14
+
+      # tar.exe ships with the runners and handles the ~1 GB tree far faster than
+      # Compress-Archive, which is slow with thousands of small WebView2 files.
+      - name: Package release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          tar.exe -a -c -f "$env:RUNNER_TEMP\download-manager-$env:GITHUB_REF_NAME-portable-x64.zip" -C portable .
+          tar.exe -a -c -f "$env:RUNNER_TEMP\download-manager-extension-$env:GITHUB_REF_NAME.zip" -C extension\dist .
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @'
+          Windows desktop download manager: a native Rust transfer engine, a Tauri + React
+          manager UI, and a Chromium extension that hands browser downloads to a resident
+          native application.
+
+          ### Downloads
+
+          - **portable-x64.zip** - unpack anywhere and run `Download Manager.exe`. Ships the
+            browser extension in `extension/` and a colocated WebView2 runtime, so there is
+            no installer, no registry entries, and no VC++ redistributable to install.
+          - **extension.zip** - the unpacked Chromium extension, if you only need to update
+            that. Load it via `chrome://extensions` with developer mode enabled.
+
+          ### Included
+
+          - Browser download interception plus generic media capture, covering progressive
+            files and segmented HLS/DASH VOD
+          - Three transfer modes chosen automatically from observed source behaviour:
+            whole-object multi-connection, ordered-segment multi-connection, and
+            single-stream fallback
+          - Pause, resume, and restart recovery with preserved partial state
+          - Portable layout with all state under `data` beside the executable
+
+          ### Notes
+
+          - Windows 10/11 x64. Chrome is the reference browser; other Chromium browsers
+            should work.
+          - Early development release. Not production-ready.
+          '@
+          $notes | Out-File -Encoding utf8 "$env:RUNNER_TEMP\notes.md"
+          gh release create "$env:GITHUB_REF_NAME" `
+            "$env:RUNNER_TEMP\download-manager-$env:GITHUB_REF_NAME-portable-x64.zip" `
+            "$env:RUNNER_TEMP\download-manager-extension-$env:GITHUB_REF_NAME.zip" `
+            --title "Download Manager $env:GITHUB_REF_NAME" `
+            --notes-file "$env:RUNNER_TEMP\notes.md"

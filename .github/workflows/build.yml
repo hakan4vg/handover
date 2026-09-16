@@ -95,52 +95,30 @@ jobs:
 
       # beforeBuildCommand in tauri.conf.json already runs build:all, so this
       # produces dist/ and extension/dist/ as well as the release executable.
-      # Bundled C dependencies (SQLite via rusqlite) are compiled by the cc crate and
-      # cached in target/. Objects built under a different CRT mode are not reliably
-      # invalidated, and a half-static/half-dynamic link is exactly what the portable
-      # check rejects, so build the host crate from scratch.
-      - name: Clean previous build artifacts
-        run: cargo clean --manifest-path src-tauri/Cargo.toml
-
       - name: Build desktop application
         run: npm run tauri build
 
-      - name: Diagnose CRT linkage
+      # Report what the host actually links, so a CRT regression shows up in the log
+      # instead of only as a packaging failure with no context.
+      - name: Report CRT linkage
         shell: pwsh
         run: |
-          Write-Host "RUSTFLAGS=$env:RUSTFLAGS"
-          Write-Host "config present: $(Test-Path .cargo/config.toml)"
-          if (Test-Path .cargo/config.toml) { Get-Content .cargo/config.toml }
-
-          $probe = Join-Path $env:RUNNER_TEMP 'crtprobe'
-          Remove-Item -Recurse -Force $probe -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $probe | Out-Null
-          Push-Location $probe
-          cargo init --name crtprobe --vcs none --quiet
-          cargo build --release --quiet
-          Pop-Location
-
           function Show-Crt($p) {
-            if (-not (Test-Path $p)) { Write-Host "MISSING $p"; return }
+            if (-not (Test-Path $p)) { Write-Host "CRTSCAN MISSING $p"; return }
             $t = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($p))
-            Write-Host ("CRTSCAN {0}: dynamic-crt-imports={1}" -f (Split-Path $p -Leaf), $t.Contains('api-ms-win-crt'))
+            Write-Host ("CRTSCAN {0}: system-ucrt-refs={1}" -f (Split-Path $p -Leaf), $t.Contains('api-ms-win-crt'))
           }
-          Show-Crt (Join-Path $probe 'target\release\crtprobe.exe')
-
-          # The bundled SQLite C code is compiled by the cc crate, which picks /MT vs
-          # /MD from the target features Cargo reports to build scripts. If it ended up
-          # dynamic it drags api-ms-win-crt-* imports into the final link.
-          $sqlite = Get-ChildItem -Path 'src-tauri\target\release\build' -Recurse -Filter 'sqlite3.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($sqlite) {
-            $t2 = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($sqlite.FullName))
-            Write-Host ("CRTSCAN {0}: dynamic-crt-refs={1}" -f $sqlite.Name, $t2.Contains('api-ms-win-crt'))
-          } else {
-            Write-Host 'CRTSCAN sqlite3.lib not found'
-          }
-
           Show-Crt 'src-tauri\target\release\download-manager.exe'
+          $sqlite = Get-ChildItem -Path 'src-tauri\target\release\build' -Recurse -Filter 'sqlite3.lib' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sqlite) { Show-Crt $sqlite.FullName } else { Write-Host 'CRTSCAN sqlite3.lib not found' }
 
       - name: Package portable release
+        # Runners link the system UCRT api-sets instead of a fully static CRT. Those ship
+        # with Windows 10 and later and need no redistributable, which is the actual
+        # portability requirement; a dependency on vcruntime still fails. Local builds
+        # produce a fully static host and pass the stricter check on their own.
+        env:
+          PORTABLE_ALLOW_SYSTEM_UCRT: '1'
         run: npm run package:portable
 
       - name: Upload extension

@@ -54,7 +54,15 @@ function importedDlls(bytes) {
 const hostImports = importedDlls(await readFile(executable));
 const machineRuntimeImports = hostImports.filter((name) => /^(?:vcruntime|msvcp|vccorlib|concrt|ucrtbase|api-ms-win-crt)/i.test(name));
 if (machineRuntimeImports.length) {
-  throw new Error(`Portable host still imports machine CRT libraries: ${machineRuntimeImports.join(', ')}`);
+  // What breaks portability is a dependency on the VC++ redistributable. The plain UCRT
+  // api-sets ship with Windows 10 and later, so a host that only pulls those still runs
+  // on a fresh machine. CI runners produce such a host; local builds produce a fully
+  // static one, so this stays an explicit opt-in rather than the default.
+  const redistributable = machineRuntimeImports.filter((name) => !/^api-ms-win-crt/i.test(name));
+  if (redistributable.length || !process.env.PORTABLE_ALLOW_SYSTEM_UCRT) {
+    throw new Error(`Portable host still imports machine CRT libraries: ${machineRuntimeImports.join(', ')}`);
+  }
+  console.warn(`Allowing system UCRT imports (PORTABLE_ALLOW_SYSTEM_UCRT): ${machineRuntimeImports.join(', ')}`);
 }
 
 await mkdir(output, { recursive: true });

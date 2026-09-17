@@ -320,8 +320,11 @@ function cleanMediaEvidence(value: unknown, expectedKind?: Exclude<MediaKind, 'u
   const playerKind = item.playerKind === 'audio' || item.playerKind === 'video' ? item.playerKind : undefined;
   const companionAudio = item.companionAudio === undefined ? undefined : cleanMediaUrl(item.companionAudio);
   if (!currentSrc || (expectedKind && playerKind && expectedKind !== playerKind) || (source !== undefined && !item.currentSrc.startsWith('blob:') && source !== currentSrc) || (item.source !== undefined && !source) || (item.companionAudio !== undefined && !companionAudio) || (companionAudio !== undefined && (expectedKind ?? playerKind) !== 'video')) return undefined;
-  const selectedValues = Array.isArray(item.selectedSegments) ? item.selectedSegments : [];
-  const selectedSegments = selectedValues
+  // Hints are advisory. A URL that is neither a manifest nor a representation
+  // is dropped; it must never invalidate the source the page did name — during
+  // steady-state playback the hint list is mostly segments, and one segment
+  // entry used to discard otherwise exact evidence.
+  const selectedSegments = (Array.isArray(item.selectedSegments) ? item.selectedSegments : [])
       .map((candidate) => cleanMediaUrl(candidate))
       .filter((candidate): candidate is string => !!candidate)
       .filter((candidate) => {
@@ -329,7 +332,6 @@ function cleanMediaEvidence(value: unknown, expectedKind?: Exclude<MediaKind, 'u
         return role === 'manifest' || (role === 'unknown' && isLikelyRepresentation(candidate));
       })
       .slice(0, 8);
-  if (selectedValues.length > 8 || selectedSegments.length !== selectedValues.length) return undefined;
   return { currentSrc, sourceIdentity: item.sourceIdentity, ...(source ? { source } : {}), ...(playerKind ? { playerKind } : {}), ...(companionAudio ? { companionAudio } : {}), selectedSegments };
 }
 

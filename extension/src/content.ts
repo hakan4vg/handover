@@ -117,9 +117,14 @@ function pageEvidenceFromValue(value: unknown, expectedCurrentSrc?: string): Med
   const source = item.source === undefined ? undefined : pageMediaUrl(item.source);
   const playerKind = item.playerKind === 'audio' || item.playerKind === 'video' ? item.playerKind : undefined;
   const companionAudio = item.companionAudio === undefined ? undefined : pageMediaUrl(item.companionAudio);
-  const selectedValues = Array.isArray(item.selectedSegments) ? item.selectedSegments : [];
-  const selectedSegments = selectedValues.map((candidate) => pageMediaUrl(candidate)).filter((candidate): candidate is string => !!candidate);
-  if (!currentSrc || !sourceIdentity || selectedValues.length > 8 || selectedSegments.length !== selectedValues.length || (expectedCurrentSrc && currentSrc !== expectedCurrentSrc) || (source !== undefined && currentSrc.startsWith('http') && source !== currentSrc) || (companionAudio !== undefined && playerKind !== 'video')) return undefined;
+  // Hints are advisory: keep the ones that resolve to a media URL and drop the
+  // rest. A single unusable entry must not throw away evidence whose source and
+  // identity are perfectly good.
+  const selectedSegments = (Array.isArray(item.selectedSegments) ? item.selectedSegments : [])
+    .map((candidate) => pageMediaUrl(candidate))
+    .filter((candidate): candidate is string => !!candidate)
+    .slice(0, 8);
+  if (!currentSrc || !sourceIdentity || (expectedCurrentSrc && currentSrc !== expectedCurrentSrc) || (source !== undefined && currentSrc.startsWith('http') && source !== currentSrc) || (companionAudio !== undefined && playerKind !== 'video')) return undefined;
   return { currentSrc, sourceIdentity, ...(source ? { source } : {}), ...(playerKind ? { playerKind } : {}), ...(companionAudio ? { companionAudio } : {}), selectedSegments };
 }
 

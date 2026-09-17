@@ -2,7 +2,7 @@ import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAUL
 import { isLikelyRepresentation, isMediaCandidate, isSolePlayingPlayer, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 // Trace harness (branch harness/capture-traces only). The service worker owns
 // the store; popup and content scripts only send or read through messages.
-import { clearTrace, flushTrace, probeFromExtension, recordTrace, setTraceEnabled, swInstance, swStartedAt, traceStatus } from './trace';
+import { clearTrace, flushTrace, isRangeFragmentUrl, probeFromExtension, recordTrace, setTraceEnabled, swInstance, swStartedAt, traceStatus } from './trace';
 import { TRACE_PROBE_PAGE } from './trace-schema';
 import type { ProbeResult } from './trace-schema';
 
@@ -328,6 +328,32 @@ function traceShouldProbe(url: string): boolean {
   return true;
 }
 
+let freshFragmentWindowAt = 0;
+let freshFragmentCount = 0;
+
+/** Probes a range-fragment URL the moment the browser first fetches it. A
+ *  fresh fragment that still 403s proves the URL is bound to the player that
+ *  fetched it (or single-use) — no header/cookie lens can fix that, so the
+ *  product must stop handing fragments over. Bounded to a few per minute. */
+async function traceProbeFreshFragment(url: string, tabId: number, frameId: number, documentId?: string): Promise<void> {
+  const now = Date.now();
+  if (now - freshFragmentWindowAt > 60_000) {
+    freshFragmentWindowAt = now;
+    freshFragmentCount = 0;
+  }
+  if (freshFragmentCount >= 6) return;
+  if (!traceShouldProbe(`${url}#fresh-fragment`)) return;
+  freshFragmentCount += 1;
+  const probe = await probeFromExtension(url, { credentials: 'omit', range: 'bytes=0-65535' });
+  void recordTrace({
+    kind: 'probe.fresh-fragment',
+    phase: 'acquirement',
+    tabId,
+    frameId,
+    payload: { observedAgeMs: Date.now() - now, documentId: documentId ? documentId.slice(0, 40) : '', ...probe },
+  });
+}
+
 /** Runs after the capture reply: probes the handed-over source through three
  *  lenses — the page's own fetch context (cookies + Referer), the extension
  *  worker without cookies, and the extension worker with cookies — plus the
@@ -629,6 +655,7 @@ chrome.webRequest.onResponseStarted.addListener(
     const kind = mediaKindFor(details.url);
     if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return;
     rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind);
+    if (isRangeFragmentUrl(details.url)) void traceProbeFreshFragment(details.url, details.tabId, details.frameId, details.documentId);
   },
   { urls: ['<all_urls>'] },
 );

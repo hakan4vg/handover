@@ -1,8 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { classifySample, parseDashManifest, parseHlsManifest, toJsonl } from './trace';
+import { classifySample, isRangeFragmentUrl, parseDashManifest, parseHlsManifest, toJsonl } from './trace';
 import type { TraceEnvelope } from './trace-schema';
 
 const encoder = new TextEncoder();
+
+describe('range-fragment shape detection', () => {
+  it('recognizes Vimeo-style range paths and range query parameters', () => {
+    expect(isRangeFragmentUrl('https://vod-adaptive-ak.vimeocdn.com/exp=1~acl=%2Fx~hmac=ab/uuid/psid=1/v2/range/prot/cmFuZ2U9MjEyMTE0MjEtMjg1NzE4MjQ/avf/b92d2162.mp4?pathsig=1~abc')).toBe(true);
+    expect(isRangeFragmentUrl('https://cdn.test/media.mp4?range=100-200&token=x')).toBe(true);
+    expect(isRangeFragmentUrl('https://cdn.test/segments/seg-0001.ts')).toBe(true);
+  });
+
+  it('leaves manifests and plain objects alone', () => {
+    expect(isRangeFragmentUrl('https://vod-adaptive-ak.vimeocdn.com/exp=1~acl=%2Fx~hmac=ab/uuid/psid=1/v2/playlist/av/primary/prot/cHI9NTQw/playlist.m3u8?pathsig=1~abc')).toBe(false);
+    expect(isRangeFragmentUrl('https://packaged-media.redd.it/abc/pb/m2-res_720p.mp4?m=DASHPlaylist.mpd')).toBe(false);
+    expect(isRangeFragmentUrl('https://rr1---sn-x.googlevideo.com/videoplayback?expire=1&mime=video%2Fmp4')).toBe(false);
+    expect(isRangeFragmentUrl('not a url')).toBe(false);
+  });
+});
 
 describe('probe sample classification', () => {
   it('recognizes an HLS master and resolves the first child variant', () => {

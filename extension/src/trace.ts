@@ -238,6 +238,20 @@ export function toJsonl(events: TraceEnvelope[]): string {
   return [header, ...events.map((event) => JSON.stringify(event))].join('\n');
 }
 
+/** URLs that carry a byte range inside the URL itself (Vimeo's
+ *  `/v2/range/prot/<b64>/avf/<uuid>.mp4`, or a `range=` query). Observed ones
+ *  may already be spent by the player; the harness probes them while fresh to
+ *  tell staleness apart from session binding. */
+export function isRangeFragmentUrl(url: string): boolean {
+  if (/\/v2\/range\//.test(url)) return true;
+  if (/[?&]range=/.test(url)) return true;
+  try {
+    return /(?:^|\/)(?:range|seg|chunk|frag)[/_.-]/.test(new URL(url).pathname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Body classification (single implementation, used for page and extension
 // probe results alike).

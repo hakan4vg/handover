@@ -107,14 +107,10 @@ function App() {
   const adapter = useMemo(() => createAdapter(), []);
   const { snapshot, error } = useAppSnapshot(adapter);
   const params = new URLSearchParams(window.location.search);
-  const surface = params.get('view');
   const isAddWindow = params.get('window') === 'add';
 
   if (error) return <Disconnected message={error} />;
   if (!snapshot) return <Loading />;
-  if (surface === 'extension') return <ExtensionPopup adapter={adapter} snapshot={snapshot} />;
-  if (surface === 'tray') return <TrayMenu adapter={adapter} snapshot={snapshot} />;
-  if (surface === 'notifications') return <NotificationsSurface snapshot={snapshot} />;
   if (isAddWindow) return <StandaloneAddWindow adapter={adapter} snapshot={snapshot} />;
   return <Manager adapter={adapter} snapshot={snapshot} />;
 }
@@ -363,10 +359,6 @@ export async function copySourceUrl(source: string): Promise<string | undefined>
   } catch (reason) {
     return errorMessage(reason, 'Could not copy the source URL.');
   }
-}
-
-function openManagerSurface(jobId?: string) {
-  window.location.href = `${window.location.pathname}${jobId ? `?job=${encodeURIComponent(jobId)}` : ''}`;
 }
 
 function closeSurface() {
@@ -1057,101 +1049,6 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const close = () => closeSurface();
   const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit }));
   return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} captured job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={async (id) => { await adapter.cancelJob(id); close(); }} onClose={close} /></div>;
-}
-
-export function ExtensionPopup({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
-  const [error, setError] = useState('');
-  const site = new URLSearchParams(window.location.search).get('site') ?? 'twitter.com';
-  const excluded = snapshot.settings.excludedSites.includes(site);
-  const update = (patch: Partial<AppSettings>) => {
-    setError('');
-    try {
-      void adapter.updateSettings(patch).catch((reason: unknown) => setError(errorMessage(reason, 'Could not update browser integration settings.')));
-    } catch (reason) {
-      setError(errorMessage(reason, 'Could not update browser integration settings.'));
-    }
-  };
-  const toggleSite = () => update({ excludedSites: excluded ? snapshot.settings.excludedSites.filter((item) => item !== site) : [...snapshot.settings.excludedSites, site] });
-  return (
-    <div className="popup-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}>
-      <div className="popup-header">
-        <span className="product-logo"><Icon name="download" size={17} /></span>
-        <strong>Download Manager</strong>
-        <button className="icon-button" aria-label="Close" onClick={closeSurface}><Icon name="close" size={15} /></button>
-      </div>
-      {error && <div className="form-error popup-error" role="alert"><Icon name="error" size={14} />{error}</div>}
-      <div className="popup-toggles">
-        <SettingToggle icon="download" title="Intercept browser downloads" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} />
-        <SettingToggle icon="media" title="Show media buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} />
-      </div>
-      <div className="popup-site">
-        <span className="eyebrow">Current site</span>
-        <strong>{site}</strong>
-        {excluded ? <span className="excluded-copy">Media buttons excluded on this site</span> : <span className="enabled-copy">Media buttons enabled on this site</span>}
-        <button className="button" onClick={toggleSite}>{excluded ? 'Enable on this site' : 'Exclude this site'}</button>
-      </div>
-      <button className="popup-manager-button" onClick={() => openManagerSurface()}><span>Open Manager</span><Icon name="open" size={15} /></button>
-    </div>
-  );
-}
-
-export function TrayMenu({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
-  const [error, setError] = useState('');
-  const active = snapshot.jobs.filter((job) => stateIn(job.state, TRANSFER_STATES)).length;
-  const paused = active === 0 && snapshot.jobs.some((job) => job.state === 'paused' || job.state === 'pending');
-  const run = (operation: () => Promise<void>) => {
-    setError('');
-    try {
-      void operation().catch((reason: unknown) => setError(errorMessage(reason, 'Tray action failed.')));
-    } catch (reason) {
-      setError(errorMessage(reason, 'Tray action failed.'));
-    }
-  };
-  const update = (patch: Partial<AppSettings>) => run(() => adapter.updateSettings(patch));
-  const toggleAll = () => run(() => paused ? adapter.resumeAll() : adapter.pauseAll());
-  return <div className="tray-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}>
-    <div className="tray-status"><span className="status-dot" /><span>{active} active downloads</span><strong>{formatSpeed(snapshot.aggregateSpeed)}</strong></div>
-    {error && <div className="form-error tray-error" role="alert"><Icon name="error" size={14} />{error}</div>}
-    <TrayAction icon="window" label="Open Download Manager" onClick={openManagerSurface} />
-    <TrayAction icon={paused ? 'play' : 'pause'} label={paused ? 'Resume All' : 'Pause All'} onClick={toggleAll} />
-    <div className="tray-divider" />
-    <TrayToggle icon="globe" label="Intercept browser downloads" checked={snapshot.settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} />
-    <TrayToggle icon="media" label="Media Buttons" checked={snapshot.settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} />
-    <TrayAction icon="network" label="Set Bandwidth Limit" chevron onClick={() => { window.location.href = `${window.location.pathname}?settings=network`; }} />
-    <div className="tray-divider" />
-    <TrayAction icon="power" label="Exit Manager" danger onClick={closeSurface} />
-  </div>;
-}
-
-function TrayAction({ icon, label, onClick, chevron, danger }: { icon: IconName; label: string; onClick?: () => void; chevron?: boolean; danger?: boolean }) {
-  return <button className={`tray-action ${danger ? 'danger' : ''}`} onClick={onClick}><Icon name={icon} size={17} /><span>{label}</span>{chevron && <Icon name="chevron-right" size={14} />}</button>;
-}
-
-function TrayToggle({ icon, label, checked, onChange }: { icon: IconName; label: string; checked: boolean; onChange: (value: boolean) => void }) {
-  return <div className="tray-toggle"><Icon name={icon} size={17} /><span>{label}</span><Toggle label={label} checked={checked} onChange={onChange} /></div>;
-}
-
-export function NotificationsSurface({ snapshot }: { snapshot: AppSnapshot }) {
-  const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set());
-  const [pathError, setPathError] = useState('');
-  const items = snapshot.notifications.filter((item) => !dismissedIds.has(item.id));
-  const dismiss = (id: string) => setDismissedIds((current) => new Set(current).add(id));
-  const dismissAll = () => setDismissedIds((current) => {
-    const next = new Set(current);
-    snapshot.notifications.forEach((item) => next.add(item.id));
-    return next;
-  });
-  const openPath = (path: string) => {
-    setPathError('');
-    void openLocalPath(path).then((error) => { if (error) setPathError(error); });
-  };
-  return <div className="notifications-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><div className="notification-stack-title"><strong>Notifications</strong><button className="icon-button" aria-label="Dismiss all" onClick={dismissAll}><Icon name="close" size={16} /></button></div>{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{items.map((item) => <NotificationCard key={item.id} item={item} job={snapshot.jobs.find((job) => job.id === item.jobId)} onDismiss={() => dismiss(item.id)} onOpen={openPath} />)}{!items.length && <div className="empty-notifications"><Icon name="check" size={24} /><span>You're all caught up</span></div>}</div>;
-}
-
-function NotificationCard({ item, job, onDismiss, onOpen }: { item: AppSnapshot['notifications'][number]; job?: DownloadJob; onDismiss: () => void; onOpen: (path: string) => void }) {
-  const completed = item.type === 'completed';
-  const folder = job?.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <article className={`notification-card ${completed ? 'completed' : 'failed'}`}><div className="notification-icon"><Icon name={completed ? 'check' : 'error'} size={20} /></div><div className="notification-copy"><div><strong>{item.title}</strong><span>{formatTime(item.time)}</span></div><p>{item.detail}</p><div className="notification-actions"><button className="button" onClick={() => completed && job ? onOpen(job.destination) : openManagerSurface(item.jobId)}>{completed ? 'Open' : 'View details'}</button><button className="button" onClick={() => completed && folder ? onOpen(folder) : openManagerSurface(item.jobId)}>{completed ? 'Show in folder' : 'Open Manager'}</button></div></div><button className="notification-close" aria-label={`Dismiss ${item.title}: ${item.detail}`} onClick={onDismiss}><Icon name="close" size={15} /></button></article>;
 }
 
 export default App;

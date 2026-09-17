@@ -49,6 +49,12 @@ jobs:
       - name: Test
         run: npm test
 
+      # The engine, the capture rules and the store live in Rust; their tests only
+      # run here. Release profile reuses the dependency cache the packaging step
+      # needs anyway.
+      - name: Test (Rust)
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
+
       # The catalog is what the official WebView2 download page itself reads. It is
       # undocumented, so a pinned version can be supplied through workflow_dispatch.
       - name: Resolve WebView2 Fixed Version runtime

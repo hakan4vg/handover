@@ -426,7 +426,32 @@ export function SortMenu({ value, onChange, onDismiss }: { value: 'created' | 'n
   return <KeyboardMenu className="sort-menu" label="Sort downloads" onDismiss={onDismiss}>{options.map(([key, label]) => <button key={key} className={value === key ? 'selected' : ''} role="menuitemradio" aria-checked={value === key} onClick={() => onChange(key)}><span>{label}</span>{value === key && <Icon name="check" size={14} />}</button>)}</KeyboardMenu>;
 }
 
-export function DownloadRow({ job, selected, menuOpen = false, onSelect, onPause, onResume, onRetry, onMenu }: { job: DownloadJob; selected: boolean; menuOpen?: boolean; onSelect: () => void; onPause: () => void; onResume: () => void; onRetry: () => void; onMenu: () => void }) {
+type DownloadRowProps = { job: DownloadJob; selected: boolean; menuOpen?: boolean; onSelect: () => void; onPause: () => void; onResume: () => void; onRetry: () => void; onMenu: () => void };
+
+/** The fields a row actually renders. Every snapshot arrives as a fresh object
+ *  graph at up to 4 Hz, so identity comparison would repaint the whole list on
+ *  every progress tick; a row only repaints when one of these changed. The
+ *  handlers are deliberately not compared: each closes over its own job id,
+ *  which is part of the comparison. */
+export function rowFieldsEqual(previous: DownloadRowProps, next: DownloadRowProps): boolean {
+  const before = previous.job;
+  const after = next.job;
+  return previous.selected === next.selected
+    && previous.menuOpen === next.menuOpen
+    && before.id === after.id
+    && before.name === after.name
+    && before.domain === after.domain
+    && before.kind === after.kind
+    && before.state === after.state
+    && before.progress === after.progress
+    && before.downloaded === after.downloaded
+    && before.total === after.total
+    && before.speed === after.speed
+    && before.eta === after.eta
+    && before.connections === after.connections;
+}
+
+export const DownloadRow = memo(function DownloadRow({ job, selected, menuOpen = false, onSelect, onPause, onResume, onRetry, onMenu }: DownloadRowProps) {
   const showsConnections = stateIn(job.state, [...TRANSFER_STATES, ...RESUMABLE_STATES]);
   const stateLabel = stateText(job.state);
   // One decision per row, so the control, its icon, and its accessible name can
@@ -450,7 +475,7 @@ export function DownloadRow({ job, selected, menuOpen = false, onSelect, onPause
     <div className="row-speed">{job.state === 'downloading' && job.speed ? formatSpeed(job.speed) : job.state === 'completed' ? formatBytes(job.total) : '—'}</div>
     <div className="row-actions">{action && <button className="row-action" aria-label={action.label} onClick={(event) => { event.stopPropagation(); action.run(); }}><Icon name={action.icon} size={16} /></button>}<button className="row-action" aria-haspopup="menu" aria-expanded={menuOpen} aria-label={`More actions for ${job.name}`} onClick={(event) => { event.stopPropagation(); onMenu(); }}><Icon name="more" size={16} /></button></div>
   </article>;
-}
+}, rowFieldsEqual);
 
 function stateText(state: DownloadState) {
   return ({ connecting: 'Connecting', downloading: 'Downloading', paused: 'Paused', pending: 'Waiting', finalizing: 'Finalizing', ready: 'Ready to save', completed: 'Completed', failed: 'Failed' })[state];

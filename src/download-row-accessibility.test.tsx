@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { DownloadRow } from './App';
+import { DownloadRow, rowFieldsEqual } from './App';
 import type { DownloadJob } from './types';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
@@ -117,5 +117,36 @@ describe('DownloadRow action names', () => {
     }
 
     act(() => root.unmount());
+  });
+});
+
+describe('DownloadRow repaint boundary', () => {
+  const props = (overrides: Partial<DownloadJob> = {}, extra: { selected?: boolean; menuOpen?: boolean } = {}) => ({
+    job: { ...job, ...overrides },
+    selected: extra.selected ?? false,
+    menuOpen: extra.menuOpen ?? false,
+    onSelect: () => undefined,
+    onPause: () => undefined,
+    onResume: () => undefined,
+    onRetry: () => undefined,
+    onMenu: () => undefined,
+  });
+
+  it('ignores the fresh object graph a progress snapshot delivers', () => {
+    // Each emit deserializes the whole snapshot, so the row sees new objects
+    // with identical data four times a second.
+    expect(rowFieldsEqual(props(), props())).toBe(true);
+  });
+
+  it('repaints when anything the row shows changed', () => {
+    expect(rowFieldsEqual(props(), props({ progress: 43 }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({ downloaded: 421 }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({ speed: 0 }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({ eta: '12s left' }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({ state: 'paused' }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({ connections: 1 }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({ name: 'renamed.zip' }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({}, { selected: true }))).toBe(false);
+    expect(rowFieldsEqual(props(), props({}, { menuOpen: true }))).toBe(false);
   });
 });

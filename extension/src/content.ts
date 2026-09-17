@@ -319,14 +319,20 @@ window.addEventListener('message', (event) => {
   pending.resolve(pageEvidenceFromValue(data.evidence));
 });
 
-function requestPageEvidence(currentSrc: string, playerKind: 'audio' | 'video'): Promise<MediaEvidence | undefined> {
+function requestPageEvidence(currentSrc: string, playerKind: 'audio' | 'video'): Promise<{ evidence: MediaEvidence | undefined; timedOut: boolean }> {
   const requestId = `evidence-${nextPageEvidenceRequest++}`;
   return new Promise((resolve) => {
     const timer = window.setTimeout(() => {
       pendingPageEvidence.delete(requestId);
-      resolve(undefined);
+      // The bridge never answered: a missing page bridge (opaque-origin frame,
+      // srcdoc iframe) looks identical to "the bridge had nothing to say"
+      // unless the caller can tell those apart.
+      resolve({ evidence: undefined, timedOut: true });
     }, 200);
-    pendingPageEvidence.set(requestId, { resolve, timer });
+    pendingPageEvidence.set(requestId, {
+      resolve: (value) => resolve({ evidence: value, timedOut: false }),
+      timer,
+    });
     window.postMessage({ marker: PAGE_MEDIA_MARKER, type: PAGE_MEDIA_QUERY, requestId, currentSrc, playerKind }, location.origin);
   });
 }
@@ -586,7 +592,8 @@ function requestMediaFilter(el: HTMLMediaElement, source: string, key: string): 
     let expires = Date.now() + 3000;
     try {
       const playerKind = el instanceof HTMLAudioElement ? 'audio' : 'video';
-      const evidence = isHttp(source) ? undefined : await requestPageEvidence(source, playerKind);
+      const evidenceReply = isHttp(source) ? undefined : await requestPageEvidence(source, playerKind);
+      const evidence = evidenceReply?.evidence;
       const resolved = isHttp(source) ? source : evidence?.currentSrc === source ? evidence.source : undefined;
       if (resolved && isHttp(resolved)) {
         const response = await chrome.runtime.sendMessage({
@@ -999,11 +1006,15 @@ async function capture(): Promise<void> {
   }
   try {
     const evidenceStarted = Date.now();
-    const pageEvidence = currentSrc ? await requestPageEvidence(currentSrc, playerKind) : undefined;
+    const evidenceReply = currentSrc
+      ? await requestPageEvidence(currentSrc, playerKind)
+      : { evidence: undefined, timedOut: false };
+    const pageEvidence = evidenceReply.evidence;
     traceRecord('acquirement', 'capture.evidence', {
       durationMs: Date.now() - evidenceStarted,
       currentSrc,
       found: !!pageEvidence,
+      timedOut: evidenceReply.timedOut,
       evidence: pageEvidence ?? null,
       hasSource: !!pageEvidence?.source,
       hintCount: pageEvidence?.selectedSegments.length ?? 0,

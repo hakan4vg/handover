@@ -7336,3 +7336,66 @@ honestly. Live rejection, DRM, and cookie-vaulted sources are unchanged.
 - Open problem, from the same trace: obtain a rebuildable handle when only signed range slices are
   visible. YouTube's captured URL is a SABR chunk request and a plain fetch of it is rejected by the
   server itself (`sabr.malformed_config`), so it stays out of reach without extraction.
+
+## 2026-09-18 — Static audit pass: ownership rules, hot-path writes, dead surfaces
+
+An independent read of every product path at `5d8459f` (SPEC/STATUS/audit consulted afterwards, then
+treated as stale) produced a findings list, `audit/AUDIT-STATIC-2026-09-18.md` (private, like the
+other internal records). This entry is the fix pass over it — branch `fix/audit-2026-09-18`, nine
+commits, each one revertable on its own.
+
+- **A job may only act on files it owns.** "Delete file from disk" was offered for every state and
+  the core deleted `destination` unconditionally. Only a completed job has a file it created there:
+  an unfinished job's destination is a plan and the reservation that makes it real happens at
+  completion, so deleting from a paused or failed row could remove a file the user already had under
+  that name. The action is now offered (inspector) and honoured (core) only for a completed job. The
+  same pass removed the managed-job Cancel action: discarding a capture is Cancel, discarding a
+  managed job is Remove from list (which already aborts the transfer and takes the partial data with
+  it), and the duplicate action's only real effect was to relabel a deliberate stop as Failed.
+- **The one-stream fallback no longer rewrites the world per chunk.** It called `emit_snapshot`
+  inside its receive loop, and that persists by deleting and re-inserting every job row before
+  shipping the whole snapshot to the UI — ~16k whole-table transactions for a 1 GB capture at 64 KiB
+  chunks. It now marks the job dirty exactly like the range and segment paths (4 Hz emits, 2 s
+  checkpoints, full snapshot on terminal transitions).
+- **`Allow per-download overrides` is enforced where it is written** (SPEC §11.4). Turning it off
+  used to only hide the Advanced fields in one dialog; the core still applied a capture's
+  `maxConnections`/`bandwidthLimit`.
+- **Hints can no longer invalidate the evidence they arrived with.** Both evidence validators
+  rejected the whole page-evidence object when any hint URL failed validation — and during
+  steady-state playback the hint list is mostly segments, so a routine `.ts` entry discarded exact
+  evidence and the capture fell through to tab-traffic attribution. Unusable hints are dropped; the
+  source the page named is kept.
+- **Finalization validates a file where it lies.** `finalize_mp4`'s slice-based validator read the
+  whole assembled file into memory; `validate_fmp4_file` walks the same box chain with headers read
+  one at a time, `moof` boxes read whole, `mdat` skipped by seeking, and a bounded box size. The
+  per-moof rules are unchanged, the multiplexed-initialization checks moved into the walk, and the
+  webm sniff reads four bytes instead of the file.
+- **Rows repaint only when they changed.** Snapshots arrive as fresh object graphs at 4 Hz, so every
+  row re-rendered on every progress tick. `DownloadRow` is memoized on the fields it renders, with
+  the comparator exported and pinned by assertions.
+- **Dead surfaces deleted** (SPEC §21.1/§21.5): `ExtensionPopup`, `TrayMenu` and
+  `NotificationsSurface` rendered only for `?view=…` URLs nothing opens — the tray is a native menu,
+  the popup is `extension/popup.html`, and the only programmatic window is `?window=add`. Their
+  styles, theme blocks, helper and four test files went with them (-428 lines). The notification
+  bookkeeping in the core stays: it gates the native toasts and enforces "never announce a row the
+  list does not contain", which is what SPEC §7.3/§11.5 actually describe.
+- **`kind` and `mediaDetails` are gone from the model.** The core filled neither: `kind` was always
+  `document` plus the player's own track kind, so every native job drew the generic file icon while
+  the disk/archive/audio styling was mock-only; `mediaDetails` was never set, so the Media tab
+  printed its fallback for every job. Icons now come from one shared rule over the name and MIME
+  (`src/file-kind.ts`, also used by the mock for its media flag) and the Media tab shows the
+  container it knows. Old DB payloads still load — serde ignores removed keys.
+- **`main.rs` lost its test module** (1.3k lines → `capture_tests.rs`) and **CI runs the Rust suite**;
+  until now only `npm test` ran, so the 118 engine tests were never executed by CI.
+- Deliberately left, with reasons in the audit file: the dual-track mux still holds three media
+  buffers (streaming it is its own change), the manual Add URL overlay is still in-page (SPEC §10.6
+  wants a window; that is an addition), and 8–9 px labels remain.
+
+- Gate: Rust `118/118`, Vitest `38` files/`167` tests, `npx tsc -b` clean, frontend and extension
+  production builds, `extension/dist` rebuilt. No live run: the changes are ownership rules, hot-path
+  bookkeeping and subtractions, all of which the suites pin.
+- Next decision (proposal in the audit file §4, not started): acquirement robustness. Recommendation
+  is to stop letting media-shaped URLs skip the pre-flight probe, to forward the tab's observed
+  representation URLs as the variant hints instead of falling back to the manifest's first entry, and
+  then — as one self-contained change with its own live proof on a session-gated hoster — to replay
+  the captured request's own scoped headers (cookies included) instead of a cookie-less fetch.

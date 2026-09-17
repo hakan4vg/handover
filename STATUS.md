@@ -7322,3 +7322,17 @@ provider was tested next.
 What this does not claim: a player whose media the tab never fetched (pure `WebCodecs` from
 in-memory data, or streams assembled from sources the browser got from a prior page) still fails
 honestly. Live rejection, DRM, and cookie-vaulted sources are unchanged.
+
+## 2026-09-18 — The audit-fix session is reverted in full
+
+- Everything that session wrote — save/delete guards, transfer caps and job states, current-media
+  epochs, request-context replay, the duplicate-track rule — is removed. The tree is back at
+  `5d8459f`, the branch is deleted, and the STATUS entries that described those changes went with
+  the revert.
+- Why: it added no download that did not already work, so none of it earned its keep. The recorded
+  13-click trace fails inside the extension's own "signed slices are never a source" rule — 8 of 13
+  clicks produce nothing before any of the changed code runs — and every class that does work
+  (playlist-backed Vimeo, HLS, progressive files) completed before these commits existed.
+- Open problem, from the same trace: obtain a rebuildable handle when only signed range slices are
+  visible. YouTube's captured URL is a SABR chunk request and a plain fetch of it is rejected by the
+  server itself (`sabr.malformed_config`), so it stays out of reach without extraction.

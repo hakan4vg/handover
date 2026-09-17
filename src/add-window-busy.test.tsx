@@ -20,7 +20,6 @@ const job = {
   name: 'capture.bin',
   source: 'http://127.0.0.1:8901/file/range.bin',
   domain: '127.0.0.1',
-  kind: 'document',
   state: 'downloading',
   progress: 10,
   downloaded: 1024,

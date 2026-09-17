@@ -12,7 +12,6 @@ const job: DownloadJob = {
   name: 'broken.iso',
   source: 'https://example.com/broken.iso',
   domain: 'example.com',
-  kind: 'disk',
   state: 'failed',
   progress: 13,
   downloaded: 13,

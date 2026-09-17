@@ -21,7 +21,6 @@ function job(): DownloadJob {
     source: 'http://127.0.0.1:9/file.bin',
     name: 'file.bin',
     domain: '127.0.0.1',
-    kind: 'document',
     state: 'finalizing',
     progress: 100,
     downloaded: 256,

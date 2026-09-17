@@ -12,7 +12,6 @@ const job: DownloadJob = {
   name: 'project-assets.zip',
   source: 'https://example.com/project-assets.zip',
   domain: 'example.com',
-  kind: 'archive',
   state: 'downloading',
   progress: 42,
   downloaded: 420,

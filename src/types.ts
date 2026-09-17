@@ -36,7 +36,6 @@ export interface DownloadJob {
   name: string;
   source: string;
   domain: string;
-  kind: 'video' | 'archive' | 'disk' | 'document' | 'audio';
   state: DownloadState;
   progress: number;
   downloaded: number;
@@ -49,7 +48,6 @@ export interface DownloadJob {
   bandwidthLimit?: number | null;
   mode: TransferMode;
   media: boolean;
-  mediaDetails?: string;
   mediaTracks?: number;
   destination: string;
   tempPath: string;

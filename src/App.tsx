@@ -6,6 +6,7 @@ import { getCurrentWindow, currentMonitor, LogicalSize, LogicalPosition } from '
 import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
 import { createAdapter, formatBytes, formatSpeed } from './adapters';
 import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
+import { fileKind, type FileKind } from './file-kind';
 import { Icon, type IconName } from './icons';
 import { notificationActionJobId } from './notification-action';
 import { settingsPageFromSearch } from './settings-route';
@@ -441,7 +442,7 @@ export function rowFieldsEqual(previous: DownloadRowProps, next: DownloadRowProp
     && before.id === after.id
     && before.name === after.name
     && before.domain === after.domain
-    && before.kind === after.kind
+    && before.mime === after.mime
     && before.state === after.state
     && before.progress === after.progress
     && before.downloaded === after.downloaded
@@ -465,12 +466,12 @@ export const DownloadRow = memo(function DownloadRow({ job, selected, menuOpen =
         ? { run: onRetry, icon: 'refresh' as const, label: `Retry ${job.name}` }
         : undefined;
   return <article className={`download-row ${selected ? 'selected' : ''}`} role="group" tabIndex={0} aria-label={`Select ${job.name}`} aria-current={selected ? 'true' : undefined} aria-keyshortcuts="Enter Space" onClick={onSelect} onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(); } }}>
-    <div className="file-cell"><FileIcon kind={job.kind} /><span className="file-type">{typeLabel(job.name)}</span></div>
+    <div className="file-cell"><FileIcon kind={fileKind(job.name, job.mime)} /><span className="file-type">{typeLabel(job.name)}</span></div>
     <div className="row-main">
       <div className="row-title-line"><strong title={job.name}>{job.name}</strong><span className={`state ${stateTone(job.state)}`}>{stateLabel}</span></div>
       <div className="row-source"><Icon name="globe" size={12} />{job.domain}</div>
       <div className="progress-track"><span className={`progress-fill ${stateTone(job.state)}`} style={{ width: `${job.progress}%` }} /></div>
-      <div className="row-meta"><span>{formatBytes(job.downloaded)}{job.total ? ` / ${formatBytes(job.total)}` : ''}</span><span>{job.eta ?? (job.state === 'completed' ? 'Completed' : '—')}</span>{job.mediaDetails && <span>{job.mediaDetails}</span>}{showsConnections && <span>{job.connections ? `${job.connections} connection${job.connections === 1 ? '' : 's'}` : 'No active connections'}</span>}</div>
+      <div className="row-meta"><span>{formatBytes(job.downloaded)}{job.total ? ` / ${formatBytes(job.total)}` : ''}</span><span>{job.eta ?? (job.state === 'completed' ? 'Completed' : '—')}</span>{showsConnections && <span>{job.connections ? `${job.connections} connection${job.connections === 1 ? '' : 's'}` : 'No active connections'}</span>}</div>
     </div>
     <div className="row-speed">{job.state === 'downloading' && job.speed ? formatSpeed(job.speed) : job.state === 'completed' ? formatBytes(job.total) : '—'}</div>
     <div className="row-actions">{action && <button className="row-action" aria-label={action.label} onClick={(event) => { event.stopPropagation(); action.run(); }}><Icon name={action.icon} size={16} /></button>}<button className="row-action" aria-haspopup="menu" aria-expanded={menuOpen} aria-label={`More actions for ${job.name}`} onClick={(event) => { event.stopPropagation(); onMenu(); }}><Icon name="more" size={16} /></button></div>
@@ -508,7 +509,7 @@ export function formatTime(value: string): string {
   return `${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}, ${timePart}`;
 }
 
-function FileIcon({ kind }: { kind: DownloadJob['kind'] }) {
+function FileIcon({ kind }: { kind: FileKind }) {
   const icon = kind === 'video' ? 'media' : kind === 'disk' ? 'disk' : kind === 'archive' ? 'archive' : kind === 'audio' ? 'audio' : 'file';
   return <div className={`file-icon file-${kind}`}><Icon name={icon} size={25} /></div>;
 }
@@ -571,7 +572,7 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
       setRemoving(false);
     }
   };
-  return <aside className="inspector"><div className="inspector-tabs" role="tablist" aria-label="Download details">{inspectorTabs.map((item) => <button disabled={item === 'Media' && !job.media} key={item} id={tabId(item)} role="tab" aria-selected={tab === item} aria-controls={panelId} tabIndex={tab === item ? 0 : -1} className={tab === item ? 'active' : ''} onClick={() => setTab(item)} onKeyDown={(event) => handleTabKeyDown(event, availableTabs.indexOf(item))}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll" id={panelId} role="tabpanel" tabIndex={0} aria-labelledby={tabId(tab)}><div className="inspector-heading"><FileIcon kind={job.kind} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile} title="Open file"><Icon name="open" size={18} /><span className="sr-only">Open file</span></button><button className="button" disabled={job.state !== 'completed'} onClick={openFolder} title="Open containing folder"><Icon name="folder" size={18} /><span className="sr-only">Open containing folder</span></button><button className="button" disabled={removing} onClick={() => void remove(false)} title="Remove from list"><Icon name="close" size={18} /><span className="sr-only">{removing ? 'Removing…' : 'Remove'}</span></button><button className="button danger-button" disabled={removing || !ownsDestination} title={ownsDestination ? 'Delete file from disk and remove from list' : 'Only a completed download can delete its file'} onClick={() => void remove(true)}><Icon name="delete" size={18} /><span className="sr-only">Delete file</span></button></div></aside>;
+  return <aside className="inspector"><div className="inspector-tabs" role="tablist" aria-label="Download details">{inspectorTabs.map((item) => <button disabled={item === 'Media' && !job.media} key={item} id={tabId(item)} role="tab" aria-selected={tab === item} aria-controls={panelId} tabIndex={tab === item ? 0 : -1} className={tab === item ? 'active' : ''} onClick={() => setTab(item)} onKeyDown={(event) => handleTabKeyDown(event, availableTabs.indexOf(item))}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll" id={panelId} role="tabpanel" tabIndex={0} aria-labelledby={tabId(tab)}><div className="inspector-heading"><FileIcon kind={fileKind(job.name, job.mime)} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile} title="Open file"><Icon name="open" size={18} /><span className="sr-only">Open file</span></button><button className="button" disabled={job.state !== 'completed'} onClick={openFolder} title="Open containing folder"><Icon name="folder" size={18} /><span className="sr-only">Open containing folder</span></button><button className="button" disabled={removing} onClick={() => void remove(false)} title="Remove from list"><Icon name="close" size={18} /><span className="sr-only">{removing ? 'Removing…' : 'Remove'}</span></button><button className="button danger-button" disabled={removing || !ownsDestination} title={ownsDestination ? 'Delete file from disk and remove from list' : 'Only a completed download can delete its file'} onClick={() => void remove(true)}><Icon name="delete" size={18} /><span className="sr-only">Delete file</span></button></div></aside>;
 }
 
 function DetailGrid({ items }: { items: Array<{ label: string; value: string; tone?: string; copyable?: boolean }> }) {
@@ -650,7 +651,7 @@ function NetworkDetails({ job }: { job: DownloadJob }) {
 
 function MediaDetails({ job }: { job: DownloadJob }) {
   const finalization = job.state === 'finalizing' ? 'In progress' : job.state === 'ready' ? 'Ready' : job.state === 'completed' ? 'Complete' : 'Not started';
-  return <><SectionTitle icon="media" title="Current media" /><DetailGrid items={[{ label: 'Presentation', value: job.mediaDetails ?? 'Finite browser media' }, { label: 'Acquisition', value: job.mode === 'segments' ? 'Manifest and ordered fragments' : 'Progressive resource' }, { label: 'Container', value: job.mime?.split('/')[1]?.toUpperCase() ?? 'Detecting' }, { label: 'Tracks', value: job.mediaTracks ? `${job.mediaTracks} · ${job.mediaTracks > 1 ? 'separate streams' : 'single stream'}` : 'Detecting' }, { label: 'Segments', value: job.segments ? `${job.segments.completed} of ${job.segments.total}` : 'Not segmented' }, { label: 'Finalization', value: finalization }]} /><div className="info-callout"><Icon name="info" size={16} /><span>The selected source follows the media currently playing in the browser.</span></div></>;
+  return <><SectionTitle icon="media" title="Current media" /><DetailGrid items={[{ label: 'Container', value: job.mime ?? 'Detecting' }, { label: 'Acquisition', value: job.mode === 'segments' ? 'Manifest and ordered fragments' : 'Progressive resource' }, { label: 'Container', value: job.mime?.split('/')[1]?.toUpperCase() ?? 'Detecting' }, { label: 'Tracks', value: job.mediaTracks ? `${job.mediaTracks} · ${job.mediaTracks > 1 ? 'separate streams' : 'single stream'}` : 'Detecting' }, { label: 'Segments', value: job.segments ? `${job.segments.completed} of ${job.segments.total}` : 'Not segmented' }, { label: 'Finalization', value: finalization }]} /><div className="info-callout"><Icon name="info" size={16} /><span>The selected source follows the media currently playing in the browser.</span></div></>;
 }
 
 function FileDetails({ job }: { job: DownloadJob }) {

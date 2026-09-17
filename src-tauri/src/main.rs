@@ -39,7 +39,6 @@ struct DownloadJob {
     name: String,
     source: String,
     domain: String,
-    kind: String,
     state: String,
     progress: f64,
     downloaded: u64,
@@ -55,7 +54,6 @@ struct DownloadJob {
     bandwidth_limit: Option<u64>,
     mode: String,
     media: bool,
-    media_details: Option<String>,
     #[serde(default)]
     media_tracks: Option<u32>,
     destination: String,
@@ -5197,7 +5195,6 @@ fn start_provisional(
                         };
                         job.source = input.source.clone();
                         job.selected_segments = input.selected_segments.clone();
-                        job.kind = player_kind.clone().unwrap_or_else(|| "document".into());
                         job.player_kind = player_kind.clone();
                         job.companion_audio = companion_audio.clone();
                         job.referrer = input.referrer.clone();
@@ -5263,7 +5260,6 @@ fn start_provisional(
         name,
         source: input.source.clone(),
         domain: domain(&input.source),
-        kind: player_kind.clone().unwrap_or_else(|| "document".into()),
         state: "connecting".into(),
         progress: 0.0,
         downloaded: 0,
@@ -5275,7 +5271,6 @@ fn start_provisional(
         bandwidth_limit,
         mode: "single-stream".into(),
         media,
-        media_details: None,
         media_tracks: None,
         destination,
         temp_path: Path::new(&temp_folder)

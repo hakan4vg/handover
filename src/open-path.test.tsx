@@ -26,7 +26,7 @@ describe('openLocalPath', () => {
     (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
     vi.mocked(invoke).mockRejectedValueOnce(new Error('launcher unavailable'));
     const job: DownloadJob = {
-      id: 'job-1', name: 'finished.bin', source: 'https://example.com/finished.bin', domain: 'example.com', kind: 'archive',
+      id: 'job-1', name: 'finished.bin', source: 'https://example.com/finished.bin', domain: 'example.com',
       state: 'completed', progress: 100, downloaded: 42, total: 42, speed: 0, connections: 1, maxConnections: 4,
       mode: 'whole-object', media: false, destination: '/tmp/finished.bin', tempPath: '/tmp/finished.bin.part', resumable: true,
       created: '2026-09-07T00:00:00Z', events: [],

@@ -12,7 +12,6 @@ const job: DownloadJob = {
   source: 'https://example.com/file.bin',
   name: 'file.bin',
   domain: 'example.com',
-  kind: 'document',
   state: 'completed',
   progress: 100,
   downloaded: 256,

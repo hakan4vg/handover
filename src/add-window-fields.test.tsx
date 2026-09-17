@@ -23,7 +23,6 @@ function job(overrides: Partial<DownloadJob> = {}): DownloadJob {
     source: 'http://127.0.0.1:9/file/original.bin',
     name: 'original.bin',
     domain: '127.0.0.1',
-    kind: 'document',
     state: 'connecting',
     progress: 0,
     downloaded: 0,

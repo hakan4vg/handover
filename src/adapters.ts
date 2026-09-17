@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { sanitizeCapBps } from './bandwidth';
+import { isMediaFile } from './file-kind';
 import type {
   AppSettings,
   AppSnapshot,
@@ -92,15 +93,6 @@ function event(message: string, tone: JobEvent['tone'] = 'normal'): JobEvent {
   return { at: timeLabel(), message, tone };
 }
 
-function guessKind(name: string): DownloadJob['kind'] {
-  const ext = name.split('.').pop()?.toLowerCase();
-  if (['mp4', 'mkv', 'webm', 'mov'].includes(ext ?? '')) return 'video';
-  if (['mp3', 'm4a', 'aac', 'wav'].includes(ext ?? '')) return 'audio';
-  if (['zip', 'tar', 'gz', 'xz', '7z', 'rar'].includes(ext ?? '')) return 'archive';
-  if (ext === 'iso' || ext === 'img') return 'disk';
-  return 'document';
-}
-
 function sourceName(source: string) {
   try {
     const url = new URL(source);
@@ -128,31 +120,31 @@ function initialJobs(): DownloadJob[] {
   });
   return [
     make({
-      id: 'job-1', name: 'ubuntu-24.04-desktop-amd64.iso', source: 'https://releases.ubuntu.com/24.04/ubuntu-24.04-desktop-amd64.iso', domain: 'releases.ubuntu.com', kind: 'disk', state: 'downloading', progress: 49.8, downloaded: 2.34 * 1024 ** 3, total: 4.70 * 1024 ** 3, speed: 42.3 * 1024 ** 2, eta: '36s left', connections: 4, maxConnections: 16, mode: 'whole-object', media: false, destination: `${base}\\ubuntu-24.04-desktop-amd64.iso`, tempPath: `${temp}\\job-1.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', events: [event('Range support verified'), event('4 workers downloading', 'success')],
+      id: 'job-1', name: 'ubuntu-24.04-desktop-amd64.iso', source: 'https://releases.ubuntu.com/24.04/ubuntu-24.04-desktop-amd64.iso', domain: 'releases.ubuntu.com', state: 'downloading', progress: 49.8, downloaded: 2.34 * 1024 ** 3, total: 4.70 * 1024 ** 3, speed: 42.3 * 1024 ** 2, eta: '36s left', connections: 4, maxConnections: 16, mode: 'whole-object', media: false, destination: `${base}\\ubuntu-24.04-desktop-amd64.iso`, tempPath: `${temp}\\job-1.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', events: [event('Range support verified'), event('4 workers downloading', 'success')],
     }),
     make({
-      id: 'job-2', name: 'Big Buck Bunny (1080p).mkv', source: 'https://media.example.org/vod/big-buck-bunny/1080p/manifest.mpd', domain: 'media.example.org', kind: 'video', state: 'finalizing', progress: 95, downloaded: 1.18 * 1024 ** 3, total: 1.28 * 1024 ** 3, speed: 0, eta: 'Finalizing', connections: 4, maxConnections: 16, mode: 'segments', media: true, mediaDetails: '1080p · H.264 + AAC', destination: `${base}\\Big Buck Bunny (1080p).mkv`, tempPath: `${temp}\\job-2\\`, resumable: true, mime: 'video/x-matroska', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', segments: { completed: 118, total: 124 }, events: [event('Manifest parsed: 124 fragments'), event('Media parts acquired', 'success'), event('Merging container (95%)', 'warning')],
+      id: 'job-2', name: 'Big Buck Bunny (1080p).mkv', source: 'https://media.example.org/vod/big-buck-bunny/1080p/manifest.mpd', domain: 'media.example.org', state: 'finalizing', progress: 95, downloaded: 1.18 * 1024 ** 3, total: 1.28 * 1024 ** 3, speed: 0, eta: 'Finalizing', connections: 4, maxConnections: 16, mode: 'segments', media: true, destination: `${base}\\Big Buck Bunny (1080p).mkv`, tempPath: `${temp}\\job-2\\`, resumable: true, mime: 'video/x-matroska', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', segments: { completed: 118, total: 124 }, events: [event('Manifest parsed: 124 fragments'), event('Media parts acquired', 'success'), event('Merging container (95%)', 'warning')],
     }),
     make({
-      id: 'job-3', name: 'project-assets.zip', source: 'https://cdn.example.com/releases/project-assets.zip', domain: 'cdn.example.com', kind: 'archive', state: 'paused', progress: 0, downloaded: 0, total: 512 * 1024 ** 2, speed: 0, eta: 'Paused', connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\project-assets.zip`, tempPath: `${temp}\\job-3.part`, resumable: true, mime: 'application/zip', created: 'Today, 9:38 AM', events: [event('Paused before start', 'warning')],
+      id: 'job-3', name: 'project-assets.zip', source: 'https://cdn.example.com/releases/project-assets.zip', domain: 'cdn.example.com', state: 'paused', progress: 0, downloaded: 0, total: 512 * 1024 ** 2, speed: 0, eta: 'Paused', connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\project-assets.zip`, tempPath: `${temp}\\job-3.part`, resumable: true, mime: 'application/zip', created: 'Today, 9:38 AM', events: [event('Paused before start', 'warning')],
     }),
     make({
-      id: 'job-4', name: 'Nature Documentary (4K).mkv', source: 'https://media.example.org/nature/4k/documentary.mkv', domain: 'media.example.org', kind: 'video', state: 'completed', progress: 100, downloaded: 2.85 * 1024 ** 3, total: 2.85 * 1024 ** 3, speed: 0, eta: undefined, connections: 0, maxConnections: 8, mode: 'segments', media: true, mediaDetails: '2160p · HEVC + AAC', destination: `${base}\\Nature Documentary (4K).mkv`, tempPath: `${temp}\\job-4\\`, resumable: true, mime: 'video/x-matroska', created: 'Yesterday, 3:12 PM', started: 'Yesterday, 3:12 PM', completed: 'Yesterday, 3:27 PM', segments: { completed: 284, total: 284 }, events: [event('Download completed', 'success')],
+      id: 'job-4', name: 'Nature Documentary (4K).mkv', source: 'https://media.example.org/nature/4k/documentary.mkv', domain: 'media.example.org', state: 'completed', progress: 100, downloaded: 2.85 * 1024 ** 3, total: 2.85 * 1024 ** 3, speed: 0, eta: undefined, connections: 0, maxConnections: 8, mode: 'segments', media: true, destination: `${base}\\Nature Documentary (4K).mkv`, tempPath: `${temp}\\job-4\\`, resumable: true, mime: 'video/x-matroska', created: 'Yesterday, 3:12 PM', started: 'Yesterday, 3:12 PM', completed: 'Yesterday, 3:27 PM', segments: { completed: 284, total: 284 }, events: [event('Download completed', 'success')],
     }),
     make({
-      id: 'job-5', name: 'Fedora-Workstation-Live-x86_64.iso', source: 'https://download.fedoraproject.org/pub/fedora/linux/releases/41/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64.iso', domain: 'download.fedoraproject.org', kind: 'disk', state: 'downloading', progress: 54.2, downloaded: 1.09 * 1024 ** 3, total: 2.01 * 1024 ** 3, speed: 18.7 * 1024 ** 2, eta: '51s left', connections: 3, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\Fedora-Workstation-Live-x86_64.iso`, tempPath: `${temp}\\job-5.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:26 AM', started: 'Today, 9:26 AM', events: [event('Range support verified'), event('3 workers downloading', 'success')],
+      id: 'job-5', name: 'Fedora-Workstation-Live-x86_64.iso', source: 'https://download.fedoraproject.org/pub/fedora/linux/releases/41/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64.iso', domain: 'download.fedoraproject.org', state: 'downloading', progress: 54.2, downloaded: 1.09 * 1024 ** 3, total: 2.01 * 1024 ** 3, speed: 18.7 * 1024 ** 2, eta: '51s left', connections: 3, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\Fedora-Workstation-Live-x86_64.iso`, tempPath: `${temp}\\job-5.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:26 AM', started: 'Today, 9:26 AM', events: [event('Range support verified'), event('3 workers downloading', 'success')],
     }),
     make({
-      id: 'job-6', name: 'old-archive.tar.xz', source: 'https://archive.example.net/old-archive.tar.xz', domain: 'archive.example.net', kind: 'archive', state: 'failed', progress: 0, downloaded: 0, total: 128 * 1024 ** 2, speed: 0, eta: undefined, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\old-archive.tar.xz`, tempPath: `${temp}\\job-6.part`, resumable: true, error: 'Network error: Connection reset by peer', created: 'Today, 8:58 AM', events: [event('Connection reset by peer', 'error')],
+      id: 'job-6', name: 'old-archive.tar.xz', source: 'https://archive.example.net/old-archive.tar.xz', domain: 'archive.example.net', state: 'failed', progress: 0, downloaded: 0, total: 128 * 1024 ** 2, speed: 0, eta: undefined, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\old-archive.tar.xz`, tempPath: `${temp}\\job-6.part`, resumable: true, error: 'Network error: Connection reset by peer', created: 'Today, 8:58 AM', events: [event('Connection reset by peer', 'error')],
     }),
-    make({ id: 'job-7', name: 'Lecture 12 — Distributed Systems.mp4', source: 'https://video.university.example/lecture/12.mp4', domain: 'video.university.example', kind: 'video', state: 'completed', progress: 100, downloaded: 846 * 1024 ** 2, total: 846 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, mediaDetails: '1080p · H.264 + AAC', destination: `${base}\\Lecture 12 — Distributed Systems.mp4`, tempPath: `${temp}\\job-7.part`, resumable: true, completed: 'Today, 8:34 AM', created: 'Today, 8:12 AM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-8', name: 'conference-keynote.webm', source: 'https://events.example.org/2026/keynote.webm', domain: 'events.example.org', kind: 'video', state: 'completed', progress: 100, downloaded: 1.3 * 1024 ** 3, total: 1.3 * 1024 ** 3, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, mediaDetails: '1440p · VP9 + Opus', destination: `${base}\\conference-keynote.webm`, tempPath: `${temp}\\job-8.part`, resumable: true, completed: 'Today, 7:15 AM', created: 'Today, 6:51 AM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-9', name: 'design-system.pdf', source: 'https://docs.example.org/design-system.pdf', domain: 'docs.example.org', kind: 'document', state: 'completed', progress: 100, downloaded: 42 * 1024 ** 2, total: 42 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\design-system.pdf`, tempPath: `${temp}\\job-9.part`, resumable: true, completed: 'Yesterday, 6:22 PM', created: 'Yesterday, 6:20 PM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-10', name: 'studio-recording.m4a', source: 'https://audio.example.org/studio-recording.m4a', domain: 'audio.example.org', kind: 'audio', state: 'completed', progress: 100, downloaded: 212 * 1024 ** 2, total: 212 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, mediaDetails: 'AAC · stereo', destination: `${base}\\studio-recording.m4a`, tempPath: `${temp}\\job-10.part`, resumable: true, completed: 'Yesterday, 4:42 PM', created: 'Yesterday, 4:37 PM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-11', name: 'City Walk (4K).mp4', source: 'https://media.example.org/city-walk/4k.mp4', domain: 'media.example.org', kind: 'video', state: 'completed', progress: 100, downloaded: 3.6 * 1024 ** 3, total: 3.6 * 1024 ** 3, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, mediaDetails: '2160p · H.265 + AAC', destination: `${base}\\City Walk (4K).mp4`, tempPath: `${temp}\\job-11.part`, resumable: true, completed: 'Yesterday, 12:06 PM', created: 'Yesterday, 11:46 AM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-12', name: 'open-source-icons.zip', source: 'https://assets.example.com/open-source-icons.zip', domain: 'assets.example.com', kind: 'archive', state: 'completed', progress: 100, downloaded: 188 * 1024 ** 2, total: 188 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\open-source-icons.zip`, tempPath: `${temp}\\job-12.part`, resumable: true, completed: 'Yesterday, 10:11 AM', created: 'Yesterday, 10:07 AM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-13', name: 'product-tour.mp4', source: 'https://media.example.org/product-tour.mp4', domain: 'media.example.org', kind: 'video', state: 'completed', progress: 100, downloaded: 632 * 1024 ** 2, total: 632 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, mediaDetails: '1080p · H.264 + AAC', destination: `${base}\\product-tour.mp4`, tempPath: `${temp}\\job-13.part`, resumable: true, completed: 'Monday, 2:30 PM', created: 'Monday, 2:20 PM', events: [event('Download completed', 'success')] }),
-    make({ id: 'job-14', name: 'backup-manifest.json', source: 'https://backup.example.net/manifest.json', domain: 'backup.example.net', kind: 'document', state: 'failed', progress: 38, downloaded: 12 * 1024 ** 2, total: 31 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\backup-manifest.json`, tempPath: `${temp}\\job-14.part`, resumable: false, error: 'The remote server returned 503', created: 'Monday, 9:03 AM', events: [event('Server returned 503', 'error')] }),
+    make({ id: 'job-7', name: 'Lecture 12 — Distributed Systems.mp4', source: 'https://video.university.example/lecture/12.mp4', domain: 'video.university.example', state: 'completed', progress: 100, downloaded: 846 * 1024 ** 2, total: 846 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\Lecture 12 — Distributed Systems.mp4`, tempPath: `${temp}\\job-7.part`, resumable: true, completed: 'Today, 8:34 AM', created: 'Today, 8:12 AM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-8', name: 'conference-keynote.webm', source: 'https://events.example.org/2026/keynote.webm', domain: 'events.example.org', state: 'completed', progress: 100, downloaded: 1.3 * 1024 ** 3, total: 1.3 * 1024 ** 3, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\conference-keynote.webm`, tempPath: `${temp}\\job-8.part`, resumable: true, completed: 'Today, 7:15 AM', created: 'Today, 6:51 AM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-9', name: 'design-system.pdf', source: 'https://docs.example.org/design-system.pdf', domain: 'docs.example.org', state: 'completed', progress: 100, downloaded: 42 * 1024 ** 2, total: 42 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\design-system.pdf`, tempPath: `${temp}\\job-9.part`, resumable: true, completed: 'Yesterday, 6:22 PM', created: 'Yesterday, 6:20 PM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-10', name: 'studio-recording.m4a', source: 'https://audio.example.org/studio-recording.m4a', domain: 'audio.example.org', state: 'completed', progress: 100, downloaded: 212 * 1024 ** 2, total: 212 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\studio-recording.m4a`, tempPath: `${temp}\\job-10.part`, resumable: true, completed: 'Yesterday, 4:42 PM', created: 'Yesterday, 4:37 PM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-11', name: 'City Walk (4K).mp4', source: 'https://media.example.org/city-walk/4k.mp4', domain: 'media.example.org', state: 'completed', progress: 100, downloaded: 3.6 * 1024 ** 3, total: 3.6 * 1024 ** 3, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\City Walk (4K).mp4`, tempPath: `${temp}\\job-11.part`, resumable: true, completed: 'Yesterday, 12:06 PM', created: 'Yesterday, 11:46 AM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-12', name: 'open-source-icons.zip', source: 'https://assets.example.com/open-source-icons.zip', domain: 'assets.example.com', state: 'completed', progress: 100, downloaded: 188 * 1024 ** 2, total: 188 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\open-source-icons.zip`, tempPath: `${temp}\\job-12.part`, resumable: true, completed: 'Yesterday, 10:11 AM', created: 'Yesterday, 10:07 AM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-13', name: 'product-tour.mp4', source: 'https://media.example.org/product-tour.mp4', domain: 'media.example.org', state: 'completed', progress: 100, downloaded: 632 * 1024 ** 2, total: 632 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\product-tour.mp4`, tempPath: `${temp}\\job-13.part`, resumable: true, completed: 'Monday, 2:30 PM', created: 'Monday, 2:20 PM', events: [event('Download completed', 'success')] }),
+    make({ id: 'job-14', name: 'backup-manifest.json', source: 'https://backup.example.net/manifest.json', domain: 'backup.example.net', state: 'failed', progress: 38, downloaded: 12 * 1024 ** 2, total: 31 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\backup-manifest.json`, tempPath: `${temp}\\job-14.part`, resumable: false, error: 'The remote server returned 503', created: 'Monday, 9:03 AM', events: [event('Server returned 503', 'error')] }),
   ].map((job) => ({
     ...job,
     destination: platformPath(job.destination),
@@ -263,14 +255,13 @@ class MockAdapter implements DownloadAdapter {
 
   async createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) {
     const name = input.name?.trim() || sourceName(input.source);
-    const media = Boolean(input.media) || ['video', 'audio'].includes(guessKind(name));
+    const media = Boolean(input.media) || isMediaFile(name);
     const id = `provisional-${this.nextId++}`;
     const job: DownloadJob = {
       id,
       name,
       source: input.source,
       domain: domainOf(input.source),
-      kind: guessKind(name),
       state: 'connecting',
       progress: 0,
       downloaded: 0,
@@ -282,7 +273,6 @@ class MockAdapter implements DownloadAdapter {
       bandwidthLimit: sanitizeCapBps(input.bandwidthLimit) ?? null,
       mode: media ? 'segments' : 'single-stream',
       media,
-      mediaDetails: media ? 'Detecting current media…' : undefined,
       destination: platformPath(`${this.snapshot.settings.defaultFolder}\\${name}`),
       tempPath: platformPath(`${mockTempRoot}\\${id}.part`),
       resumable: false,

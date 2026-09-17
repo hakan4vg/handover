@@ -263,9 +263,11 @@ describe('media candidate selection', () => {
     expect(choosePlayerEvidence(players, 4, 0, 1000, 'doc-new')?.playerKey).toBe('new');
   });
 
-  it('attributes tab traffic to the sole playing player, whatever realm fetched it', () => {
+  it('attributes a frame\'s own traffic to the sole playing player in that frame, whatever realm fetched it', () => {
+    // A worker or cache-backed service worker fetch still lands in the player's
+    // own frame, so ownership by elimination works there.
     const candidates: MediaCandidate[] = [
-      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
+      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, role: 'unknown' },
     ];
     const players: MediaPlayerEvidence[] = [
       { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, active: true, hovered: false, playing: true, visible: true },
@@ -275,6 +277,20 @@ describe('media candidate selection', () => {
       selectedSegments: [],
       alternatives: [],
     });
+  });
+
+  it('never attributes another frame\'s traffic to an embedded player', () => {
+    // Live evidence (trace 2026-09-17 02-56): an inline YouTube embed inside a
+    // Reddit post was handed the host page's video, because frame-zero traffic
+    // was pooled for any player. A cross-origin embed's media can only come
+    // from its own frame; the host's media is an honest failure, not a guess.
+    const hostMedia: MediaCandidate[] = [
+      { url: 'https://packaged-media.redd.it/abc/pb/m2-res_720p.mp4', tabId: 4, frameId: 0, documentId: 'host-doc', at: 100, role: 'unknown', kind: 'video' },
+    ];
+    const players: MediaPlayerEvidence[] = [
+      { playerKey: 'embed-player', tabId: 4, frameId: 7, documentId: 'embed-doc', at: 100, active: true, hovered: false, playing: true, visible: true },
+    ];
+    expect(planMediaCapture(hostMedia, players, 4, 7, 'embed-player', 'embed-doc', 100)).toBeUndefined();
   });
 
   it('attributes frame-zero traffic to a top-level player whose bytes came from elsewhere', () => {
@@ -317,11 +333,11 @@ describe('media candidate selection', () => {
     expect(planMediaCapture(candidates, players, 4, 0, 'player-1', 'top-doc', 100)).toBeUndefined();
   });
 
-  it('ignores unclassified tab assets when attributing traffic', () => {
+  it('ignores unclassified assets when attributing a frame\'s traffic', () => {
     const candidates: MediaCandidate[] = [
-      { url: 'https://cdn.test/assets/player.js', tabId: 4, frameId: 0, documentId: 'top-doc', at: 100, role: 'unknown' },
-      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 0, documentId: 'top-doc', at: 101, role: 'unknown', kind: 'video' },
-      { url: 'https://cdn.test/assets/chunk.js', tabId: 4, frameId: 0, documentId: 'top-doc', at: 102, role: 'unknown' },
+      { url: 'https://cdn.test/assets/player.js', tabId: 4, frameId: 3, documentId: 'child-doc', at: 100, role: 'unknown' },
+      { url: 'https://cdn.test/vod/xgplayer-demo.mp4', tabId: 4, frameId: 3, documentId: 'child-doc', at: 101, role: 'unknown', kind: 'video' },
+      { url: 'https://cdn.test/assets/chunk.js', tabId: 4, frameId: 3, documentId: 'child-doc', at: 102, role: 'unknown' },
     ];
     const players: MediaPlayerEvidence[] = [
       { playerKey: 'child-player', tabId: 4, frameId: 3, documentId: 'child-doc', at: 102, active: true, hovered: false, playing: true, visible: true },

@@ -17,6 +17,12 @@ const recentMedia: MediaCandidate[] = [];
 const recentPlayers: MediaPlayerEvidence[] = [];
 const MEDIA_BUFFER_MAX = 60;
 const MEDIA_BUFFER_MS = 90_000;
+// Manifests are the only durable handle for chunked providers — their fragment
+// signatures expire within seconds (measured live) — so they are retained on a
+// much longer window instead of being flooded out by the segments that follow
+// them. This is role-based retention, not site knowledge.
+const MANIFEST_BUFFER_MAX = 16;
+const MANIFEST_BUFFER_MS = 10 * 60_000;
 const PLAYER_BUFFER_MAX = 40;
 const PLAYER_BUFFER_MS = 15_000;
 
@@ -259,8 +265,15 @@ async function sendApp(message: unknown): Promise<unknown> {
 }
 
 function pruneMedia(now = Date.now()): void {
-  while (recentMedia.length && now - recentMedia[0].at > MEDIA_BUFFER_MS) recentMedia.shift();
-  while (recentMedia.length > MEDIA_BUFFER_MAX) recentMedia.shift();
+  const manifests: MediaCandidate[] = [];
+  const others: MediaCandidate[] = [];
+  for (const item of recentMedia) (item.role === 'manifest' ? manifests : others).push(item);
+  while (manifests.length && now - manifests[0].at > MANIFEST_BUFFER_MS) manifests.shift();
+  while (manifests.length > MANIFEST_BUFFER_MAX) manifests.shift();
+  while (others.length && now - others[0].at > MEDIA_BUFFER_MS) others.shift();
+  while (others.length > MEDIA_BUFFER_MAX) others.shift();
+  recentMedia.length = 0;
+  recentMedia.push(...[...manifests, ...others].sort((left, right) => left.at - right.at));
 }
 
 function prunePlayers(now = Date.now()): void {
@@ -499,6 +512,8 @@ function rememberPlayer(payload: Record<string, unknown>, tabId: number, frameId
   if (!playerKey) return;
   const now = Date.now();
   prunePlayers(now);
+  const currentSrc = typeof payload.currentSrc === 'string' && payload.currentSrc ? payload.currentSrc.slice(0, 500) : undefined;
+  const mediaIdentity = typeof payload.mediaIdentity === 'string' && payload.mediaIdentity ? payload.mediaIdentity.slice(0, 300) : undefined;
   const evidence: MediaPlayerEvidence = {
     playerKey,
     tabId,
@@ -509,10 +524,19 @@ function rememberPlayer(payload: Record<string, unknown>, tabId: number, frameId
     hovered: payload.hovered === true,
     playing: payload.playing === true,
     visible: payload.visible === true,
+    ...(currentSrc ? { currentSrc } : {}),
+    ...(mediaIdentity ? { mediaIdentity } : {}),
   };
   const existing = recentPlayers.find((item) => item.playerKey === playerKey && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
-  if (existing) Object.assign(existing, evidence);
-  else recentPlayers.push(evidence);
+  if (existing) {
+    // srcAt marks when the current source first appeared: attribution only
+    // credits traffic newer than it (an SPA navigation replaces currentSrc).
+    const sameSrc = currentSrc !== undefined && existing.currentSrc === currentSrc;
+    Object.assign(existing, evidence);
+    existing.srcAt = sameSrc ? existing.srcAt ?? now : now;
+  } else {
+    recentPlayers.push({ ...evidence, srcAt: now });
+  }
 }
 
 function cleanFilename(value: unknown): string | undefined {

@@ -54,9 +54,9 @@ is itself evidence (the traffic ring is in-memory and dies with it).
 | --- | --- | --- |
 | `capture.click` | media button clicked, before anything else | **`buttonAgeMs`**, `mediaFirstSeenAgoMs`, hovered/playing/visible, pointer, currentSrc and its kind, player state, wrappers |
 | `capture.evidence` | page-bridge evidence reply (or timeout) | `durationMs`, the full evidence object (`source`, `sourceIdentity`, `selectedSegments` hints, manifest match) or `found:false` |
-| `capture.decision` | the worker's decision, recorded at every exit | `result`: `policy-error` / `no-source` / `filtered` / (handoff follows); for the fallback path: `solePlayingPlayer`, and full `mediaBuffer` (count, newest ages, per-entry role/kind/age/document+playerKey match) and `playerBuffer` (per-player playing/hovered/visible/age) snapshots |
-| `probe.page` | after a successful handoff | the source fetched **from the page's own context** (cookies + natural Referer), first 64 KiB, status/headers selection, byte sniff, and — if it is a manifest — the first child probed one level deep |
-| `probe.extension` | after a successful handoff | the same URL fetched **from the service worker**, once `credentials:'omit'` and once `credentials:'include'`, plus up to 2 candidate URLs (omit). The delta between these three lenses is exactly the cookie/referer story of a 403 |
+| `capture.decision` | the worker's decision, recorded at every exit | `result`: `policy-error` / `no-source` / `filtered` / (handoff follows); `kindInfo` (expected/decided/url kinds, role, and whether the kind guard cleared the source); for the fallback path: `solePlayingPlayer`, and full `mediaBuffer` (count, newest ages, per-entry role/kind/age/document+playerKey match) and `playerBuffer` (per-player playing/hovered/visible/age) snapshots |
+| `probe.page` | after a successful handoff | the source fetched **from the page's own context** (cookies + natural Referer): `role=primary` ranged with one-level manifest child, then `role=primary-plain` with **no Range header**. `elapsedMs`/`answered` distinguish a slow answer from a silent bridge |
+| `probe.extension` | after a successful handoff | the same URL fetched **from the service worker**: primary `omit+ranged`, primary `omit+plain`, primary `include+ranged`, then up to 2 candidates (`omit+ranged`). `requestRange` says which lens a row belongs to. A ranged 403 next to a plain 200 is the signature for CDNs that sign a byte range into the URL itself |
 
 ### handoff
 

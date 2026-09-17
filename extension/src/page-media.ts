@@ -568,9 +568,9 @@ async function traceReadBounded(response: Response, limit: number): Promise<Uint
   return merged;
 }
 
-async function traceProbeOnce(url: string): Promise<Record<string, unknown>> {
+async function traceProbeOnce(url: string, range: boolean): Promise<Record<string, unknown>> {
   const started = Date.now();
-  if (!traceNativeFetch) return { url, t: started, durationMs: 0, ok: false, error: 'fetch unavailable' };
+  if (!traceNativeFetch) return { url, t: started, durationMs: 0, ok: false, requestRange: range ? 'ranged' : 'plain', error: 'fetch unavailable' };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TRACE_PROBE_TIMEOUT_MS);
   try {
@@ -579,7 +579,7 @@ async function traceProbeOnce(url: string): Promise<Record<string, unknown>> {
       credentials: 'include',
       redirect: 'follow',
       cache: 'no-store',
-      headers: { Range: `bytes=0-${TRACE_PROBE_MAX_BYTES - 1}` },
+      ...(range ? { headers: { Range: `bytes=0-${TRACE_PROBE_MAX_BYTES - 1}` } } : {}),
       signal: controller.signal,
     });
     const bytes = await traceReadBounded(response, TRACE_PROBE_MAX_BYTES);
@@ -593,6 +593,7 @@ async function traceProbeOnce(url: string): Promise<Record<string, unknown>> {
       t: started,
       durationMs: Date.now() - started,
       ok: response.ok,
+      requestRange: range ? 'ranged' : 'plain',
       status: response.status,
       statusText: response.statusText,
       finalUrl: response.url.slice(0, 500),
@@ -609,6 +610,7 @@ async function traceProbeOnce(url: string): Promise<Record<string, unknown>> {
       t: started,
       durationMs: Date.now() - started,
       ok: false,
+      requestRange: range ? 'ranged' : 'plain',
       error: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason),
     };
   } finally {
@@ -616,12 +618,12 @@ async function traceProbeOnce(url: string): Promise<Record<string, unknown>> {
   }
 }
 
-async function traceProbe(url: string, depth: number): Promise<Record<string, unknown>> {
-  const primary = await traceProbeOnce(url);
+async function traceProbe(url: string, depth: number, range: boolean): Promise<Record<string, unknown>> {
+  const primary = await traceProbeOnce(url, range);
   const result: Record<string, unknown> = { mode: 'page', ...primary };
   if (depth > 0 && typeof primary.sampleText === 'string') {
     const child = traceManifestChild(primary.sampleText, typeof primary.finalUrl === 'string' ? primary.finalUrl : url);
-    if (child) result.firstChild = await traceProbe(child, depth - 1);
+    if (child) result.firstChild = await traceProbe(child, depth - 1, range);
   }
   return result;
 }
@@ -633,12 +635,19 @@ window.addEventListener('message', (event) => {
     const requestId = typeof data.requestId === 'string' && data.requestId.length <= MAX_REQUEST_ID ? data.requestId : '';
     const url = mediaUrl(data.url);
     const depth = typeof data.depth === 'number' && Number.isFinite(data.depth) ? Math.max(0, Math.min(2, Math.floor(data.depth))) : 0;
-    if (!requestId || !url) return;
-    void traceProbe(url, depth).then((result) => {
-      postMessage(TRACE_PROBE_RESPONSE, { requestId, result });
-    }).catch(() => {
-      postMessage(TRACE_PROBE_RESPONSE, { requestId, result: null });
-    });
+    const range = data.range !== 'none';
+    if (!requestId) return;
+    if (!url) {
+      postMessage(TRACE_PROBE_RESPONSE, { requestId, result: { url: String(data.url ?? '').slice(0, 500), ok: false, stage: 'validate', error: 'url rejected' } });
+      return;
+    }
+    // Always answer: a silent probe is indistinguishable from a broken pipe.
+    void traceProbe(url, depth, range)
+      .then((result) => postMessage(TRACE_PROBE_RESPONSE, { requestId, result }))
+      .catch((reason) => postMessage(TRACE_PROBE_RESPONSE, {
+        requestId,
+        result: { url, ok: false, stage: 'handler', error: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason) },
+      }));
     return;
   }
   if (data.type !== MEDIA_EVIDENCE_QUERY) return;

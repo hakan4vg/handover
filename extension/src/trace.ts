@@ -380,6 +380,8 @@ function headerSubset(headers: Headers): Pick<ProbeResult, 'contentType' | 'cont
 
 export interface ExtensionProbeOptions {
   credentials: 'omit' | 'include';
+  /** `'none'` sends no Range header at all — the control for signed-range URLs. */
+  range?: 'none' | string;
   rangeBytes?: number;
   timeoutMs?: number;
   followChild?: boolean;
@@ -390,7 +392,15 @@ export interface ExtensionProbeOptions {
  *  and either no cookies or the extension's view of them. */
 export async function probeFromExtension(url: string, options: ExtensionProbeOptions): Promise<ProbeResult> {
   const started = Date.now();
-  const result: ProbeResult = { mode: options.credentials === 'include' ? 'extension-include' : 'extension-omit', url, t: started, durationMs: 0, ok: false };
+  const rangeHeader = options.range === 'none' ? undefined : options.range ?? `bytes=0-${(options.rangeBytes ?? 65536) - 1}`;
+  const result: ProbeResult = {
+    mode: options.credentials === 'include' ? 'extension-include' : 'extension-omit',
+    url,
+    t: started,
+    durationMs: 0,
+    ok: false,
+    requestRange: rangeHeader ? 'ranged' : 'plain',
+  };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 8000);
   try {
@@ -399,7 +409,7 @@ export async function probeFromExtension(url: string, options: ExtensionProbeOpt
       credentials: options.credentials,
       redirect: 'follow',
       cache: 'no-store',
-      headers: { Range: `bytes=0-${(options.rangeBytes ?? 65536) - 1}` },
+      ...(rangeHeader ? { headers: { Range: rangeHeader } } : {}),
       signal: controller.signal,
     });
     result.status = response.status;

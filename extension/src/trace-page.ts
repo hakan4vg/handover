@@ -28,6 +28,17 @@ const ATTR_KEEP = new Set([
 
 const STYLE_NOISE = /\d+(?:\.\d+)?(?:px|%|s|ms|em|rem|vh|vw)/gi;
 const URL_NOISE = /https?:\/\/[^\s"')]+/gi;
+// Live clocks and progress readouts churn every frame on most players; they
+// are not structure, so both the payload and the signature store them masked.
+const CLOCK_NOISE = /^(?:\d{1,3}:)?\d{1,3}:\d{2}(?:\.\d+)?$/;
+const NUMBER_NOISE = /^\d+(?:[.,]\d+)?%?$/;
+
+function stabilizeText(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (CLOCK_NOISE.test(trimmed) || NUMBER_NOISE.test(trimmed)) return '#';
+  return trimmed;
+}
 
 function clamp(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}…`;
@@ -90,7 +101,9 @@ function attrsOf(el: Element): Record<string, string> | undefined {
 function textOf(el: Element): string | undefined {
   if (el.childElementCount > 0) return undefined;
   const text = el.textContent?.trim().replace(/\s+/g, ' ');
-  return text ? clamp(text, SNAPSHOT_MAX_TEXT) : undefined;
+  if (!text) return undefined;
+  const stabilized = stabilizeText(text);
+  return stabilized ? clamp(stabilized, SNAPSHOT_MAX_TEXT) : undefined;
 }
 
 interface SnapshotBudget {
@@ -292,7 +305,10 @@ export function wrapperChain(el: Element, maxDepth = WRAPPER_MAX_DEPTH): Wrapper
       })(),
     };
     const text = node.textContent?.trim().replace(/\s+/g, ' ');
-    if (text) summary.text = clamp(text, 60);
+    if (text) {
+      const stabilized = stabilizeText(text);
+      if (stabilized) summary.text = clamp(stabilized, 60);
+    }
     out.push(summary);
     node = node.parentElement;
   }

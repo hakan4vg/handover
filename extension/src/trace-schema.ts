@@ -137,6 +137,8 @@ export interface ProbeResult {
   t: number;
   durationMs: number;
   ok: boolean;
+  /** whether the probe sent a Range header (`ranged`) or a plain GET (`plain`) */
+  requestRange?: 'ranged' | 'plain';
   status?: number;
   statusText?: string;
   finalUrl?: string;

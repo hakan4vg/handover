@@ -3,6 +3,7 @@ import { isLikelyRepresentation, isMediaCandidate, isSolePlayingPlayer, mediaKin
 // Trace harness (branch harness/capture-traces only). The service worker owns
 // the store; popup and content scripts only send or read through messages.
 import { clearTrace, flushTrace, probeFromExtension, recordTrace, setTraceEnabled, swInstance, swStartedAt, traceStatus } from './trace';
+import { TRACE_PROBE_PAGE } from './trace-schema';
 import type { ProbeResult } from './trace-schema';
 
 const POLICY_KEY = 'dm-policy';
@@ -340,27 +341,46 @@ async function traceProbeSources(args: {
   candidates: string[];
 }): Promise<void> {
   const base = { pageUrl: args.pageUrl, tabId: args.tabId, frameId: args.frameId, playerKey: args.playerKey };
-  const pageProbe = async (url: string, depth: number, role: string): Promise<void> => {
+  const pageProbe = async (url: string, depth: number, role: string, range: 'ranged' | 'none'): Promise<void> => {
     if (args.tabId === undefined || !traceShouldProbe(`${url}#${role}`)) return;
+    const started = Date.now();
     try {
-      const result = (await chrome.tabs.sendMessage(args.tabId, { type: 'trace-probe-page', url, depth }, { frameId: args.frameId })) as ProbeResult | null;
-      void recordTrace({ ...base, kind: 'probe.page', phase: 'acquirement', payload: { role, ...(result ?? { url, ok: false, error: 'no response' }) } });
+      const result = (await chrome.tabs.sendMessage(args.tabId, { type: TRACE_PROBE_PAGE, url, depth, range }, { frameId: args.frameId })) as ProbeResult | null;
+      void recordTrace({
+        ...base,
+        kind: 'probe.page',
+        phase: 'acquirement',
+        payload: { role, elapsedMs: Date.now() - started, answered: result !== null && result !== undefined, ...(result ?? { url, ok: false, error: 'no response' }) },
+      });
     } catch (reason) {
-      void recordTrace({ ...base, kind: 'probe.page', phase: 'acquirement', payload: { role, url, ok: false, error: reason instanceof Error ? reason.message : String(reason) } });
+      void recordTrace({
+        ...base,
+        kind: 'probe.page',
+        phase: 'acquirement',
+        payload: { role, elapsedMs: Date.now() - started, answered: false, url, ok: false, error: reason instanceof Error ? reason.message : String(reason) },
+      });
     }
   };
-  await pageProbe(args.source, 1, 'primary');
-  if (traceShouldProbe(`${args.source}#ext-omit`)) {
-    const omit = await probeFromExtension(args.source, { credentials: 'omit' });
+  await pageProbe(args.source, 1, 'primary', 'ranged');
+  await pageProbe(args.source, 0, 'primary-plain', 'none');
+  if (traceShouldProbe(`${args.source}#ext-omit-ranged`)) {
+    const omit = await probeFromExtension(args.source, { credentials: 'omit', range: 'bytes=0-65535' });
     void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'primary', ...omit } });
   }
+  if (traceShouldProbe(`${args.source}#ext-omit-plain`)) {
+    // A plain GET (no Range header) is the decisive control for CDNs that sign
+    // a byte range into the URL itself: ranged 403 + plain 200 means the
+    // handoff is delivering a fragment where the resident expects an object.
+    const plain = await probeFromExtension(args.source, { credentials: 'omit', range: 'none' });
+    void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'primary', ...plain } });
+  }
   if (traceShouldProbe(`${args.source}#ext-include`)) {
-    const include = await probeFromExtension(args.source, { credentials: 'include' });
+    const include = await probeFromExtension(args.source, { credentials: 'include', range: 'bytes=0-65535' });
     void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'primary', ...include } });
   }
   for (const url of args.candidates.slice(0, 2)) {
-    if (!traceShouldProbe(`${url}#ext-omit`)) continue;
-    const candidate = await probeFromExtension(url, { credentials: 'omit' });
+    if (!traceShouldProbe(`${url}#ext-omit-ranged`)) continue;
+    const candidate = await probeFromExtension(url, { credentials: 'omit', range: 'bytes=0-65535' });
     void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'candidate', ...candidate } });
   }
 }
@@ -834,8 +854,16 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         mediaIdentity: typeof payload.mediaIdentity === 'string' ? payload.mediaIdentity.slice(0, 200) : undefined,
       };
       const traceDecision = (payloadIn: Record<string, unknown>): void => {
-        void recordTrace({ ...traceBase, kind: 'capture.decision', phase: 'acquirement', payload: payloadIn });
+        void recordTrace({
+          ...traceBase,
+          kind: 'capture.decision',
+          phase: 'acquirement',
+          payload: { ...payloadIn, ...(traceKindNote ? { kindInfo: traceKindNote } : {}) },
+        });
       };
+      // Set when the source-resolution path learns something about track kinds;
+      // included in every decision record so a "no-source" is never ambiguous.
+      let traceKindNote: Record<string, unknown> | null = null;
       const policyError = mediaCapturePolicyError(pageUrl ?? '');
       if (policyError) {
         traceDecision({ result: 'policy-error', policyError });
@@ -860,9 +888,12 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         traceExact = {
           evidencePresent: true,
           evidenceSource: evidence.source ? evidence.source.slice(0, 300) : '',
+          evidenceSourceKind: evidence.source ? mediaKindFor(evidence.source) : '',
+          companionAudio: evidence.companionAudio ? evidence.companionAudio.slice(0, 200) : '',
+          companionKind: evidence.companionAudio ? mediaKindFor(evidence.companionAudio) : '',
+          companionIsSameUrl: !!evidence.source && evidence.source === evidence.companionAudio,
           sourceIdentity: evidence.sourceIdentity.slice(0, 120),
           hintCount: evidence.selectedSegments.length,
-          companionAudio: evidence.companionAudio ? evidence.companionAudio.slice(0, 200) : '',
           selected: exact ? { source: exact.source.slice(0, 300), selectedSegments: exact.selectedSegments.length, companionAudio: !!exact.companionAudio } : null,
         };
         if (exact) {
@@ -873,10 +904,22 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       } else {
         traceExact = { evidencePresent: false, payloadSource: typeof payload.source === 'string' ? payload.source.slice(0, 300) : '' };
       }
-      const directKind = isHttp(source) && sender.tab?.id !== undefined
-        ? observedKind(source, sender.tab.id, sender.frameId ?? 0, documentId)
-        : mediaKindFor(source);
-      if (expectedKind && directKind !== 'unknown' && directKind !== expectedKind && roleFor(source) !== 'manifest') source = '';
+      const resolvedSource = source;
+      const directKind = isHttp(resolvedSource) && sender.tab?.id !== undefined
+        ? observedKind(resolvedSource, sender.tab.id, sender.frameId ?? 0, documentId)
+        : mediaKindFor(resolvedSource);
+      const kindCleared = !!expectedKind && directKind !== 'unknown' && directKind !== expectedKind && isHttp(resolvedSource) && roleFor(resolvedSource) !== 'manifest';
+      if (kindCleared) source = '';
+      if (isHttp(resolvedSource)) {
+        traceKindNote = {
+          expectedKind: expectedKind ?? null,
+          decidedKind: directKind,
+          urlKind: mediaKindFor(resolvedSource),
+          role: roleFor(resolvedSource),
+          cleared: kindCleared,
+          source: resolvedSource.slice(0, 300),
+        };
+      }
       if (isHttp(source) && roleFor(source) === 'unknown') source = normalizeChunkUrl(source);
       let candidates: string[] = [];
       if (!isHttp(source) && sender.tab?.id !== undefined) {

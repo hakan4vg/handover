@@ -115,6 +115,9 @@ const TRACE_PROBE_PAGE_RESPONSE = 'dm-trace-probe-response';
 const TRACE_MEDIA_MAX_NODES = 320;
 const TRACE_WRAPPER_MAX_NODES = 150;
 const TRACE_MIN_INTERVAL_MS = 400;
+// Player chrome redraws constantly (progress bars, clocks); wrapper trees get
+// their own, slower cadence so a busy player cannot flood the trace.
+const TRACE_WRAPPER_MIN_INTERVAL_MS = 1_200;
 const TRACE_RATE_LIMIT = 120;
 const TRACE_HEARTBEAT_MS = 60_000;
 const TRACE_CENSUS_MIN_INTERVAL_MS = 2_000;
@@ -171,6 +174,7 @@ function traceTree(
   maxNodes: number,
   extra: Record<string, unknown>,
   media?: HTMLMediaElement,
+  minIntervalMs = TRACE_MIN_INTERVAL_MS,
 ): void {
   const now = Date.now();
   const state = treeTraceStates.get(stateKey) ?? { hash: '', snapshots: 0, lastAt: 0, lastHeartbeat: 0 };
@@ -184,7 +188,7 @@ function traceTree(
     traceRecord('recognition', kind, { reason: 'heartbeat', hash, changed: false, snapshots: state.snapshots, ...extra }, media);
     return;
   }
-  if (reason !== 'attach' && now - state.lastAt < TRACE_MIN_INTERVAL_MS) return;
+  if (reason !== 'attach' && now - state.lastAt < minIntervalMs) return;
   const diff = diffSnapshots(state.tree, tree);
   const rateLimited = state.snapshots >= TRACE_RATE_LIMIT;
   treeTraceStates.set(stateKey, {
@@ -219,7 +223,7 @@ function traceMediaTrees(el: HTMLMediaElement, reason: string): void {
     traceTree(wrapper, `wrap:${key}`, 'dom.wrapper-tree', reason, TRACE_WRAPPER_MAX_NODES, {
       wrapperTag: wrapper.tagName.toLowerCase(),
       ...(wrapper.id ? { wrapperId: wrapper.id } : {}),
-    }, el);
+    }, el, TRACE_WRAPPER_MIN_INTERVAL_MS);
   }
 }
 
@@ -255,7 +259,7 @@ function traceCensus(): void {
   traceRecord('recognition', 'dom.census', { changed, count: media.length, shown: entries.length, entries });
 }
 
-function pageWorldProbe(url: string, depth: number): Promise<ProbeResult | undefined> {
+function pageWorldProbe(url: string, depth: number, range: 'ranged' | 'none' = 'ranged'): Promise<ProbeResult | undefined> {
   if (!/^https?:/i.test(url)) return Promise.resolve(undefined);
   const requestId = `page-probe-${nextPageProbeRequest++}`;
   return new Promise((resolve) => {
@@ -264,7 +268,7 @@ function pageWorldProbe(url: string, depth: number): Promise<ProbeResult | undef
       resolve(undefined);
     }, 12_000);
     pendingPageProbes.set(requestId, { resolve, timer });
-    window.postMessage({ marker: PAGE_MEDIA_MARKER, type: TRACE_PROBE_PAGE, requestId, url, depth }, location.origin);
+    window.postMessage({ marker: PAGE_MEDIA_MARKER, type: TRACE_PROBE_PAGE, requestId, url, depth, range }, location.origin);
   });
 }
 
@@ -1091,7 +1095,8 @@ chrome.runtime.onMessage?.addListener((message, _sender, sendResponse) => {
   if (type !== TRACE_PROBE_PAGE) return undefined;
   const url = typeof (message as { url?: unknown }).url === 'string' ? (message as { url: string }).url : '';
   const depth = typeof (message as { depth?: unknown }).depth === 'number' ? (message as { depth: number }).depth : 0;
-  void pageWorldProbe(url, depth)
+  const range = (message as { range?: unknown }).range === 'none' ? 'none' : 'ranged';
+  void pageWorldProbe(url, depth, range)
     .then((result) => sendResponse(result ?? null))
     .catch(() => sendResponse(null));
   return true;

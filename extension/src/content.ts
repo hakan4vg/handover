@@ -1,5 +1,10 @@
 import { captureNeedsBrowserRestore, restoreBrowserDownload } from './download-fallback';
 import type { MediaEvidence } from './media-candidates';
+// Trace harness (branch harness/capture-traces): content-side snapshot/diff
+// helpers are imported as a module used by this entry only, so the bundler
+// inlines them — content scripts are classic scripts and cannot load chunks.
+import { censusEntry, diffSnapshots, elementKey, hashString, playerStateSummary, signatureOf, snapshotElement, wrapperChain } from './trace-page';
+import type { ProbeResult, SnapshotNode } from './trace-schema';
 
 // Local copies (not imported): MV3 content scripts must be classic scripts,
 // so they cannot share an ES module chunk with the service worker.
@@ -96,6 +101,173 @@ const pendingPageEvidence = new Map<string, { resolve: (value: MediaEvidence | u
 let nextPageEvidenceRequest = 1;
 let nextMediaIdentity = 1;
 
+// ---------------------------------------------------------------------------
+// Trace harness (branch harness/capture-traces only).
+//
+// Records are forwarded to the service worker, which owns the store. Every
+// hook is best-effort: a tracing failure must never disturb capture. String
+// constants are local copies on purpose (content scripts cannot share module
+// chunks with the worker or the page bridge).
+// ---------------------------------------------------------------------------
+
+const TRACE_PROBE_PAGE = 'dm-trace-probe';
+const TRACE_PROBE_PAGE_RESPONSE = 'dm-trace-probe-response';
+const TRACE_MEDIA_MAX_NODES = 320;
+const TRACE_WRAPPER_MAX_NODES = 150;
+const TRACE_MIN_INTERVAL_MS = 400;
+const TRACE_RATE_LIMIT = 120;
+const TRACE_HEARTBEAT_MS = 60_000;
+const TRACE_CENSUS_MIN_INTERVAL_MS = 2_000;
+const TRACE_CENSUS_LIMIT = 24;
+const TRACE_WRAPPER_SELECTOR = '.html5-video-player, [data-testid*="video"], [class*="player"], figure, .video-js, .plyr';
+
+interface TreeTraceState {
+  hash: string;
+  tree?: SnapshotNode;
+  snapshots: number;
+  lastAt: number;
+  lastHeartbeat: number;
+}
+
+const treeTraceStates = new Map<string, TreeTraceState>();
+const traceButtonAttachAt = new Map<string, number>();
+const tracePlayerFirstSeen = new WeakMap<HTMLMediaElement, number>();
+const pendingPageProbes = new Map<string, { resolve: (value: ProbeResult | undefined) => void; timer: number }>();
+let nextPageProbeRequest = 1;
+let traceAttachedKey = '';
+let traceCensusHash = '';
+let traceCensusAt = 0;
+let traceCensusHeartbeatAt = 0;
+
+function traceRecord(
+  phase: 'recognition' | 'acquirement' | 'handoff',
+  kind: string,
+  payload: Record<string, unknown>,
+  el?: HTMLMediaElement,
+): void {
+  try {
+    void chrome.runtime.sendMessage({
+      type: 'trace-record',
+      payload: {
+        kind,
+        phase,
+        pageUrl: location.href,
+        ...(el ? { playerKey: keyFor(el), mediaIdentity: mediaIdentityFor(el) } : {}),
+        ...payload,
+      },
+    }).catch(() => undefined);
+  } catch {
+    // Tracing is diagnostic only.
+  }
+}
+
+/** Streams one element subtree, but only when its structure actually changed
+ *  (hash-deduplicated), plus a slow heartbeat so the timeline shows liveness. */
+function traceTree(
+  el: Element,
+  stateKey: string,
+  kind: string,
+  reason: string,
+  maxNodes: number,
+  extra: Record<string, unknown>,
+  media?: HTMLMediaElement,
+): void {
+  const now = Date.now();
+  const state = treeTraceStates.get(stateKey) ?? { hash: '', snapshots: 0, lastAt: 0, lastHeartbeat: 0 };
+  const tree = snapshotElement(el, maxNodes);
+  const sig = signatureOf(tree);
+  const hash = hashString(sig);
+  if (hash === state.hash) {
+    if (now - state.lastHeartbeat < TRACE_HEARTBEAT_MS) return;
+    state.lastHeartbeat = now;
+    treeTraceStates.set(stateKey, state);
+    traceRecord('recognition', kind, { reason: 'heartbeat', hash, changed: false, snapshots: state.snapshots, ...extra }, media);
+    return;
+  }
+  if (reason !== 'attach' && now - state.lastAt < TRACE_MIN_INTERVAL_MS) return;
+  const diff = diffSnapshots(state.tree, tree);
+  const rateLimited = state.snapshots >= TRACE_RATE_LIMIT;
+  treeTraceStates.set(stateKey, {
+    hash,
+    tree: rateLimited ? state.tree : tree,
+    snapshots: state.snapshots + 1,
+    lastAt: now,
+    lastHeartbeat: now,
+  });
+  traceRecord('recognition', kind, {
+    reason,
+    hash,
+    ...(state.hash ? { prevHash: state.hash, changed: true } : { changed: false }),
+    changedPaths: diff,
+    snapshots: state.snapshots + 1,
+    rateLimited,
+    ...(rateLimited ? {} : { tree }),
+    ...extra,
+  }, media);
+}
+
+/** The media element's own subtree plus the nearest player wrapper — this is
+ *  "everything the button attaches to", minus the button itself. */
+function traceMediaTrees(el: HTMLMediaElement, reason: string): void {
+  const key = keyFor(el);
+  traceTree(el, `media:${key}`, 'dom.media-tree', reason, TRACE_MEDIA_MAX_NODES, {
+    player: playerStateSummary(el),
+    wrappers: wrapperChain(el, 4),
+  }, el);
+  const wrapper = el.closest(TRACE_WRAPPER_SELECTOR) ?? el.parentElement;
+  if (wrapper && wrapper !== el) {
+    traceTree(wrapper, `wrap:${key}`, 'dom.wrapper-tree', reason, TRACE_WRAPPER_MAX_NODES, {
+      wrapperTag: wrapper.tagName.toLowerCase(),
+      ...(wrapper.id ? { wrapperId: wrapper.id } : {}),
+    }, el);
+  }
+}
+
+function traceCensus(): void {
+  if (!active()) return;
+  const now = Date.now();
+  if (now - traceCensusAt < TRACE_CENSUS_MIN_INTERVAL_MS) return;
+  traceCensusAt = now;
+  const media = collectMedia();
+  const entries = media.slice(0, TRACE_CENSUS_LIMIT).map((el) => {
+    const anchor = anchorRect(el);
+    return censusEntry(
+      el,
+      elementKey(el),
+      { x: Math.round(anchor.x), y: Math.round(anchor.y), w: Math.round(anchor.width), h: Math.round(anchor.height) },
+      visible(el),
+      playerKeys.get(el),
+    );
+  });
+  const hash = hashString(JSON.stringify(entries.map((entry) => [
+    entry.key,
+    entry.playerKey ?? '',
+    entry.state.currentSrcKind,
+    entry.state.currentSrc,
+    entry.state.paused,
+    entry.visible,
+    entry.wrappers.map((wrapper) => [wrapper.tag, wrapper.id ?? '', wrapper.cls ?? []]),
+  ])));
+  const changed = hash !== traceCensusHash;
+  if (!changed && now - traceCensusHeartbeatAt < TRACE_HEARTBEAT_MS) return;
+  traceCensusHash = hash;
+  traceCensusHeartbeatAt = now;
+  traceRecord('recognition', 'dom.census', { changed, count: media.length, shown: entries.length, entries });
+}
+
+function pageWorldProbe(url: string, depth: number): Promise<ProbeResult | undefined> {
+  if (!/^https?:/i.test(url)) return Promise.resolve(undefined);
+  const requestId = `page-probe-${nextPageProbeRequest++}`;
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => {
+      pendingPageProbes.delete(requestId);
+      resolve(undefined);
+    }, 12_000);
+    pendingPageProbes.set(requestId, { resolve, timer });
+    window.postMessage({ marker: PAGE_MEDIA_MARKER, type: TRACE_PROBE_PAGE, requestId, url, depth }, location.origin);
+  });
+}
+
 function pageMediaUrl(value: unknown): string | undefined {
   if (typeof value !== 'string' || !value || value.length > PAGE_MEDIA_MAX_URL) return undefined;
   try {
@@ -126,8 +298,16 @@ function pageEvidenceFromValue(value: unknown, expectedCurrentSrc?: string): Med
 window.addEventListener('message', (event) => {
   if (event.source !== window || event.origin !== location.origin || !event.data || typeof event.data !== 'object') return;
   const data = event.data as Record<string, unknown>;
-  if (data.marker !== PAGE_MEDIA_MARKER) return;
-  if (data.type !== PAGE_MEDIA_RESPONSE || typeof data.requestId !== 'string') return;
+  if (data.marker !== PAGE_MEDIA_MARKER || typeof data.requestId !== 'string') return;
+  if (data.type === TRACE_PROBE_PAGE_RESPONSE) {
+    const pending = pendingPageProbes.get(data.requestId);
+    if (!pending) return;
+    pendingPageProbes.delete(data.requestId);
+    window.clearTimeout(pending.timer);
+    pending.resolve((data.result as ProbeResult | undefined) ?? undefined);
+    return;
+  }
+  if (data.type !== PAGE_MEDIA_RESPONSE) return;
   const pending = pendingPageEvidence.get(data.requestId);
   if (!pending) return;
   pendingPageEvidence.delete(data.requestId);
@@ -599,6 +779,7 @@ function reportPlayer(el: HTMLMediaElement, force = false): void {
 
 function observePlayer(el: HTMLMediaElement): void {
   keyFor(el);
+  if (!tracePlayerFirstSeen.has(el)) tracePlayerFirstSeen.set(el, Date.now());
   if (observedPlayers.has(el)) return;
   observedPlayers.add(el);
   const update = () => {
@@ -679,6 +860,10 @@ let loopCount = 0;
 
 function positionButton(): boolean {
   if (!current || !active() || !current.isConnected || !visible(current) || !usable(current)) {
+    if (traceAttachedKey) {
+      traceRecord('recognition', 'button.detach', { label: button?.dataset.label ?? '', reason: 'ineligible' });
+      traceAttachedKey = '';
+    }
     button?.remove();
     button = null;
     return false;
@@ -688,6 +873,22 @@ function positionButton(): boolean {
   el.style.top = `${Math.max(6, rect.top + 6)}px`;
   el.style.left = `${Math.max(32, Math.min(document.documentElement.clientWidth - 6, rect.right - 6))}px`;
   el.style.transform = 'translateX(-100%)';
+  const key = keyFor(current);
+  if (traceAttachedKey !== key) {
+    traceAttachedKey = key;
+    traceButtonAttachAt.set(key, Date.now());
+    const hovered = isPointerOver(current, lastPointerX, lastPointerY);
+    traceRecord('recognition', 'button.attach', {
+      label: el.dataset.label ?? '',
+      hovered,
+      playing: !current.paused && !current.ended,
+      mediaFirstSeenAgoMs: Date.now() - (tracePlayerFirstSeen.get(current) ?? Date.now()),
+      anchor: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+      player: playerStateSummary(current),
+      wrappers: wrapperChain(current, 4),
+    }, current);
+    traceMediaTrees(current, 'attach');
+  }
   return true;
 }
 
@@ -720,6 +921,10 @@ function track(): void {
       cancelAnimationFrame(frame);
       frame = null;
     }
+    if (traceAttachedKey) {
+      traceRecord('recognition', 'button.detach', { label: button?.dataset.label ?? '', reason: 'current-changed' });
+      traceAttachedKey = '';
+    }
     button?.remove();
     button = null;
     if (previous) reportPlayer(previous, true);
@@ -729,6 +934,8 @@ function track(): void {
     if (!positionButton()) current = null;
     else frame = requestAnimationFrame(loop);
   }
+  traceCensus();
+  if (current) traceMediaTrees(current, 'tick');
 }
 
 function mediaExtension(media: HTMLMediaElement, source: string): string {
@@ -762,6 +969,23 @@ async function capture(): Promise<void> {
   const el = current;
   const currentSrc = currentSrcFor(el);
   const playerKind = el instanceof HTMLAudioElement ? 'audio' : 'video';
+  const clickAt = Date.now();
+  const playerKey = keyFor(el);
+  traceRecord('acquirement', 'capture.click', {
+    buttonAgeMs: clickAt - (traceButtonAttachAt.get(playerKey) ?? clickAt),
+    mediaFirstSeenAgoMs: clickAt - (tracePlayerFirstSeen.get(el) ?? clickAt),
+    hovered: isPointerOver(el, lastPointerX, lastPointerY),
+    playing: !el.paused && !el.ended,
+    visible: visible(el),
+    pointer: { x: lastPointerX, y: lastPointerY },
+    label: button?.dataset.label ?? '',
+    currentSrc,
+    urlSource: isHttp(sourceFor(el)) ? sourceFor(el) : '',
+    playerKind,
+    name: captureName(el, currentSrc) ?? '',
+    player: playerStateSummary(el),
+    wrappers: wrapperChain(el, 4),
+  }, el);
   captureInFlight = true;
   if (button) {
     button.disabled = true;
@@ -770,9 +994,20 @@ async function capture(): Promise<void> {
     button.setAttribute('aria-label', 'Download this media');
   }
   try {
+    const evidenceStarted = Date.now();
     const pageEvidence = currentSrc ? await requestPageEvidence(currentSrc, playerKind) : undefined;
+    traceRecord('acquirement', 'capture.evidence', {
+      durationMs: Date.now() - evidenceStarted,
+      currentSrc,
+      found: !!pageEvidence,
+      evidence: pageEvidence ?? null,
+      hasSource: !!pageEvidence?.source,
+      hintCount: pageEvidence?.selectedSegments.length ?? 0,
+      sourceIdentity: pageEvidence?.sourceIdentity ?? mediaIdentityFor(el, currentSrc),
+    }, el);
     const directSource = currentSrc.startsWith('http:') || currentSrc.startsWith('https:') ? currentSrc : '';
     const source = pageEvidence?.source || directSource;
+    const sentAt = Date.now();
     const response = (await chrome.runtime.sendMessage({
       type: 'media-capture',
       payload: {
@@ -788,8 +1023,19 @@ async function capture(): Promise<void> {
         name: captureName(el, source || currentSrc),
       },
     })) as { ok?: boolean; error?: string };
+    traceRecord('handoff', 'capture.handoff.content', {
+      durationMs: Date.now() - sentAt,
+      ok: !!response?.ok,
+      ...(response?.error ? { error: response.error } : {}),
+      submittedSource: isHttp(source) ? source : '',
+      fromEvidence: !!pageEvidence?.source,
+    }, el);
     if (!response?.ok) flashError(response?.error);
-  } catch {
+  } catch (reason) {
+    traceRecord('handoff', 'capture.handoff.content', {
+      ok: false,
+      error: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason),
+    }, el);
     flashError();
   } finally {
     captureInFlight = false;
@@ -802,6 +1048,7 @@ function flashError(error?: string): void {
   button.dataset.label = 'Unavailable';
   button.title = error || 'Media unavailable';
   button.setAttribute('aria-label', `${button.title}. Retry download`);
+  traceRecord('handoff', 'button.unavailable', { error: error || 'Media unavailable' }, current ?? undefined);
 }
 
 function onPointerMove(event: PointerEvent | MouseEvent): void {
@@ -832,6 +1079,22 @@ document.addEventListener('mouseenter', track, true);
 document.addEventListener('scroll', track, { capture: true, passive: true });
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && (changes['dm-policy'] || changes['dm-media-filters'])) void refreshPolicy();
+});
+
+// Trace harness: the service worker asks this frame to run a source probe in
+// the page's own fetch context (cookies + referer come for free there). The
+// bridge executes it with the native fetch so the probe is not mistaken for
+// player traffic by the page-side observer. Registration is optional-chained:
+// the harness must be inert wherever the runtime surface is trimmed.
+chrome.runtime.onMessage?.addListener((message, _sender, sendResponse) => {
+  const type = (message as { type?: string } | null | undefined)?.type;
+  if (type !== TRACE_PROBE_PAGE) return undefined;
+  const url = typeof (message as { url?: unknown }).url === 'string' ? (message as { url: string }).url : '';
+  const depth = typeof (message as { depth?: unknown }).depth === 'number' ? (message as { depth: number }).depth : 0;
+  void pageWorldProbe(url, depth)
+    .then((result) => sendResponse(result ?? null))
+    .catch(() => sendResponse(null));
+  return true;
 });
 
 void refreshPolicy().then(() => {

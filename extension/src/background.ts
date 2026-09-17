@@ -1,5 +1,9 @@
 import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
-import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
+import { isLikelyRepresentation, isMediaCandidate, isSolePlayingPlayer, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
+// Trace harness (branch harness/capture-traces only). The service worker owns
+// the store; popup and content scripts only send or read through messages.
+import { clearTrace, flushTrace, probeFromExtension, recordTrace, setTraceEnabled, swInstance, swStartedAt, traceStatus } from './trace';
+import type { ProbeResult } from './trace-schema';
 
 const POLICY_KEY = 'dm-policy';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
@@ -261,6 +265,104 @@ function pruneMedia(now = Date.now()): void {
 function prunePlayers(now = Date.now()): void {
   while (recentPlayers.length && now - recentPlayers[0].at > PLAYER_BUFFER_MS) recentPlayers.shift();
   while (recentPlayers.length > PLAYER_BUFFER_MAX) recentPlayers.shift();
+}
+
+// ---------------------------------------------------------------------------
+// Trace harness (branch harness/capture-traces only)
+// ---------------------------------------------------------------------------
+
+/** Snapshot of the traffic ring as the capture decision sees it, with ages —
+ *  the number that decides whether a capture can work at all. */
+function traceMediaSummary(tabId: number, frameId: number, documentId?: string, playerKey?: string): Record<string, unknown> {
+  const now = Date.now();
+  const scoped = recentMedia.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0));
+  const newest = [...scoped].sort((left, right) => right.at - left.at).slice(0, 12);
+  return {
+    count: scoped.length,
+    bufferWindowMs: MEDIA_BUFFER_MS,
+    newestAgesMs: newest.slice(0, 5).map((item) => now - item.at),
+    newest: newest.map((item) => ({
+      url: item.url.slice(0, 220),
+      role: item.role,
+      kind: item.kind ?? 'unknown',
+      ageMs: now - item.at,
+      contentType: item.contentType,
+      totalBytes: item.totalBytes,
+      documentMatch: !documentId || item.documentId === documentId,
+      playerKeyMatch: !!playerKey && item.playerKey === playerKey,
+    })),
+  };
+}
+
+function tracePlayerSummary(tabId: number, frameId: number, documentId?: string, playerKey?: string): Record<string, unknown> {
+  const now = Date.now();
+  const scoped = recentPlayers.filter((item) => item.tabId === tabId);
+  return {
+    count: scoped.length,
+    windowMs: PLAYER_BUFFER_MS,
+    players: [...scoped].sort((left, right) => right.at - left.at).slice(0, 6).map((player) => ({
+      playerKey: player.playerKey,
+      isClickedPlayer: !!playerKey && player.playerKey === playerKey,
+      frameId: player.frameId,
+      documentMatch: !documentId || player.documentId === documentId,
+      playing: player.playing,
+      hovered: player.hovered,
+      visible: player.visible,
+      active: player.active,
+      ageMs: now - player.at,
+    })),
+  };
+}
+
+const traceProbeDedupe = new Map<string, number>();
+
+function traceShouldProbe(url: string): boolean {
+  const now = Date.now();
+  for (const [key, at] of traceProbeDedupe) {
+    if (now - at > 30_000) traceProbeDedupe.delete(key);
+  }
+  const seen = traceProbeDedupe.get(url);
+  if (seen !== undefined && now - seen < 30_000) return false;
+  traceProbeDedupe.set(url, now);
+  return true;
+}
+
+/** Runs after the capture reply: probes the handed-over source through three
+ *  lenses — the page's own fetch context (cookies + Referer), the extension
+ *  worker without cookies, and the extension worker with cookies — plus the
+ *  manifest's first child. Results land in the trace, never in the job. */
+async function traceProbeSources(args: {
+  tabId?: number;
+  frameId?: number;
+  pageUrl?: string;
+  playerKey?: string;
+  source: string;
+  candidates: string[];
+}): Promise<void> {
+  const base = { pageUrl: args.pageUrl, tabId: args.tabId, frameId: args.frameId, playerKey: args.playerKey };
+  const pageProbe = async (url: string, depth: number, role: string): Promise<void> => {
+    if (args.tabId === undefined || !traceShouldProbe(`${url}#${role}`)) return;
+    try {
+      const result = (await chrome.tabs.sendMessage(args.tabId, { type: 'trace-probe-page', url, depth }, { frameId: args.frameId })) as ProbeResult | null;
+      void recordTrace({ ...base, kind: 'probe.page', phase: 'acquirement', payload: { role, ...(result ?? { url, ok: false, error: 'no response' }) } });
+    } catch (reason) {
+      void recordTrace({ ...base, kind: 'probe.page', phase: 'acquirement', payload: { role, url, ok: false, error: reason instanceof Error ? reason.message : String(reason) } });
+    }
+  };
+  await pageProbe(args.source, 1, 'primary');
+  if (traceShouldProbe(`${args.source}#ext-omit`)) {
+    const omit = await probeFromExtension(args.source, { credentials: 'omit' });
+    void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'primary', ...omit } });
+  }
+  if (traceShouldProbe(`${args.source}#ext-include`)) {
+    const include = await probeFromExtension(args.source, { credentials: 'include' });
+    void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'primary', ...include } });
+  }
+  for (const url of args.candidates.slice(0, 2)) {
+    if (!traceShouldProbe(`${url}#ext-omit`)) continue;
+    const candidate = await probeFromExtension(url, { credentials: 'omit' });
+    void recordTrace({ ...base, kind: 'probe.extension', phase: 'acquirement', payload: { role: 'candidate', ...candidate } });
+  }
 }
 
 function cleanUserAgent(value: unknown): string | undefined {
@@ -723,8 +825,20 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       await Promise.all([policyReady, mediaFiltersReady]);
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
       const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined;
+      // Trace harness: every exit of this branch records why it exited.
+      const traceBase = {
+        pageUrl,
+        tabId: sender.tab?.id,
+        frameId: sender.frameId,
+        playerKey: typeof payload.playerKey === 'string' ? payload.playerKey : undefined,
+        mediaIdentity: typeof payload.mediaIdentity === 'string' ? payload.mediaIdentity.slice(0, 200) : undefined,
+      };
+      const traceDecision = (payloadIn: Record<string, unknown>): void => {
+        void recordTrace({ ...traceBase, kind: 'capture.decision', phase: 'acquirement', payload: payloadIn });
+      };
       const policyError = mediaCapturePolicyError(pageUrl ?? '');
       if (policyError) {
+        traceDecision({ result: 'policy-error', policyError });
         reply({ ok: false, error: policyError });
         return;
       }
@@ -738,14 +852,26 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       let source = typeof payload.source === 'string' ? cleanMediaUrl(payload.source) ?? '' : '';
       let selectedSegments: string[] = [];
       let companionAudio: string | undefined;
+      let traceExact: Record<string, unknown> | null = null;
+      let tracePlan: Record<string, unknown> | null = null;
       if (sender.tab?.id !== undefined && evidence) {
         rememberEvidence(evidence, sender.tab.id, sender.frameId ?? 0, documentId, playerKey, expectedKind);
         const exact = selectionFromEvidence(evidence, expectedKind);
+        traceExact = {
+          evidencePresent: true,
+          evidenceSource: evidence.source ? evidence.source.slice(0, 300) : '',
+          sourceIdentity: evidence.sourceIdentity.slice(0, 120),
+          hintCount: evidence.selectedSegments.length,
+          companionAudio: evidence.companionAudio ? evidence.companionAudio.slice(0, 200) : '',
+          selected: exact ? { source: exact.source.slice(0, 300), selectedSegments: exact.selectedSegments.length, companionAudio: !!exact.companionAudio } : null,
+        };
         if (exact) {
           source = exact.source;
           selectedSegments = exact.selectedSegments;
           companionAudio = exact.companionAudio;
         }
+      } else {
+        traceExact = { evidencePresent: false, payloadSource: typeof payload.source === 'string' ? payload.source.slice(0, 300) : '' };
       }
       const directKind = isHttp(source) && sender.tab?.id !== undefined
         ? observedKind(source, sender.tab.id, sender.frameId ?? 0, documentId)
@@ -767,6 +893,17 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
           Date.now(),
           expectedKind,
         );
+        // Trace harness: the fallback path is where the reload-window defect
+        // lives, so record its full input state, not just its output.
+        tracePlan = {
+          found: !!plan,
+          source: plan?.source ? plan.source.slice(0, 300) : '',
+          selectedSegments: plan?.selectedSegments.length ?? 0,
+          alternatives: plan?.alternatives.map((url) => url.slice(0, 200)) ?? [],
+          solePlayingPlayer: playerKey ? isSolePlayingPlayer(recentPlayers, sender.tab.id, sender.frameId ?? 0, playerKey, documentId) : false,
+          mediaBuffer: traceMediaSummary(sender.tab.id, sender.frameId ?? 0, documentId, playerKey),
+          playerBuffer: tracePlayerSummary(sender.tab.id, sender.frameId ?? 0, documentId, playerKey),
+        };
         source = plan?.source ?? '';
         selectedSegments = plan?.selectedSegments ?? [];
         companionAudio = plan?.companionAudio;
@@ -784,11 +921,20 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         rememberResolvedMedia(scope, source, selectedSegments, companionAudio);
       }
       if (!isHttp(source)) {
+        traceDecision({ result: 'no-source', exact: traceExact, plan: tracePlan });
         reply({ ok: false, error: 'no downloadable media found for this player' });
         return;
       }
       const filterResult = mediaFilterDecision(source, sender.tab?.id, sender.frameId ?? 0, documentId, '', companionAudio);
       if (!filterResult.allowed) {
+        traceDecision({
+          result: 'filtered',
+          source: source.slice(0, 300),
+          filterReason: filterResult.reason,
+          filterType: filterResult.type,
+          exact: traceExact,
+          plan: tracePlan,
+        });
         reply({ ok: false, error: filterResult.reason === 'excluded-type' ? `media type ${filterResult.type ?? 'unknown'} is excluded` : 'media is below the minimum size' });
         return;
       }
@@ -806,9 +952,68 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         ...(cleanFilename(payload.name) ? { name: cleanFilename(payload.name) } : {}),
         ...(companionAudio ? { companionAudio } : {}),
       };
-      reply(await sendApp({ type: 'media-capture', payload: outboundPayload }));
+      const handoffStarted = Date.now();
+      const appResponse = await sendApp({ type: 'media-capture', payload: outboundPayload });
+      const appRecord = (appResponse ?? {}) as { ok?: boolean; error?: string; id?: string };
+      void recordTrace({
+        ...traceBase,
+        kind: 'capture.handoff.worker',
+        phase: 'handoff',
+        payload: {
+          durationMs: Date.now() - handoffStarted,
+          ok: !!appRecord.ok,
+          ...(appRecord.error ? { error: appRecord.error } : {}),
+          ...(appRecord.id ? { appId: appRecord.id } : {}),
+          outbound: {
+            source: source.slice(0, 400),
+            selectedSegments: selectedSegments.map((url) => url.slice(0, 200)),
+            candidates: candidates.map((url) => url.slice(0, 200)),
+            companionAudio: companionAudio ? companionAudio.slice(0, 200) : '',
+            name: cleanFilename(payload.name) ?? '',
+            playerKind: expectedKind,
+          },
+        },
+      });
+      if (appRecord.ok) {
+        void traceProbeSources({
+          tabId: sender.tab?.id,
+          frameId: sender.frameId,
+          pageUrl,
+          playerKey,
+          source,
+          candidates: [...new Set([...candidates, ...selectedSegments])],
+        });
+      }
+      reply(appResponse);
     } else if (type === 'open-manager') {
       reply(await sendApp({ type: 'open-manager' }));
+    } else if (type === 'trace-record') {
+      const incoming = (message as { payload?: Record<string, unknown> }).payload ?? {};
+      void recordTrace({
+        kind: typeof incoming.kind === 'string' ? incoming.kind : 'unknown',
+        phase: incoming.phase === 'acquirement' || incoming.phase === 'handoff' || incoming.phase === 'recognition' ? incoming.phase : 'recognition',
+        pageUrl: typeof incoming.pageUrl === 'string' ? incoming.pageUrl.slice(0, 800) : undefined,
+        tabId: sender.tab?.id,
+        frameId: sender.frameId,
+        playerKey: typeof incoming.playerKey === 'string' ? incoming.playerKey.slice(0, 120) : undefined,
+        mediaIdentity: typeof incoming.mediaIdentity === 'string' ? incoming.mediaIdentity.slice(0, 240) : undefined,
+        payload: (() => {
+          const { kind: _kind, phase: _phase, pageUrl: _pageUrl, playerKey: _playerKey, mediaIdentity: _mediaIdentity, ...rest } = incoming;
+          return rest;
+        })(),
+      });
+      reply({ ok: true });
+    } else if (type === 'trace-status') {
+      reply({ ok: true, ...(await traceStatus()), sw: swInstance, swStartedAt });
+    } else if (type === 'trace-flush') {
+      await flushTrace();
+      reply({ ok: true });
+    } else if (type === 'trace-clear') {
+      await clearTrace();
+      reply({ ok: true });
+    } else if (type === 'trace-set-enabled') {
+      await setTraceEnabled((message as { enabled?: unknown }).enabled === true);
+      reply({ ok: true });
     } else {
       reply({ ok: false, error: 'unsupported message' });
     }

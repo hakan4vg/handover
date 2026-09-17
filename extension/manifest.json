@@ -4,16 +4,29 @@
   "version": "0.1.0",
   "description": "Hands browser acquisitions to the resident Download Manager application.",
   "minimum_chrome_version": "116",
-  "permissions": ["storage", "downloads", "webRequest"],
-  "host_permissions": ["<all_urls>", "http://127.0.0.1/*"],
+  "permissions": [
+    "storage",
+    "downloads",
+    "webRequest",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["page-media.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "page-media.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": true,
@@ -21,8 +34,13 @@
       "match_origin_as_fallback": true
     },
     {
-      "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": true,

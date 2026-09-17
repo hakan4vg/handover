@@ -1,4 +1,5 @@
 import { DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
+import { clearTrace, readTraceEvents, toJsonl, traceStatus } from './trace';
 
 let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 let mediaFilters: MediaFilterSettings = { ...DEFAULT_MEDIA_FILTERS, excludedFileTypes: [...DEFAULT_MEDIA_FILTERS.excludedFileTypes] };
@@ -178,8 +179,75 @@ async function init(): Promise<void> {
       void pushMediaFilters();
     }
   });
+  wireTraceControls();
   paint();
   window.setInterval(() => void pull(), 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Trace harness (harness/capture-traces branch): status, pause, export, clear.
+// The popup reads the store directly (same extension origin) — no message size
+// limits — after asking the worker to flush its in-memory tail.
+// ---------------------------------------------------------------------------
+
+function paintTraceStatus(): void {
+  const element = document.getElementById('trace-status');
+  if (!element) return;
+  void traceStatus()
+    .then((status) => {
+      const kb = Math.round(status.meta.bytes / 1024);
+      element.textContent = status.enabled
+        ? `${status.meta.events} events · ${kb} KB · worker restarts: ${status.meta.swStarts}`
+        : 'Tracing paused.';
+      const toggle = document.getElementById('trace-toggle');
+      if (toggle) toggle.textContent = status.enabled ? 'Pause tracing' : 'Resume tracing';
+    })
+    .catch(() => {
+      element.textContent = 'Trace status unavailable.';
+    });
+}
+
+function wireTraceControls(): void {
+  paintTraceStatus();
+  window.setInterval(paintTraceStatus, 2000);
+  document.getElementById('trace-export')?.addEventListener('click', () => {
+    void (async () => {
+      try {
+        await chrome.runtime.sendMessage({ type: 'trace-flush' });
+      } catch {
+        // The worker may be asleep; storage still has the persisted chunks.
+      }
+      const events = await readTraceEvents();
+      if (!events.length) {
+        setStatus('No trace events recorded yet.');
+        return;
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const blob = new Blob([toJsonl(events)], { type: 'application/x-ndjson' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `dm-trace-${stamp}.jsonl`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      setStatus(`Exported ${events.length} trace events.`);
+      paintTraceStatus();
+    })();
+  });
+  document.getElementById('trace-toggle')?.addEventListener('click', () => {
+    void (async () => {
+      const status = await traceStatus().catch(() => undefined);
+      await chrome.runtime.sendMessage({ type: 'trace-set-enabled', enabled: !(status?.enabled ?? true) }).catch(() => undefined);
+      paintTraceStatus();
+    })();
+  });
+  document.getElementById('trace-clear')?.addEventListener('click', () => {
+    void (async () => {
+      await clearTrace();
+      setStatus('Trace buffer cleared.');
+      paintTraceStatus();
+    })();
+  });
 }
 
 void init();

@@ -46,6 +46,16 @@
           <input id="excluded-types" class="filter-input" type="text" value="gif" placeholder="gif, webp, webm" autocomplete="off" aria-describedby="media-filter-help" />
           <span class="filter-help" id="media-filter-help">0 disables the size limit. Unknown-size streams remain eligible. GIF matches actual GIF responses; MP4-served animations stay MP4.</span>
         </section>
+        <section class="popup-filters" aria-labelledby="trace-heading">
+          <span class="eyebrow" id="trace-heading">Capture traces (harness build)</span>
+          <span class="filter-help" id="trace-status">No traces recorded yet.</span>
+          <div class="filter-input-row">
+            <button class="button" id="trace-export" type="button">Export traces</button>
+            <button class="button" id="trace-toggle" type="button">Pause tracing</button>
+            <button class="button" id="trace-clear" type="button">Clear</button>
+          </div>
+          <span class="filter-help">Records DOM snapshots, button lifecycle, capture decisions, handoff payloads and source probes while you browse. Export writes a .jsonl file.</span>
+        </section>
         <button class="popup-manager-button" id="open" type="button"><span>Open Manager</span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" aria-hidden="true"><path d="M7 17.5h10a2 2 0 0 0 2-2V9.8" /><path d="M12 5h7v7M19 5l-8 8" /></svg></button>
       </div>
     </div>

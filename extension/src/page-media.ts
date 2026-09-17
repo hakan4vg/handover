@@ -73,6 +73,12 @@ const knownMediaElements = new Set<HTMLMediaElement>();
 let nextGeneration = 1;
 let nextSourceIdentity = 1;
 
+// Trace harness (branch harness/capture-traces only): a handle on the untouched
+// fetch, captured before the observer patches below install. Harness probes use
+// it so they are never attributed to the player.
+const traceNativeFetch: typeof fetch | undefined =
+  typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined;
+
 function validUrl(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= MAX_URL;
 }
@@ -455,9 +461,186 @@ function validMessage(event: MessageEvent): Record<string, unknown> | undefined 
   return data.marker === MESSAGE_MARKER ? data : undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Trace harness (branch harness/capture-traces only): page-context probes.
+//
+// Some fetch from the page's own context buys cookies and a natural Referer —
+// exactly the two things the resident's cookie-less fetch lacks. The raw body
+// sample travels back to the service worker, which owns classification, so the
+// sniff/parse logic exists in exactly one place.
+// ---------------------------------------------------------------------------
+
+const TRACE_PROBE_QUERY = 'dm-trace-probe';
+const TRACE_PROBE_RESPONSE = 'dm-trace-probe-response';
+const TRACE_PROBE_MAX_BYTES = 65_536;
+const TRACE_PROBE_SAMPLE_BYTES = 4_096;
+const TRACE_PROBE_TEXT_BYTES = 32_768;
+const TRACE_PROBE_TIMEOUT_MS = 8_000;
+
+function traceBytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
+  try {
+    return btoa(binary);
+  } catch {
+    return '';
+  }
+}
+
+function traceLooksTextual(bytes: Uint8Array): boolean {
+  const limit = Math.min(bytes.length, 256);
+  if (!limit) return false;
+  let printable = 0;
+  for (let index = 0; index < limit; index += 1) {
+    const byte = bytes[index];
+    if ((byte >= 32 && byte < 127) || byte === 9 || byte === 10 || byte === 13) printable += 1;
+  }
+  return printable / limit > 0.9;
+}
+
+function traceDecodeText(bytes: Uint8Array): string {
+  try {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, TRACE_PROBE_TEXT_BYTES));
+  } catch {
+    return '';
+  }
+}
+
+function traceManifestChild(text: string, baseUrl: string): string | undefined {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith('#EXTM3U') && !trimmed.includes('<MPD')) return undefined;
+  let raw: string | undefined;
+  if (trimmed.startsWith('#EXTM3U')) {
+    for (const line of text.split(/\r?\n/)) {
+      const value = line.trim();
+      if (value && !value.startsWith('#')) {
+        raw = value;
+        break;
+      }
+    }
+  } else {
+    raw = text.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)?.[1]?.trim();
+    if (!raw) {
+      const segment = text.match(/<SegmentURL[^>]*\bmedia="([^"]+)"/i)?.[1];
+      if (segment) raw = segment;
+    }
+  }
+  if (!raw) return undefined;
+  try {
+    return new URL(raw, baseUrl).href;
+  } catch {
+    return undefined;
+  }
+}
+
+async function traceReadBounded(response: Response, limit: number): Promise<Uint8Array> {
+  if (!response.body) {
+    const buffer = await response.arrayBuffer();
+    const view = new Uint8Array(buffer);
+    return view.length <= limit ? view : view.subarray(0, limit);
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        const slice = value.subarray(0, Math.max(0, limit - total));
+        chunks.push(slice);
+        total += slice.length;
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Stream already closed.
+    }
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+async function traceProbeOnce(url: string): Promise<Record<string, unknown>> {
+  const started = Date.now();
+  if (!traceNativeFetch) return { url, t: started, durationMs: 0, ok: false, error: 'fetch unavailable' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TRACE_PROBE_TIMEOUT_MS);
+  try {
+    const response = await traceNativeFetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'follow',
+      cache: 'no-store',
+      headers: { Range: `bytes=0-${TRACE_PROBE_MAX_BYTES - 1}` },
+      signal: controller.signal,
+    });
+    const bytes = await traceReadBounded(response, TRACE_PROBE_MAX_BYTES);
+    const headers: Record<string, string> = {};
+    for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control', 'server', 'vary']) {
+      const value = response.headers.get(name);
+      if (value) headers[name] = value.slice(0, 200);
+    }
+    const result: Record<string, unknown> = {
+      url,
+      t: started,
+      durationMs: Date.now() - started,
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      finalUrl: response.url.slice(0, 500),
+      redirected: response.redirected,
+      headers,
+      bytesRead: bytes.length,
+      sampleBase64: traceBytesToBase64(bytes.subarray(0, TRACE_PROBE_SAMPLE_BYTES)),
+    };
+    if (traceLooksTextual(bytes)) result.sampleText = traceDecodeText(bytes);
+    return result;
+  } catch (reason) {
+    return {
+      url,
+      t: started,
+      durationMs: Date.now() - started,
+      ok: false,
+      error: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function traceProbe(url: string, depth: number): Promise<Record<string, unknown>> {
+  const primary = await traceProbeOnce(url);
+  const result: Record<string, unknown> = { mode: 'page', ...primary };
+  if (depth > 0 && typeof primary.sampleText === 'string') {
+    const child = traceManifestChild(primary.sampleText, typeof primary.finalUrl === 'string' ? primary.finalUrl : url);
+    if (child) result.firstChild = await traceProbe(child, depth - 1);
+  }
+  return result;
+}
+
 window.addEventListener('message', (event) => {
   const data = validMessage(event);
   if (!data) return;
+  if (data.type === TRACE_PROBE_QUERY) {
+    const requestId = typeof data.requestId === 'string' && data.requestId.length <= MAX_REQUEST_ID ? data.requestId : '';
+    const url = mediaUrl(data.url);
+    const depth = typeof data.depth === 'number' && Number.isFinite(data.depth) ? Math.max(0, Math.min(2, Math.floor(data.depth))) : 0;
+    if (!requestId || !url) return;
+    void traceProbe(url, depth).then((result) => {
+      postMessage(TRACE_PROBE_RESPONSE, { requestId, result });
+    }).catch(() => {
+      postMessage(TRACE_PROBE_RESPONSE, { requestId, result: null });
+    });
+    return;
+  }
   if (data.type !== MEDIA_EVIDENCE_QUERY) return;
   const requestId = typeof data.requestId === 'string' && data.requestId.length <= MAX_REQUEST_ID ? data.requestId : '';
   const currentSrc = mediaUrl(data.currentSrc);

@@ -5057,7 +5057,12 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
             if job.state != "completed" {
                 temporary = Some(job.temp_path.clone());
             }
-            if delete_file.unwrap_or(false) {
+            // Only a completed job owns the file at its destination: an
+            // unfinished job's destination is a plan, and the reservation that
+            // creates that file only happens at completion. Deleting it for a
+            // failed or paused job would remove whatever the user already had
+            // under that name.
+            if delete_file.unwrap_or(false) && job.state == "completed" {
                 destination_to_delete = Some(job.destination.clone());
             }
         }

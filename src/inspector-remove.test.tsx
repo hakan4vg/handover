@@ -124,4 +124,18 @@ describe('Inspector removal feedback', () => {
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('Permission denied');
     act(() => root.unmount());
   });
+
+  it('never offers to delete a file an unfinished job does not own', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(<Inspector job={{ ...job, state: 'paused', progress: 40 }} adapter={{ removeJob: vi.fn() } as unknown as DownloadAdapter} onClose={() => undefined} />);
+    });
+
+    const deleteFileBtn = Array.from(host.querySelectorAll('button')).find((button) => button.textContent?.includes('Delete file'));
+    if (!(deleteFileBtn instanceof HTMLButtonElement)) throw new Error('delete file button missing');
+    expect(deleteFileBtn.disabled).toBe(true);
+    act(() => root.unmount());
+  });
 });

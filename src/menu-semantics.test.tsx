@@ -92,7 +92,29 @@ describe('transient menu semantics', () => {
     const menu = host.querySelector('.context-menu');
     expect(menu?.getAttribute('role')).toBe('menu');
     expect(menu?.getAttribute('aria-label')).toBe('Actions for project-assets.zip');
-    expect(menu?.querySelectorAll('[role="menuitem"]')).toHaveLength(6);
+    // A failed job never created a file at its destination, so the actions are
+    // exactly the ones it can perform: retry, reveal, copy, reattach, remove.
+    expect(Array.from(menu?.querySelectorAll('[role="menuitem"]') ?? []).map((item) => item.textContent)).toEqual([
+      'Retry',
+      'Open containing folder',
+      'Copy source URL',
+      'Reattach download',
+      'Remove from list',
+    ]);
+    act(() => root.unmount());
+  });
+
+  it('offers file deletion only for a download that owns its file', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    act(() => {
+      root.render(<JobContextMenu job={{ ...job, state: 'completed' }} adapter={adapter} onClose={() => undefined} onNotice={() => undefined} />);
+    });
+
+    const labels = Array.from(host.querySelectorAll('.context-menu [role="menuitem"]')).map((item) => item.textContent);
+    expect(labels).toContain('Delete file from disk');
+
     act(() => root.unmount());
   });
 

@@ -1,6 +1,8 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Url;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
@@ -1891,110 +1893,6 @@ fn build_muxed_initialization(tracks: &mut [ParsedTrack<'_>]) -> Result<Vec<u8>,
     wrap_mp4_box(*b"moov", &moov_children, "The merged moov box")
 }
 
-/// A multiplexed fragmented MP4 (audio + video in one initialization, common
-/// in HLS) is already playable: validate every track's structure and every
-/// fragment's pairing, then pass the bytes through untouched. The single-track
-/// parser stays the contract for per-track mux inputs (F03).
-fn validate_multiplexed_fmp4(data: &[u8], context: &str) -> Result<(), String> {
-    let (top, _, moov_index, moov_children, trak_boxes) =
-        fragmented_presentation_parts(data, context)?;
-    let mut track_ids = Vec::with_capacity(trak_boxes.len());
-    for (index, trak) in trak_boxes.iter().enumerate() {
-        let trak_context = format!("{context} trak {index}");
-        let trak_children = child_boxes(data, *trak, &trak_context)?;
-        let tkhd = exactly_one_box(&trak_children, *b"tkhd", &trak_context)?;
-        let track_id = track_id_from_tkhd(data, tkhd, &trak_context)?;
-        if track_id == 0 {
-            return Err(format!("{trak_context} has an invalid zero track ID"));
-        }
-        if track_ids.contains(&track_id) {
-            return Err(format!("{trak_context} reuses track ID {track_id}"));
-        }
-        let mdia = exactly_one_box(&trak_children, *b"mdia", &trak_context)?;
-        let mdia_children = child_boxes(data, mdia, &trak_context)?;
-        let mdhd = exactly_one_box(&mdia_children, *b"mdhd", &trak_context)?;
-        mdhd_timescale(data, mdhd, &trak_context)?;
-        track_ids.push(track_id);
-    }
-    let mvex = matching_boxes(&moov_children, *b"mvex");
-    if mvex.len() != 1 {
-        return Err(format!("{context} is not a fragmented MP4 initialization"));
-    }
-    let mvex_children = child_boxes(data, mvex[0], &format!("{context} mvex"))?;
-    let trex_boxes = matching_boxes(&mvex_children, *b"trex");
-    if trex_boxes.len() != trak_boxes.len() {
-        return Err(format!(
-            "{context} has {} trex boxes for {} tracks",
-            trex_boxes.len(),
-            trak_boxes.len()
-        ));
-    }
-    for trex in &trex_boxes {
-        let (_, _, trex_payload) = full_box_header(data, *trex, &format!("{context} trex"))?;
-        let trex_track_id = read_u32_at(data, trex_payload + 4, &format!("{context} trex"))?;
-        if !track_ids.contains(&trex_track_id) {
-            return Err(format!(
-                "{context} trex references unknown track ID {trex_track_id}"
-            ));
-        }
-    }
-    let mut pending_moof = None;
-    let mut fragments = 0usize;
-    for item in top.iter().skip(moov_index + 1) {
-        match item.kind {
-            [b'm', b'o', b'o', b'f'] => {
-                if pending_moof.is_some() {
-                    return Err(format!("{context} has consecutive moof boxes without mdat"));
-                }
-                pending_moof = Some(*item);
-            }
-            [b'm', b'd', b'a', b't'] => {
-                let moof = pending_moof
-                    .take()
-                    .ok_or_else(|| format!("{context} has mdat without a preceding moof"))?;
-                validate_multiplexed_moof(data, moof, &track_ids, context)?;
-                fragments += 1;
-            }
-            [b'm', b'f', b'r', b'a'] => {
-                if pending_moof.is_some() {
-                    return Err(format!(
-                        "{context} has a fragment without its mdat before mfra"
-                    ));
-                }
-            }
-            [b's', b't', b'y', b'p']
-            | [b's', b'i', b'd', b'x']
-            | [b'e', b'm', b's', b'g']
-            | [b'p', b'r', b'f', b't']
-            | [b'f', b'r', b'e', b'e']
-            | [b's', b'k', b'i', b'p']
-            | [b'w', b'i', b'd', b'e'] => {
-                if pending_moof.is_some() {
-                    return Err(format!("{context} has data between moof and mdat"));
-                }
-            }
-            [b'f', b't', b'y', b'p'] | [b'm', b'o', b'o', b'v'] => {
-                return Err(format!(
-                    "{context} has a duplicate initialization box at top level"
-                ))
-            }
-            _ => {
-                return Err(format!(
-                    "{context} contains unsupported top-level box {}",
-                    String::from_utf8_lossy(&item.kind)
-                ))
-            }
-        }
-    }
-    if pending_moof.is_some() {
-        return Err(format!("{context} has a moof without mdat"));
-    }
-    if fragments == 0 {
-        return Err(format!("{context} is not a fragmented MP4 media stream"));
-    }
-    Ok(())
-}
-
 /// Validate one multiplexed moof: every traf references a known track and
 /// every sample run parses. Mirrors the single-track fragment rules without
 /// assuming one track per moof (F03).
@@ -2037,15 +1935,127 @@ fn validate_multiplexed_moof(
     }
     Ok(())
 }
-/// Validate one already-assembled fragmented MP4 resource in place. The bytes
-/// are correct as acquired, so validation borrows them and returns nothing:
-/// no full-file duplicate on the media path (F08).
-pub fn finalize_fmp4(input: &[u8]) -> Result<(), String> {
-    let (_, _, _, _, trak_boxes) = fragmented_presentation_parts(input, "Media")?;
-    if trak_boxes.len() == 1 {
-        parse_fragmented_track(input, 0)?;
+/// Largest box this walker holds in memory. Only fragments and the movie header
+/// are read whole; both are small beside the media, and the bound keeps a
+/// hostile box size from turning validation into an allocation.
+const FMP4_VALIDATION_BOX_LIMIT: u64 = 64 * 1024 * 1024;
+
+fn file_bytes(file: &mut std::fs::File, offset: u64, length: u64, context: &str) -> Result<Vec<u8>, String> {
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|length| *length <= FMP4_VALIDATION_BOX_LIMIT as usize)
+        .ok_or_else(|| format!("{context} contains a box too large to validate"))?;
+    let mut buffer = vec![0u8; length];
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(&mut buffer))
+        .map_err(|error| format!("{context} could not be read: {error}"))?;
+    Ok(buffer)
+}
+
+/// One top-level box header: (kind, total size).
+fn file_box_header(file: &mut std::fs::File, offset: u64, total: u64, context: &str) -> Result<([u8; 4], u64), String> {
+    if total - offset < 8 {
+        return Err(format!("{context} has a truncated MP4 box header"));
+    }
+    let available = (total - offset).min(16) as usize;
+    let head = file_bytes(file, offset, available as u64, context)?;
+    let size32 = u32::from_be_bytes(head[0..4].try_into().unwrap());
+    let kind: [u8; 4] = head[4..8].try_into().unwrap();
+    let (size, header) = if size32 == 1 {
+        if head.len() < 16 {
+            return Err(format!("{context} has a truncated large MP4 box size"));
+        }
+        (u64::from_be_bytes(head[8..16].try_into().unwrap()), 16)
+    } else if size32 == 0 {
+        (total - offset, 8)
     } else {
-        validate_multiplexed_fmp4(input, "Media")?;
+        (u64::from(size32), 8)
+    };
+    if size < header {
+        return Err(format!("{context} contains an invalid MP4 box size"));
+    }
+    if offset.checked_add(size).is_none_or(|end| end > total) {
+        return Err(format!("{context} contains a truncated MP4 box"));
+    }
+    Ok((kind, size))
+}
+
+/// Validate an assembled fragmented-MP4 file where it lies. The bytes were
+/// checked as they were acquired, so this is a structural walk of the box
+/// chain: top-level headers are read one at a time, fragment headers are read
+/// whole because they are small, and media payloads are skipped by seeking. A
+/// file that does not describe a finite fragmented presentation fails honestly
+/// without ever being held in memory (F08: no full-file duplicate on the media
+/// path).
+pub fn validate_fmp4_file(path: &Path) -> Result<(), String> {
+    let context = "Media";
+    let mut file = std::fs::File::open(path).map_err(|error| format!("{context} could not be opened: {error}"))?;
+    let total = file.metadata().map_err(|error| format!("{context} could not be read: {error}"))?.len();
+    if total == 0 {
+        return Err(format!("{context} is empty"));
+    }
+    let mut cursor = 0u64;
+    let mut typed = false;
+    let mut track_ids: Option<Vec<u32>> = None;
+    let mut fragments = 0u64;
+    let mut pending_moof = false;
+    while cursor < total {
+        let (kind, size) = file_box_header(&mut file, cursor, total, context)?;
+        match &kind {
+            b"ftyp" => typed = true,
+            b"moov" => {
+                let bytes = file_bytes(&mut file, cursor, size, context)?;
+                let boxes = parse_mp4_boxes(&bytes, 0, bytes.len(), context)?;
+                let moov = exactly_one_box(&boxes, *b"moov", context)?;
+                let traks = matching_boxes(&child_boxes(&bytes, moov, context)?, *b"trak");
+                if traks.is_empty() {
+                    return Err(format!("{context} has a movie header without a track"));
+                }
+                let mut ids = Vec::with_capacity(traks.len());
+                for trak in &traks {
+                    let trak_context = format!("{context} track {}", ids.len());
+                    let tkhd = exactly_one_box(&child_boxes(&bytes, *trak, &trak_context)?, *b"tkhd", &trak_context)?;
+                    let id = track_id_from_tkhd(&bytes, tkhd, &trak_context)?;
+                    if id == 0 {
+                        return Err(format!("{trak_context} has an invalid zero track ID"));
+                    }
+                    if ids.contains(&id) {
+                        return Err(format!("{trak_context} reuses track ID {id}"));
+                    }
+                    ids.push(id);
+                }
+                track_ids = Some(ids);
+            }
+            b"moof" => {
+                if pending_moof {
+                    return Err(format!("{context} has a fragment without its media data"));
+                }
+                let bytes = file_bytes(&mut file, cursor, size, context)?;
+                let boxes = parse_mp4_boxes(&bytes, 0, bytes.len(), context)?;
+                let moof = exactly_one_box(&boxes, *b"moof", context)?;
+                let ids = track_ids
+                    .clone()
+                    .ok_or_else(|| format!("{context} has a fragment before its movie header"))?;
+                validate_multiplexed_moof(&bytes, moof, &ids, context)?;
+                fragments += 1;
+                pending_moof = true;
+            }
+            b"mdat" => pending_moof = false,
+            _ => {}
+        }
+        cursor += size;
+    }
+    if !typed {
+        return Err(format!("{context} has no file type box"));
+    }
+    if track_ids.is_none() {
+        return Err(format!("{context} has no movie header"));
+    }
+    if pending_moof {
+        return Err(format!("{context} ends inside a fragment"));
+    }
+    if fragments == 0 {
+        return Err(format!("{context} is not a fragmented MP4 media stream"));
     }
     Ok(())
 }
@@ -4646,8 +4656,18 @@ mod tests {
         )
     }
 
+    /// The validator walks a file, so fixtures are written out for it.
+    fn with_fixture_file<T>(bytes: &[u8], body: impl FnOnce(&Path) -> T) -> T {
+        let path = std::env::temp_dir().join(format!("dm-media-{}.bin", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).expect("fixture write");
+        let result = body(&path);
+        std::fs::remove_file(&path).ok();
+        result
+    }
+
+
     #[test]
-    fn finalizes_a_concatenated_fmp4_track_without_changing_bytes() {
+    fn validates_a_concatenated_fmp4_track_where_it_lies() {
         let input = fixture_track(
             include_bytes!("../../fixtures/media/v-init.mp4"),
             &[
@@ -4656,12 +4676,18 @@ mod tests {
                 include_bytes!("../../fixtures/media/v-2.m4s")
             ]
         );
-        finalize_fmp4(&input).expect("fragmented track validates");
+        with_fixture_file(&input, |path| validate_fmp4_file(path).expect("fragmented track validates"));
+        // A truncated tail is what a corrupt assembly looks like.
+        with_fixture_file(&input[..input.len() - 16], |path| {
+            assert!(validate_fmp4_file(path).is_err());
+        });
     }
 
     #[test]
     fn rejects_non_fragmented_mp4_inputs() {
-        assert!(finalize_fmp4(include_bytes!("../../fixtures/real.mp4")).is_err());
+        with_fixture_file(include_bytes!("../../fixtures/real.mp4"), |path| {
+            assert!(validate_fmp4_file(path).is_err());
+        });
         assert!(mux_fmp4_tracks(&[
             include_bytes!("../../fixtures/real.mp4"),
             include_bytes!("../../fixtures/real.mp4")
@@ -4780,7 +4806,7 @@ mod tests {
             &[include_bytes!("../../fixtures/media/a-0.m4s")]
         );
         let multiplexed = mux_fmp4_tracks(&[video, audio]).expect("muxed fragmented tracks");
-        finalize_fmp4(&multiplexed).expect("multiplexed fMP4 validates");
+        with_fixture_file(&multiplexed, |path| validate_fmp4_file(path).expect("multiplexed fMP4 validates"));
     }
 
     #[test]

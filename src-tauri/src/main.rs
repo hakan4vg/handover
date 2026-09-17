@@ -1556,13 +1556,19 @@ async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String
     if matches!(extension.as_deref(), None | Some("ts") | Some("m4s")) {
         return Ok(());
     }
-    let input = tokio::fs::read(temp_path)
-        .await
-        .map_err(|error| error.to_string())?;
-    if looks_like_webm(&input) {
+    // The container kind lives in the leading bytes; the rest of the assembled
+    // media is validated where it lies, so finalizing a multi-gigabyte download
+    // never loads it into memory.
+    let mut header = [0u8; 4];
+    let mut file = File::open(temp_path).await.map_err(|error| error.to_string())?;
+    if file.read_exact(&mut header).await.is_err() {
+        return Err("Media finalization failed: the assembled media is empty; downloaded parts were preserved".into());
+    }
+    drop(file);
+    if looks_like_webm(&header) {
         return Ok(());
     }
-    media::finalize_fmp4(&input).map_err(|error| {
+    media::validate_fmp4_file(Path::new(temp_path)).map_err(|error| {
         format!("Media finalization failed: {error}; downloaded parts were preserved")
     })?;
     Ok(())

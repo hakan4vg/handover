@@ -2752,6 +2752,9 @@ async fn acquire_ranges(
                     job.eta = Some("Retrying as one stream".into());
                     job.connections = 1;
                 });
+                // Same progress bookkeeping as every other streaming path: a
+                // full snapshot here would rewrite the whole jobs table and
+                // re-render every row once per network chunk.
                 emit_snapshot(&app, &state);
             }
             drop(file);
@@ -5222,7 +5225,7 @@ fn start_provisional(
         }
     }
     let id = format!("provisional-{}", Uuid::new_v4());
-    let (name, destination, temp_folder, max_connections) = {
+    let (name, destination, temp_folder, max_connections, bandwidth_limit) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let name = input
             .name
@@ -5230,16 +5233,23 @@ fn start_provisional(
             .map(|value| safe_filename(&value))
             .unwrap_or_else(|| source_name(&input.source));
         let destination = destination_for_filename(&snapshot.settings.default_folder, &name);
+        // SPEC §11.4: a capture may carry a per-download override, and it
+        // only applies while Settings allows overrides at all.
+        let overrides = snapshot.settings.per_download_overrides;
         let max_connections = clamp_connections(
-            input
-                .max_connections
-                .unwrap_or(snapshot.settings.max_connections)
+            if overrides {
+                input.max_connections
+            } else {
+                None
+            }
+            .unwrap_or(snapshot.settings.max_connections)
         );
         (
             name,
             destination,
             temp_root().to_string_lossy().into_owned(),
-            max_connections
+            max_connections,
+            if overrides { input.bandwidth_limit } else { None }
         )
     };
     let job = DownloadJob {
@@ -5256,7 +5266,7 @@ fn start_provisional(
         eta: Some("Connecting…".into()),
         connections: 0,
         max_connections,
-        bandwidth_limit: input.bandwidth_limit,
+        bandwidth_limit,
         mode: "single-stream".into(),
         media,
         media_details: None,
@@ -5486,6 +5496,7 @@ async fn commit_provisional(
             .map_err(|_| "Lifecycle unavailable")?;
         let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let collision = snapshot.settings.collision_behavior.clone();
+        let overrides = snapshot.settings.per_download_overrides;
         let active = transfer_is_active(state.inner(), &id);
         let job = snapshot
             .jobs
@@ -5541,12 +5552,13 @@ async fn commit_provisional(
                 )
             );
         }
-        if let Some(max_connections) = input.max_connections {
+        if let Some(max_connections) = input.max_connections.filter(|_| overrides) {
             job.max_connections = clamp_connections(max_connections);
         }
         // None (absent) = keep the existing cap; Some(None) (explicit null)
-        // = clear back to the global setting; Some(n) = set.
-        if let Some(cap) = input.bandwidth_limit {
+        // = clear back to the global setting; Some(n) = set. With overrides
+        // disallowed the capture's caps are ignored either way (SPEC §11.4).
+        if let Some(cap) = input.bandwidth_limit.filter(|_| overrides) {
             job.bandwidth_limit = cap.filter(|value| *value > 0);
         }
         job.provisional = Some(false);

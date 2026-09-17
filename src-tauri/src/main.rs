@@ -4547,6 +4547,44 @@ fn url_implies_media(url: &str) -> bool {
         .any(|extension| path.ends_with(extension))
 }
 
+/// A URL whose bytes are one signed slice of an object: a `/range/` path segment
+/// (Vimeo's `/v2/range/prot/<b64>/…`) or a `range=` parameter the signature
+/// covers (`sparams` lists it, as YouTube's URLs do).
+///
+/// Such a URL can never be acquired as a file: the slice is a few kilobytes and
+/// the signature expires within seconds (measured live — the same Vimeo
+/// fragment answered 206 at +30 ms and 403 at +4.4 s; YouTube captures built on
+/// ranged URLs produced 62 B–62 KB "downloads"). The job must rebuild from a
+/// manifest or fail honestly; downloading a slice and calling it a file is the
+/// one outcome that is never acceptable.
+const FRAGMENT_SOURCE_ERROR: &str = "The observed media URL is a single byte-range fragment: its signature expires within seconds and its bytes are not a file. No manifest was captured for this player — reopen it (or play it briefly) and capture again.";
+
+fn url_is_byte_range_fragment(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed
+        .path()
+        .to_ascii_lowercase()
+        .split('/')
+        .any(|segment| segment == "range")
+    {
+        return true;
+    }
+    let mut has_range = false;
+    let mut signed = false;
+    for (name, value) in parsed.query_pairs() {
+        if name.eq_ignore_ascii_case("range") {
+            has_range = true;
+        } else if name.eq_ignore_ascii_case("sparams")
+            && value.split(',').any(|item| item.trim().eq_ignore_ascii_case("range"))
+        {
+            signed = true;
+        }
+    }
+    has_range && signed
+}
+
 /// Classify one candidate source by what it actually returns. A page that could
 /// not tell which URL feeds its player usually still observed several plausible
 /// ones; this is what turns that list into one answer.
@@ -4618,7 +4656,7 @@ async fn classify_candidate(
 /// deciding means fetching. The first source that behaves like finite media
 /// becomes the job's source, the job's log records the swap, and the alternates
 /// are consumed either way so nothing lingers in the store.
-async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> String {
+async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> Result<String, String> {
     let candidates = app
         .state::<CoreState>()
         .snapshot
@@ -4632,15 +4670,29 @@ async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> String
                 .map(|job| job.candidates.clone())
         })
         .unwrap_or_default();
+    // A signed byte-range URL cannot become a file, whatever it looks like: its
+    // bytes are a slice and its signature dies within seconds. Only a manifest
+    // (or a non-fragment alternate) may be acquired.
+    let fragment_source =
+        url_is_byte_range_fragment(&source) && !media::is_manifest_source(&source, None);
     if candidates.is_empty() {
-        return source;
+        return if fragment_source {
+            Err(FRAGMENT_SOURCE_ERROR.into())
+        } else {
+            Ok(source)
+        };
     }
     let (referrer, _, user_agent) = job_context(app, id);
     let mut chosen = source.clone();
-    if !url_implies_media(&source) {
+    if !url_implies_media(&source) || fragment_source {
         let client = http_client();
         let pool = std::iter::once(source.clone()).chain(candidates.iter().cloned());
         for url in pool.take(MAX_SOURCE_PROBES) {
+            // A fragment is never a verdict, only a hint that something else
+            // must exist; skip it and keep probing.
+            if url_is_byte_range_fragment(&url) && !media::is_manifest_source(&url, None) {
+                continue;
+            }
             if classify_candidate(&client, &url, referrer.as_deref(), user_agent.as_deref()).await
                 == CandidateVerdict::Media
             {
@@ -4648,6 +4700,9 @@ async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> String
                 break;
             }
         }
+    }
+    if chosen == source && fragment_source {
+        return Err(FRAGMENT_SOURCE_ERROR.into());
     }
     let state = app.state::<CoreState>();
     emit_job(&state, id, |job| {
@@ -4665,14 +4720,29 @@ async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> String
         }
     });
     emit_snapshot(app, &state);
-    chosen
+    Ok(chosen)
 }
 
 async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
     if !transfer_can_continue(&app, &id, generation) {
         return;
     }
-    let source = resolve_job_source(&app, &id, source).await;
+    let source = match resolve_job_source(&app, &id, source).await {
+        Ok(source) => source,
+        Err(error) => {
+            if transfer_can_continue(&app, &id, generation) {
+                let state = app.state::<CoreState>();
+                mark_acquisition_failed(
+                    &app,
+                    state.inner(),
+                    &id,
+                    error,
+                    "Source was a byte-range fragment, not a file",
+                );
+            }
+            return;
+        }
+    };
     if !transfer_can_continue(&app, &id, generation) {
         return;
     }
@@ -6740,6 +6810,29 @@ mod capture_tests {
         ] {
             assert!(!url_implies_media(page), "{page} must not be trusted as media");
         }
+    }
+
+    #[test]
+    fn byte_range_fragments_are_recognized() {
+        use super::url_is_byte_range_fragment;
+        // Signed range query (YouTube shape).
+        assert!(url_is_byte_range_fragment(
+            "https://rr1---sn-x.googlevideo.com/videoplayback?expire=1&range=0-62000&sparams=expire%2Cid%2Crange&mime=video%2Fmp4"
+        ));
+        // Range as a path segment (Vimeo shape).
+        assert!(url_is_byte_range_fragment(
+            "https://vod-adaptive-ak.vimeocdn.com/exp=1~acl=%2Fx~hmac=ab/uuid/psid=1/v2/range/prot/cHI9NTQw/avf/x.mp4?pathsig=1~a"
+        ));
+        // Unsigned range: strippable, so it is not a fragment.
+        assert!(!url_is_byte_range_fragment("https://cdn.test/video.mp4?range=0-1000"));
+        assert!(!url_is_byte_range_fragment("https://cdn.test/video.mp4"));
+        assert!(!url_is_byte_range_fragment("https://cdn.test/hls/master.m3u8"));
+        assert!(!url_is_byte_range_fragment("not a url"));
+        // Manifests are never fragments even when they carry a range parameter.
+        assert!(crate::media::is_manifest_source(
+            "https://cdn.test/hls/master.m3u8?range=0-1000&sparams=range",
+            None
+        ));
     }
 
     #[test]

@@ -24,6 +24,13 @@ export interface MediaPlayerEvidence {
   hovered: boolean;
   playing: boolean;
   visible: boolean;
+  /** The player's source at report time: a player may only be credited with
+   *  traffic that happened after its current source appeared (this is what
+   *  keeps an SPA navigation from re-using the previous video's URL). */
+  currentSrc?: string;
+  mediaIdentity?: string;
+  /** when the current source was first reported (ms epoch) */
+  srcAt?: number;
 }
 
 export interface MediaEvidence {
@@ -104,6 +111,49 @@ export function isLikelyRepresentation(url: string, contentType = ''): boolean {
   }
 }
 
+/**
+ * A URL whose bytes are a signed slice of an object: a path segment that
+ * carries the range (Vimeo's `/v2/range/prot/<b64>/…`) or a `range=` parameter
+ * that is part of the signature (`sparams` lists it, as YouTube's do).
+ *
+ * Such URLs are never sources. They name a few kilobytes of a stream and their
+ * signatures expire within seconds (measured live: the same Vimeo fragment
+ * answered 206 at +30 ms and 403 at +4.4 s), so a job built on one either
+ * downloads a fragment as if it were a file (the 62 KB YouTube "downloads") or
+ * fails on an expired token. They stay candidates/hints; only manifests and
+ * whole objects are acquire-able.
+ *
+ * An *unsigned* `range=` parameter is a different thing: it can be stripped, so
+ * `normalizeChunkUrl` turns that URL into a whole-object URL and it stays
+ * acquire-able.
+ */
+export function isByteRangeFragment(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.pathname.toLowerCase().split('/').includes('range')) return true;
+    if (!parsed.searchParams.has('range')) return false;
+    const sparams = (parsed.searchParams.get('sparams') || '').split(',').map((item) => item.trim().toLowerCase());
+    return sparams.includes('range');
+  } catch {
+    return false;
+  }
+}
+
+/** A URL is a usable source only after normalization removes any range it is
+ *  allowed to remove. */
+export function acquireableSource(url: string): boolean {
+  return isHttpUrl(url) && !isByteRangeFragment(normalizeChunkUrl(url));
+}
+
+function isHttpUrl(url: string): boolean {
+  try {
+    const scheme = new URL(url).protocol;
+    return scheme === 'http:' || scheme === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export function isMediaCandidate(candidate: Pick<MediaCandidate, 'url' | 'role' | 'kind' | 'contentType'>, contentType = ''): boolean {
   return candidate.role !== 'unknown'
     || (candidate.kind !== undefined && candidate.kind !== 'unknown')
@@ -161,11 +211,18 @@ export function chooseMediaSelection(
   playerKey?: string,
   documentId?: string,
   expectedKind?: Exclude<MediaKind, 'unknown'>,
+  notBefore = 0,
 ): MediaSelection | undefined {
+  // Ownership is per frame, not per tab: a cross-origin embedded player may
+  // only inherit traffic observed in its own frame. The previous
+  // `item.frameId === 0` clause let a host page's media be attributed to an
+  // embedded player (proven live: an inline YouTube embed downloading the
+  // Reddit post's video).
   const scoped = candidates.filter((item) =>
     item.tabId === tabId &&
-    (item.frameId === frameId || item.frameId === 0) &&
-    (!documentId || item.documentId === documentId),
+    item.frameId === frameId &&
+    (!documentId || item.documentId === documentId) &&
+    item.at >= notBefore,
   );
   const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
     const allNewest = [...pool].sort((left, right) => right.at - left.at);
@@ -188,10 +245,14 @@ export function chooseMediaSelection(
 
     if (pool.some((item) => item.role === 'segment')) return undefined;
 
-    const videoCandidates = newest.filter((item) => item.role !== 'segment' && (item.kind === 'video' || (item.kind !== 'audio' && mediaKindFor(item.url, item.contentType) === 'video')) && (item.kind === 'video' || isLikelyRepresentation(item.url, item.contentType)));
+    // A byte-range fragment is a slice with a seconds-long signature: usable as
+    // a hint, never as the thing a job is built on.
+    const acquireable = (item: MediaCandidate) => acquireableSource(item.url);
+
+    const videoCandidates = newest.filter((item) => item.role !== 'segment' && acquireable(item) && (item.kind === 'video' || (item.kind !== 'audio' && mediaKindFor(item.url, item.contentType) === 'video')) && (item.kind === 'video' || isLikelyRepresentation(item.url, item.contentType)));
     const audioPool = expectedKind === 'video' ? allNewest : newest;
-    const audioCandidates = audioPool.filter((item) => item.role !== 'segment' && (item.kind === 'audio' || mediaKindFor(item.url, item.contentType) === 'audio') && (item.kind === 'audio' || isLikelyRepresentation(item.url, item.contentType)));
-    const untypedCandidates = newest.filter((item) => item.role !== 'segment' && isLikelyRepresentation(item.url, item.contentType) && !videoCandidates.includes(item) && !audioCandidates.includes(item));
+    const audioCandidates = audioPool.filter((item) => item.role !== 'segment' && acquireable(item) && (item.kind === 'audio' || mediaKindFor(item.url, item.contentType) === 'audio') && (item.kind === 'audio' || isLikelyRepresentation(item.url, item.contentType)));
+    const untypedCandidates = newest.filter((item) => item.role !== 'segment' && acquireable(item) && isLikelyRepresentation(item.url, item.contentType) && !videoCandidates.includes(item) && !audioCandidates.includes(item));
 
     if (expectedKind === 'audio') {
       const primaryAudio = audioCandidates[0] ?? untypedCandidates.find((item) => mediaKindFor(item.url, item.contentType) !== 'video');
@@ -245,12 +306,15 @@ export function rankedMediaCandidates(
   expectedKind?: Exclude<MediaKind, 'unknown'>,
   now = Date.now(),
   limit = 6,
+  notBefore = 0,
 ): string[] {
   const pool = candidates.filter((item) =>
     item.tabId === tabId &&
-    (item.frameId === frameId || item.frameId === 0) &&
+    item.frameId === frameId &&
     now - item.at <= 90_000 &&
+    item.at >= notBefore &&
     item.role !== 'segment' &&
+    acquireableSource(item.url) &&
     matchesKind(item, expectedKind),
   );
   const own = pool.filter((item) => !documentId || item.documentId === documentId);
@@ -260,6 +324,9 @@ export function rankedMediaCandidates(
     const media = found.filter((item) => !isSubtitlePlaylist(item.url));
     return [...media.filter((item) => isLikelyMasterManifest(item.url)), ...media.filter((item) => !isLikelyMasterManifest(item.url)), ...found];
   };
+  // Own-document traffic ranks first, then the rest of this frame's observed
+  // traffic. It is never widened to the tab: another frame's media does not
+  // belong to this player (SPEC §6.2.1).
   const representations = (items: MediaCandidate[]) => ordered(items.filter((item) =>
     item.role === 'unknown' && isLikelyRepresentation(item.url, item.contentType)));
 
@@ -307,14 +374,26 @@ export function planMediaCapture(
   now = Date.now(),
   expectedKind?: Exclude<MediaKind, 'unknown'>,
 ): MediaCapturePlan | undefined {
-  const exact = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId, expectedKind);
+  // A player can only own traffic that happened after its current source
+  // appeared: without this, a YouTube SPA navigation re-uses the previous
+  // video's URL, and a Reddit page's video can be attributed to an embedded
+  // player it does not belong to. 2 s of slack covers requests that started
+  // just before the source flipped.
+  const clicked = players.find((item) =>
+    item.playerKey === playerKey &&
+    item.tabId === tabId &&
+    item.frameId === frameId &&
+    (!documentId || item.documentId === documentId),
+  );
+  const notBefore = clicked?.srcAt !== undefined ? Math.max(0, clicked.srcAt - 2_000) : 0;
+  const exact = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId, expectedKind, notBefore);
   if (exact?.source) {
-    const alternatives = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now)
+    const alternatives = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now, 6, notBefore)
       .filter((url) => url !== normalizeChunkUrl(exact.source));
     return { ...exact, alternatives: alternatives.slice(0, 5) };
   }
   if (!playerKey || !isSolePlayingPlayer(players, tabId, frameId, playerKey, documentId, now)) return undefined;
-  const ranked = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now);
+  const ranked = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now, 6, notBefore);
   if (!ranked.length) return undefined;
   // The pool's own ordering already put manifests before representations, so the
   // head is the source and the tail is what the resident may try next.

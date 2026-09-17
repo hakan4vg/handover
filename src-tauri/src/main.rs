@@ -2755,7 +2755,7 @@ async fn acquire_ranges(
                 // Same progress bookkeeping as every other streaming path: a
                 // full snapshot here would rewrite the whole jobs table and
                 // re-render every row once per network chunk.
-                emit_snapshot(&app, &state);
+                emit_progress(&app, &state, &id);
             }
             drop(file);
             if full_downloaded != total {

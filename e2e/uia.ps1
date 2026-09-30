@@ -1,8 +1,9 @@
 # Drives the resident's own windows through Windows UI Automation for e2e runs.
 #   uia.ps1 -List  [-Window "Add Download"]            names of the window's controls
 #   uia.ps1 -Button Save [-Window "Add Download"]      invokes a button by its accessible name
+#   uia.ps1 -Field Filename -Value x.bin [-Window ...]  sets an input by its accessible name
 # WebView2 fills its accessibility tree lazily, so both retry for -Seconds.
-param([string]$Window = "Add Download", [string]$Button = "", [switch]$List, [int]$Seconds = 10)
+param([string]$Window = "Add Download", [string]$Button = "", [string]$Field = "", [string]$Value = "", [switch]$List, [int]$Seconds = 10)
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $all = [System.Windows.Automation.Condition]::TrueCondition
@@ -15,7 +16,15 @@ do {
     Select-Object -First 1
   if ($win) {
     $items = $win.FindAll($descendants, $all)
-    if ($List) {
+    if ($Field) {
+      $input = $items | Where-Object {
+        $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit -and $_.Current.Name -eq $Field
+      } | Select-Object -First 1
+      if ($input) {
+        $input.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Value)
+        "set $Field"; exit 0
+      }
+    } elseif ($List) {
       $names = $items | Where-Object { $_.Current.Name } | ForEach-Object { $_.Current.Name }
       if (@($names).Count -gt 3) { $names; exit 0 }
     } else {

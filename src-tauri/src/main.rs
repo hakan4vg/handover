@@ -267,7 +267,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool, #[serde(default)] destination: Option<String> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5352,7 +5352,16 @@ fn start_provisional(
     let id = format!("provisional-{}", Uuid::new_v4());
     // A link's download attribute or the URL only suggest a name; the
     // server's own filename outranks both, as it does in Chromium.
-    let adopt_response_name = input.name_is_hint || input.name.as_deref().map_or(true, |value| value.trim().is_empty());
+    // Manual Add may name the destination up front; it is the user's choice
+    // and outranks both the default folder and a server-suggested name (F11).
+    let chosen_destination = input
+        .destination
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let adopt_response_name = chosen_destination.is_none()
+        && (input.name_is_hint || input.name.as_deref().map_or(true, |value| value.trim().is_empty()));
     let (name, destination, temp_folder, max_connections, bandwidth_limit) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let name = input
@@ -5360,7 +5369,21 @@ fn start_provisional(
             .filter(|value| !value.trim().is_empty())
             .map(|value| safe_filename(&value))
             .unwrap_or_else(|| source_name(&input.source));
-        let destination = destination_for_filename(&snapshot.settings.default_folder, &name);
+        let (name, destination) = match chosen_destination {
+            Some(chosen) if Path::new(&chosen).is_dir() => {
+                let destination = destination_for_filename(&chosen, &name);
+                (name, destination)
+            }
+            Some(chosen) => {
+                let leaf = Path::new(&chosen).file_name().and_then(|value| value.to_str()).map(safe_filename).unwrap_or(name);
+                let destination = Path::new(&chosen).with_file_name(&leaf).to_string_lossy().into_owned();
+                (leaf, destination)
+            }
+            None => {
+                let destination = destination_for_filename(&snapshot.settings.default_folder, &name);
+                (name, destination)
+            }
+        };
         // SPEC §11.4: a capture may carry a per-download override, and it
         // only applies while Settings allows overrides at all.
         let overrides = snapshot.settings.per_download_overrides;
@@ -6143,7 +6166,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         referrer,
         post_body,
         user_agent,
-        name_is_hint: payload.get("nameIsHint").and_then(Value::as_bool).unwrap_or(false)
+        name_is_hint: payload.get("nameIsHint").and_then(Value::as_bool).unwrap_or(false),
+        destination: None
     })
 }
 

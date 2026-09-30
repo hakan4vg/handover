@@ -253,8 +253,9 @@ class MockAdapter implements DownloadAdapter {
     this.emit();
   }
 
-  async createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) {
-    const name = input.name?.trim() || sourceName(input.source);
+  async createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null; destination?: string }) {
+    const chosen = input.destination?.trim();
+    const name = chosen?.split(/[\\/]/).pop() || input.name?.trim() || sourceName(input.source);
     const media = Boolean(input.media) || isMediaFile(name);
     const id = `provisional-${this.nextId++}`;
     const job: DownloadJob = {
@@ -273,7 +274,7 @@ class MockAdapter implements DownloadAdapter {
       bandwidthLimit: sanitizeCapBps(input.bandwidthLimit) ?? null,
       mode: media ? 'segments' : 'single-stream',
       media,
-      destination: platformPath(`${this.snapshot.settings.defaultFolder}\\${name}`),
+      destination: chosen || platformPath(`${this.snapshot.settings.defaultFolder}\\${name}`),
       tempPath: platformPath(`${mockTempRoot}\\${id}.part`),
       resumable: false,
       created: 'Just now',
@@ -354,7 +355,7 @@ class NativeAdapter implements DownloadAdapter {
   removeJob(id: string, deleteFile?: boolean) { return this.command<void>('remove_job', { id, deleteFile: deleteFile ?? false }); }
   pauseAll() { return this.command<void>('pause_all'); }
   resumeAll() { return this.command<void>('resume_all'); }
-  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<string>('create_provisional', { input }); }
+  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null; destination?: string }) { return this.command<string>('create_provisional', { input }); }
   commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<void>('commit_provisional', { id, input }); }
   updateSettings(patch: Partial<AppSettings>) { return this.command<void>('update_settings', { patch: sanitizeSettingsPatch(patch) }); }
   reattachJob(id: string) { return this.command<void>('reattach_job', { id }); }

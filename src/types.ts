@@ -115,7 +115,7 @@ export interface DownloadAdapter {
   removeJob(id: string, deleteFile?: boolean): Promise<void>;
   pauseAll(): Promise<void>;
   resumeAll(): Promise<void>;
-  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null }): Promise<string>;
+  createProvisional(input: { source: string; name?: string; media?: boolean; maxConnections?: number; bandwidthLimit?: number | null; destination?: string }): Promise<string>;
   commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }): Promise<void>;
   // bandwidthLimit wire contract (commit): undefined = keep existing cap,
   // null = clear back to the global setting, number = set cap in bytes/sec.

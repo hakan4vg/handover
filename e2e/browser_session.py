@@ -1,7 +1,7 @@
 """Real-browser session: the resident plus a test page, for a person (or a
 computer-use agent) driving Chrome with the unpacked extension.
 
-  python e2e/browser_session.py [--no-build]
+  python e2e/browser_session.py [--no-build] [--in-place]
 
 Builds the frontend, the extension and the resident, runs the resident from an
 isolated portable folder (so your real data is untouched), and serves
@@ -95,6 +95,7 @@ class Handler(fixture.Handler):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-build", action="store_true")
+    parser.add_argument("--in-place", action="store_true", help="run target/debug's exe itself (for desktop automation grants)")
     args = parser.parse_args()
     for port in (38217, PORT):
         with socket.socket() as probe:
@@ -106,11 +107,28 @@ def main() -> int:
         subprocess.run([npm, "run", "build:all"], cwd=ROOT, check=True)
         subprocess.run(["cargo", "build", "--manifest-path", str(ROOT / "src-tauri" / "Cargo.toml")], check=True)
 
-    runtime = Path(tempfile.mkdtemp(prefix="dm-browser-e2e-"))
-    (runtime / "data").mkdir()
-    out = runtime / "saved"
-    exe = runtime / "download-manager.exe"
-    shutil.copy2(ROOT / "src-tauri" / "target" / "debug" / "download-manager.exe", exe)
+    built = ROOT / "src-tauri" / "target" / "debug" / "download-manager.exe"
+    if args.in_place:
+        # Run the build where it lies, so a desktop-automation grant tied to
+        # that path (the "Download Manager Dev" Start-menu shortcut) applies.
+        # The portable data folder beside it must be one this harness made.
+        runtime = built.parent
+        marker = runtime / "data" / ".e2e-session"
+        if (runtime / "data").exists() and not marker.exists():
+            print(f"{runtime / 'data'} exists and was not created by this harness; not touching it.")
+            return 2
+        shutil.rmtree(runtime / "data", ignore_errors=True)
+        shutil.rmtree(runtime / "e2e-saved", ignore_errors=True)
+        (runtime / "data").mkdir()
+        marker.write_text("created by e2e/browser_session.py --in-place\n", encoding="utf-8")
+        out = runtime / "e2e-saved"
+        exe = built
+    else:
+        runtime = Path(tempfile.mkdtemp(prefix="dm-browser-e2e-"))
+        (runtime / "data").mkdir()
+        out = runtime / "saved"
+        exe = runtime / "download-manager.exe"
+        shutil.copy2(built, exe)
     db = runtime / "data" / "download-manager.db"
     with sqlite3.connect(db) as con:
         con.executescript("CREATE TABLE jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE notifications (id TEXT PRIMARY KEY, payload TEXT);")

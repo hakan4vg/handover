@@ -220,9 +220,9 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
     setAddWindowId(null);
   };
 
-  const handleManualSubmit = async (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => {
+  const handleManualSubmit = async (source: string, name: string, maxConnections: number, bandwidthLimit: number | null, destination?: string) => {
     try {
-      const id = await adapter.createProvisional({ source, name, maxConnections, bandwidthLimit });
+      const id = await adapter.createProvisional({ source, name, maxConnections, bandwidthLimit, destination });
       setShowManualAdd(false);
       setAddWindowId(id);
       setSelectedId(id);
@@ -907,7 +907,7 @@ function Radio({ checked, onClick, label }: { checked: boolean; onClick: () => v
   return <button className="radio" role="radio" aria-checked={checked} onClick={onClick}><span className={checked ? 'checked' : ''} />{label}</button>;
 }
 
-export function AddDownloadWindow({ settings, job, captured, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; captured?: boolean; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void | Promise<void>; onClose: () => void }) {
+export function AddDownloadWindow({ settings, job, captured, onCreate, onCommit, onCancel, onClose }: { adapter?: DownloadAdapter; settings: AppSettings; job?: DownloadJob; captured?: boolean; onCreate?: (source: string, name: string, maxConnections: number, bandwidthLimit: number | null, destination?: string) => Promise<void>; onCommit?: (id: string, name: string, destination: string, maxConnections: number, bandwidthLimit: number | null) => void | Promise<void>; onCancel: (id: string) => void | Promise<void>; onClose: () => void }) {
   // A capture surface is bound to one provisional acquisition, whose data
   // arrives with the next snapshot. Mode comes from the caller, never from
   // whether the job happens to be present yet, so the window can not flash into
@@ -1025,7 +1025,7 @@ export function AddDownloadWindow({ settings, job, captured, onCreate, onCommit,
     busyRef.current = true;
     setFormError('');
     setBusyAction('create');
-    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit); } catch (reason) { setFormError(errorMessage(reason, 'Could not start the download.')); } finally { busyRef.current = false; setBusyAction(null); }
+    try { await onCreate(source.trim(), name.trim(), maxConnections, bandwidthLimit, destTouched ? shownDestination.trim() : undefined); } catch (reason) { setFormError(errorMessage(reason, 'Could not start the download.')); } finally { busyRef.current = false; setBusyAction(null); }
   };
   const cancel = async () => {
     if (busy || busyRef.current) return;
@@ -1073,7 +1073,7 @@ function StandaloneAddWindow({ adapter, snapshot }: { adapter: DownloadAdapter; 
   const [createdId, setCreatedId] = useState<string | undefined>(jobId);
   const currentJob = snapshot.jobs.find((item) => item.id === createdId);
   const close = () => closeSurface();
-  const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit }));
+  const create = async (url: string, name: string, maxConnections: number, bandwidthLimit: number | null, destination?: string) => setCreatedId(await adapter.createProvisional({ source: url, name, maxConnections, bandwidthLimit, destination }));
   return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><AddDownloadWindow adapter={adapter} settings={snapshot.settings} captured job={currentJob ?? job} onCreate={create} onCommit={async (id, name, destination, maxConnections, bandwidthLimit) => { await adapter.commitProvisional(id, { name, destination, maxConnections, bandwidthLimit }); close(); }} onCancel={async (id) => { await adapter.cancelJob(id); close(); }} onClose={close} /></div>;
 }
 

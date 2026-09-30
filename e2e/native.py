@@ -50,6 +50,24 @@ EXPORT_BYTES = b"id,account\n1,requested-export\n"
 NAMED_BYTES = b"named by the server\n" * 64
 counts: collections.Counter = collections.Counter()
 
+# Server pacing (F22): the first request for each range or segment is told
+# to come back in a second; a retry inside that second is counted as early.
+PACING_FIRST: dict[str, float] = {}
+PACING_EARLY: collections.Counter = collections.Counter()
+PACED_HLS = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2"] + [line for i in range(3) for line in ("#EXTINF:2.0,", f"/paced-hls/seg{i}.ts")] + ["#EXT-X-ENDLIST", ""])
+
+
+def pacing_says_wait(key: str, scenario: str) -> bool:
+    now = time.time()
+    first = PACING_FIRST.setdefault(key, now)
+    if first == now:
+        return True
+    if now - first < 1.0:
+        PACING_EARLY[scenario] += 1
+        return True
+    return False
+
+
 # Presentations the assembler cannot reproduce faithfully (F09). Each uses the
 # real fixture video, so an engine that ignores the boundary completes a file.
 _VIDEO_SET = '<AdaptationSet contentType="video"><Representation id="v"><BaseURL>/dash/</BaseURL><SegmentList><Initialization sourceURL="v-init.mp4"/><SegmentURL media="v-0.m4s"/></SegmentList></Representation></AdaptationSet>'
@@ -117,6 +135,19 @@ class Handler(fixture.Handler):
         if path == "/hls-two-maps.m3u8":
             data = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2", '#EXT-X-MAP:URI="/dash/v-init.mp4"', "#EXTINF:2.0,", "/dash/v-0.m4s", "#EXT-X-DISCONTINUITY", '#EXT-X-MAP:URI="/dash/a-init.mp4"', "#EXTINF:2.0,", "/dash/a-0.m4s", "#EXT-X-ENDLIST", ""])
             return self._raw(200, data.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/paced/range.bin":
+            rng = self.headers.get("Range", "")
+            size, seed, _ = fixture.FILES["range.bin"]
+            if rng.startswith("bytes=") and not rng.startswith("bytes=0-") and pacing_says_wait(rng, "range"):
+                return self._raw(503, b"slow down", {"Retry-After": "1"})
+            return self._serve_file("range.bin", seed, size, True)
+        if path == "/paced-hls.m3u8":
+            return self._raw(200, PACED_HLS.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path.startswith("/paced-hls/seg"):
+            if pacing_says_wait(path, "hls"):
+                return self._raw(503, b"slow down", {"Retry-After": "1"})
+            index = int(path[len("/paced-hls/seg"):-3])
+            return self._raw(200, fixture.file_data(f"seg{index}", 0x80 + index, 188 * 16), {"Content-Type": "video/mp2t"})
         if path in DASH_BOUNDARY:
             return self._raw(200, DASH_BOUNDARY[path].encode(), {"Content-Type": "application/dash+xml"})
         if path == "/zero.mpd":
@@ -194,6 +225,8 @@ def main() -> int:
         "post-reject": ("/post-reject.bin", {"postBody": "export=requested"}),
         "post-ok": ("/post-ok.bin", {"postBody": "export=requested"}),
         "zero-mpd": ("/zero.mpd", {"media": True, "playerKind": "video"}),
+        "paced-range": ("/paced/range.bin", {}),
+        "paced-hls": ("/paced-hls.m3u8", {"media": True, "playerKind": "video"}),
         "mpd-dynamic": ("/dynamic-spaced.mpd", {"media": True, "playerKind": "video"}),
         "mpd-periods": ("/two-periods.mpd", {"media": True, "playerKind": "video"}),
         "mpd-drm": ("/drm.mpd", {"media": True, "playerKind": "video"}),
@@ -267,6 +300,11 @@ def main() -> int:
         ):
             j = job(name)
             run.check(f"engine/{name}", guards, j["state"] == "failed" and expect in (j["error"] or "") and j["_data"] is None, evidence(name))
+
+        j = job("paced-range")
+        run.check("engine/paced-range", "range workers told Retry-After wait it out: the download completes byte-exact with no retry inside the server's window", j["state"] == "completed" and j["_data"] == RANGE_BYTES and PACING_EARLY["range"] == 0, evidence("paced-range", earlyRetries=PACING_EARLY["range"], pacedRanges=sum(1 for k in PACING_FIRST if k.startswith("bytes="))))
+        j = job("paced-hls")
+        run.check("engine/paced-hls", "media segments told Retry-After wait it out: the playlist completes with no retry inside the server's window", j["state"] == "completed" and bool(j["bytes"]) and PACING_EARLY["hls"] == 0, evidence("paced-hls", earlyRetries=PACING_EARLY["hls"]))
 
         j = job("hls-vod")
         run.check("engine/hls-vod", "an ordinary finite HLS playlist still assembles (control)", j["state"] == "completed" and bool(j["bytes"]), evidence("hls-vod"))

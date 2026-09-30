@@ -2201,12 +2201,10 @@ async fn fragment_bytes(
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     let expected_length = byte_range.map(|(_, length)| length);
+    let mut pacing = None;
     for attempt in 0..attempts {
-        if attempt > 0 {
-            sleep(Duration::from_millis(100)).await;
-            if !transfer_can_continue(app, id, generation) {
-                return Err("paused".to_string());
-            }
+        if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
+            return Err("paused".to_string());
         }
         let mut request = acquisition_request(client, app, id, source);
         if let Some((start, length)) = byte_range {
@@ -2272,7 +2270,10 @@ async fn fragment_bytes(
             Ok(response) if terminal_source_status(response.status()) => {
                 return Err(terminal_source_error(response.status()));
             }
-            Ok(response) => last_error = format!("source returned {}", response.status()),
+            Ok(response) => {
+                pacing = retry_after(&response);
+                last_error = format!("source returned {}", response.status());
+            }
             Err(error) => last_error = error.to_string()
         }
     }
@@ -2298,12 +2299,10 @@ async fn fragment_to_file(
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     let expected_length = byte_range.map(|(_, length)| length);
+    let mut pacing = None;
     for attempt in 0..attempts {
-        if attempt > 0 {
-            sleep(Duration::from_millis(100)).await;
-            if !transfer_can_continue(app, id, generation) {
-                return Err("paused".to_string());
-            }
+        if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
+            return Err("paused".to_string());
         }
         let mut request = acquisition_request(client, app, id, source);
         if let Some((start, length)) = byte_range {
@@ -2381,7 +2380,10 @@ async fn fragment_to_file(
             Ok(response) if terminal_source_status(response.status()) => {
                 return Err(terminal_source_error(response.status()));
             }
-            Ok(response) => last_error = format!("source returned {}", response.status()),
+            Ok(response) => {
+                pacing = retry_after(&response);
+                last_error = format!("source returned {}", response.status());
+            }
             Err(error) => last_error = error.to_string()
         }
     }
@@ -2499,6 +2501,52 @@ fn content_range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
     Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
 }
 
+/// Longest wait a server's Retry-After can impose on one retry.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+
+/// A response's Retry-After, as delta-seconds or an IMF-fixdate
+/// ("Sun, 06 Nov 1994 08:49:37 GMT"); other forms are ignored.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let [_, day, month, year, time, "GMT"] = parts.as_slice() else { return None; };
+    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|name| name == month)? as i64 + 1;
+    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let clock: Vec<i64> = time.split(':').map(|part| part.parse().ok()).collect::<Option<_>>()?;
+    let [hours, minutes, seconds] = clock.as_slice() else { return None; };
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let at = (era * 146_097 + day_of_era - 719_468) * 86_400 + hours * 3600 + minutes * 60 + seconds;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(Duration::from_secs(at.saturating_sub(now).max(0) as u64))
+}
+
+/// Wait before retry number `attempt` (1-based) of a transfer request (F22):
+/// the server's Retry-After when it sent one, otherwise exponential backoff
+/// from 250 ms, both capped. The wait is sliced so pause and cancel stay
+/// responsive; false means the transfer may no longer continue.
+async fn wait_before_retry(app: &AppHandle, id: &str, generation: u64, attempt: u32, server_pacing: Option<Duration>) -> bool {
+    let backoff = Duration::from_millis(250u64 << attempt.saturating_sub(1).min(4));
+    let deadline = std::time::Instant::now() + server_pacing.unwrap_or(backoff).min(RETRY_AFTER_CAP);
+    loop {
+        if !transfer_can_continue(app, id, generation) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
 async fn range_bytes(
     client: &reqwest::Client,
     app: &AppHandle,
@@ -2513,7 +2561,11 @@ async fn range_bytes(
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("range request failed");
     let total_len = end.saturating_sub(start).saturating_add(1);
-    for _ in 0..attempts {
+    let mut pacing = None;
+    for attempt in 0..attempts {
+        if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
+            return Err("paused".to_string());
+        }
         match acquisition_request(client, app, id, source)
             .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
             .send()
@@ -2532,8 +2584,9 @@ async fn range_bytes(
                     continue;
                 }
                 if !valid_range_identity(&response, expected) {
-                    last_error = "The resource changed while it was being acquired".into();
-                    continue;
+                    // A different resource will not turn back into the
+                    // verified one: retrying only spends requests.
+                    return Err("The resource changed while it was being acquired".into());
                 }
                 let mut buf = Vec::new();
                 let mut stream = response.bytes_stream();
@@ -2577,7 +2630,10 @@ async fn range_bytes(
             Ok(response) if terminal_source_status(response.status()) => {
                 return Err(terminal_source_error(response.status()));
             }
-            Ok(response) => last_error = format!("range request returned {}", response.status()),
+            Ok(response) => {
+                pacing = retry_after(&response);
+                last_error = format!("range request returned {}", response.status());
+            }
             Err(error) => last_error = error.to_string()
         }
     }

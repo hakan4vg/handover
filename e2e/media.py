@@ -53,6 +53,7 @@ FIXTURES = {
     # name: (ffmpeg arguments after the inputs, manifest file)
     "webm": (VP9 + ["-c:a", "libopus", "-b:a", "64k", "-f", "dash", "-seg_duration", "2", "-dash_segment_type", "webm", "-use_template", "1", "-use_timeline", "0", "manifest.mpd"], "manifest.mpd"),
     "mixed": (VP9 + ["-c:a", "aac", "-b:a", "96k", "-f", "dash", "-seg_duration", "2", "-dash_segment_type", "auto", "-use_template", "1", "-use_timeline", "0", "manifest.mpd"], "manifest.mpd"),
+    "aes": (["-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "aac", "-b:a", "96k", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_enc", "1", "-hls_enc_key", "000102030405060708090a0b0c0d0e0f", "-hls_enc_iv", "0f0e0d0c0b0a09080706050403020100", "-hls_segment_filename", "e%d.ts", "playlist.m3u8"], "playlist.m3u8"),
     "hls": (["-c:v", "libx264", "-preset", "ultrafast", "-g", "50", "-c:a", "aac", "-b:a", "96k", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_segment_type", "mpegts", "-var_stream_map", "v:0,agroup:aud a:0,agroup:aud,default:yes", "-master_pl_name", "master.m3u8", "-hls_segment_filename", "s%v-%d.ts", "p%v.m3u8"], "master.m3u8"),
 }
 
@@ -219,11 +220,12 @@ def main() -> int:
     base = f"http://127.0.0.1:{server.server_port}"
 
     jobs_to_run = {
-        # name: (manifest path, requested file name, muxer it reaches)
+        # name: (manifest path, requested file name, what it exercises)
         "fmp4": ("/dash/manifest.mpd", "fmp4.mp4", "fragmented MP4 video + audio"),
         "webm": ("/mc/webm/manifest.mpd", "webm.webm", "WebM VP9 + WebM Opus into Matroska"),
         "mixed": ("/mc/mixed/manifest.mpd", "mixed.webm", "WebM VP9 + fragmented-MP4 AAC into Matroska"),
         "ts": ("/mc/hls/master.m3u8", "ts.ts", "MPEG-TS video + separate MPEG-TS audio"),
+        "aes": ("/mc/aes/playlist.m3u8", "aes.ts", "AES-128 encrypted HLS, decrypted as each segment streams to disk"),
     }
     if BIG:
         jobs_to_run["large"] = ("/big/manifest.mpd", "large.mp4", f"{BIG.count * BIG_SEGMENT // MIB} MiB fragmented MP4 video + audio")
@@ -244,6 +246,7 @@ def main() -> int:
     process = psutil.Process(app.pid)
     run = Run()
     peak_private = 0
+    timeline: list[dict] = []
     finished_at: dict[str, float] = {}
 
     def jobs() -> dict[str, dict]:
@@ -256,17 +259,23 @@ def main() -> int:
         while time.time() < deadline:
             time.sleep(0.25)
             try:
-                peak_private = max(peak_private, process.memory_info().private)
+                private = process.memory_info().private
+                peak_private = max(peak_private, private)
                 state = jobs()
             except (sqlite3.Error, psutil.Error):
                 continue
+            # Where the memory goes: private bytes against the large job's phase.
+            big = state.get("large", {})
+            point = {"t": round(time.time() - started, 2), "privateMiB": round(private / MIB), "phase": big.get("state"), "progress": round(big.get("progress") or 0)}
+            if not timeline or abs(point["privateMiB"] - timeline[-1]["privateMiB"]) >= 32 or point["phase"] != timeline[-1]["phase"]:
+                timeline.append(point)
             for name in jobs_to_run:
                 if state.get(name, {}).get("state") in ("completed", "failed"):
                     finished_at.setdefault(name, round(time.time() - started, 1))
             if len(finished_at) == len(jobs_to_run):
                 break
         memory = process.memory_info()
-        memory_evidence = {"peakCommitMiB": round(memory.peak_pagefile / MIB, 1), "peakWorkingSetMiB": round(memory.peak_wset / MIB, 1), "sampledPeakPrivateMiB": round(peak_private / MIB, 1)}
+        memory_evidence = {"peakCommitMiB": round(memory.peak_pagefile / MIB, 1), "peakWorkingSetMiB": round(memory.peak_wset / MIB, 1), "sampledPeakPrivateMiB": round(peak_private / MIB, 1), "timeline": timeline}
     finally:
         app.terminate()
         try:
@@ -291,7 +300,7 @@ def main() -> int:
             if name != "large":
                 evidence.update(probe(dest))
         outputs[name] = evidence
-        scenario = f"mux/{name}"
+        scenario = f"{'segments' if name == 'aes' else 'mux'}/{name}"
         if name == "large":
             ok = evidence["state"] == "completed" and evidence.get("bytes", 0) >= BIG.count * BIG_SEGMENT
             run.check(scenario, f"a {reaches} download completes", ok, evidence)

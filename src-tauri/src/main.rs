@@ -774,7 +774,7 @@ fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
             })
     });
     if let Some((destination, marker)) = reservation {
-        if std::fs::read(&destination).ok().as_deref() == Some(marker.as_bytes()) {
+        if holds_reservation_marker(Path::new(&destination), &marker) {
             let _ = std::fs::remove_file(destination);
         }
         emit_job(state, id, |job| job.destination_reservation = None);
@@ -1208,27 +1208,55 @@ enum DestinationReservationRecovery { Retry, Completed, Missing, Unknown }
 
 fn destination_reservation_marker() -> String { format!("{DESTINATION_RESERVATION_PREFIX}{}", Uuid::new_v4()) }
 
+/// The first `limit` bytes of a file and its full length. Reservation checks
+/// only ever need a marker's worth of a destination, which may by then be a
+/// finished multi-gigabyte download (F13).
+fn file_prefix(path: &Path, limit: usize) -> std::io::Result<(u64, Vec<u8>)> {
+    let file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut prefix = Vec::with_capacity(limit.min(length as usize));
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, limit as u64), &mut prefix)?;
+    Ok((length, prefix))
+}
+
+/// Whether `path` holds exactly `marker`: only a file of the marker's length
+/// is read at all.
+fn holds_reservation_marker(path: &Path, marker: &str) -> bool {
+    file_prefix(path, marker.len())
+        .is_ok_and(|(length, prefix)| length == marker.len() as u64 && prefix == marker.as_bytes())
+}
+
+async fn holds_reservation_marker_async(path: &str, marker: &str) -> bool {
+    let (path, marker) = (PathBuf::from(path), marker.to_string());
+    tauri::async_runtime::spawn_blocking(move || holds_reservation_marker(&path, &marker))
+        .await
+        .unwrap_or(false)
+}
+
 fn reconcile_destination_reservation(
     path: &Path,
     marker: &str,
     allow_empty_completed: bool
 ) -> DestinationReservationRecovery {
-    match std::fs::read(path) {
-        Ok(bytes)
-            if bytes == marker.as_bytes()
-                || (bytes.len() < marker.len()
-                    && marker.as_bytes().starts_with(&bytes)
-                    && bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes())) =>
+    // At most a marker's worth is read; a length equal to the prefix's
+    // means the prefix is the whole file.
+    match file_prefix(path, marker.len()) {
+        Ok((length, bytes))
+            if length == bytes.len() as u64
+                && (bytes == marker.as_bytes()
+                    || (bytes.len() < marker.len()
+                        && marker.as_bytes().starts_with(&bytes)
+                        && bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()))) =>
         {
             match std::fs::remove_file(path) {
                 Ok(()) => DestinationReservationRecovery::Retry,
                 Err(_) => DestinationReservationRecovery::Unknown
             }
         }
-        Ok(bytes) if bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => {
+        Ok((_, bytes)) if bytes.starts_with(DESTINATION_RESERVATION_PREFIX.as_bytes()) => {
             DestinationReservationRecovery::Unknown
         }
-        Ok(bytes) if bytes.is_empty() && !allow_empty_completed => match std::fs::remove_file(path)
+        Ok((length, _)) if length == 0 && !allow_empty_completed => match std::fs::remove_file(path)
         {
             Ok(()) => DestinationReservationRecovery::Retry,
             Err(_) => DestinationReservationRecovery::Unknown
@@ -1775,7 +1803,7 @@ fn move_needs_fallback(error: &std::io::Error) -> bool {
 
 async fn remove_owned_reservation(destination: &str, marker: Option<&str>) {
     let Some(marker) = marker else { return; };
-    if tokio::fs::read(destination).await.ok().as_deref() == Some(marker.as_bytes()) {
+    if holds_reservation_marker_async(destination, marker).await {
         let _ = tokio::fs::remove_file(destination).await;
     }
 }
@@ -1833,7 +1861,7 @@ fn reservation_restore_message(result: &ReservationRestore) -> String {
 }
 
 async fn install_reserved_staging(staging: &str, destination: &str, marker: &str) -> Result<(), String> {
-    let owns_reservation = tokio::fs::read(destination).await.ok().as_deref() == Some(marker.as_bytes());
+    let owns_reservation = holds_reservation_marker_async(destination, marker).await;
     if !owns_reservation {
         let _ = tokio::fs::remove_file(staging).await;
         return Err("fallback destination reservation changed".into());

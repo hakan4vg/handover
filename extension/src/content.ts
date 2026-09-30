@@ -550,7 +550,10 @@ function collectMedia(scanShadow = true): MediaElement[] {
     return lightMediaCache;
   }
   const now = performance.now();
-  if (scanShadow && (mediaCache === null || now - lastShadowScan >= 1000)) scanShadowMedia();
+  // The full-document shadow scan is the expensive part of tracking: rescan
+  // every second while shadow-hosted media exists, every five otherwise.
+  const shadowInterval = shadowMediaCache.length ? 1000 : 5000;
+  if (scanShadow && (mediaCache === null || now - lastShadowScan >= shadowInterval)) scanShadowMedia();
   return mediaCache ?? rebuildMediaCache();
 }
 
@@ -849,10 +852,20 @@ document.addEventListener('scroll', track, { capture: true, passive: true });
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && (changes['dm-policy'] || changes['dm-media-filters'])) void refreshPolicy();
 });
+// No standing poll: storage changes push browser-side edits, and returning to
+// a tab picks up edits made in the resident (the worker re-reads its policy
+// on each of these and again before every interception decision).
+if (window.top === window) {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void refreshPolicy();
+  });
+  window.addEventListener('focus', () => { void refreshPolicy(); });
+}
 
 void refreshPolicy().then(() => {
-  window.setInterval(track, 500);
-  if (window.top === window) window.setInterval(refreshPolicy, 1000);
+  window.setInterval(() => {
+    if (!document.hidden) track();
+  }, 500);
   let queuedTrack: number | null = null;
   const scheduleTrack = () => {
     if (queuedTrack !== null) return;

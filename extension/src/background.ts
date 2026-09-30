@@ -237,6 +237,18 @@ async function refreshResidentPolicy(): Promise<void> {
   await residentPolicySync;
 }
 
+/** The policy an interception decision should use: the resident's current
+ *  one when it answers, else the last known. Pages no longer poll the worker
+ *  every second, so freshness is established here, where it matters. */
+async function decisionPolicyReady(): Promise<void> {
+  await policyReady;
+  try {
+    await refreshResidentPolicy();
+  } catch {
+    // The resident is stopped: the stored browser-owned policy stands.
+  }
+}
+
 async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<unknown> {
   const type = (message as { type?: string })?.type;
   const route = type === 'get-policy' ? '/v1/policy' : type === 'open-manager' ? '/v1/manager' : type === 'update-policy' ? '/v1/policy' : '/v1/capture';
@@ -431,6 +443,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   await policyReady;
   const source = typeof payload.source === 'string' ? payload.source.trim() : '';
   const pageUrl = typeof payload.pageUrl === 'string' ? payload.pageUrl : '';
+  await decisionPolicyReady();
   const captureError = ordinaryCaptureError(source, pageUrl);
   if (captureError) {
     return { ok: false, error: captureError };
@@ -668,7 +681,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     let paused = false;
     let nativeId: string | undefined;
     try {
-      await policyReady;
+      await decisionPolicyReady();
       if (ordinaryCaptureError(source, item.referrer ?? '')) {
         return;
       }

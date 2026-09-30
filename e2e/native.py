@@ -327,7 +327,7 @@ def main() -> int:
             for _ in range(30):
                 time.sleep(1)
                 code, during = uia("-List", "-Seconds", "5")
-                if code != 0 or "Saving" not in during:
+                if code != 0 or "Could not record the Save" in during:
                     break
         finally:
             lock.execute("ROLLBACK")
@@ -335,7 +335,7 @@ def main() -> int:
         stayed_open = code == 0 and "Save" in during
         told_why = "Could not record the Save" in during
         stored = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
-        run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[-12:], "storedProvisional": stored.get("provisional")})
+        run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[:16], "storedProvisional": stored.get("provisional")})
         uia("-Button", "Save")
         final = {}
         for _ in range(40):

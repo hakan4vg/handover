@@ -245,8 +245,10 @@ pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // A fragment that cannot be addressed is a hole in the media, not a
+        // line to skip: skipping it yields a file with a silent gap.
         let Some(url) = resolve(source, line) else {
-            continue;
+            return Err("The VOD playlist lists a fragment whose address cannot be resolved".into());
         };
         let range = if let Some((length, offset)) = pending_range.take() {
             let start = match offset {
@@ -274,24 +276,26 @@ pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
     if segments.is_empty() {
         return Err("The VOD playlist did not contain any media fragments".into());
     }
-    if let Some(line) = body
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("#EXT-X-MAP"))
-    {
+    // One initialization map is prepended to the whole output, so a playlist
+    // that switches maps part-way would assemble later fragments under the
+    // wrong header: refuse it rather than write a file that cannot play.
+    let mut maps = Vec::new();
+    for line in body.lines().map(str::trim).filter(|line| line.starts_with("#EXT-X-MAP")) {
         let Some(map) = hls_map_segment(line)? else {
             return Err("The HLS initialization map is missing its URI".into());
         };
-        if let Some(url) = resolve(source, &map.0) {
-            segments.insert(
-                0,
-                Segment {
-                    url,
-                    range: map.1,
-                    key: None
-                }
-            );
+        let Some(url) = resolve(source, &map.0) else {
+            return Err("The HLS initialization map's address cannot be resolved".into());
+        };
+        if !maps.contains(&(url.clone(), map.1)) {
+            maps.push((url, map.1));
         }
+    }
+    if maps.len() > 1 {
+        return Err("The VOD playlist switches its initialization map part-way, which is not supported".into());
+    }
+    if let Some((url, range)) = maps.pop() {
+        segments.insert(0, Segment { url, range, key: None });
     }
     Ok(segments)
 }

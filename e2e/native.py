@@ -100,6 +100,12 @@ class Handler(fixture.Handler):
             return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream", "Content-Disposition": 'attachment; filename="server; plain.bin"'})
         if path == "/named/star.bin":
             return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream", "Content-Disposition": "attachment; filename=\"fallback.bin\"; filename*=UTF-8''server%20%C3%A9t%C3%A9.bin"})
+        if path == "/hls-hole.m3u8":
+            data = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXTINF:2.0,", "/hls/seg0.ts", "#EXTINF:2.0,", "http://[unresolvable", "#EXTINF:2.0,", "/hls/seg1.ts", "#EXT-X-ENDLIST", ""])
+            return self._raw(200, data.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/hls-two-maps.m3u8":
+            data = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2", '#EXT-X-MAP:URI="/dash/v-init.mp4"', "#EXTINF:2.0,", "/dash/v-0.m4s", "#EXT-X-DISCONTINUITY", '#EXT-X-MAP:URI="/dash/a-init.mp4"', "#EXTINF:2.0,", "/dash/a-0.m4s", "#EXT-X-ENDLIST", ""])
+            return self._raw(200, data.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
         if path == "/zero.mpd":
             data = b'<MPD type="static" mediaPresentationDuration="PT4S"><Period><AdaptationSet contentType="video"><Representation id="v"><SegmentTemplate timescale="1" duration="0" media="s-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>'
             return self._raw(200, data, {"Content-Type": "application/dash+xml"})
@@ -175,6 +181,9 @@ def main() -> int:
         "post-reject": ("/post-reject.bin", {"postBody": "export=requested"}),
         "post-ok": ("/post-ok.bin", {"postBody": "export=requested"}),
         "zero-mpd": ("/zero.mpd", {"media": True, "playerKind": "video"}),
+        "hls-vod": ("/hls/vod.m3u8", {"media": True, "playerKind": "video"}),
+        "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
+        "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
     }
     for name, (path, extra) in engine.items():
         job = dict(id=name, name=f"{name}.bin", source=base + path, domain="127.0.0.1", state="connecting", progress=0, downloaded=0, total=None, speed=0, eta=None, connections=0, maxConnections=4, mode="single-stream", media=False, destination=str(out / f"{name}.bin"), tempPath=str(runtime / "data" / "tmp" / f"{name}.part"), resumable=False, mime=None, error=None, created="2026-09-29T19:00:00Z", started=None, completed=None, provisional=False, segments=None, referrer=base + "/page", events=[])
@@ -234,6 +243,13 @@ def main() -> int:
         run.check("engine/post-ok", "an accepted POST completes with the POST response and never issues a GET", j["state"] == "completed" and j["_data"] == EXPORT_BYTES and gets_ok == 0, evidence("post-ok", gets=gets_ok))
         j = job("zero-mpd")
         run.check("engine/zero-duration-mpd", "a malformed manifest fails visibly instead of leaving the job stuck connecting", j["state"] == "failed" and bool(j["error"]), evidence("zero-mpd"))
+
+        j = job("hls-vod")
+        run.check("engine/hls-vod", "an ordinary finite HLS playlist still assembles (control)", j["state"] == "completed" and bool(j["bytes"]), evidence("hls-vod"))
+        j = job("hls-hole")
+        run.check("engine/hls-unresolvable-fragment", "a fragment line that cannot be addressed fails the job instead of leaving a silent gap", j["state"] == "failed" and "cannot be resolved" in (j["error"] or ""), evidence("hls-hole"))
+        j = job("hls-two-maps")
+        run.check("engine/hls-map-switch", "a playlist that switches initialization maps is refused, not assembled under the first map", j["state"] == "failed" and "initialization map" in (j["error"] or ""), evidence("hls-two-maps"))
 
         # ---- bridge scenarios ------------------------------------------------
         def capture(path: str, capture_id: str, viable: bool = True) -> dict:

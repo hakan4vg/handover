@@ -214,6 +214,10 @@ function interceptDownloadClick(event: MouseEvent): void {
   if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download') || anchor.hasAttribute('data-dm-browser-fallback')) return;
   const source = anchor.href;
   if (!isHttp(source)) return;
+  // After the extension is reloaded or updated, scripts already injected
+  // into open tabs are orphaned: runtime.id is gone and sendMessage throws.
+  // Such a script must leave the click to the browser, not swallow it.
+  if (!chrome.runtime?.id) return;
   event.preventDefault();
   event.stopImmediatePropagation();
   // Chromium drops the author-supplied filename for cross-origin targets.
@@ -230,15 +234,23 @@ function interceptDownloadClick(event: MouseEvent): void {
     authorName = undefined;
   }
   const name = authorName;
-  void chrome.runtime.sendMessage({
-    type: 'ordinary-capture',
-    payload: {
-      source,
-      name,
-      pageUrl: window.location.href,
-      userAgent: navigator.userAgent,
-    },
-  }).then((response) => {
+  let sent: Promise<unknown>;
+  try {
+    sent = chrome.runtime.sendMessage({
+      type: 'ordinary-capture',
+      payload: {
+        source,
+        name,
+        pageUrl: window.location.href,
+        userAgent: navigator.userAgent,
+      },
+    });
+  } catch (error) {
+    // An invalidated extension context throws here synchronously, not as a
+    // rejection; the click was already prevented, so hand it back now.
+    sent = Promise.reject(error);
+  }
+  void sent.then((response) => {
     // Background answers ok:false only after its own downloads-API fallback
     // failed; the synthetic anchor is the last resort, not a duplicate.
     if (captureNeedsBrowserRestore(response)) restoreBrowserDownload(source, name);

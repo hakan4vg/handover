@@ -1,5 +1,10 @@
 export const APP_BRIDGE_ORIGIN = 'http://127.0.0.1:38217';
 export const APP_BRIDGE_TIMEOUT_MS = 1500;
+// An ordinary capture is answered only once the resident's own first response
+// proved it can fetch the file (the resident waits up to 20 s for that), so the
+// browser keeps its copy until then.
+export const APP_CAPTURE_TIMEOUT_MS = 25_000;
+export const APP_MEDIA_CAPTURE_TIMEOUT_MS = 5_000;
 
 export interface BrowserPolicy {
   interceptDownloads: boolean;

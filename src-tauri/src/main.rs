@@ -148,7 +148,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -163,6 +163,18 @@ impl Default for ProgressThrottle {
         Self { dirty_jobs: std::collections::HashSet::new(), last_emit: now, last_persist: now }
     }
 }
+
+/// Resolved once per acquisition that asked to prove itself before the browser
+/// lets go of its own copy: Ok when the first response is the file, Err with
+/// the reason otherwise (SPEC §5.1.1).
+type Viability = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// What the bridge knows about an extension-generated capture id. A capture
+/// whose acknowledgement was lost is cancelled by id, and that cancel may
+/// arrive before the create it refers to.
+#[derive(Clone)]
+enum CaptureRecord { Job(String), Cancelled }
+const CAPTURE_LEDGER_MAX: usize = 256;
 
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
@@ -1850,6 +1862,31 @@ fn transfer_is_active(state: &CoreState, id: &str) -> bool {
 
 fn abort_transfer(state: &CoreState, id: &str) {
     state.transfer_controls.abort(id);
+}
+
+fn report_viability(app: &AppHandle, id: &str, result: Result<(), String>) {
+    let sender = app
+        .state::<CoreState>()
+        .viability
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.remove(id));
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
+    }
+}
+
+/// No-op once viability was reported; otherwise the acquisition ended without
+/// reaching its file, and whoever is waiting learns why.
+fn report_viability_failure(app: &AppHandle, id: &str) {
+    let error = app
+        .state::<CoreState>()
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).and_then(|job| job.error.clone()))
+        .unwrap_or_else(|| "The acquisition stopped before it received the file".into());
+    report_viability(app, id, Err(error));
 }
 
 fn spawn_transfer(app: &AppHandle, state: &CoreState, id: String, source: String) -> bool {
@@ -3914,6 +3951,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     let known_manifest = media::is_manifest_source(&manifest_source, response_mime.as_deref())
         || manifest_mime(response_mime.as_deref());
     if known_manifest {
+        report_viability(&app, &id, Ok(()));
         let body = response.text().await.map_err(|error| error.to_string());
         let result = match body {
             Ok(body) => acquire_manifest(
@@ -3946,6 +3984,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         return false;
     }
     if let Some(audio_source) = companion_audio_url {
+        report_viability(&app, &id, Ok(()));
         if expected_kind.as_deref() != Some("video") {
             mark_acquisition_failed(&app, &state, &id, "Companion audio requires a video source".into(), "Invalid companion audio metadata");
             return false;
@@ -4008,6 +4047,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         sniff_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     if media::is_manifest_body(&sniff_prefix) {
+        report_viability(&app, &id, Ok(()));
         let mut body = prefix_chunks
             .iter()
             .flat_map(|chunk| chunk.iter().copied())
@@ -4059,6 +4099,8 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         );
         return false;
     }
+    // Headers and first bytes say this is the file: the browser may let go.
+    report_viability(&app, &id, Ok(()));
     if safe_ranges {
         let probe_end = total
             .expect("safe range response has a total")
@@ -4662,6 +4704,7 @@ async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
             }
         }
         let retryable = acquire_once(app.clone(), id.clone(), source.clone(), generation).await;
+        report_viability_failure(&app, &id);
         if !transfer_is_current(&app, &id, generation)
             || !automatic
             || !retryable
@@ -5006,7 +5049,8 @@ fn start_provisional(
     app: AppHandle,
     state: &CoreState,
     input: ProvisionalInput,
-    show_window: bool
+    show_window: bool,
+    mut viability: Option<Viability>
 ) -> Result<String, String> {
     let _lifecycle = state
         .lifecycle
@@ -5082,6 +5126,9 @@ fn start_provisional(
                     .unwrap_or(false);
             if accepted {
                 emit_snapshot(&app, state);
+                if let (Some(sender), Ok(mut pending)) = (viability.take(), state.viability.lock()) {
+                    pending.insert(target_id.clone(), sender);
+                }
                 let _ = spawn_transfer(&app, state, target_id.clone(), input.source);
                 return Ok(target_id);
             }
@@ -5171,60 +5218,68 @@ fn start_provisional(
         snapshot.jobs.insert(0, job);
     }
     emit_snapshot(&app, state);
+    if let (Some(sender), Ok(mut pending)) = (viability.take(), state.viability.lock()) {
+        pending.insert(id.clone(), sender);
+    }
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
     if show_window {
-        let label = format!("add-{}", id);
-        let url = format!("index.html?window=add&id={id}");
-        let mut add_window = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into()))
-            .title("Add Download")
-            .inner_size(440.0, 500.0)
-            .resizable(false)
-            .decorations(false)
-            .shadow(true)
-            .visible(false)
-            .on_page_load(|window, payload| {
-                if payload.event() == PageLoadEvent::Finished {
-                    let _ = window.show().and_then(|_| window.set_focus());
-                }
-            })
-            .center();
-        #[cfg(windows)]
-        {
-            add_window = add_window.data_directory(app_data_root().join("webview"));
-        }
-        match add_window.build() {
-            Ok(window) => {
-                let close_handle = app.clone();
-                let close_id = id.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { .. } = event {
-                        let state = close_handle.state::<CoreState>();
-                        let is_provisional = state
-                            .snapshot
-                            .lock()
-                            .ok()
-                            .and_then(|snapshot| {
-                                snapshot
-                                    .jobs
-                                    .iter()
-                                    .find(|job| job.id == close_id)
-                                    .map(|job| job.provisional == Some(true))
-                            })
-                            .unwrap_or(false);
-                        if is_provisional {
-                            cancel_job_internal(&close_handle, &state, &close_id);
-                        }
-                    }
-                });
-            }
-            Err(error) => {
-                drop(_lifecycle);
-                cancel_job_internal(&app, state, &id);
-                return Err(format!("Could not open Add Download window: {error}"));
-            }
+        if let Err(error) = open_add_window(&app, &id) {
+            drop(_lifecycle);
+            cancel_job_internal(&app, state, &id);
+            return Err(error);
         }
     }
     Ok(id)
+}
+
+/// The Add Download window for one provisional acquisition. Closing it is
+/// Cancel while the acquisition is still provisional (SPEC §7.3).
+fn open_add_window(app: &AppHandle, id: &str) -> Result<(), String> {
+    let label = format!("add-{id}");
+    let url = format!("index.html?window=add&id={id}");
+    let mut add_window = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title("Add Download")
+        .inner_size(440.0, 500.0)
+        .resizable(false)
+        .decorations(false)
+        .shadow(true)
+        .visible(false)
+        .on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let _ = window.show().and_then(|_| window.set_focus());
+            }
+        })
+        .center();
+    #[cfg(windows)]
+    {
+        add_window = add_window.data_directory(app_data_root().join("webview"));
+    }
+    let window = add_window
+        .build()
+        .map_err(|error| format!("Could not open Add Download window: {error}"))?;
+    let close_handle = app.clone();
+    let close_id = id.to_string();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { .. } = event {
+            let state = close_handle.state::<CoreState>();
+            let is_provisional = state
+                .snapshot
+                .lock()
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .jobs
+                        .iter()
+                        .find(|job| job.id == close_id)
+                        .map(|job| job.provisional == Some(true))
+                })
+                .unwrap_or(false);
+            if is_provisional {
+                cancel_job_internal(&close_handle, &state, &close_id);
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -5233,7 +5288,7 @@ fn create_provisional(
     state: State<'_, CoreState>,
     input: ProvisionalInput,
 ) -> Result<String, String> {
-    start_provisional(app, state.inner(), input, false)
+    start_provisional(app, state.inner(), input, false, None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5937,7 +5992,144 @@ fn bridge_respond(request: &ipc::Request, status: u16, value: Value) -> ipc::Res
     bridge_json(status, value).with_origin(bridge_allow_origin(request))
 }
 
-fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
+fn capture_id_of(message: &Value) -> Option<String> {
+    message
+        .get("payload")
+        .and_then(|payload| payload.get("captureId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_string)
+}
+
+/// Cancel an acquisition the extension owns the decision for. Only a
+/// provisional is discarded: a capture that reattached to a managed job must
+/// not turn that job into a user cancellation.
+fn cancel_capture_job(app: &AppHandle, id: &str) {
+    let state = app.state::<CoreState>();
+    let provisional = state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.provisional == Some(true)))
+        .unwrap_or(false);
+    if provisional {
+        cancel_job_internal(app, state.inner(), id);
+        close_add_window(app, id);
+    }
+}
+
+/// Browser captures (SPEC §5.1, §7.1). With `requireViable`, the bridge answers
+/// only once the resident's own first response is the file: the extension
+/// keeps the browser's copy until then and resumes it on a hand-back, so a
+/// source the resident cannot fetch (session cookies, one-use URL, login page)
+/// never costs the user their download (§5.1.1). `captureId` makes creation
+/// idempotent and lets the extension cancel a capture whose answer it lost.
+async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) -> ipc::Response {
+    let capture_id = capture_id_of(&message);
+    if message.get("type").and_then(Value::as_str) == Some("cancel-acquisition") {
+        let id = message
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if id.is_none() && capture_id.is_none() {
+            return bridge_reject(request, 400, "invalid cancellation");
+        }
+        let mut targets: Vec<String> = id.into_iter().collect();
+        if let Some(capture_id) = capture_id {
+            let state = app.state::<CoreState>();
+            if let Ok(mut ledger) = state.captures.lock() {
+                match ledger.iter().find(|(key, _)| *key == capture_id).map(|(_, record)| record.clone()) {
+                    Some(CaptureRecord::Job(job_id)) => targets.push(job_id),
+                    Some(CaptureRecord::Cancelled) => {}
+                    None => {
+                        ledger.push_back((capture_id, CaptureRecord::Cancelled));
+                        while ledger.len() > CAPTURE_LEDGER_MAX {
+                            ledger.pop_front();
+                        }
+                    }
+                }
+            };
+        }
+        for target in targets {
+            cancel_capture_job(&app, &target);
+        }
+        return bridge_respond(request, 200, json!({ "ok": true }));
+    }
+    let Some(input) = provisional_input_from_message(&message) else {
+        return bridge_reject(request, 400, "invalid acquisition");
+    };
+    let require_viable = message
+        .get("payload")
+        .and_then(|payload| payload.get("requireViable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (sender, receiver) = if require_viable {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let created = {
+        let state = app.state::<CoreState>();
+        let Ok(mut ledger) = state.captures.lock() else {
+            return bridge_respond(request, 500, json!({ "ok": false, "error": "capture ledger unavailable" }));
+        };
+        let known = capture_id
+            .as_ref()
+            .and_then(|capture_id| ledger.iter().find(|(key, _)| key == capture_id).map(|(_, record)| record.clone()));
+        match known {
+            Some(CaptureRecord::Cancelled) => {
+                return bridge_respond(request, 200, json!({ "ok": false, "error": "capture was cancelled" }));
+            }
+            Some(CaptureRecord::Job(id)) => {
+                return bridge_respond(request, 200, json!({ "ok": true, "id": id, "duplicate": true }));
+            }
+            None => {}
+        }
+        let created = start_provisional(app.clone(), state.inner(), input, !require_viable, sender);
+        if let (Ok(id), Some(capture_id)) = (&created, capture_id) {
+            ledger.push_back((capture_id, CaptureRecord::Job(id.clone())));
+            while ledger.len() > CAPTURE_LEDGER_MAX {
+                ledger.pop_front();
+            }
+        }
+        created
+    };
+    let id = match created {
+        Ok(id) => id,
+        Err(error) => return bridge_respond(request, 500, json!({ "ok": false, "error": error })),
+    };
+    if let Some(receiver) = receiver {
+        let reason = match tokio::time::timeout(Duration::from_secs(20), receiver).await {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(error))) => Some(error),
+            Ok(Err(_)) => Some("The acquisition stopped before it received the file".to_string()),
+            Err(_) => Some("The source did not answer in time".to_string()),
+        };
+        if let Some(reason) = reason {
+            cancel_capture_job(&app, &id);
+            return bridge_respond(request, 200, json!({ "ok": false, "handback": true, "error": redact_url_credentials(&reason) }));
+        }
+        let still_provisional = app
+            .state::<CoreState>()
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.provisional == Some(true)))
+            .unwrap_or(false);
+        if !still_provisional {
+            return bridge_respond(request, 200, json!({ "ok": false, "error": "capture was cancelled" }));
+        }
+        if let Err(error) = open_add_window(&app, &id) {
+            cancel_capture_job(&app, &id);
+            return bridge_respond(request, 500, json!({ "ok": false, "error": error }));
+        }
+    }
+    bridge_respond(request, 200, json!({ "ok": true, "id": id }))
+}
+
+async fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
     if request.method == "OPTIONS" {
         if !bridge_origin_allowed(&request.origin) {
             return bridge_reject(&request, 403, "bridge preflight not from the browser extension");
@@ -5993,27 +6185,7 @@ fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
             let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
                 return bridge_reject(&request, 400, "invalid acquisition");
             };
-            if message.get("type").and_then(Value::as_str) == Some("cancel-acquisition") {
-                let Some(id) = message
-                    .get("payload")
-                    .and_then(|payload| payload.get("id"))
-                    .and_then(Value::as_str)
-                else {
-                    return bridge_reject(&request, 400, "invalid cancellation");
-                };
-                let state = app.state::<CoreState>();
-                cancel_job_internal(&app, state.inner(), id);
-                close_add_window(&app, id);
-                return bridge_respond(&request, 200, json!({ "ok": true }));
-            }
-            let Some(input) = provisional_input_from_message(&message) else {
-                return bridge_reject(&request, 400, "invalid acquisition");
-            };
-            let state = app.state::<CoreState>();
-            match start_provisional(app.clone(), state.inner(), input, true) {
-                Ok(id) => bridge_respond(&request, 200, json!({ "ok": true, "id": id })),
-                Err(error) => bridge_respond(&request, 500, json!({ "ok": false, "error": error }))
-            }
+            bridge_capture(app, &request, message).await
         }
         ("POST", "/v1/manager") => {
             let Some(window) = app.get_webview_window("main") else {
@@ -6053,7 +6225,7 @@ fn start_bridge(app: &AppHandle) {
         };
         let handler = move |request| {
             let app = app.clone();
-            async move { bridge_request(app, request) }
+            async move { bridge_request(app, request).await }
         };
         if let Err(error) = ipc::serve(listener, handler).await {
             eprintln!("Local browser bridge stopped: {error}");
@@ -6310,7 +6482,7 @@ fn main() {
                     let _ = window.hide();
                 }
                 let state = app.state::<CoreState>();
-                let _ = start_provisional(app.clone(), state.inner(), input, true);
+                let _ = start_provisional(app.clone(), state.inner(), input, true, None);
             } else if argv.iter().any(|value| value == "--startup") {
                 let show_manager = app
                     .state::<CoreState>()
@@ -6371,7 +6543,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());
@@ -6396,7 +6568,7 @@ fn main() {
             } else if let Some(input) = capture_input_from_args(&launch_args) {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
                 let state = app.state::<CoreState>();
-                let _ = start_provisional(app.handle().clone(), state.inner(), input, true);
+                let _ = start_provisional(app.handle().clone(), state.inner(), input, true, None);
             } else if launch_args.iter().any(|value| value == "--startup") && !show_manager_at_startup {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
             } else if launch_args.iter().any(|value| value == "--startup") {

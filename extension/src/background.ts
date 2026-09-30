@@ -1,4 +1,4 @@
-import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
+import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, APP_CAPTURE_TIMEOUT_MS, APP_MEDIA_CAPTURE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
 import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
@@ -237,11 +237,11 @@ async function refreshResidentPolicy(): Promise<void> {
   await residentPolicySync;
 }
 
-async function sendApp(message: unknown): Promise<unknown> {
+async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<unknown> {
   const type = (message as { type?: string })?.type;
   const route = type === 'get-policy' ? '/v1/policy' : type === 'open-manager' ? '/v1/manager' : type === 'update-policy' ? '/v1/policy' : '/v1/capture';
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), APP_BRIDGE_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${APP_BRIDGE_ORIGIN}${route}`, {
       method: type === 'get-policy' ? 'GET' : 'POST',
@@ -253,10 +253,23 @@ async function sendApp(message: unknown): Promise<unknown> {
     if (!response.ok && typeof payload === 'object' && payload !== null && 'error' in payload) return payload;
     return payload;
   } catch {
-    return { ok: false, error: 'Download Manager is not running' };
+    return { ok: false, unanswered: true, error: 'Download Manager is not running' };
   } finally {
     clearTimeout(timer);
   }
+}
+
+type HandOverReply = { ok?: boolean; id?: string; error?: string; handback?: boolean; unanswered?: boolean };
+
+/** Hands one capture to the resident under a fresh capture id. When no answer
+ *  arrives, the resident may still have created the job before the answer was
+ *  lost: it is cancelled by id, so the browser fallback that follows is the
+ *  only owner. The resident honours a cancel that overtakes its create. */
+async function handOver(type: 'capture-acquisition' | 'media-capture', payload: Record<string, unknown>, timeoutMs: number): Promise<HandOverReply> {
+  const captureId = crypto.randomUUID();
+  const reply = ((await sendApp({ type, payload: { ...payload, captureId } }, timeoutMs)) ?? {}) as HandOverReply;
+  if (reply.unanswered) void sendApp({ type: 'cancel-acquisition', payload: { captureId } });
+  return reply;
 }
 
 function pruneMedia(now = Date.now()): void {
@@ -422,20 +435,20 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   if (captureError) {
     return { ok: false, error: captureError };
   }
-  const response = (await sendApp({
-    type: 'capture-acquisition',
-    payload: {
-      source,
-      name: cleanFilename(payload.name),
-      pageUrl: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
-      referrer: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
-      userAgent: cleanUserAgent(payload.userAgent),
-    },
-  })) as { ok?: boolean };
-  if (response?.ok) return { ok: true };
-  // The pre-browser path consumed the anchor event. If the resident app is
-  // unavailable, preserve the user's download through the extension API;
-  // the onCreated listener ignores downloads started by this extension.
+  const response = await handOver('capture-acquisition', {
+    source,
+    name: cleanFilename(payload.name),
+    pageUrl: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
+    referrer: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
+    userAgent: cleanUserAgent(payload.userAgent),
+    requireViable: true,
+  }, APP_CAPTURE_TIMEOUT_MS);
+  if (response.ok) return { ok: true };
+  // The pre-browser path consumed the anchor event. If the resident is
+  // unavailable, or handed the capture back because it cannot fetch the file
+  // with the context it has (session cookies, one-use URL), the browser does
+  // the download with its own context. The interception listener ignores
+  // downloads started by this extension.
   try {
     rememberBrowserFallback(source, cleanFilename(payload.name));
     const id = await chrome.downloads.download({
@@ -597,22 +610,27 @@ chrome.webRequest.onBeforeRequest.addListener(
   ['requestBody'],
 );
 
-function takeFormBody(url: string, tabId?: number): string | undefined {
+/** The form body behind a download the Downloads API reports without a tab.
+ *  URL alone cannot say which submission a download belongs to: when recent
+ *  submissions to that URL disagree, replaying any one of them could fetch
+ *  another tab's export, so the answer is 'ambiguous' and the browser keeps
+ *  the download. */
+function takeFormBody(url: string): string | 'ambiguous' | undefined {
   pruneFormBodies();
-  const now = Date.now();
-  let index = tabId !== undefined && tabId >= 0
-    ? recentFormBodies.findIndex((item) => item.url === url && item.tabId === tabId)
-    : -1;
-  if (index < 0) index = recentFormBodies.findIndex((item) => item.url === url);
-  if (index < 0) return undefined;
-  const [found] = recentFormBodies.splice(index, 1);
-  return now - found.at <= FORM_BODY_TTL_MS ? found.body : undefined;
+  const matches = recentFormBodies.filter((item) => item.url === url);
+  if (!matches.length) return undefined;
+  if (new Set(matches.map((item) => item.body)).size > 1) return 'ambiguous';
+  const found = matches[matches.length - 1];
+  recentFormBodies.splice(recentFormBodies.indexOf(found), 1);
+  return found.body;
 }
 
 // Downloads without an interceptable page anchor are handed over
-// transactionally: pause Chromium, create the native provisional job, then
-// cancel Chromium. Any failed step resumes the browser and rolls back the
-// native provisional job so exactly one owner remains.
+// transactionally: pause Chromium, let the resident prove its own first
+// response is the file, then cancel Chromium. A hand-back (the resident cannot
+// fetch it: session cookies, one-use URL, login page), a lost answer, or any
+// failed step resumes the browser's copy and cancels the resident's job, so
+// exactly one owner remains and the user never loses the download (SPEC §5.1.1).
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   const source = item.finalUrl || item.url || '';
   if (consumeBrowserFallback(item) || consumeBrowserOwnedDownload(item) || item.byExtensionId === chrome.runtime.id || !isHttp(source)) {
@@ -627,6 +645,8 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       if (ordinaryCaptureError(source, item.referrer ?? '')) {
         return;
       }
+      const postBody = takeFormBody(source);
+      if (postBody === 'ambiguous') return;
       try {
         await chrome.downloads.pause(item.id);
         paused = true;
@@ -635,18 +655,17 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
       }
       // The Downloads API exposes no tab/frame identifier, so do not guess a
       // User-Agent from another document on this fallback path.
-      // A matching observed POST is replayed once; otherwise acquisition uses GET.
-      const postBody = takeFormBody(source);
-      const response = await sendApp({
-        type: 'capture-acquisition',
-        payload: {
-          source,
-          name: cleanFilename(item.filename),
-          pageUrl: item.referrer,
-          referrer: item.referrer,
-          ...(postBody === undefined ? {} : { method: 'POST', postBody }),
-        },
-      }) as { ok?: boolean; id?: string };
+      // A matching observed POST is replayed once; otherwise acquisition uses
+      // GET. The browser's copy stays paused, not cancelled, until the
+      // resident proves it can fetch the file; a hand-back resumes it.
+      const response = await handOver('capture-acquisition', {
+        source,
+        name: cleanFilename(item.filename),
+        pageUrl: item.referrer,
+        referrer: item.referrer,
+        requireViable: true,
+        ...(postBody === undefined ? {} : { method: 'POST', postBody }),
+      }, APP_CAPTURE_TIMEOUT_MS);
       if (!response?.ok || typeof response.id !== 'string') {
         await chrome.downloads.resume(item.id).catch(() => undefined);
         paused = false;
@@ -832,7 +851,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         ...(cleanFilename(payload.name) ? { name: cleanFilename(payload.name) } : {}),
         ...(companionAudio ? { companionAudio } : {}),
       };
-      reply(await sendApp({ type: 'media-capture', payload: outboundPayload }));
+      reply(await handOver('media-capture', outboundPayload, APP_MEDIA_CAPTURE_TIMEOUT_MS));
     } else if (type === 'open-manager') {
       reply(await sendApp({ type: 'open-manager' }));
     } else {

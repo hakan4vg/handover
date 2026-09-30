@@ -818,10 +818,49 @@ fn refresh_tray(app: &AppHandle, state: &CoreState) {
 
 fn job_event(message: &str, tone: Option<&str>) -> JobEvent { JobEvent { at: now_label(), message: redact_url_credentials(message), tone: tone.map(str::to_string) } }
 
+/// Mark of the Web: the same Attachment Manager record Chromium writes for a
+/// download, so SmartScreen, Office Protected View and "unblock" prompts treat
+/// the file as coming from the internet. Intercepting a browser download must
+/// not strip that protection. Query strings, fragments and userinfo are
+/// dropped: signed tokens do not belong in file metadata.
+fn mark_downloaded_file(destination: &str, source: &str, referrer: Option<&str>) {
+    #[cfg(windows)]
+    {
+        let origin = |value: &str| {
+            reqwest::Url::parse(value)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .map(|mut url| {
+                    url.set_query(None);
+                    url.set_fragment(None);
+                    let _ = url.set_username("");
+                    let _ = url.set_password(None);
+                    url.to_string()
+                })
+        };
+        if !Path::new(destination).is_file() {
+            return;
+        }
+        let mut record = String::from("[ZoneTransfer]\r\nZoneId=3\r\n");
+        if let Some(referrer) = referrer.and_then(origin) {
+            record.push_str(&format!("ReferrerUrl={referrer}\r\n"));
+        }
+        if let Some(host) = origin(source) {
+            record.push_str(&format!("HostUrl={host}\r\n"));
+        }
+        if let Err(error) = std::fs::write(format!("{destination}:Zone.Identifier"), record) {
+            eprintln!("Could not mark the download's origin: {error}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (destination, source, referrer);
+}
+
 fn complete_job(job: &mut DownloadJob) {
     // A finished acquisition knows its size even when the source never
     // advertised one (segmented or unknown-length transfers).
     if job.total.is_none() { job.total = Some(job.downloaded); }
+    mark_downloaded_file(&job.destination, &job.source, job.referrer.as_deref());
     job.speed = 0;
     job.connections = 0;
     job.eta = None;

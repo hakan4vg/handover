@@ -133,15 +133,12 @@ fn show_linux(
     });
 }
 
-/// The body click's primary action mirrors the in-app card: completed opens
-/// the file, failed shows details. Pure: unit-covered (F16).
-#[cfg(any(target_os = "linux", windows, test))]
-pub fn primary_action_for(kind: &str) -> &'static str {
-    if kind == "completed" {
-        "open"
-    } else {
-        "details"
-    }
+/// A body click shows the job. Opening a downloaded file runs it when it is a
+/// program or script, so that stays an explicit toast button, never the
+/// generic "I clicked the notification" gesture.
+#[cfg(any(target_os = "linux", windows))]
+pub fn primary_action_for(_kind: &str) -> &'static str {
+    "details"
 }
 
 

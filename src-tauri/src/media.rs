@@ -335,14 +335,6 @@ pub fn parse_dash_tracks_for_segments(
     body: &str,
     selected_segments: &[String]
 ) -> Result<Vec<MediaTrack>, String> {
-    let lower = body.to_ascii_lowercase();
-    if lower.contains("type=\"dynamic\"")
-        || lower.contains("type='dynamic'")
-        || lower.contains("minimumupdateperiod=")
-        || lower.contains("timeshiftbufferdepth=")
-    {
-        return Err("Live media is not supported; a static MPD is required".into());
-    }
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
     let mut stack: Vec<Vec<u8>> = Vec::new();
@@ -351,10 +343,12 @@ pub fn parse_dash_tracks_for_segments(
     let mut current_track: Option<DashTrackBuilder> = None;
     let mut presentation_duration = None;
     let mut tracks = Vec::new();
+    let mut periods = 0usize;
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 let name = element.name().as_ref().to_ascii_lowercase();
+                dash_capability_boundary(&element, &name, &mut periods)?;
                 if name.as_slice() == b"mpd" {
                     presentation_duration = attribute(&element, b"mediaPresentationDuration")
                         .and_then(|value| parse_duration(&value));
@@ -446,6 +440,7 @@ pub fn parse_dash_tracks_for_segments(
             }
             Ok(Event::Empty(element)) => {
                 let name = element.name().as_ref().to_ascii_lowercase();
+                dash_capability_boundary(&element, &name, &mut periods)?;
                 if name.as_slice() == b"mpd" {
                     presentation_duration = attribute(&element, b"mediaPresentationDuration")
                         .and_then(|value| parse_duration(&value));
@@ -600,6 +595,40 @@ pub fn parse_dash_tracks_for_segments(
         return Err("The static MPD did not contain downloadable segments".into());
     }
     Ok(tracks)
+}
+
+/// Refuse what this assembler cannot turn into a faithful file, read from the
+/// parsed elements rather than from raw text (F09): live presentations,
+/// more than one Period (each would become its own track stretched over the
+/// whole duration), and DRM-protected media, whose bytes would be unplayable.
+fn dash_capability_boundary(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+    periods: &mut usize
+) -> Result<(), String> {
+    match name {
+        b"mpd" => {
+            let dynamic = attribute(element, b"type")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("dynamic"));
+            if dynamic
+                || attribute(element, b"minimumUpdatePeriod").is_some()
+                || attribute(element, b"timeShiftBufferDepth").is_some()
+            {
+                return Err("Live media is not supported; a static MPD is required".into());
+            }
+        }
+        b"period" => {
+            *periods += 1;
+            if *periods > 1 {
+                return Err("The MPD has more than one Period (for example inserted ads), which is not supported".into());
+            }
+        }
+        b"contentprotection" => {
+            return Err("The media is DRM-protected (ContentProtection) and cannot be downloaded".into());
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 struct DashSegmentBaseCandidate {

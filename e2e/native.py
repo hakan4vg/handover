@@ -50,6 +50,15 @@ EXPORT_BYTES = b"id,account\n1,requested-export\n"
 NAMED_BYTES = b"named by the server\n" * 64
 counts: collections.Counter = collections.Counter()
 
+# Presentations the assembler cannot reproduce faithfully (F09). Each uses the
+# real fixture video, so an engine that ignores the boundary completes a file.
+_VIDEO_SET = '<AdaptationSet contentType="video"><Representation id="v"><BaseURL>/dash/</BaseURL><SegmentList><Initialization sourceURL="v-init.mp4"/><SegmentURL media="v-0.m4s"/></SegmentList></Representation></AdaptationSet>'
+DASH_BOUNDARY = {
+    "/dynamic-spaced.mpd": f'<MPD type = "dynamic" mediaPresentationDuration="PT4S"><Period>{_VIDEO_SET}</Period></MPD>',
+    "/two-periods.mpd": f'<MPD type="static" mediaPresentationDuration="PT8S"><Period id="main">{_VIDEO_SET}</Period><Period id="ad">{_VIDEO_SET}</Period></MPD>',
+    "/drm.mpd": '<MPD type="static" mediaPresentationDuration="PT4S"><Period>' + _VIDEO_SET.replace('<Representation', '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc"/><Representation') + '</Period></MPD>',
+}
+
 
 class Handler(fixture.Handler):
     def _count(self, method: str) -> None:
@@ -108,6 +117,8 @@ class Handler(fixture.Handler):
         if path == "/hls-two-maps.m3u8":
             data = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2", '#EXT-X-MAP:URI="/dash/v-init.mp4"', "#EXTINF:2.0,", "/dash/v-0.m4s", "#EXT-X-DISCONTINUITY", '#EXT-X-MAP:URI="/dash/a-init.mp4"', "#EXTINF:2.0,", "/dash/a-0.m4s", "#EXT-X-ENDLIST", ""])
             return self._raw(200, data.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path in DASH_BOUNDARY:
+            return self._raw(200, DASH_BOUNDARY[path].encode(), {"Content-Type": "application/dash+xml"})
         if path == "/zero.mpd":
             data = b'<MPD type="static" mediaPresentationDuration="PT4S"><Period><AdaptationSet contentType="video"><Representation id="v"><SegmentTemplate timescale="1" duration="0" media="s-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>'
             return self._raw(200, data, {"Content-Type": "application/dash+xml"})
@@ -183,6 +194,9 @@ def main() -> int:
         "post-reject": ("/post-reject.bin", {"postBody": "export=requested"}),
         "post-ok": ("/post-ok.bin", {"postBody": "export=requested"}),
         "zero-mpd": ("/zero.mpd", {"media": True, "playerKind": "video"}),
+        "mpd-dynamic": ("/dynamic-spaced.mpd", {"media": True, "playerKind": "video"}),
+        "mpd-periods": ("/two-periods.mpd", {"media": True, "playerKind": "video"}),
+        "mpd-drm": ("/drm.mpd", {"media": True, "playerKind": "video"}),
         "hls-vod": ("/hls/vod.m3u8", {"media": True, "playerKind": "video"}),
         "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
         "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
@@ -245,6 +259,14 @@ def main() -> int:
         run.check("engine/post-ok", "an accepted POST completes with the POST response and never issues a GET", j["state"] == "completed" and j["_data"] == EXPORT_BYTES and gets_ok == 0, evidence("post-ok", gets=gets_ok))
         j = job("zero-mpd")
         run.check("engine/zero-duration-mpd", "a malformed manifest fails visibly instead of leaving the job stuck connecting", j["state"] == "failed" and bool(j["error"]), evidence("zero-mpd"))
+
+        for name, expect, guards in (
+            ("mpd-dynamic", "Live media", "a live MPD is refused even when its type attribute is written with spaces"),
+            ("mpd-periods", "more than one Period", "a multi-Period MPD is refused instead of stretching each Period into its own track"),
+            ("mpd-drm", "DRM-protected", "a DRM-protected MPD is refused instead of saving undecryptable bytes"),
+        ):
+            j = job(name)
+            run.check(f"engine/{name}", guards, j["state"] == "failed" and expect in (j["error"] or "") and j["_data"] is None, evidence(name))
 
         j = job("hls-vod")
         run.check("engine/hls-vod", "an ordinary finite HLS playlist still assembles (control)", j["state"] == "completed" and bool(j["bytes"]), evidence("hls-vod"))

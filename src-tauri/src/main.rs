@@ -256,10 +256,16 @@ fn persist_job(state: &CoreState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Transfer ownership is separate from persisted job state. A paused task may
-// still be inside an HTTP future; retaining its handle prevents Resume from
-// launching a second task until the first one has actually unwound.
+// Transfer ownership is separate from persisted job state. Pause and cancel
+// abort the owning task and free its ownership at once, so Resume can start a
+// new task immediately. The aborted task runs no further engine code (its
+// future is dropped at its next poll) and its generation is no longer
+// current, so nothing gated on transfer_is_current proceeds. What can still
+// land is a file operation already handed to the blocking pool: the same
+// bytes of the same resource at the same offset, or a part file that is
+// truncated and rewritten before it is ever renamed into place.
 
+// One shared token bucket paces every transfer, so the bandwidth used in
 // aggregate never exceeds the global limit no matter how many workers or jobs
 // run (SPEC §8.6). Per-worker sleeping would multiply the limit by the worker
 // count; a shared bucket cannot.

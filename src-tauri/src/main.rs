@@ -148,7 +148,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -267,7 +267,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1054,6 +1054,84 @@ fn source_name(source: &str) -> String {
         })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download.bin".into())
+}
+
+/// The filename a Content-Disposition header names, if any. RFC 6266:
+/// `filename*` (RFC 8187, percent-encoded with a charset) wins over `filename`.
+fn disposition_filename(value: &str) -> Option<String> {
+    let mut params = Vec::new();
+    let (mut current, mut quoted, mut escaped) = (String::new(), false, false);
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == ';' && !quoted {
+            params.push(std::mem::take(&mut current));
+        } else {
+            current.push(character);
+        }
+    }
+    params.push(current);
+    let mut plain = None;
+    for param in params {
+        let Some((key, raw)) = param.split_once('=') else { continue };
+        let (key, raw) = (key.trim().to_ascii_lowercase(), raw.trim());
+        if key == "filename*" {
+            let mut parts = raw.splitn(3, '\'');
+            let (Some(charset), Some(_language), Some(encoded)) = (parts.next(), parts.next(), parts.next()) else { continue };
+            let mut bytes = Vec::with_capacity(encoded.len());
+            let mut input = encoded.bytes();
+            while let Some(byte) = input.next() {
+                if byte != b'%' {
+                    bytes.push(byte);
+                    continue;
+                }
+                let hex = [input.next().unwrap_or(b'_'), input.next().unwrap_or(b'_')];
+                bytes.push(std::str::from_utf8(&hex).ok().and_then(|hex| u8::from_str_radix(hex, 16).ok()).unwrap_or(b'_'));
+            }
+            let decoded = if charset.eq_ignore_ascii_case("utf-8") {
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else {
+                bytes.iter().map(|&byte| byte as char).collect()
+            };
+            if !decoded.trim().is_empty() {
+                return Some(decoded);
+            }
+        } else if key == "filename" && !raw.is_empty() {
+            plain = Some(raw.to_string());
+        }
+    }
+    plain
+}
+
+/// Chromium's precedence for a download's name: the server's filename, then
+/// the link's download attribute, then the URL. A job created from a hint or
+/// the URL takes the server's name at its first file response, once, while it
+/// is still provisional; a name the user committed is never replaced.
+fn adopt_response_name(app: &AppHandle, state: &CoreState, id: &str, disposition: Option<&str>) {
+    let adoptable = state.adoptable_names.lock().map(|mut adoptable| adoptable.remove(id)).unwrap_or(false);
+    if !adoptable {
+        return;
+    }
+    let Some(named) = disposition.and_then(disposition_filename).map(|value| safe_filename(&value)) else { return };
+    let mut renamed = false;
+    emit_job(state, id, |job| {
+        if job.provisional != Some(true) || job.name == named {
+            return;
+        }
+        job.name = named.clone();
+        let mut destination = PathBuf::from(&job.destination);
+        destination.set_file_name(&named);
+        job.destination = destination.to_string_lossy().into_owned();
+        renamed = true;
+    });
+    if renamed {
+        emit_snapshot(app, state);
+    }
 }
 
 fn collision_destination(path: &str, behavior: &str) -> String {
@@ -4152,6 +4230,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         );
         return false;
     }
+    adopt_response_name(&app, &state, &id, page_disposition.as_deref());
     // Headers and first bytes say this is the file: the browser may let go.
     report_viability(&app, &id, Ok(()));
     if safe_ranges {
@@ -5193,6 +5272,9 @@ fn start_provisional(
         }
     }
     let id = format!("provisional-{}", Uuid::new_v4());
+    // A link's download attribute or the URL only suggest a name; the
+    // server's own filename outranks both, as it does in Chromium.
+    let adopt_response_name = input.name_is_hint || input.name.as_deref().map_or(true, |value| value.trim().is_empty());
     let (name, destination, temp_folder, max_connections, bandwidth_limit) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let name = input
@@ -5273,6 +5355,11 @@ fn start_provisional(
     emit_snapshot(&app, state);
     if let (Some(sender), Ok(mut pending)) = (viability.take(), state.viability.lock()) {
         pending.insert(id.clone(), sender);
+    }
+    if adopt_response_name {
+        if let Ok(mut adoptable) = state.adoptable_names.lock() {
+            adoptable.insert(id.clone());
+        }
     }
     let _ = spawn_transfer(&app, state, id.clone(), input.source);
     if show_window {
@@ -5428,6 +5515,10 @@ async fn commit_provisional(
     id: String,
     input: CommitInput
 ) -> Result<(), String> {
+    // The user's committed name is final.
+    if let Ok(mut adoptable) = state.adoptable_names.lock() {
+        adoptable.remove(&id);
+    }
     let (decision, ready_at_start) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let job = snapshot
@@ -5946,7 +6037,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         companion_audio,
         referrer,
         post_body,
-        user_agent
+        user_agent,
+        name_is_hint: payload.get("nameIsHint").and_then(Value::as_bool).unwrap_or(false)
     })
 }
 
@@ -6596,7 +6688,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());

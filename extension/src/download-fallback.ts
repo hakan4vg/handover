@@ -20,7 +20,9 @@ export function restoreBrowserDownload(source: string, name?: string): void {
   const anchor = document.createElement('a');
   anchor.href = source;
   anchor.setAttribute(FALLBACK_MARKER, 'true');
-  if (name) anchor.download = name;
+  // An empty download attribute still downloads; Chromium then names the
+  // file from the response, as it would have for the original click.
+  anchor.download = name ?? '';
   anchor.hidden = true;
   (document.body ?? document.documentElement).appendChild(anchor);
   anchor.click();

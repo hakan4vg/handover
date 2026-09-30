@@ -438,6 +438,7 @@ async function captureOrdinary(payload: Record<string, unknown>): Promise<{ ok: 
   const response = await handOver('capture-acquisition', {
     source,
     name: cleanFilename(payload.name),
+    nameIsHint: true,
     pageUrl: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
     referrer: typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined,
     userAgent: cleanUserAgent(payload.userAgent),

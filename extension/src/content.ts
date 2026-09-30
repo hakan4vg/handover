@@ -210,9 +210,11 @@ function interceptDownloadClick(event: MouseEvent): void {
   if (!isHttp(source)) return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  // Chromium drops the author-supplied filename for cross-origin targets
-  // and saves under the server basename instead. Mirror that: honor the
-  // download attribute only when the target is same-origin with the page.
+  // Chromium drops the author-supplied filename for cross-origin targets.
+  // Mirror that: honor the download attribute only when the target is
+  // same-origin with the page. Either way the name is only a hint: the
+  // server's filename outranks it, then the URL, decided by the resident
+  // once it sees the response.
   let authorName: string | undefined;
   try {
     authorName = new URL(source).origin === new URL(window.location.href).origin
@@ -221,7 +223,7 @@ function interceptDownloadClick(event: MouseEvent): void {
   } catch {
     authorName = undefined;
   }
-  const name = authorName ?? basenameFromUrl(source);
+  const name = authorName;
   void chrome.runtime.sendMessage({
     type: 'ordinary-capture',
     payload: {

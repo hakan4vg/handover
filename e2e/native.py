@@ -47,6 +47,7 @@ NO_RANGE_BYTES = fixture.file_data("no-range.bin", fixture.FILES["no-range.bin"]
 FALLBACK_BYTES = bytes(range(256)) * (2 * MIB // 256)
 LOGIN_PAGE = b"<!DOCTYPE html><html>login required</html>"
 EXPORT_BYTES = b"id,account\n1,requested-export\n"
+NAMED_BYTES = b"named by the server\n" * 64
 counts: collections.Counter = collections.Counter()
 
 
@@ -95,6 +96,10 @@ class Handler(fixture.Handler):
             return self._raw(200, LOGIN_PAGE, {"Content-Type": "text/html"})
         if path in ("/post-reject.bin", "/post-ok.bin"):
             return self._raw(200, b"GET landing page instead of the POST export", {"Content-Type": "application/octet-stream"})
+        if path == "/named/plain.bin":
+            return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream", "Content-Disposition": 'attachment; filename="server; plain.bin"'})
+        if path == "/named/star.bin":
+            return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream", "Content-Disposition": "attachment; filename=\"fallback.bin\"; filename*=UTF-8''server%20%C3%A9t%C3%A9.bin"})
         if path == "/zero.mpd":
             data = b'<MPD type="static" mediaPresentationDuration="PT4S"><Period><AdaptationSet contentType="video"><Representation id="v"><SegmentTemplate timescale="1" duration="0" media="s-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>'
             return self._raw(200, data, {"Content-Type": "application/dash+xml"})
@@ -258,6 +263,25 @@ def main() -> int:
             time.sleep(1)
             leftovers = job_ids_for(capture_id)
             run.check(f"bridge/handback {label}", f"a {label} is handed back to the browser and leaves no job behind", reply.get("ok") is False and reply.get("handback") is True and not leftovers, {"reply": reply, "seconds": round(time.time() - started, 2), "leftoverJobs": leftovers})
+
+        # Chromium's naming precedence: server filename > download attribute > URL.
+        def named(path: str, capture_id: str, name: str | None, hint: bool) -> str | None:
+            payload = {"source": base + path, "pageUrl": base + "/page", "captureId": capture_id, "requireViable": True, **({"name": name} if name else {}), **({"nameIsHint": True} if hint else {})}
+            reply = bridge({"type": "capture-acquisition", "payload": payload})
+            found = None
+            for _ in range(20):
+                time.sleep(0.25)
+                found = jobs().get(reply.get("id") or "", {}).get("name")
+                if found and found != name:
+                    break
+            bridge({"type": "cancel-acquisition", "payload": {"captureId": capture_id}})
+            return found
+        got = named("/named/plain.bin", "cap-name-hint", "hint-from-link.bin", True)
+        run.check("bridge/name-server-beats-hint", "a link's name is a hint: the server's Content-Disposition filename wins", got == "server; plain.bin", {"name": got})
+        got = named("/named/star.bin", "cap-name-star", None, False)
+        run.check("bridge/name-rfc8187", "with no name at all, an RFC 8187 filename* is decoded and preferred over filename", got == "server été.bin", {"name": got})
+        got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
+        run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
 
         early = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-early"}})
         late = capture("/file/range.bin", "cap-early")

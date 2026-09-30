@@ -34,20 +34,50 @@ pub fn hls_key_iv(key: &HlsKey) -> [u8; 16] {
     iv
 }
 
-/// Decrypt one full-segment AES-128-CBC body and strip PKCS#7. Ciphertext
-/// must be non-empty and block-aligned; anything else is an honest error so
-/// undecryptable bytes never land in an output silently.
-pub fn decrypt_aes128_segment(mut ciphertext: Vec<u8>, key_bytes: &[u8; 16], iv: [u8; 16]) -> Result<Vec<u8>, String> {
-    use aes::Aes128;
-    use cbc::Decryptor;
-    use cipher::{BlockDecryptMut, KeyIvInit};
-    if ciphertext.is_empty() { return Err("The AES-128 segment is empty".into()); }
-    if ciphertext.len() % 16 != 0 { return Err("The AES-128 segment is not block-aligned".into()); }
-    // Decrypt and strip padding in the same buffer: no second segment-sized
-    // allocation on the media path (F08).
-    let decrypted_len = Decryptor::<Aes128>::new(key_bytes.into(), &iv.into()).decrypt_padded_mut::<cipher::block_padding::Pkcs7>(&mut ciphertext).map_err(|_| "The AES-128 segment failed PKCS#7 validation".to_string())?.len();
-    ciphertext.truncate(decrypted_len);
-    Ok(ciphertext)
+/// Full-segment AES-128-CBC decryption fed in arbitrary pieces, so a segment
+/// is decrypted as it streams to disk (F13). Whole blocks are released as
+/// they arrive; the last block is held back until `finish`, which checks and
+/// strips the PKCS#7 padding. Empty, unaligned or badly padded ciphertext is
+/// an honest error, so undecryptable bytes never land in an output silently.
+pub struct SegmentDecryptor {
+    cipher: cbc::Decryptor<aes::Aes128>,
+    pending: Vec<u8>,
+    seen: u64,
+}
+
+impl SegmentDecryptor {
+    pub fn new(key_bytes: &[u8; 16], iv: [u8; 16]) -> Self {
+        use cipher::KeyIvInit;
+        Self { cipher: cbc::Decryptor::new(key_bytes.into(), &iv.into()), pending: Vec::new(), seen: 0 }
+    }
+
+    /// Decrypt what can be released of `input`; the result may be empty.
+    pub fn update(&mut self, input: &[u8]) -> Vec<u8> {
+        use cipher::BlockDecryptMut;
+        self.seen += input.len() as u64;
+        self.pending.extend_from_slice(input);
+        let partial = self.pending.len() % 16;
+        let release = if partial == 0 { self.pending.len().saturating_sub(16) } else { self.pending.len() - partial };
+        let mut plain: Vec<u8> = self.pending.drain(..release).collect();
+        for block in plain.chunks_exact_mut(16) {
+            self.cipher.decrypt_block_mut(cipher::generic_array::GenericArray::from_mut_slice(block));
+        }
+        plain
+    }
+
+    /// The final block with its padding removed.
+    pub fn finish(mut self) -> Result<Vec<u8>, String> {
+        use cipher::BlockDecryptMut;
+        if self.seen == 0 { return Err("The AES-128 segment is empty".into()); }
+        if self.pending.len() != 16 { return Err("The AES-128 segment is not block-aligned".into()); }
+        self.cipher.decrypt_block_mut(cipher::generic_array::GenericArray::from_mut_slice(&mut self.pending));
+        let padding = usize::from(self.pending[15]);
+        if padding == 0 || padding > 16 || self.pending[16 - padding..].iter().any(|byte| usize::from(*byte) != padding) {
+            return Err("The AES-128 segment failed PKCS#7 validation".into());
+        }
+        self.pending.truncate(16 - padding);
+        Ok(self.pending)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

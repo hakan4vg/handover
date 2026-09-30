@@ -2279,9 +2279,149 @@ async fn fragment_bytes(
     Err(last_error)
 }
 
+/// Stream one media fragment into `part_path`, decrypting on the way when
+/// the segment carries an AES-128 key, and make it durable. Only one network
+/// chunk (plus at most one cipher block) is held at a time, so a segment of
+/// any size costs no more memory than a small one (F13). Returns the number
+/// of bytes written.
+async fn fragment_to_file(
+    client: &reqwest::Client,
+    app: &AppHandle,
+    id: &str,
+    source: &str,
+    byte_range: Option<(u64, u64)>,
+    key: Option<([u8; 16], [u8; 16])>,
+    part_path: &Path,
+    retries: u32,
+    generation: u64
+) -> Result<u64, String> {
+    let attempts = retries.saturating_add(1).max(1);
+    let mut last_error = String::from("fragment request failed");
+    let expected_length = byte_range.map(|(_, length)| length);
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            sleep(Duration::from_millis(100)).await;
+            if !transfer_can_continue(app, id, generation) {
+                return Err("paused".to_string());
+            }
+        }
+        let mut request = acquisition_request(client, app, id, source);
+        if let Some((start, length)) = byte_range {
+            let Some(end) = start
+                .checked_add(length)
+                .and_then(|value| value.checked_sub(1))
+            else {
+                return Err("The HLS byte range exceeds the addressable resource size".into());
+            };
+            request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                if let Some((start, length)) = byte_range {
+                    let valid_range = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                        && content_range(&response)
+                            .map(|(actual_start, actual_end, _)| {
+                                actual_start == start
+                                    && actual_end == start.saturating_add(length).saturating_sub(1)
+                            })
+                            .unwrap_or(false);
+                    if !valid_range {
+                        last_error = "The server returned an invalid HLS byte range".into();
+                        continue;
+                    }
+                }
+                let mut part = File::create(part_path).await.map_err(|error| error.to_string())?;
+                let mut decryptor = key.map(|(key, iv)| media::SegmentDecryptor::new(&key, iv));
+                let mut received = 0u64;
+                let mut written = 0u64;
+                let mut interrupted = false;
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(chunk) => {
+                            if !throttle(app, id, chunk.len(), generation).await {
+                                return Err("paused".to_string());
+                            }
+                            received += chunk.len() as u64;
+                            if expected_length.is_some_and(|length| received > length) {
+                                last_error = "The server returned an overlong HLS byte range".into();
+                                interrupted = true;
+                                break;
+                            }
+                            let plain = match decryptor.as_mut() {
+                                Some(decryptor) => decryptor.update(&chunk),
+                                None => chunk.to_vec(),
+                            };
+                            part.write_all(&plain).await.map_err(|error| error.to_string())?;
+                            written += plain.len() as u64;
+                        }
+                        Err(error) => {
+                            last_error = error.to_string();
+                            interrupted = true;
+                            break;
+                        }
+                    }
+                }
+                if !interrupted && expected_length.map(|length| received == length).unwrap_or(received > 0) {
+                    if let Some(decryptor) = decryptor {
+                        let tail = decryptor.finish()?;
+                        part.write_all(&tail).await.map_err(|error| error.to_string())?;
+                        written += tail.len() as u64;
+                    }
+                    // Durability barrier: a renamed part file must hold
+                    // complete bytes, so a power loss can never leave a
+                    // trusted-but-torn segment (F10).
+                    part.sync_all().await.map_err(|error| error.to_string())?;
+                    return Ok(written);
+                }
+                if !interrupted && expected_length.is_some() {
+                    last_error = "The server returned an incomplete HLS byte range".into();
+                }
+            }
+            Ok(response) if terminal_source_status(response.status()) => {
+                return Err(terminal_source_error(response.status()));
+            }
+            Ok(response) => last_error = format!("source returned {}", response.status()),
+            Err(error) => last_error = error.to_string()
+        }
+    }
+    Err(last_error)
+}
+
+/// Read a response body, refusing to hold more than `limit` bytes: at most
+/// `limit` bytes come back, so a caller can tell an oversized body apart.
+async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        let room = limit - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if body.len() == limit {
+            break;
+        }
+    }
+    Ok(body)
+}
+
+/// Largest manifest (HLS playlist or DASH MPD) read into memory. Long VOD
+/// timelines run to a few megabytes; this leaves ample room.
+const MANIFEST_LIMIT: usize = 32 * 1024 * 1024;
+
+/// A manifest body as text, refusing one larger than `MANIFEST_LIMIT` (F13).
+async fn manifest_text(response: reqwest::Response) -> Result<String, String> {
+    let body = bounded_body(response, MANIFEST_LIMIT + 1).await?;
+    if body.len() > MANIFEST_LIMIT {
+        return Err("The media manifest is larger than 32 MiB".into());
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 async fn fetch_hls_key_bytes(client: &reqwest::Client, app: &AppHandle, id: &str, uri: &str) -> Result<[u8; 16], String> {
-    let bytes = acquisition_request(client, app, id, uri).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.bytes().await.map_err(|error| error.to_string())?;
-    if bytes.len() != 16 { return Err(format!("The HLS AES-128 key did not contain 16 bytes (got {})", bytes.len())); }
+    let response = acquisition_request(client, app, id, uri).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
+    // A key is 16 bytes; reading stops just past that, whatever the server sends.
+    let bytes = bounded_body(response, 17).await?;
+    if bytes.len() != 16 { return Err(format!("The HLS AES-128 key did not contain 16 bytes (got {}{})", bytes.len().min(16), if bytes.len() > 16 { " or more" } else { "" })); }
     let mut key = [0u8; 16];
     key.copy_from_slice(&bytes);
     Ok(key)
@@ -2305,32 +2445,29 @@ async fn acquire_media_segment(
     connection_cap: usize,
 ) -> Result<(), String> {
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
-    let raw_bytes = fragment_bytes(client, app, id, &fragment.url, fragment.range, retry_count, generation).await?;
-    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
-    // RFC 8216 4.4.2.4: full-segment AES-128 arrives encrypted; fetch the
-    // 16-byte key through the same acquisition context (Referer flows via
-    // acquisition_request) and decrypt CBC/PKCS#7 before writing. Byte-range
-    // segments never carry a key (parser leaves key None), so no partial
-    // decryption path exists.
-    let bytes = if let Some(key) = fragment.key.as_ref() {
-        let key_bytes = fetch_hls_key_bytes(client, app, id, &key.uri).await?;
-        media::decrypt_aes128_segment(raw_bytes, &key_bytes, media::hls_key_iv(key))?
-    } else {
-        raw_bytes
+    // RFC 8216 4.4.2.4: full-segment AES-128 arrives encrypted; the 16-byte
+    // key is fetched first through the same acquisition context (Referer
+    // flows via acquisition_request) so the segment is decrypted as it
+    // streams to disk. Byte-range segments never carry a key (the parser
+    // leaves key None), so no partial decryption path exists.
+    let key = match fragment.key.as_ref() {
+        Some(key) => Some((fetch_hls_key_bytes(client, app, id, &key.uri).await?, media::hls_key_iv(key))),
+        None => None,
     };
     if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
-    // Durability barrier: a renamed part file must hold complete bytes, so a
-    // power loss can never leave a trusted-but-torn segment (F10).
-    let mut part = tokio::fs::File::create(segment_temp_path).await.map_err(|error| error.to_string())?;
-    part.write_all(&bytes).await.map_err(|error| error.to_string())?;
-    part.sync_all().await.map_err(|error| error.to_string())?;
-    drop(part);
+    let written = match fragment_to_file(client, app, id, &fragment.url, fragment.range, key, segment_temp_path, retry_count, generation).await {
+        Ok(written) => written,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(segment_temp_path).await;
+            return Err(error);
+        }
+    };
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
     tokio::fs::rename(segment_temp_path, segment_path).await.map_err(|error| error.to_string())?;
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-    let size = downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
+    let size = downloaded.fetch_add(written, Ordering::Relaxed) + written;
     let elapsed = started.elapsed().as_secs_f64().max(0.1);
     let speed = ((size.saturating_sub(existing_bytes)) as f64 / elapsed) as u64;
     let remaining = (total_segments as u64).saturating_sub(done);
@@ -3139,10 +3276,17 @@ async fn resource_length(client: &reqwest::Client, app: &AppHandle, id: &str, ur
     response.content_length().ok_or_else(|| "DASH resource length probe returned no total size".into())
 }
 
+const DASH_HEADER_LIMIT: u64 = 16 * 1024 * 1024;
+
 async fn materialize_dash_segment_bases(client: &reqwest::Client, app: &AppHandle, id: &str, mut tracks: Vec<media::MediaTrack>, retries: u32, generation: u64) -> Result<Vec<media::MediaTrack>, String> {
     for track in &mut tracks {
         let Some(base) = track.segment_base.clone() else { continue; };
         let total_length = resource_length(client, app, id, &base.url).await?;
+        // The index and initialization are parsed in memory; real ones are
+        // kilobytes, so a manifest claiming more is refused (F13).
+        if base.index_range.1 > DASH_HEADER_LIMIT || base.initialization_range.is_some_and(|(_, length)| length > DASH_HEADER_LIMIT) {
+            return Err("The DASH index or initialization range is larger than 16 MiB".into());
+        }
         let index = media::Segment { url: base.url.clone(), range: Some(base.index_range), key: None };
         let index_data = fragment_bytes(client, app, id, &index.url, index.range, retries, generation).await?;
         let initialization_data = if let Some(range) = base.initialization_range {
@@ -3201,7 +3345,7 @@ async fn acquire_manifest(
         // Redirects change the resolution base: relative segment references
         // belong to the manifest's effective URL, not the requested one (F04).
         manifest_source = fetch.url().to_string();
-        manifest_body = fetch.text().await.map_err(|error| error.to_string())?;
+        manifest_body = manifest_text(fetch).await?;
         if !transfer_can_continue(&app, &id, generation) {
             return Ok(());
         }
@@ -3221,7 +3365,7 @@ async fn acquire_manifest(
                 .map_err(|error| error.to_string())?;
             // Same redirect rule as the variant loop above (F04).
             source = fetch.url().to_string();
-            let mut body = fetch.text().await.map_err(|error| error.to_string())?;
+            let mut body = manifest_text(fetch).await?;
             if !transfer_can_continue(&app, &id, generation) {
                 return Ok(());
             }
@@ -3236,7 +3380,7 @@ async fn acquire_manifest(
                     .error_for_status()
                     .map_err(|error| error.to_string())?;
                 source = fetch.url().to_string();
-                body = fetch.text().await.map_err(|error| error.to_string())?;
+                body = manifest_text(fetch).await?;
                 if !transfer_can_continue(&app, &id, generation) {
                     return Ok(());
                 }
@@ -3624,20 +3768,22 @@ async fn acquire_manifest(
         }
         for index in 0..*length {
             let path = manifest_segment_path(&segment_dir, track, index, track_count);
-            let bytes = tokio::fs::read(&path)
+            let mut segment = File::open(&path)
                 .await
                 .map_err(|error| error.to_string())?;
             if !transfer_can_continue(&app, &id, generation) {
                 return Ok(());
             }
-            output
-                .write_all(&bytes)
+            tokio::io::copy(&mut segment, &mut output)
                 .await
                 .map_err(|error| error.to_string())?;
             if !transfer_can_continue(&app, &id, generation) {
                 return Ok(());
             }
         }
+        // The muxer reads the track from another thread: every write must
+        // have landed before the handle goes.
+        output.flush().await.map_err(|error| error.to_string())?;
         drop(output);
         track_paths.push(output_path);
     }
@@ -4174,7 +4320,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         || manifest_mime(response_mime.as_deref());
     if known_manifest {
         report_viability(&app, &id, Ok(()));
-        let body = response.text().await.map_err(|error| error.to_string());
+        let body = manifest_text(response).await;
         let result = match body {
             Ok(body) => acquire_manifest(
                 app.clone(),

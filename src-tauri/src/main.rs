@@ -7,7 +7,7 @@ mod notify;
 mod protect;
 mod startup;
 
-use futures_util::{future::Abortable, StreamExt};
+use futures_util::{future::Abortable, FutureExt, StreamExt};
 use lifecycle::{state_allows_transfer, TransferRegistry};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -1893,10 +1893,24 @@ fn spawn_transfer(app: &AppHandle, state: &CoreState, id: String, source: String
     let Some((generation, registration)) = state.transfer_controls.claim_with_generation(&id) else { return false; };
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = Abortable::new(acquire(handle.clone(), id.clone(), source, generation), registration).await;
+        let transfer = Abortable::new(acquire(handle.clone(), id.clone(), source, generation), registration);
+        // A panic inside the engine (a malformed manifest, an unexpected
+        // body) must end as a visible failure, and must never skip the
+        // release below: a stranded owner makes Retry and Resume no-ops.
+        let panicked = std::panic::AssertUnwindSafe(transfer).catch_unwind().await.is_err();
         let state = handle.state::<CoreState>();
         state.transfer_controls.release_if_current(&id, generation);
         if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(&id); };
+        if panicked && state_allows_transfer(job_state(&handle, &id).as_deref()) {
+            mark_acquisition_failed(
+                &handle,
+                &state,
+                &id,
+                "An internal error stopped this download; the source may be malformed".into(),
+                "Acquisition stopped by an internal error",
+            );
+        }
+        report_viability_failure(&handle, &id);
     });
     true
 }

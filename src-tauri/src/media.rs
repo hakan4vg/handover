@@ -793,13 +793,21 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
         let value = expand_template(initialization, template.start_number, 0, representation_id, bandwidth);
         if let Some(url) = resolve(base, &value) { segments.push(Segment { url, range: None, key: None }); }
     }
+    // Malformed timing is a property of the manifest, not a reason to panic:
+    // every divisor below is proven non-zero here.
+    if template.timescale == 0
+        || template.duration == Some(0)
+        || template.timeline.iter().any(|item| item.duration == 0)
+    {
+        return Err("The MPD declares a zero segment duration or timescale".into());
+    }
     let mut number = template.start_number;
     let mut current_time = 0u64;
     if !template.timeline.is_empty() {
         for (index, item) in template.timeline.iter().enumerate() {
             let start = item.time.unwrap_or(current_time);
             let next_time = template.timeline.get(index + 1).and_then(|next| next.time);
-            let repeat = if item.repeat >= 0 { item.repeat as u64 + 1 } else if let Some(next) = next_time { ((next.saturating_sub(start) + item.duration.max(1) - 1) / item.duration.max(1)).max(1) } else if let Some(duration) = presentation_duration { ((duration.saturating_mul(template.timescale).saturating_sub(start) + item.duration.max(1) - 1) / item.duration.max(1)).max(1) } else { 1 };
+            let repeat = if item.repeat >= 0 { (item.repeat as u64).saturating_add(1) } else if let Some(next) = next_time { next.saturating_sub(start).div_ceil(item.duration).max(1) } else if let Some(duration) = presentation_duration { duration.saturating_mul(template.timescale).saturating_sub(start).div_ceil(item.duration).max(1) } else { 1 };
             for offset in 0..repeat.min(100_000) {
                 let time = start.saturating_add(offset.saturating_mul(item.duration));
                 let value = expand_template(media, number, time, representation_id, bandwidth);
@@ -809,7 +817,7 @@ fn expand_dash_template(template: &DashTemplate, base: &str, representation_id: 
             current_time = start.saturating_add(repeat.saturating_mul(item.duration));
         }
     } else if let (Some(duration), Some(segment_duration)) = (presentation_duration, template.duration) {
-        let count = ((duration.saturating_mul(template.timescale) + segment_duration.saturating_sub(1)) / segment_duration).min(100_000);
+        let count = duration.saturating_mul(template.timescale).div_ceil(segment_duration).min(100_000);
         for index in 0..count {
             let time = index.saturating_mul(segment_duration);
             let value = expand_template(media, number, time, representation_id, bandwidth);
@@ -827,7 +835,9 @@ fn expand_template(template: &str, number: u64, time: u64, representation_id: &s
         let Some(end_offset) = value[start..].find("d$") else { break; };
         let width_end = start + end_offset;
         let end = width_end + 2;
-        let width = value[start + 8..width_end].parse::<usize>().unwrap_or(0);
+        // Real templates pad to a handful of digits; a manifest must not be
+        // able to ask for a multi-gigabyte URL.
+        let width = value[start + 8..width_end].parse::<usize>().unwrap_or(0).min(32);
         let formatted = if width > 0 { format!("{number:0width$}") } else { number.to_string() };
         value.replace_range(start..end, &formatted);
     }

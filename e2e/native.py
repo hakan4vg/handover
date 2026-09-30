@@ -135,6 +135,8 @@ class Handler(fixture.Handler):
         if path == "/hls-two-maps.m3u8":
             data = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2", '#EXT-X-MAP:URI="/dash/v-init.mp4"', "#EXTINF:2.0,", "/dash/v-0.m4s", "#EXT-X-DISCONTINUITY", '#EXT-X-MAP:URI="/dash/a-init.mp4"', "#EXTINF:2.0,", "/dash/a-0.m4s", "#EXT-X-ENDLIST", ""])
             return self._raw(200, data.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
+        if path == "/gone.mpd":
+            return self._raw(410, b"expired")
         if path == "/paced/range.bin":
             rng = self.headers.get("Range", "")
             size, seed, _ = fixture.FILES["range.bin"]
@@ -226,6 +228,8 @@ def main() -> int:
         "post-ok": ("/post-ok.bin", {"postBody": "export=requested"}),
         "zero-mpd": ("/zero.mpd", {"media": True, "playerKind": "video"}),
         "paced-range": ("/paced/range.bin", {}),
+        # Stopped while finalizing: every fragment is on disk, the source has expired.
+        "recover-media": ("/gone.mpd", {"media": True, "playerKind": "video", "state": "finalizing", "progress": 100, "segments": {"completed": 6, "total": 6, "identity": "seeded"}}),
         "paced-hls": ("/paced-hls.m3u8", {"media": True, "playerKind": "video"}),
         "mpd-dynamic": ("/dynamic-spaced.mpd", {"media": True, "playerKind": "video"}),
         "mpd-periods": ("/two-periods.mpd", {"media": True, "playerKind": "video"}),
@@ -234,6 +238,11 @@ def main() -> int:
         "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
         "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
     }
+    parts = runtime / "data" / "tmp" / "recover-media.part.segments"
+    for track, files in (("00", ["v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s"]), ("01", ["a-init.mp4", "a-0.m4s"])):
+        (parts / track).mkdir(parents=True)
+        for index, file in enumerate(files):
+            (parts / track / f"{index:08}.part").write_bytes(fixture.media_file(file))
     for name, (path, extra) in engine.items():
         job = dict(id=name, name=f"{name}.bin", source=base + path, domain="127.0.0.1", state="connecting", progress=0, downloaded=0, total=None, speed=0, eta=None, connections=0, maxConnections=4, mode="single-stream", media=False, destination=str(out / f"{name}.bin"), tempPath=str(runtime / "data" / "tmp" / f"{name}.part"), resumable=False, mime=None, error=None, created="2026-09-29T19:00:00Z", started=None, completed=None, provisional=False, segments=None, referrer=base + "/page", events=[])
         job.update(extra)
@@ -300,6 +309,10 @@ def main() -> int:
         ):
             j = job(name)
             run.check(f"engine/{name}", guards, j["state"] == "failed" and expect in (j["error"] or "") and j["_data"] is None, evidence(name))
+
+        j = job("recover-media")
+        asked = sum(v for (p, _, _), v in counts.items() if p == "/gone.mpd")
+        run.check("engine/recover-finalizing-from-disk", "a media job that stopped while finalizing is finished from its downloaded fragments, without asking the expired source again", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and asked == 0, evidence("recover-media", sourceRequests=asked))
 
         j = job("paced-range")
         run.check("engine/paced-range", "range workers told Retry-After wait it out: the download completes byte-exact with no retry inside the server's window", j["state"] == "completed" and j["_data"] == RANGE_BYTES and PACING_EARLY["range"] == 0, evidence("paced-range", earlyRetries=PACING_EARLY["range"], pacedRanges=sum(1 for k in PACING_FIRST if k.startswith("bytes="))))

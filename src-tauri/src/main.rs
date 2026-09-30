@@ -3782,6 +3782,24 @@ async fn acquire_manifest(
             return Err(error);
         }
     }
+    finish_segmented(app.clone(), id.clone(), generation, segment_dir, temp_path, track_lengths, replace_existing).await
+}
+
+/// Join a segmented download's part files into track files, mux them when
+/// there are several, and publish the result. Shared by a live acquisition
+/// and by recovery of one whose fragments were all on disk when the resident
+/// stopped (1.10).
+async fn finish_segmented(
+    app: AppHandle,
+    id: String,
+    generation: u64,
+    segment_dir: PathBuf,
+    temp_path: String,
+    track_lengths: Vec<usize>,
+    replace_existing: bool
+) -> Result<(), String> {
+    let state = app.state::<CoreState>();
+    let track_count = track_lengths.len();
     if !transfer_is_current(&app, &id, generation) {
         return Ok(());
     }
@@ -5065,8 +5083,73 @@ async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> Result
     Ok(chosen)
 }
 
+/// Per-track fragment counts of a segmented download whose part files are
+/// all present: `NNNNNNNN.part` files directly in the directory for one
+/// track, or in `00`, `01`, ... for several. None unless they add up to the
+/// expected total with no gap or empty part.
+fn complete_segment_layout(segment_dir: &Path, expected_total: u32) -> Option<Vec<usize>> {
+    fn contiguous(directory: &Path) -> usize {
+        let mut count = 0;
+        while std::fs::metadata(directory.join(format!("{count:08}.part"))).is_ok_and(|meta| meta.is_file() && meta.len() > 0) {
+            count += 1;
+        }
+        count
+    }
+    let single = contiguous(segment_dir);
+    let lengths = if single > 0 {
+        vec![single]
+    } else {
+        let mut lengths = Vec::new();
+        loop {
+            let count = contiguous(&segment_dir.join(format!("{:02}", lengths.len())));
+            if count == 0 {
+                break;
+            }
+            lengths.push(count);
+        }
+        if lengths.len() < 2 {
+            return None;
+        }
+        lengths
+    };
+    (expected_total > 0 && lengths.iter().sum::<usize>() == expected_total as usize).then_some(lengths)
+}
+
+/// A committed segmented job that stopped while finalizing already had every
+/// fragment on disk: finish it from them rather than asking the source again,
+/// which may have expired since (1.10). Returns false when the job is not in
+/// that position and must be acquired normally.
+async fn finish_from_disk(app: &AppHandle, id: &str, generation: u64) -> bool {
+    let state = app.state::<CoreState>();
+    let found = state.snapshot.lock().ok().and_then(|snapshot| {
+        let replace_existing = snapshot.settings.collision_behavior == "replace";
+        snapshot.jobs.iter().find(|job| job.id == id).and_then(|job| {
+            let segments = job.segments.as_ref()?;
+            (job.state == "finalizing" && job.provisional != Some(true) && segments.completed == segments.total)
+                .then(|| (job.temp_path.clone(), segments.total, replace_existing))
+        })
+    });
+    let Some((temp_path, total, replace_existing)) = found else { return false; };
+    let segment_dir = PathBuf::from(format!("{temp_path}.segments"));
+    let Some(track_lengths) = complete_segment_layout(&segment_dir, total) else { return false; };
+    emit_job(&state, id, |job| {
+        job.state = "downloading".into();
+        job.events.insert(0, job_event("Resuming assembly from the fragments already downloaded", Some("warning")));
+    });
+    emit_snapshot(app, &state);
+    if let Err(error) = finish_segmented(app.clone(), id.to_string(), generation, segment_dir, temp_path, track_lengths, replace_existing).await {
+        if transfer_is_current(app, id, generation) && job_state(app, id).as_deref() != Some("failed") {
+            mark_acquisition_failed(app, &state, id, error, "Media finalization failed");
+        }
+    }
+    true
+}
+
 async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
     if !transfer_can_continue(&app, &id, generation) {
+        return;
+    }
+    if finish_from_disk(&app, &id, generation).await {
         return;
     }
     let source = match resolve_job_source(&app, &id, source).await {

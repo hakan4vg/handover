@@ -100,6 +100,8 @@ class Handler(fixture.Handler):
             return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream", "Content-Disposition": 'attachment; filename="server; plain.bin"'})
         if path == "/named/star.bin":
             return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream", "Content-Disposition": "attachment; filename=\"fallback.bin\"; filename*=UTF-8''server%20%C3%A9t%C3%A9.bin"})
+        if path.startswith("/url-named/"):
+            return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream"})
         if path == "/hls-hole.m3u8":
             data = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2", "#EXTINF:2.0,", "/hls/seg0.ts", "#EXTINF:2.0,", "http://[unresolvable", "#EXTINF:2.0,", "/hls/seg1.ts", "#EXT-X-ENDLIST", ""])
             return self._raw(200, data.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
@@ -296,6 +298,10 @@ def main() -> int:
         run.check("bridge/name-server-beats-hint", "a link's name is a hint: the server's Content-Disposition filename wins", got == "server; plain.bin", {"name": got})
         got = named("/named/star.bin", "cap-name-star", None, False)
         run.check("bridge/name-rfc8187", "with no name at all, an RFC 8187 filename* is decoded and preferred over filename", got == "server été.bin", {"name": got})
+        got = named("/url-named/My%20Report%20%C3%A9t%C3%A9.bin", "cap-name-url", None, False)
+        run.check("bridge/name-url-decoded", "a name taken from the URL is percent-decoded, as a browser saves it", got == "My Report été.bin", {"name": got})
+        got = named("/url-named/" + "a" * 300 + ".bin", "cap-name-long", None, False)
+        run.check("bridge/name-length-capped", "an overlong name is shortened to a Windows-safe length and keeps its extension", bool(got) and len(got) <= 180 and got.endswith(".bin"), {"name": got, "length": len(got or "")})
         got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
         run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
 

@@ -1007,6 +1007,7 @@ fn safe_filename(value: &str) -> String {
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         return "download.bin".into();
     }
+    let cleaned = cap_filename(&cleaned);
     #[cfg(windows)]
     if windows_device_name(&cleaned) {
         return format!("_{cleaned}");
@@ -1049,6 +1050,31 @@ fn manifest_output_name(current: &str, container_ext: &str) -> String {
     format!("{stem}.{container_ext}")
 }
 
+/// A file name longer than this is shortened, keeping its extension: common
+/// Windows file systems allow 255 UTF-16 units per name, and the folder path
+/// still has to fit around it.
+const FILENAME_MAX_CHARS: usize = 180;
+
+fn cap_filename(name: &str) -> String {
+    if name.chars().count() <= FILENAME_MAX_CHARS {
+        return name.to_string();
+    }
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty() && value.chars().count() <= 16)
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let stem: String = name
+        .chars()
+        .take(FILENAME_MAX_CHARS - extension.chars().count())
+        .collect();
+    format!("{}{extension}", stem.trim_end_matches([' ', '.']))
+}
+
+/// The URL's last path segment, percent-decoded as a browser would name it
+/// (`My%20File.pdf` saves as `My File.pdf`). Bytes that do not decode to
+/// UTF-8 keep their escapes rather than turning into replacement characters.
 fn source_name(source: &str) -> String {
     reqwest::Url::parse(source)
         .ok()
@@ -1058,6 +1084,29 @@ fn source_name(source: &str) -> String {
                 .map(str::to_string)
         })
         .filter(|name| !name.is_empty())
+        .map(|name| {
+            let bytes = name.as_bytes();
+            let mut decoded = Vec::with_capacity(bytes.len());
+            let mut index = 0;
+            while index < bytes.len() {
+                let hex = (bytes[index] == b'%')
+                    .then(|| bytes.get(index + 1..index + 3))
+                    .flatten()
+                    .and_then(|pair| std::str::from_utf8(pair).ok())
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        decoded.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            String::from_utf8(decoded).unwrap_or(name)
+        })
         .unwrap_or_else(|| "download.bin".into())
 }
 
@@ -5368,7 +5417,7 @@ fn start_provisional(
             .name
             .filter(|value| !value.trim().is_empty())
             .map(|value| safe_filename(&value))
-            .unwrap_or_else(|| source_name(&input.source));
+            .unwrap_or_else(|| safe_filename(&source_name(&input.source)));
         let (name, destination) = match chosen_destination {
             Some(chosen) if Path::new(&chosen).is_dir() => {
                 let destination = destination_for_filename(&chosen, &name);

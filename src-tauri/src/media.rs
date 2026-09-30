@@ -1230,8 +1230,11 @@ fn ebml_vint(data: &[u8], cursor: usize) -> Result<(Option<u64>, usize), String>
     for byte in &data[cursor + 1..cursor + width] {
         value = (value << 8) | u64::from(*byte);
     }
+    // All value bits set means "unknown size" at every width, not only one
+    // byte: recorders and chunked DASH write the Segment's unknown size as
+    // 01 FF FF FF FF FF FF FF.
     Ok((
-        if value == marker - 1 {
+        if value == (1u64 << (7 * width)) - 1 {
             None
         } else {
             Some(value)

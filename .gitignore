@@ -39,3 +39,4 @@ audit/
 # End-to-end run artifacts
 e2e/results/
 __pycache__/
+e2e/.media-cache/

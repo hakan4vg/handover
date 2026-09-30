@@ -1936,14 +1936,6 @@ fn media_extension(destination: &str) -> String {
     PathBuf::from(destination).extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).unwrap_or_else(|| "mkv".into())
 }
 
-fn looks_like_mpeg_ts(input: &[u8]) -> bool {
-    input.len() >= 188
-        && input.len() % 188 == 0
-        && input
-            .chunks_exact(188)
-            .all(|packet| packet.first() == Some(&0x47))
-}
-
 fn looks_like_webm(input: &[u8]) -> bool {
     input.len() >= 4 && &input[..4] == [0x1a, 0x45, 0xdf, 0xa3]
 }
@@ -1961,47 +1953,16 @@ fn destination_with_output_extension(destination: &str, output_path: &str) -> St
 }
 
 async fn mux_media_tracks(track_paths: &[String], output_path: &str) -> Result<String, String> {
-    if track_paths.len() < 2 {
-        return Err("Separate media tracks require at least two inputs".into());
-    }
-    let mut inputs = Vec::with_capacity(track_paths.len());
-    for path in track_paths {
-        inputs.push(
-            tokio::fs::read(path)
-                .await
-                .map_err(|error| error.to_string())?
-        );
-    }
-    let webm_count = inputs.iter().filter(|input| looks_like_webm(input)).count();
-    let mixed_webm = inputs.len() == 2
-        && webm_count == 1
-        && !inputs.iter().any(|input| looks_like_mpeg_ts(input));
-    let (merged, actual_output_path) = if inputs.iter().all(|input| looks_like_mpeg_ts(input)) {
-        (
-            media::mux_mpeg_ts_tracks(&inputs),
-            PathBuf::from(output_path)
-        )
-    } else if inputs.len() == 2 && webm_count == 2 {
-        let mut path = PathBuf::from(output_path);
-        path.set_extension("mkv");
-        (media::mux_webm_webm_tracks(&inputs), path)
-    } else if mixed_webm {
-        let mut path = PathBuf::from(output_path);
-        path.set_extension("mkv");
-        (media::mux_webm_fmp4_tracks(&inputs), path)
-    } else {
-        (media::mux_fmp4_tracks(&inputs), PathBuf::from(output_path))
-    };
-    let merged = merged.map_err(|error| {
-        format!("Media track finalization failed: {error}; downloaded parts were preserved")
-    })?;
-    if let Err(error) = tokio::fs::write(&actual_output_path, merged).await {
-        let _ = tokio::fs::remove_file(&actual_output_path).await;
-        return Err(format!(
-            "Media track output could not be written: {error}; downloaded parts were preserved"
-        ));
-    }
-    Ok(actual_output_path.to_string_lossy().into_owned())
+    let inputs: Vec<PathBuf> = track_paths.iter().map(PathBuf::from).collect();
+    let output = PathBuf::from(output_path);
+    // The mux reads and writes files of any size (F13): it runs on the
+    // blocking pool so a long finalization never stalls other downloads.
+    tauri::async_runtime::spawn_blocking(move || media::mux_track_files(&inputs, &output))
+        .await
+        .map_err(|error| {
+            format!("Media track finalization stopped: {error}; downloaded parts were preserved")
+        })?
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 fn job_state(app: &AppHandle, id: &str) -> Option<String> {

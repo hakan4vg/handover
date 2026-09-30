@@ -1,8 +1,8 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Url;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
@@ -1284,9 +1284,15 @@ impl Mp4Box {
     }
 }
 
-struct ParsedFragment<'a> {
-    mdat: &'a [u8],
-    moof: Vec<u8>,
+/// One moof/mdat pair of a track file, remembered by position. The fragment
+/// header is re-read when it is written, so a track's fragments never sit in
+/// memory together (F13).
+struct ParsedFragment {
+    moof_offset: u64,
+    moof_size: u64,
+    mdat_offset: u64,
+    mdat_size: u64,
+    mdat_header: u64,
     decode_time: Option<u64>,
     mfhd_sequence_offset: usize,
     tfhd_track_offsets: Vec<usize>,
@@ -1294,16 +1300,22 @@ struct ParsedFragment<'a> {
     ordinal: usize
 }
 
-struct ParsedTrack<'a> {
-    data: &'a [u8],
-    ftyp: &'a [u8],
+/// One fragmented-MP4 track file, indexed where it lies: the file type and
+/// movie headers are held, everything after them stays on disk.
+struct ParsedTrack {
+    file: std::fs::File,
+    ftyp: Vec<u8>,
+    /// The moov box alone; `moov_children` and `mvex_children` index into it.
+    moov: Vec<u8>,
     moov_children: Vec<Mp4Box>,
     mvex_children: Vec<Mp4Box>,
     trak: Vec<u8>,
     trex: Vec<u8>,
     track_id: u32,
     timescale: u32,
-    fragments: Vec<ParsedFragment<'a>>
+    fragments: Vec<ParsedFragment>,
+    /// First emsg/prft box between fragments (the Matroska audio path refuses these).
+    auxiliary_box: Option<[u8; 4]>
 }
 
 fn parse_mp4_boxes(
@@ -1596,14 +1608,25 @@ fn validate_trun(data: &[u8], item: Mp4Box, context: &str) -> Result<(), String>
     Ok(())
 }
 
-fn parse_fragment<'a>(
-    data: &'a [u8],
-    moof: Mp4Box,
-    mdat: &'a [u8],
+/// The single box a buffer read from a file holds.
+fn only_box(data: &[u8], context: &str) -> Result<Mp4Box, String> {
+    parse_mp4_boxes(data, 0, data.len(), context)?
+        .first()
+        .copied()
+        .ok_or_else(|| format!("{context} has an invalid box"))
+}
+
+/// Parse one fragment header. `data` is the moof box alone, read from
+/// `moof_offset`; `mdat` is the following box as (offset, size, header size).
+fn parse_fragment(
+    data: &[u8],
+    moof_offset: u64,
+    mdat: (u64, u64, u64),
     track_id: u32,
     ordinal: usize,
     context: &str
-) -> Result<ParsedFragment<'a>, String> {
+) -> Result<ParsedFragment, String> {
+    let moof = only_box(data, context)?;
     let children = child_boxes(data, moof, context)?;
     let mfhd = exactly_one_box(&children, *b"mfhd", context)?;
     let (_, _, mfhd_payload) = full_box_header(data, mfhd, context)?;
@@ -1646,10 +1669,12 @@ fn parse_fragment<'a>(
             decode_time = Some(tfdt_decode_time(data, *tfdt, &traf_context)?);
         }
     }
-    let moof_bytes = box_bytes(data, moof).to_vec();
     Ok(ParsedFragment {
-        mdat,
-        moof: moof_bytes,
+        moof_offset,
+        moof_size: data.len() as u64,
+        mdat_offset: mdat.0,
+        mdat_size: mdat.1,
+        mdat_header: mdat.2,
         decode_time,
         mfhd_sequence_offset,
         tfhd_track_offsets,
@@ -1658,49 +1683,66 @@ fn parse_fragment<'a>(
     })
 }
 
-/// Shared ftyp/moov preamble for fragmented presentations: locates the
-/// initialization and every track box without assuming a track count (F03).
-/// Returns the top-level boxes, the ftyp/moov positions, the moov children,
-/// and every trak box.
-fn fragmented_presentation_parts(
-    data: &[u8],
-    context: &str,
-) -> Result<(Vec<Mp4Box>, usize, usize, Vec<Mp4Box>, Vec<Mp4Box>), String> {
-    if data.is_empty() {
+/// Top-level boxes of a file as (kind, offset, size, header size), read one
+/// header at a time.
+fn file_top_boxes(
+    file: &mut std::fs::File,
+    total: u64,
+    context: &str
+) -> Result<Vec<([u8; 4], u64, u64, u64)>, String> {
+    let mut boxes = Vec::new();
+    let mut cursor = 0u64;
+    while cursor < total {
+        let (kind, size, header) = file_box_header(file, cursor, total, context)?;
+        boxes.push((kind, cursor, size, header));
+        cursor += size;
+    }
+    Ok(boxes)
+}
+
+fn open_media_file(path: &Path, context: &str) -> Result<(std::fs::File, u64), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("{context} could not be opened: {error}"))?;
+    let total = file
+        .metadata()
+        .map_err(|error| format!("{context} could not be read: {error}"))?
+        .len();
+    Ok((file, total))
+}
+
+/// Index one single-track fragmented-MP4 file. The ftyp and moov boxes are
+/// read whole (they are small); fragments are walked header by header, so
+/// the media data itself is never loaded (F13).
+fn parse_fragmented_track(path: &Path, track_index: usize) -> Result<ParsedTrack, String> {
+    let context = format!("Media track {track_index}");
+    let (mut file, total) = open_media_file(path, &context)?;
+    if total == 0 {
         return Err(format!("{context} is empty"));
     }
-    let top = parse_mp4_boxes(data, 0, data.len(), context)?;
+    let top = file_top_boxes(&mut file, total, &context)?;
     let ftyp_index = top
         .iter()
-        .position(|item| item.kind == *b"ftyp")
+        .position(|item| item.0 == *b"ftyp")
         .ok_or_else(|| format!("{context} is missing an ftyp box"))?;
     let moov_index = top
         .iter()
-        .position(|item| item.kind == *b"moov")
+        .position(|item| item.0 == *b"moov")
         .ok_or_else(|| format!("{context} is missing a moov box"))?;
     if ftyp_index > moov_index {
         return Err(format!("{context} has ftyp after moov"));
     }
-    let moov_children = child_boxes(data, top[moov_index], &format!("{context} moov"))?;
+    let ftyp = file_bytes(&mut file, top[ftyp_index].1, top[ftyp_index].2, &context)?;
+    let moov = file_bytes(&mut file, top[moov_index].1, top[moov_index].2, &context)?;
+    let data = moov.as_slice();
+    let moov_children = child_boxes(data, only_box(data, &context)?, &format!("{context} moov"))?;
     let trak_boxes = matching_boxes(&moov_children, *b"trak");
     if trak_boxes.is_empty() {
         return Err(format!("{context} has no media tracks"));
     }
-    Ok((top, ftyp_index, moov_index, moov_children, trak_boxes))
-}
-
-fn parse_fragmented_track<'a>(
-    data: &'a [u8],
-    track_index: usize,
-) -> Result<ParsedTrack<'a>, String> {
-    let context = format!("Media track {track_index}");
-    let (top, ftyp_index, moov_index, moov_children, trak_boxes) =
-        fragmented_presentation_parts(data, &context)?;
     if trak_boxes.len() != 1 {
         return Err(format!("{context} must contain exactly one track"));
     }
     let trak = trak_boxes[0];
-    let ftyp = box_bytes(data, top[ftyp_index]);
     let trak_children = child_boxes(data, trak, &format!("{context} trak"))?;
     let tkhd = exactly_one_box(&trak_children, *b"tkhd", &format!("{context} trak"))?;
     let track_id = track_id_from_tkhd(data, tkhd, &format!("{context} tkhd"))?;
@@ -1728,51 +1770,53 @@ fn parse_fragmented_track<'a>(
             "{context} trex references track ID {trex_track_id}, expected {track_id}"
         ));
     }
+    let trak_bytes = box_bytes(data, trak).to_vec();
+    let trex_bytes = box_bytes(data, trex).to_vec();
     let mut fragments = Vec::new();
-    let mut pending_moof = None;
+    let mut pending_moof: Option<(u64, u64)> = None;
     let mut saw_fragment_area = false;
-    for item in top.iter().skip(moov_index + 1) {
-        match item.kind {
-            [b'm', b'o', b'o', b'f'] => {
+    let mut auxiliary_box = None;
+    for &(kind, offset, size, header) in top.iter().skip(moov_index + 1) {
+        match &kind {
+            b"moof" => {
                 if pending_moof.is_some() {
                     return Err(format!("{context} has consecutive moof boxes without mdat"));
                 }
-                pending_moof = Some(*item);
+                pending_moof = Some((offset, size));
                 saw_fragment_area = true;
             }
-            [b'm', b'd', b'a', b't'] => {
-                let moof = pending_moof
+            b"mdat" => {
+                let (moof_offset, moof_size) = pending_moof
                     .take()
                     .ok_or_else(|| format!("{context} has mdat without a preceding moof"))?;
+                let fragment_context = format!("{context} fragment {}", fragments.len());
+                let moof = file_bytes(&mut file, moof_offset, moof_size, &fragment_context)?;
                 let fragment = parse_fragment(
-                    data,
-                    moof,
-                    box_bytes(data, *item),
+                    &moof,
+                    moof_offset,
+                    (offset, size, header),
                     track_id,
                     fragments.len(),
-                    &format!("{context} fragment {}", fragments.len())
+                    &fragment_context
                 )?;
                 fragments.push(fragment);
             }
-            [b'm', b'f', b'r', b'a'] => {
+            b"mfra" => {
                 if pending_moof.is_some() {
                     return Err(format!(
                         "{context} has a fragment without its mdat before mfra"
                     ));
                 }
             }
-            [b's', b't', b'y', b'p']
-            | [b's', b'i', b'd', b'x']
-            | [b'e', b'm', b's', b'g']
-            | [b'p', b'r', b'f', b't']
-            | [b'f', b'r', b'e', b'e']
-            | [b's', b'k', b'i', b'p']
-            | [b'w', b'i', b'd', b'e'] => {
+            b"styp" | b"sidx" | b"emsg" | b"prft" | b"free" | b"skip" | b"wide" => {
                 if pending_moof.is_some() {
                     return Err(format!("{context} has data between moof and mdat"));
                 }
+                if matches!(&kind, b"emsg" | b"prft") && auxiliary_box.is_none() {
+                    auxiliary_box = Some(kind);
+                }
             }
-            [b'f', b't', b'y', b'p'] | [b'm', b'o', b'o', b'v'] => {
+            b"ftyp" | b"moov" => {
                 return Err(format!(
                     "{context} has a duplicate initialization box at top level"
                 ))
@@ -1780,7 +1824,7 @@ fn parse_fragmented_track<'a>(
             _ => {
                 return Err(format!(
                     "{context} contains unsupported top-level box {}",
-                    String::from_utf8_lossy(&item.kind)
+                    String::from_utf8_lossy(&kind)
                 ))
             }
         }
@@ -1791,18 +1835,18 @@ fn parse_fragmented_track<'a>(
     if !saw_fragment_area || fragments.is_empty() {
         return Err(format!("{context} is not a fragmented MP4 media stream"));
     }
-    let trak_bytes = box_bytes(data, trak).to_vec();
-    let trex_bytes = box_bytes(data, trex).to_vec();
     Ok(ParsedTrack {
-        data,
+        file,
         ftyp,
+        moov,
         moov_children,
         mvex_children,
         trak: trak_bytes,
         trex: trex_bytes,
         track_id,
         timescale,
-        fragments
+        fragments,
+        auxiliary_box
     })
 }
 
@@ -1835,7 +1879,7 @@ fn wrap_mp4_box(kind: [u8; 4], children: &[Vec<u8>], context: &str) -> Result<Ve
     Ok(output)
 }
 
-fn build_muxed_initialization(tracks: &mut [ParsedTrack<'_>]) -> Result<Vec<u8>, String> {
+fn build_muxed_initialization(tracks: &mut [ParsedTrack]) -> Result<Vec<u8>, String> {
     let first = &tracks[0];
     let mut mvhd = None;
     let mut other_moov_children = Vec::new();
@@ -1845,9 +1889,9 @@ fn build_muxed_initialization(tracks: &mut [ParsedTrack<'_>]) -> Result<Vec<u8>,
             if mvhd.is_some() {
                 return Err("The first media initialization contains multiple mvhd boxes".into());
             }
-            mvhd = Some(box_bytes(first.data, *child).to_vec());
+            mvhd = Some(box_bytes(&first.moov, *child).to_vec());
         } else if child.kind != *b"trak" && child.kind != *b"mvex" {
-            other_moov_children.push(box_bytes(first.data, *child).to_vec());
+            other_moov_children.push(box_bytes(&first.moov, *child).to_vec());
         }
     }
     let mut mvhd = mvhd.ok_or_else(|| "The media initialization is missing mvhd".to_string())?;
@@ -1865,7 +1909,7 @@ fn build_muxed_initialization(tracks: &mut [ParsedTrack<'_>]) -> Result<Vec<u8>,
     patch_mvhd_next_track_id(&mut mvhd, mvhd_box, next_track_id, "mvhd")?;
     for child in &first.mvex_children {
         if child.kind != *b"trex" {
-            first_mvex_children.push(box_bytes(first.data, *child).to_vec());
+            first_mvex_children.push(box_bytes(&first.moov, *child).to_vec());
         }
     }
     let mut moov_children = vec![mvhd];
@@ -1942,16 +1986,16 @@ fn validate_multiplexed_moof(
     }
     Ok(())
 }
-/// Largest box this walker holds in memory. Only fragments and the movie header
-/// are read whole; both are small beside the media, and the bound keeps a
-/// hostile box size from turning validation into an allocation.
+/// Largest box the validator and the muxers hold in memory. Only fragment and
+/// movie headers (and Matroska headers) are read whole; they are small beside
+/// the media, and the bound keeps a hostile size from becoming an allocation.
 const FMP4_VALIDATION_BOX_LIMIT: u64 = 64 * 1024 * 1024;
 
 fn file_bytes(file: &mut std::fs::File, offset: u64, length: u64, context: &str) -> Result<Vec<u8>, String> {
     let length = usize::try_from(length)
         .ok()
         .filter(|length| *length <= FMP4_VALIDATION_BOX_LIMIT as usize)
-        .ok_or_else(|| format!("{context} contains a box too large to validate"))?;
+        .ok_or_else(|| format!("{context} contains a header too large to read"))?;
     let mut buffer = vec![0u8; length];
     file.seek(SeekFrom::Start(offset))
         .and_then(|_| file.read_exact(&mut buffer))
@@ -1959,8 +2003,8 @@ fn file_bytes(file: &mut std::fs::File, offset: u64, length: u64, context: &str)
     Ok(buffer)
 }
 
-/// One top-level box header: (kind, total size).
-fn file_box_header(file: &mut std::fs::File, offset: u64, total: u64, context: &str) -> Result<([u8; 4], u64), String> {
+/// One top-level box header: (kind, total size, header size).
+fn file_box_header(file: &mut std::fs::File, offset: u64, total: u64, context: &str) -> Result<([u8; 4], u64, u64), String> {
     if total - offset < 8 {
         return Err(format!("{context} has a truncated MP4 box header"));
     }
@@ -1984,7 +2028,7 @@ fn file_box_header(file: &mut std::fs::File, offset: u64, total: u64, context: &
     if offset.checked_add(size).is_none_or(|end| end > total) {
         return Err(format!("{context} contains a truncated MP4 box"));
     }
-    Ok((kind, size))
+    Ok((kind, size, header))
 }
 
 /// Validate an assembled fragmented-MP4 file where it lies. The bytes were
@@ -2007,7 +2051,7 @@ pub fn validate_fmp4_file(path: &Path) -> Result<(), String> {
     let mut fragments = 0u64;
     let mut pending_moof = false;
     while cursor < total {
-        let (kind, size) = file_box_header(&mut file, cursor, total, context)?;
+        let (kind, size, _) = file_box_header(&mut file, cursor, total, context)?;
         match &kind {
             b"ftyp" => typed = true,
             b"moov" => {
@@ -2067,15 +2111,148 @@ pub fn validate_fmp4_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn mux_fmp4_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> {
+const MUX_COPY_CHUNK: usize = 1024 * 1024;
+
+/// The muxed file being written. Output goes to disk through a buffer and
+/// media payloads are copied from the track files in bounded chunks, so the
+/// muxer's memory does not grow with the size of the media (F13).
+struct MuxOutput {
+    writer: std::io::BufWriter<std::fs::File>,
+    position: u64,
+    chunk: Vec<u8>
+}
+
+impl MuxOutput {
+    fn create(path: &Path) -> Result<Self, String> {
+        let file = std::fs::File::create(path)
+            .map_err(|error| format!("the output could not be created: {error}"))?;
+        Ok(Self {
+            writer: std::io::BufWriter::with_capacity(MUX_COPY_CHUNK, file),
+            position: 0,
+            chunk: vec![0; MUX_COPY_CHUNK]
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.writer
+            .write_all(bytes)
+            .map_err(|error| format!("the output could not be written: {error}"))?;
+        self.position += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Append `length` bytes of `file` starting at `offset`.
+    fn copy_from(&mut self, file: &mut std::fs::File, offset: u64, length: u64) -> Result<(), String> {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("a media track could not be read: {error}"))?;
+        let mut remaining = length;
+        while remaining > 0 {
+            let count = remaining.min(MUX_COPY_CHUNK as u64) as usize;
+            file.read_exact(&mut self.chunk[..count])
+                .map_err(|error| format!("a media track could not be read: {error}"))?;
+            self.writer
+                .write_all(&self.chunk[..count])
+                .map_err(|error| format!("the output could not be written: {error}"))?;
+            self.position += count as u64;
+            remaining -= count as u64;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), String> {
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|error| format!("the output could not be written: {}", error.error()))?;
+        file.sync_all()
+            .map_err(|error| format!("the output could not be written: {error}"))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackFileKind {
+    MpegTs,
+    Webm,
+    Other
+}
+
+/// Recognise a track file from its leading bytes. An MPEG-TS track is whole
+/// 188-byte packets; the sync byte of every packet is checked again when the
+/// track is read.
+fn track_file_kind(path: &Path) -> Result<TrackFileKind, String> {
+    let (mut file, length) = open_media_file(path, "A media track")?;
+    let mut head = [0u8; MPEG_TS_PACKET_SIZE + 1];
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) => return Err(format!("A media track could not be read: {error}"))
+        }
+    }
+    let head = &head[..filled];
+    if head.len() >= 4 && head[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Ok(TrackFileKind::Webm);
+    }
+    let packet_size = MPEG_TS_PACKET_SIZE as u64;
+    if length >= packet_size
+        && length % packet_size == 0
+        && head[0] == 0x47
+        && (length == packet_size || head.get(MPEG_TS_PACKET_SIZE) == Some(&0x47))
+    {
+        return Ok(TrackFileKind::MpegTs);
+    }
+    Ok(TrackFileKind::Other)
+}
+
+/// Mux separately downloaded track files into one file, file to file.
+/// Returns the path written: WebM tracks are muxed into Matroska, so their
+/// output takes the .mkv extension instead of `output_path`'s.
+pub fn mux_track_files(inputs: &[PathBuf], output_path: &Path) -> Result<PathBuf, String> {
+    if inputs.len() < 2 {
+        return Err("Separate media tracks require at least two inputs".into());
+    }
+    let mut kinds = Vec::with_capacity(inputs.len());
+    for path in inputs {
+        kinds.push(track_file_kind(path)?);
+    }
+    let webm_count = kinds.iter().filter(|kind| **kind == TrackFileKind::Webm).count();
+    let all_ts = kinds.iter().all(|kind| *kind == TrackFileKind::MpegTs);
+    let mixed_webm = inputs.len() == 2 && webm_count == 1 && !kinds.contains(&TrackFileKind::MpegTs);
+    let both_webm = inputs.len() == 2 && webm_count == 2;
+    let mut actual = output_path.to_path_buf();
+    if !all_ts && (both_webm || mixed_webm) {
+        actual.set_extension("mkv");
+    }
+    let result = MuxOutput::create(&actual).and_then(|mut output| {
+        if all_ts {
+            mux_mpeg_ts_tracks(inputs, &mut output)?;
+        } else if both_webm {
+            mux_webm_webm_tracks(inputs, &mut output)?;
+        } else if mixed_webm {
+            mux_webm_fmp4_tracks(inputs, &mut output)?;
+        } else {
+            mux_fmp4_tracks(inputs, &mut output)?;
+        }
+        output.finish()
+    });
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&actual);
+        return Err(format!(
+            "Media track finalization failed: {error}; downloaded parts were preserved"
+        ));
+    }
+    Ok(actual)
+}
+
+fn mux_fmp4_tracks(inputs: &[PathBuf], output: &mut MuxOutput) -> Result<(), String> {
     if inputs.len() < 2 {
         return Err("Fragmented MP4 muxing requires at least two tracks".into());
     }
     let mut tracks = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.iter().enumerate() {
-        tracks.push(parse_fragmented_track(input.as_ref(), index)?);
+        tracks.push(parse_fragmented_track(input, index)?);
     }
-    let ftyp = tracks[0].ftyp;
     let initialization = build_muxed_initialization(&mut tracks)?;
     let mut references = Vec::new();
     let all_have_decode_times = tracks.iter().all(|track| {
@@ -2111,39 +2288,34 @@ pub fn mux_fmp4_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> 
                 .then_with(|| left.1.cmp(&right.1))
         }
     });
-    let mut output = Vec::new();
-    output.extend_from_slice(ftyp);
-    output.extend_from_slice(&initialization);
+    let ftyp = std::mem::take(&mut tracks[0].ftyp);
+    output.write(&ftyp)?;
+    output.write(&initialization)?;
     for (sequence, (track_index, fragment_index, _, _)) in references.iter().enumerate() {
         let sequence =
             u32::try_from(sequence + 1).map_err(|_| "Too many media fragments".to_string())?;
         let track = &mut tracks[*track_index];
-        let fragment = &mut track.fragments[*fragment_index];
-        patch_u32(
-            &mut fragment.moof,
-            fragment.mfhd_sequence_offset,
-            sequence,
-            "mfhd",
+        let fragment = &track.fragments[*fragment_index];
+        let mut moof = file_bytes(
+            &mut track.file,
+            fragment.moof_offset,
+            fragment.moof_size,
+            "A media fragment"
         )?;
+        patch_u32(&mut moof, fragment.mfhd_sequence_offset, sequence, "mfhd")?;
         for offset in &fragment.tfhd_track_offsets {
-            patch_u32(&mut fragment.moof, *offset, track.track_id, "tfhd")?;
+            patch_u32(&mut moof, *offset, track.track_id, "tfhd")?;
         }
         if !fragment.base_data_offset_offsets.is_empty() {
-            let moof_offset = u64::try_from(output.len())
-                .map_err(|_| "The merged media is too large".to_string())?;
+            let moof_offset = output.position;
             for offset in &fragment.base_data_offset_offsets {
-                patch_u64(
-                    &mut fragment.moof,
-                    *offset,
-                    moof_offset,
-                    "tfhd base-data-offset",
-                )?;
+                patch_u64(&mut moof, *offset, moof_offset, "tfhd base-data-offset")?;
             }
         }
-        output.extend_from_slice(&fragment.moof);
-        output.extend_from_slice(fragment.mdat);
+        output.write(&moof)?;
+        output.copy_from(&mut track.file, fragment.mdat_offset, fragment.mdat_size)?;
     }
-    Ok(output)
+    Ok(())
 }
 
 const MPEG_TS_PACKET_SIZE: usize = 188;
@@ -2160,10 +2332,55 @@ struct MpegTsPes {
     pts: Option<u64>,
 }
 
+/// One MPEG-TS track file after its checking pass: its elementary stream is
+/// known to reassemble, and is read again unit by unit when it is muxed.
 struct MpegTsTrack {
+    path: PathBuf,
+    context: String,
+    elementary_pid: u16,
     stream_type: u8,
     descriptors: Vec<u8>,
-    pes: Vec<MpegTsPes>,
+    has_timestamps: bool,
+}
+
+/// Largest PES unit held in memory while a track is read. Units are single
+/// frames in practice; the bound keeps a stream that never starts a new unit
+/// from growing without limit.
+const MPEG_TS_PES_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The 188-byte packets of one track file, read in order through a buffer.
+struct MpegTsPackets {
+    reader: std::io::BufReader<std::fs::File>,
+    index: usize,
+    packet: [u8; MPEG_TS_PACKET_SIZE],
+}
+
+impl MpegTsPackets {
+    fn open(path: &Path, context: &str) -> Result<Self, String> {
+        let (file, length) = open_media_file(path, context)?;
+        if length % MPEG_TS_PACKET_SIZE as u64 != 0 {
+            return Err(format!(
+                "{context} is not a whole number of 188-byte MPEG-TS packets"
+            ));
+        }
+        Ok(Self {
+            reader: std::io::BufReader::with_capacity(MUX_COPY_CHUNK, file),
+            index: 0,
+            packet: [0; MPEG_TS_PACKET_SIZE],
+        })
+    }
+
+    /// The next packet and its index, or None at the end of the file.
+    fn next(&mut self) -> Result<Option<(usize, &[u8])>, String> {
+        match self.reader.read_exact(&mut self.packet) {
+            Ok(()) => {
+                self.index += 1;
+                Ok(Some((self.index - 1, &self.packet)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(error) => Err(format!("A media track could not be read: {error}")),
+        }
+    }
 }
 
 struct MpegTsPsiAssembler {
@@ -2210,7 +2427,13 @@ impl MpegTsPsiAssembler {
                 self.expected_length = Some(3 + section_length);
             }
             if self.expected_length == Some(self.buffer.len()) {
-                self.sections.push(std::mem::take(&mut self.buffer));
+                // Tables repeat every few packets; a run of identical copies
+                // is kept once, so a long track's table history stays small.
+                if self.sections.last() == Some(&self.buffer) {
+                    self.buffer.clear();
+                } else {
+                    self.sections.push(std::mem::take(&mut self.buffer));
+                }
                 self.expected_length = None;
             }
         }
@@ -2281,29 +2504,30 @@ fn mpeg_ts_crc32(data: &[u8]) -> u32 {
     crc
 }
 
-fn parse_mpeg_ts_packet<'a>(packet: &'a [u8], context: &str) -> Result<MpegTsPacket<'a>, String> {
+fn parse_mpeg_ts_packet<'a>(packet: &'a [u8], track: &str, index: usize) -> Result<MpegTsPacket<'a>, String> {
+    let context = || format!("{track} packet {index}");
     if packet.len() != MPEG_TS_PACKET_SIZE {
-        return Err(format!("{context} is not a 188-byte MPEG-TS packet"));
+        return Err(format!("{} is not a 188-byte MPEG-TS packet", context()));
     }
     if packet[0] != 0x47 {
-        return Err(format!("{context} has an invalid MPEG-TS sync byte"));
+        return Err(format!("{} has an invalid MPEG-TS sync byte", context()));
     }
     if packet[1] & 0x80 != 0 {
-        return Err(format!("{context} has a transport error indicator"));
+        return Err(format!("{} has a transport error indicator", context()));
     }
     if packet[3] >> 6 != 0 {
-        return Err(format!("{context} uses scrambled MPEG-TS payload"));
+        return Err(format!("{} uses scrambled MPEG-TS payload", context()));
     }
     let adaptation_control = (packet[3] >> 4) & 0x03;
     if adaptation_control == 0 {
-        return Err(format!("{context} has a reserved adaptation-field control"));
+        return Err(format!("{} has a reserved adaptation-field control", context()));
     }
     let mut payload_start = 4;
     if adaptation_control & 0x02 != 0 {
         let adaptation_length = usize::from(packet[4]);
         payload_start = 5 + adaptation_length;
         if payload_start > MPEG_TS_PACKET_SIZE {
-            return Err(format!("{context} has a truncated adaptation field"));
+            return Err(format!("{} has a truncated adaptation field", context()));
         }
     }
     let payload = if adaptation_control & 0x01 != 0 {
@@ -2318,15 +2542,11 @@ fn parse_mpeg_ts_packet<'a>(packet: &'a [u8], context: &str) -> Result<MpegTsPac
     })
 }
 
-fn collect_mpeg_ts_sections(data: &[u8], pid: u16, context: &str) -> Result<Vec<Vec<u8>>, String> {
-    if data.len() % MPEG_TS_PACKET_SIZE != 0 {
-        return Err(format!(
-            "{context} is not a whole number of 188-byte MPEG-TS packets"
-        ));
-    }
+fn collect_mpeg_ts_sections(path: &Path, pid: u16, context: &str) -> Result<Vec<Vec<u8>>, String> {
+    let mut packets = MpegTsPackets::open(path, context)?;
     let mut assembler = MpegTsPsiAssembler::new();
-    for (index, packet) in data.chunks_exact(MPEG_TS_PACKET_SIZE).enumerate() {
-        let packet = parse_mpeg_ts_packet(packet, &format!("{context} packet {index}"))?;
+    while let Some((index, packet)) = packets.next()? {
+        let packet = parse_mpeg_ts_packet(packet, context, index)?;
         if packet.pid == pid && !packet.payload.is_empty() {
             assembler.push(packet.payload_unit_start, packet.payload, context)?;
         }
@@ -2572,69 +2792,104 @@ fn parse_mpeg_ts_pes(mut data: Vec<u8>, context: &str) -> Result<MpegTsPes, Stri
     Ok(MpegTsPes { data, pts })
 }
 
-fn collect_mpeg_ts_pes(data: &[u8], pid: u16, context: &str) -> Result<Vec<MpegTsPes>, String> {
-    if data.len() % MPEG_TS_PACKET_SIZE != 0 {
-        return Err(format!(
-            "{context} is not a whole number of 188-byte MPEG-TS packets"
-        ));
-    }
-    let mut current = None;
-    let mut pes = Vec::new();
-    for (index, packet) in data.chunks_exact(MPEG_TS_PACKET_SIZE).enumerate() {
-        let packet = parse_mpeg_ts_packet(packet, &format!("{context} packet {index}"))?;
-        if packet.pid != pid {
-            continue;
-        }
-        if packet.payload_unit_start {
-            if packet.payload.len() < 3 {
-                return Err(format!(
-                    "{context} packet {index} has a truncated PES start"
-                ));
-            }
-            if let Some(data) = current.take() {
-                pes.push(parse_mpeg_ts_pes(
-                    data,
-                    &format!("{context} PES {}", pes.len())
-                )?);
-            }
-            if packet.payload[0..3] != [0x00, 0x00, 0x01] {
-                return Err(format!("{context} packet {index} does not start a PES"));
-            }
-            current = Some(packet.payload.to_vec());
-        } else if !packet.payload.is_empty() {
-            let Some(current) = current.as_mut() else {
-                return Err(format!(
-                    "{context} has PES payload before its first start packet"
-                ));
-            };
-            current.extend_from_slice(packet.payload);
-        }
-    }
-    if let Some(data) = current {
-        pes.push(parse_mpeg_ts_pes(
-            data,
-            &format!("{context} PES {}", pes.len())
-        )?);
-    }
-    if pes.is_empty() {
-        return Err(format!("{context} contains no PES units"));
-    }
-    Ok(pes)
+/// The PES units of one elementary stream, reassembled from a track file one
+/// unit at a time.
+struct MpegTsPesReader {
+    packets: MpegTsPackets,
+    pid: u16,
+    context: String,
+    current: Option<Vec<u8>>,
+    count: usize,
+    finished: bool,
 }
 
-fn parse_mpeg_ts_input(data: &[u8], index: usize) -> Result<MpegTsTrack, String> {
+impl MpegTsPesReader {
+    fn open(path: &Path, pid: u16, context: String) -> Result<Self, String> {
+        Ok(Self {
+            packets: MpegTsPackets::open(path, &context)?,
+            pid,
+            context,
+            current: None,
+            count: 0,
+            finished: false,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<MpegTsPes>, String> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some((index, raw)) = self.packets.next()? else {
+                self.finished = true;
+                let Some(data) = self.current.take() else {
+                    if self.count == 0 {
+                        return Err(format!("{} contains no PES units", self.context));
+                    }
+                    return Ok(None);
+                };
+                let pes = parse_mpeg_ts_pes(data, &format!("{} PES {}", self.context, self.count))?;
+                self.count += 1;
+                return Ok(Some(pes));
+            };
+            let packet = parse_mpeg_ts_packet(raw, &self.context, index)?;
+            if packet.pid != self.pid {
+                continue;
+            }
+            if packet.payload_unit_start {
+                if packet.payload.len() < 3 {
+                    return Err(format!(
+                        "{} packet {index} has a truncated PES start",
+                        self.context
+                    ));
+                }
+                let finished = match self.current.take() {
+                    Some(data) => Some(parse_mpeg_ts_pes(
+                        data,
+                        &format!("{} PES {}", self.context, self.count)
+                    )?),
+                    None => None,
+                };
+                if packet.payload[0..3] != [0x00, 0x00, 0x01] {
+                    return Err(format!("{} packet {index} does not start a PES", self.context));
+                }
+                self.current = Some(packet.payload.to_vec());
+                if let Some(pes) = finished {
+                    self.count += 1;
+                    return Ok(Some(pes));
+                }
+            } else if !packet.payload.is_empty() {
+                let Some(current) = self.current.as_mut() else {
+                    return Err(format!(
+                        "{} has PES payload before its first start packet",
+                        self.context
+                    ));
+                };
+                current.extend_from_slice(packet.payload);
+                if current.len() > MPEG_TS_PES_LIMIT {
+                    return Err(format!("{} has a PES unit larger than 64 MiB", self.context));
+                }
+            }
+        }
+    }
+}
+
+/// Check one MPEG-TS track file: its program tables, and every PES unit of
+/// its elementary stream (read and dropped one at a time).
+fn parse_mpeg_ts_input(path: &Path, index: usize) -> Result<MpegTsTrack, String> {
     let context = format!("MPEG-TS input {index}");
-    if data.is_empty() {
+    let (_, length) = open_media_file(path, &context)?;
+    if length == 0 {
         return Err(format!("{context} is empty"));
     }
-    if data.len() % MPEG_TS_PACKET_SIZE != 0 {
+    if length % MPEG_TS_PACKET_SIZE as u64 != 0 {
         return Err(format!(
             "{context} is not a whole number of 188-byte packets"
         ));
     }
-    let pat_sections = collect_mpeg_ts_sections(data, 0, &format!("{context} PAT"))?;
+    let pat_sections = collect_mpeg_ts_sections(path, 0, &format!("{context} PAT"))?;
     let (program_number, pmt_pid) = parse_mpeg_ts_pat(&pat_sections, &format!("{context} PAT"))?;
-    let pmt_sections = collect_mpeg_ts_sections(data, pmt_pid, &format!("{context} PMT"))?;
+    let pmt_sections = collect_mpeg_ts_sections(path, pmt_pid, &format!("{context} PMT"))?;
     let (elementary_pid, stream_type, descriptors) =
         parse_mpeg_ts_pmt_stream(&pmt_sections, program_number, &format!("{context} PMT"))?;
     if elementary_pid == pmt_pid {
@@ -2642,15 +2897,19 @@ fn parse_mpeg_ts_input(data: &[u8], index: usize) -> Result<MpegTsTrack, String>
             "{context} maps its PMT PID as an elementary stream"
         ));
     }
-    let pes = collect_mpeg_ts_pes(
-        data,
-        elementary_pid,
-        &format!("{context} elementary stream")
-    )?;
+    let stream_context = format!("{context} elementary stream");
+    let mut reader = MpegTsPesReader::open(path, elementary_pid, stream_context.clone())?;
+    let mut has_timestamps = false;
+    while let Some(pes) = reader.next()? {
+        has_timestamps |= pes.pts.is_some();
+    }
     Ok(MpegTsTrack {
+        path: path.to_path_buf(),
+        context: stream_context,
+        elementary_pid,
         stream_type,
         descriptors,
-        pes
+        has_timestamps
     })
 }
 
@@ -2844,18 +3103,18 @@ fn append_mpeg_ts_pes_with_pcr(
     Ok(())
 }
 
-fn next_mpeg_ts_track(tracks: &[MpegTsTrack], cursors: &[usize]) -> Option<usize> {
-    let mut selected = None;
-    for index in 0..tracks.len() {
-        if cursors[index] >= tracks[index].pes.len() {
+fn next_mpeg_ts_track(heads: &[Option<MpegTsPes>]) -> Option<usize> {
+    let mut selected: Option<usize> = None;
+    for index in 0..heads.len() {
+        let Some(head) = &heads[index] else {
             continue;
-        }
+        };
         let Some(current) = selected else {
             selected = Some(index);
             continue;
         };
-        let left = tracks[index].pes[cursors[index]].pts;
-        let right = tracks[current].pes[cursors[current]].pts;
+        let left = head.pts;
+        let right = heads[current].as_ref().and_then(|pes| pes.pts);
         let ordering = match (left, right) {
             (Some(left), Some(right)) => left.cmp(&right),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -2870,13 +3129,15 @@ fn next_mpeg_ts_track(tracks: &[MpegTsTrack], cursors: &[usize]) -> Option<usize
 }
 
 /// Remux separate 188-byte MPEG-TS elementary-stream inputs into one program.
-pub fn mux_mpeg_ts_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> {
+/// Each track is checked in a first pass; the merge then holds one PES unit
+/// per track (F13).
+fn mux_mpeg_ts_tracks(inputs: &[PathBuf], output: &mut MuxOutput) -> Result<(), String> {
     if inputs.len() < 2 {
         return Err("MPEG-TS muxing requires at least two tracks".into());
     }
     let mut tracks = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.iter().enumerate() {
-        tracks.push(parse_mpeg_ts_input(input.as_ref(), index)?);
+        tracks.push(parse_mpeg_ts_input(input, index)?);
     }
     let mut pids = Vec::with_capacity(tracks.len());
     for index in 0..tracks.len() {
@@ -2890,46 +3151,55 @@ pub fn mux_mpeg_ts_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, Strin
         pids.push(pid);
     }
     let pat = build_mpeg_ts_pat(1, MPEG_TS_PMT_PID);
-    let pcr_track = tracks
-        .iter()
-        .position(|track| track.pes.iter().any(|pes| pes.pts.is_some()));
+    let pcr_track = tracks.iter().position(|track| track.has_timestamps);
     let pcr_pid = pcr_track.map(|index| pids[index]).unwrap_or(0x1fff);
     let pmt = build_mpeg_ts_pmt(1, pcr_pid, &pids, &tracks)?;
-    let mut output = Vec::new();
+    let mut buffer = Vec::new();
     let mut pat_continuity = 0;
-    append_mpeg_ts_section(&mut output, 0, &pat, &mut pat_continuity)?;
+    append_mpeg_ts_section(&mut buffer, 0, &pat, &mut pat_continuity)?;
     let mut pmt_continuity = 0;
-    append_mpeg_ts_section(&mut output, MPEG_TS_PMT_PID, &pmt, &mut pmt_continuity)?;
-    let total_pes = tracks
-        .iter()
-        .try_fold(0usize, |total, track| total.checked_add(track.pes.len()))
-        .ok_or_else(|| "Too many MPEG-TS PES units".to_string())?;
-    let mut cursors = vec![0usize; tracks.len()];
+    append_mpeg_ts_section(&mut buffer, MPEG_TS_PMT_PID, &pmt, &mut pmt_continuity)?;
+    output.write(&buffer)?;
+    let mut readers = Vec::with_capacity(tracks.len());
+    let mut heads = Vec::with_capacity(tracks.len());
+    for track in &tracks {
+        let mut reader = MpegTsPesReader::open(&track.path, track.elementary_pid, track.context.clone())?;
+        heads.push(reader.next()?);
+        readers.push(reader);
+    }
     let mut continuities = vec![0u8; tracks.len()];
-    for _ in 0..total_pes {
-        let track_index = next_mpeg_ts_track(&tracks, &cursors)
+    while let Some(track_index) = next_mpeg_ts_track(&heads) {
+        let pes = heads[track_index]
+            .take()
             .ok_or_else(|| "The MPEG-TS track merge ended unexpectedly".to_string())?;
-        let pes_index = cursors[track_index];
-        let pcr = (pcr_track == Some(track_index))
-            .then(|| tracks[track_index].pes[pes_index].pts)
-            .flatten();
+        let pcr = (pcr_track == Some(track_index)).then_some(pes.pts).flatten();
+        buffer.clear();
         append_mpeg_ts_pes_with_pcr(
-            &mut output,
+            &mut buffer,
             pids[track_index],
-            &tracks[track_index].pes[pes_index],
+            &pes,
             &mut continuities[track_index],
             pcr
         )?;
-        cursors[track_index] += 1;
+        output.write(&buffer)?;
+        heads[track_index] = readers[track_index].next()?;
     }
-    Ok(output)
+    Ok(())
+}
+
+/// Where one media sample's bytes lie: which input file, and the byte range.
+#[derive(Clone, Copy)]
+struct SampleBytes {
+    input: usize,
+    offset: u64,
+    length: u64
 }
 
 #[derive(Clone)]
 struct TimedMediaSample {
     timestamp_ns: i128,
     duration_ns: u64,
-    data: Vec<u8>,
+    bytes: SampleBytes,
     keyframe: bool
 }
 
@@ -3011,8 +3281,14 @@ fn ebml_child_bytes(
     Ok(Some(data[child_start..child_end].to_vec()))
 }
 
+/// Parse a Block's header. `head` holds the Block's first bytes (at most
+/// `EBML_BLOCK_HEAD`); the Block itself spans `length` bytes from `start` in
+/// input file `input`, and the sample is the part after its header.
 fn parse_webm_block(
-    data: &[u8],
+    head: &[u8],
+    start: u64,
+    length: u64,
+    input: usize,
     cluster_timecode: u64,
     timecode_scale: u64,
     track_number: u64,
@@ -3020,7 +3296,7 @@ fn parse_webm_block(
     default_duration: Option<u64>,
     context: &str
 ) -> Result<TimedMediaSample, String> {
-    let (block_track, track_width) = ebml_vint(data, 0)?;
+    let (block_track, track_width) = ebml_vint(head, 0)?;
     let block_track =
         block_track.ok_or_else(|| format!("{context} has an unknown track number"))?;
     if block_track != track_number {
@@ -3028,13 +3304,14 @@ fn parse_webm_block(
             "{context} references track {block_track}, expected {track_number}"
         ));
     }
-    if data.len() < track_width + 3 {
+    let header = (track_width + 3) as u64;
+    if length < header {
         return Err(format!("{context} is truncated"));
     }
-    if data[track_width + 2] & 0x06 != 0 {
+    if head[track_width + 2] & 0x06 != 0 {
         return Err(format!("{context} uses unsupported lacing"));
     }
-    let relative = i16::from_be_bytes([data[track_width], data[track_width + 1]]) as i128;
+    let relative = i16::from_be_bytes([head[track_width], head[track_width + 1]]) as i128;
     let ticks = i128::from(cluster_timecode)
         .checked_add(relative)
         .ok_or_else(|| format!("{context} timecode overflowed"))?;
@@ -3047,9 +3324,216 @@ fn parse_webm_block(
     Ok(TimedMediaSample {
         timestamp_ns,
         duration_ns: default_duration.unwrap_or(0),
-        data: data[track_width + 3..].to_vec(),
+        bytes: SampleBytes {
+            input,
+            offset: start + header,
+            length: length - header
+        },
         keyframe
     })
+}
+
+/// A Block's track number (up to 8 bytes), timecode and flags.
+const EBML_BLOCK_HEAD: u64 = 11;
+const MATROSKA_CLUSTER: u64 = 0x1f43_b675;
+/// Segment-level IDs; an unknown-size Cluster ends where one of them begins.
+const MATROSKA_SEGMENT_CHILDREN: [u64; 8] = [
+    0x1f43_b675,
+    0x1c53_bb6b,
+    0x1254_c367,
+    0x1043_a770,
+    0x1941_a469,
+    0x114d_9b74,
+    0x1549_a966,
+    0x1654_ae6b
+];
+
+/// One EBML element header read from a file: (id, data start, data end,
+/// unknown size). An unknown size runs to `end`, the enclosing element's end.
+fn file_ebml_element(
+    file: &mut std::fs::File,
+    cursor: u64,
+    end: u64
+) -> Result<(u64, u64, u64, bool), String> {
+    let head = file_bytes(file, cursor, (end - cursor).min(12), "A WebM element")?;
+    let (id, id_width) = ebml_id(&head, 0)?;
+    let (size, size_width) = ebml_vint(&head, id_width)?;
+    let data_start = cursor + (id_width + size_width) as u64;
+    let (data_end, unknown) = match size {
+        Some(size) => (
+            data_start
+                .checked_add(size)
+                .ok_or_else(|| "The EBML element size overflowed".to_string())?,
+            false
+        ),
+        None => (end, true)
+    };
+    if data_end > end {
+        return Err("The EBML element is truncated".into());
+    }
+    Ok((id, data_start, data_end, unknown))
+}
+
+/// The child elements of a file range as (id, data start, data end), read
+/// header by header. An unknown-size Cluster (as live recorders write them)
+/// ends at the next Segment-level element rather than swallowing the rest of
+/// the Segment.
+fn file_ebml_children(
+    file: &mut std::fs::File,
+    mut cursor: u64,
+    end: u64
+) -> Result<Vec<(u64, u64, u64)>, String> {
+    let mut elements = Vec::new();
+    while cursor < end {
+        let (id, data_start, mut data_end, unknown) = file_ebml_element(file, cursor, end)?;
+        if unknown && id == MATROSKA_CLUSTER {
+            let mut child = data_start;
+            while child < end {
+                let (child_id, _, child_end, _) = file_ebml_element(file, child, end)?;
+                if MATROSKA_SEGMENT_CHILDREN.contains(&child_id) {
+                    break;
+                }
+                child = child_end;
+            }
+            data_end = child;
+        }
+        elements.push((id, data_start, data_end));
+        cursor = data_end;
+    }
+    Ok(elements)
+}
+
+/// A WebM file indexed where it lies: the Segment's children by position,
+/// with only the Info and Tracks elements read into memory (F13).
+struct WebmFile {
+    file: std::fs::File,
+    segment_children: Vec<(u64, u64, u64)>,
+    info: Option<Vec<u8>>,
+    tracks: Vec<u8>
+}
+
+/// One Block as the cluster walk finds it.
+struct WebmBlock<'a> {
+    cluster_timecode: u64,
+    /// The Block's first bytes, or None for a BlockGroup without a Block.
+    head: Option<&'a [u8]>,
+    start: u64,
+    length: u64,
+    /// Some(keyframe) for a BlockGroup, None for a SimpleBlock.
+    group_keyframe: Option<bool>
+}
+
+fn open_webm(path: &Path, context: &str) -> Result<WebmFile, String> {
+    let (mut file, total) = open_media_file(path, context)?;
+    let mut magic = [0u8; 4];
+    if total < 4 || file.read_exact(&mut magic).is_err() || magic != [0x1a, 0x45, 0xdf, 0xa3] {
+        return Err(format!("{context} is not an EBML/WebM file"));
+    }
+    let top = file_ebml_children(&mut file, 0, total)?;
+    let (_, segment_start, segment_end) = top
+        .iter()
+        .find(|(id, _, _)| *id == 0x1853_8067)
+        .copied()
+        .ok_or_else(|| format!("{context} is missing a Segment element"))?;
+    let segment_children = file_ebml_children(&mut file, segment_start, segment_end)?;
+    let info = match segment_children.iter().find(|(id, _, _)| *id == 0x1549_a966) {
+        Some(&(_, start, end)) => Some(file_bytes(&mut file, start, end - start, context)?),
+        None => None
+    };
+    let (_, tracks_start, tracks_end) = segment_children
+        .iter()
+        .find(|(id, _, _)| *id == 0x1654_ae6b)
+        .copied()
+        .ok_or_else(|| format!("{context} is missing Tracks"))?;
+    let tracks = file_bytes(&mut file, tracks_start, tracks_end - tracks_start, context)?;
+    Ok(WebmFile {
+        file,
+        segment_children,
+        info,
+        tracks
+    })
+}
+
+impl WebmFile {
+    fn timecode_scale(&self, context: &str) -> Result<u64, String> {
+        let scale = match &self.info {
+            Some(info) => ebml_child_uint(info, 0, info.len(), 0x2ad7_b1)?.unwrap_or(1_000_000),
+            None => 1_000_000
+        };
+        if scale == 0 {
+            return Err(format!("{context} has a zero timecode scale"));
+        }
+        Ok(scale)
+    }
+
+    /// The first TrackEntry of `track_type`, as a range of `self.tracks`.
+    fn track_entry(&self, track_type: u64) -> Result<Option<(usize, usize)>, String> {
+        let data = &self.tracks;
+        Ok(ebml_children(data, 0, data.len())?
+            .into_iter()
+            .filter(|(id, _, _)| *id == 0xae)
+            .find_map(|(_, start, end)| {
+                let found = ebml_child_uint(data, start, end, 0x83).ok().flatten();
+                (found == Some(track_type)).then_some((start, end))
+            }))
+    }
+
+    /// Visit every Block of every Cluster in file order. Only each Block's
+    /// header is read; its media bytes stay in the file.
+    fn blocks(
+        &mut self,
+        mut visit: impl FnMut(WebmBlock<'_>) -> Result<(), String>
+    ) -> Result<(), String> {
+        let clusters: Vec<(u64, u64)> = self
+            .segment_children
+            .iter()
+            .filter(|(id, _, _)| *id == MATROSKA_CLUSTER)
+            .map(|(_, start, end)| (*start, *end))
+            .collect();
+        for (cluster_start, cluster_end) in clusters {
+            let children = file_ebml_children(&mut self.file, cluster_start, cluster_end)?;
+            let cluster_timecode = match children.iter().find(|(id, _, _)| *id == 0xe7) {
+                Some(&(_, start, end)) => {
+                    let bytes = file_bytes(&mut self.file, start, end - start, "A WebM cluster")?;
+                    ebml_uint(&bytes, 0, bytes.len())?
+                }
+                None => 0
+            };
+            for (id, child_start, child_end) in children {
+                let (block, group_keyframe) = if id == 0xa3 {
+                    (Some((child_start, child_end)), None)
+                } else if id == 0xa0 {
+                    let group = file_ebml_children(&mut self.file, child_start, child_end)?;
+                    let block = group
+                        .iter()
+                        .find(|(group_id, _, _)| *group_id == 0xa1)
+                        .map(|(_, start, end)| (*start, *end));
+                    let keyframe = !group.iter().any(|(group_id, _, _)| *group_id == 0xfb);
+                    (block, Some(keyframe))
+                } else {
+                    continue;
+                };
+                let head = match block {
+                    Some((start, end)) => Some(file_bytes(
+                        &mut self.file,
+                        start,
+                        (end - start).min(EBML_BLOCK_HEAD),
+                        "A WebM block"
+                    )?),
+                    None => None
+                };
+                let (start, end) = block.unwrap_or((child_start, child_start));
+                visit(WebmBlock {
+                    cluster_timecode,
+                    head: head.as_deref(),
+                    start,
+                    length: end - start,
+                    group_keyframe
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn fill_sample_durations(
@@ -3075,44 +3559,14 @@ fn fill_sample_durations(
     Ok(())
 }
 
-fn parse_webm_video(data: &[u8], track_index: usize) -> Result<WebmVideoTrack, String> {
-    let context = format!("WebM input {track_index}");
-    if data.len() < 4 || &data[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
-        return Err(format!("{context} is not an EBML/WebM file"));
-    }
-    let top = ebml_children(data, 0, data.len())?;
-    let (_, segment_start, segment_end) = top
-        .iter()
-        .find(|(id, _, _)| *id == 0x1853_8067)
-        .copied()
-        .ok_or_else(|| format!("{context} is missing a Segment element"))?;
-    let segment_children = ebml_children(data, segment_start, segment_end)?;
-    let timecode_scale = if let Some((_, info_start, info_end)) = segment_children
-        .iter()
-        .find(|(id, _, _)| *id == 0x1549_a966)
-        .copied()
-    {
-        ebml_child_uint(data, info_start, info_end, 0x2ad7_b1)?.unwrap_or(1_000_000)
-    } else {
-        1_000_000
-    };
-    if timecode_scale == 0 {
-        return Err(format!("{context} has a zero timecode scale"));
-    }
-    let (_, tracks_start, tracks_end) = segment_children
-        .iter()
-        .find(|(id, _, _)| *id == 0x1654_ae6b)
-        .copied()
-        .ok_or_else(|| format!("{context} is missing Tracks"))?;
-    let track_entry = ebml_children(data, tracks_start, tracks_end)?
-        .into_iter()
-        .filter(|(id, _, _)| *id == 0xae)
-        .find_map(|(_, start, end)| {
-            let track_type = ebml_child_uint(data, start, end, 0x83).ok().flatten();
-            (track_type == Some(1)).then_some((start, end))
-        })
+fn parse_webm_video(path: &Path, input: usize) -> Result<WebmVideoTrack, String> {
+    let context = format!("WebM input {input}");
+    let mut webm = open_webm(path, &context)?;
+    let timecode_scale = webm.timecode_scale(&context)?;
+    let (entry_start, entry_end) = webm
+        .track_entry(1)?
         .ok_or_else(|| format!("{context} contains no video TrackEntry"))?;
-    let (entry_start, entry_end) = track_entry;
+    let data = &webm.tracks;
     let track_number = ebml_child_uint(data, entry_start, entry_end, 0xd7)?
         .ok_or_else(|| format!("{context} video TrackEntry has no track number"))?;
     if track_number == 0 {
@@ -3145,49 +3599,34 @@ fn parse_webm_video(data: &[u8], track_index: usize) -> Result<WebmVideoTrack, S
         return Err(format!("{context} has invalid video dimensions"));
     }
     let mut samples = Vec::new();
-    for (_, cluster_start, cluster_end) in segment_children
-        .iter()
-        .filter(|(id, _, _)| *id == 0x1f43_b675)
-    {
-        let cluster_timecode =
-            ebml_child_uint(data, *cluster_start, *cluster_end, 0xe7)?.unwrap_or(0);
-        for (id, child_start, child_end) in ebml_children(data, *cluster_start, *cluster_end)? {
-            if id == 0xa3 {
-                let block = &data[child_start..child_end];
-                let (_, track_width) = ebml_vint(block, 0)?;
-                let flags = *block
+    webm.blocks(|block| {
+        let head = block
+            .head
+            .ok_or_else(|| format!("{context} BlockGroup has no Block"))?;
+        let (keyframe, block_context) = match block.group_keyframe {
+            Some(keyframe) => (keyframe, format!("{context} BlockGroup {}", samples.len())),
+            None => {
+                let (_, track_width) = ebml_vint(head, 0)?;
+                let flags = *head
                     .get(track_width + 2)
                     .ok_or_else(|| format!("{context} SimpleBlock is truncated"))?;
-                let sample_index = samples.len();
-                samples.push(parse_webm_block(
-                    block,
-                    cluster_timecode,
-                    timecode_scale,
-                    track_number,
-                    flags & 0x80 != 0,
-                    default_duration,
-                    &format!("{context} SimpleBlock {sample_index}")
-                )?);
-            } else if id == 0xa0 {
-                let group = ebml_children(data, child_start, child_end)?;
-                let (_, block_start, block_end) = group
-                    .iter()
-                    .find(|(child_id, _, _)| *child_id == 0xa1)
-                    .copied()
-                    .ok_or_else(|| format!("{context} BlockGroup has no Block"))?;
-                let keyframe = !group.iter().any(|(child_id, _, _)| *child_id == 0xfb);
-                samples.push(parse_webm_block(
-                    &data[block_start..block_end],
-                    cluster_timecode,
-                    timecode_scale,
-                    track_number,
-                    keyframe,
-                    default_duration,
-                    &format!("{context} BlockGroup {}", samples.len())
-                )?);
+                (flags & 0x80 != 0, format!("{context} SimpleBlock {}", samples.len()))
             }
-        }
-    }
+        };
+        samples.push(parse_webm_block(
+            head,
+            block.start,
+            block.length,
+            input,
+            block.cluster_timecode,
+            timecode_scale,
+            track_number,
+            keyframe,
+            default_duration,
+            &block_context
+        )?);
+        Ok(())
+    })?;
     fill_sample_durations(
         &mut samples,
         default_duration.unwrap_or(1_000_000),
@@ -3201,44 +3640,14 @@ fn parse_webm_video(data: &[u8], track_index: usize) -> Result<WebmVideoTrack, S
     })
 }
 
-fn parse_webm_audio(data: &[u8], track_index: usize) -> Result<WebmAudioTrack, String> {
-    let context = format!("WebM audio input {track_index}");
-    if data.len() < 4 || &data[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
-        return Err(format!("{context} is not an EBML/WebM file"));
-    }
-    let top = ebml_children(data, 0, data.len())?;
-    let (_, segment_start, segment_end) = top
-        .iter()
-        .find(|(id, _, _)| *id == 0x1853_8067)
-        .copied()
-        .ok_or_else(|| format!("{context} is missing a Segment element"))?;
-    let segment_children = ebml_children(data, segment_start, segment_end)?;
-    let timecode_scale = if let Some((_, info_start, info_end)) = segment_children
-        .iter()
-        .find(|(id, _, _)| *id == 0x1549_a966)
-        .copied()
-    {
-        ebml_child_uint(data, info_start, info_end, 0x2ad7_b1)?.unwrap_or(1_000_000)
-    } else {
-        1_000_000
-    };
-    if timecode_scale == 0 {
-        return Err(format!("{context} has a zero timecode scale"));
-    }
-    let (_, tracks_start, tracks_end) = segment_children
-        .iter()
-        .find(|(id, _, _)| *id == 0x1654_ae6b)
-        .copied()
-        .ok_or_else(|| format!("{context} is missing Tracks"))?;
-    let track_entry = ebml_children(data, tracks_start, tracks_end)?
-        .into_iter()
-        .filter(|(id, _, _)| *id == 0xae)
-        .find_map(|(_, start, end)| {
-            let track_type = ebml_child_uint(data, start, end, 0x83).ok().flatten();
-            (track_type == Some(2)).then_some((start, end))
-        })
+fn parse_webm_audio(path: &Path, input: usize) -> Result<WebmAudioTrack, String> {
+    let context = format!("WebM audio input {input}");
+    let mut webm = open_webm(path, &context)?;
+    let timecode_scale = webm.timecode_scale(&context)?;
+    let (entry_start, entry_end) = webm
+        .track_entry(2)?
         .ok_or_else(|| format!("{context} contains no audio TrackEntry"))?;
-    let (entry_start, entry_end) = track_entry;
+    let data = &webm.tracks;
     let track_number = ebml_child_uint(data, entry_start, entry_end, 0xd7)?
         .ok_or_else(|| format!("{context} audio TrackEntry has no track number"))?;
     if track_number == 0 {
@@ -3282,52 +3691,32 @@ fn parse_webm_audio(data: &[u8], track_index: usize) -> Result<WebmAudioTrack, S
     };
 
     let mut samples = Vec::new();
-    for (_, cluster_start, cluster_end) in segment_children
-        .iter()
-        .filter(|(id, _, _)| *id == 0x1f43_b675)
-    {
-        let cluster_timecode =
-            ebml_child_uint(data, *cluster_start, *cluster_end, 0xe7)?.unwrap_or(0);
-        for (id, child_start, child_end) in ebml_children(data, *cluster_start, *cluster_end)? {
-            if id == 0xa3 {
-                let block = &data[child_start..child_end];
-                let (block_track, _) = ebml_vint(block, 0)?;
-                if block_track == Some(track_number) {
-                    let sample_index = samples.len();
-                    samples.push(parse_webm_block(
-                        block,
-                        cluster_timecode,
-                        timecode_scale,
-                        track_number,
-                        false,
-                        default_duration,
-                        &format!("{context} SimpleBlock {sample_index}"),
-                    )?);
-                }
-            } else if id == 0xa0 {
-                let group = ebml_children(data, child_start, child_end)?;
-                if let Some((_, block_start, block_end)) = group
-                    .iter()
-                    .find(|(child_id, _, _)| *child_id == 0xa1)
-                    .copied()
-                {
-                    let block = &data[block_start..block_end];
-                    let (block_track, _) = ebml_vint(block, 0)?;
-                    if block_track == Some(track_number) {
-                        samples.push(parse_webm_block(
-                            block,
-                            cluster_timecode,
-                            timecode_scale,
-                            track_number,
-                            false,
-                            default_duration,
-                            &format!("{context} BlockGroup {}", samples.len()),
-                        )?);
-                    }
-                }
-            }
+    webm.blocks(|block| {
+        let Some(head) = block.head else {
+            return Ok(());
+        };
+        let (block_track, _) = ebml_vint(head, 0)?;
+        if block_track != Some(track_number) {
+            return Ok(());
         }
-    }
+        let block_context = match block.group_keyframe {
+            Some(_) => format!("{context} BlockGroup {}", samples.len()),
+            None => format!("{context} SimpleBlock {}", samples.len())
+        };
+        samples.push(parse_webm_block(
+            head,
+            block.start,
+            block.length,
+            input,
+            block.cluster_timecode,
+            timecode_scale,
+            track_number,
+            false,
+            default_duration,
+            &block_context,
+        )?);
+        Ok(())
+    })?;
     fill_sample_durations(
         &mut samples,
         default_duration.unwrap_or(20_000_000),
@@ -3342,23 +3731,10 @@ fn parse_webm_audio(data: &[u8], track_index: usize) -> Result<WebmAudioTrack, S
     })
 }
 
-fn webm_track_type(data: &[u8]) -> Result<u64, String> {
-    if data.len() < 4 || &data[..4] != [0x1a, 0x45, 0xdf, 0xa3] {
-        return Err("Not an EBML/WebM file".into());
-    }
-    let top = ebml_children(data, 0, data.len())?;
-    let (_, segment_start, segment_end) = top
-        .iter()
-        .find(|(id, _, _)| *id == 0x1853_8067)
-        .copied()
-        .ok_or_else(|| "Missing Segment element in WebM".to_string())?;
-    let segment_children = ebml_children(data, segment_start, segment_end)?;
-    let (_, tracks_start, tracks_end) = segment_children
-        .iter()
-        .find(|(id, _, _)| *id == 0x1654_ae6b)
-        .copied()
-        .ok_or_else(|| "Missing Tracks element in WebM".to_string())?;
-    for (id, start, end) in ebml_children(data, tracks_start, tracks_end)? {
+fn webm_track_type(path: &Path) -> Result<u64, String> {
+    let webm = open_webm(path, "WebM input")?;
+    let data = &webm.tracks;
+    for (id, start, end) in ebml_children(data, 0, data.len())? {
         if id == 0xae {
             if let Some(track_type) = ebml_child_uint(data, start, end, 0x83)? {
                 return Ok(track_type);
@@ -3466,10 +3842,15 @@ fn find_mp4_descriptor(
     Ok(None)
 }
 
+/// Read one AAC fragment's samples. `data` is the moof box alone, read from
+/// file offset `moof_offset`; the mdat payload spans `mdat_payload..mdat_end`
+/// of the same file. Samples are recorded by position, not copied.
 fn parse_fmp4_audio_fragment(
     data: &[u8],
-    moof: Mp4Box,
-    mdat: Mp4Box,
+    moof_offset: u64,
+    mdat_payload: u64,
+    mdat_end: u64,
+    input: usize,
     track_id: u32,
     trex_duration: u32,
     trex_size: u32,
@@ -3477,6 +3858,7 @@ fn parse_fmp4_audio_fragment(
     samples: &mut Vec<TimedMediaSample>,
     context: &str
 ) -> Result<(), String> {
+    let moof = only_box(data, context)?;
     let moof_children = child_boxes(data, moof, context)?;
     let trafs = matching_boxes(&moof_children, *b"traf");
     if trafs.len() != 1 {
@@ -3503,7 +3885,7 @@ fn parse_fmp4_audio_fragment(
         cursor += 8;
         value
     } else {
-        moof.start as u64
+        moof_offset
     };
     if flags & 0x2 != 0 {
         cursor += 4;
@@ -3534,7 +3916,7 @@ fn parse_fmp4_audio_fragment(
     if truns.is_empty() {
         return Err(format!("{context} has no trun"));
     }
-    let mut data_cursor = mdat.payload_start() as u64;
+    let mut data_cursor = mdat_payload;
     let mut decode_cursor = decode_time;
     for (trun_index, trun) in truns.iter().enumerate() {
         let trun_context = format!("{context} trun {trun_index}");
@@ -3605,7 +3987,7 @@ fn parse_fmp4_audio_fragment(
             let sample_end = data_cursor
                 .checked_add(u64::from(size))
                 .ok_or_else(|| format!("{trun_context} sample offset overflowed"))?;
-            if data_cursor < mdat.payload_start() as u64 || sample_end > mdat.end as u64 {
+            if data_cursor < mdat_payload || sample_end > mdat_end {
                 return Err(format!("{trun_context} sample exceeds mdat"));
             }
             let timestamp = i128::from(decode_cursor)
@@ -3625,7 +4007,11 @@ fn parse_fmp4_audio_fragment(
             samples.push(TimedMediaSample {
                 timestamp_ns,
                 duration_ns,
-                data: data[data_cursor as usize..sample_end as usize].to_vec(),
+                bytes: SampleBytes {
+                    input,
+                    offset: data_cursor,
+                    length: u64::from(size)
+                },
                 keyframe: false
             });
             data_cursor = sample_end;
@@ -3640,12 +4026,17 @@ fn parse_fmp4_audio_fragment(
     Ok(())
 }
 
-fn parse_fmp4_audio(data: &[u8], track_index: usize) -> Result<Fmp4AudioTrack, String> {
-    let context = format!("fMP4 input {track_index}");
-    let parsed = parse_fragmented_track(data, track_index)?;
-    let top = parse_mp4_boxes(data, 0, data.len(), &context)?;
-    let moov = exactly_one_box(&top, *b"moov", &context)?;
-    let moov_children = child_boxes(data, moov, &context)?;
+fn parse_fmp4_audio(path: &Path, input: usize) -> Result<Fmp4AudioTrack, String> {
+    let context = format!("fMP4 input {input}");
+    let mut parsed = parse_fragmented_track(path, input)?;
+    if let Some(kind) = parsed.auxiliary_box {
+        return Err(format!(
+            "{context} contains unsupported top-level box {}",
+            String::from_utf8_lossy(&kind)
+        ));
+    }
+    let data = parsed.moov.as_slice();
+    let moov_children = child_boxes(data, only_box(data, &context)?, &context)?;
     let trak = exactly_one_box(&moov_children, *b"trak", &context)?;
     let trak_children = child_boxes(data, trak, &context)?;
     let mdia = exactly_one_box(&trak_children, *b"mdia", &context)?;
@@ -3700,59 +4091,30 @@ fn parse_fmp4_audio(data: &[u8], track_index: usize) -> Result<Fmp4AudioTrack, S
     }
     let trex_duration = read_u32_at(data, trex_payload + 12, &context)?;
     let trex_size = read_u32_at(data, trex_payload + 16, &context)?;
-    let moov_index = top
-        .iter()
-        .position(|item| item.kind == *b"moov")
-        .ok_or_else(|| format!("{context} is missing moov"))?;
-    let mut pending_moof = None;
     let mut samples = Vec::new();
-    for item in top.iter().skip(moov_index + 1) {
-        match item.kind {
-            [b'm', b'o', b'o', b'f'] => {
-                if pending_moof.is_some() {
-                    return Err(format!("{context} has consecutive moof boxes"));
-                }
-                pending_moof = Some(*item);
-            }
-            [b'm', b'd', b'a', b't'] => {
-                let moof = pending_moof
-                    .take()
-                    .ok_or_else(|| format!("{context} has mdat without moof"))?;
-                let sample_index = samples.len();
-                parse_fmp4_audio_fragment(
-                    data,
-                    moof,
-                    *item,
-                    parsed.track_id,
-                    trex_duration,
-                    trex_size,
-                    timescale,
-                    &mut samples,
-                    &format!("{context} fragment {sample_index}")
-                )?;
-            }
-            [b's', b'i', b'd', b'x']
-            | [b's', b't', b'y', b'p']
-            | [b'm', b'f', b'r', b'a']
-            | [b'f', b'r', b'e', b'e']
-            | [b's', b'k', b'i', b'p']
-            | [b'w', b'i', b'd', b'e'] => {
-                if pending_moof.is_some() {
-                    return Err(format!("{context} has data between moof and mdat"));
-                }
-            }
-            [b'f', b't', b'y', b'p'] | [b'm', b'o', b'o', b'v'] => {
-                return Err(format!("{context} has duplicate initialization boxes"))
-            }
-            _ => {
-                return Err(format!(
-                    "{context} contains unsupported top-level box {}",
-                    String::from_utf8_lossy(&item.kind)
-                ))
-            }
-        }
+    for fragment in &parsed.fragments {
+        let fragment_context = format!("{context} fragment {}", samples.len());
+        let moof = file_bytes(
+            &mut parsed.file,
+            fragment.moof_offset,
+            fragment.moof_size,
+            &fragment_context
+        )?;
+        parse_fmp4_audio_fragment(
+            &moof,
+            fragment.moof_offset,
+            fragment.mdat_offset + fragment.mdat_header,
+            fragment.mdat_offset + fragment.mdat_size,
+            input,
+            parsed.track_id,
+            trex_duration,
+            trex_size,
+            timescale,
+            &mut samples,
+            &fragment_context
+        )?;
     }
-    if pending_moof.is_some() || samples.is_empty() {
+    if samples.is_empty() {
         return Err(format!("{context} has incomplete media fragments"));
     }
     samples.sort_by_key(|sample| sample.timestamp_ns);
@@ -3868,7 +4230,15 @@ fn matroska_track_entry(
     ebml_element(&[0xae], &children.concat())
 }
 
-fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8>, String> {
+/// Write one VP9 video track and one audio track as Matroska. Every element
+/// size is computed from the sample positions first, then the file is written
+/// front to back with each sample copied from its input (F13).
+fn write_matroska(
+    video: WebmVideoTrack,
+    audio: AudioTrackInfo,
+    files: &mut [std::fs::File],
+    output: &mut MuxOutput
+) -> Result<(), String> {
     let first_timestamp = video
         .samples
         .iter()
@@ -3906,7 +4276,7 @@ fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8
             .ok_or_else(|| "The video timestamp underflowed".to_string())?;
         let timestamp_ms = u64::try_from((relative + 500_000) / 1_000_000)
             .map_err(|_| "The video timestamp is too large".to_string())?;
-        events.push((timestamp_ms, 1u64, sample.keyframe, sample.data));
+        events.push((timestamp_ms, 1u64, sample.keyframe, sample.bytes));
     }
     for sample in audio.samples {
         let relative = sample
@@ -3915,10 +4285,10 @@ fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8
             .ok_or_else(|| "The audio timestamp underflowed".to_string())?;
         let timestamp_ms = u64::try_from((relative + 500_000) / 1_000_000)
             .map_err(|_| "The audio timestamp is too large".to_string())?;
-        events.push((timestamp_ms, 2u64, false, sample.data));
+        events.push((timestamp_ms, 2u64, false, sample.bytes));
     }
     events.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let mut clusters: Vec<(u64, Vec<(u64, u64, bool, Vec<u8>)>)> = Vec::new();
+    let mut clusters: Vec<(u64, Vec<(u64, u64, bool, SampleBytes)>)> = Vec::new();
     for event in events {
         let start_new = clusters
             .last()
@@ -3928,31 +4298,30 @@ fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8
         }
         clusters.last_mut().unwrap().1.push(event);
     }
-    let mut cluster_bytes = Vec::new();
-    for (base, blocks) in clusters {
-        let mut payload = ebml_uint_element(&[0xe7], base)?;
-        for (timestamp, track_number, keyframe, data) in blocks {
+    // Size every Cluster before writing: an EBML element's size precedes it.
+    let block_length = |track_number: u64, bytes: &SampleBytes| -> Result<usize, String> {
+        usize::try_from(bytes.length)
+            .ok()
+            .and_then(|length| length.checked_add(ebml_track_number(track_number).ok()?.len() + 3))
+            .ok_or_else(|| "The Matroska block is too large".to_string())
+    };
+    let mut cluster_payloads = Vec::with_capacity(clusters.len());
+    for (base, blocks) in &clusters {
+        let mut payload = ebml_uint_element(&[0xe7], *base)?.len();
+        for (timestamp, track_number, _, bytes) in blocks {
             let relative = timestamp
-                .checked_sub(base)
+                .checked_sub(*base)
                 .ok_or_else(|| "The Matroska block timestamp underflowed".to_string())?;
             if relative > i64::from(i16::MAX as u16) as u64 {
                 return Err("The Matroska block timestamp is out of range".into());
             }
-            let mut block = ebml_track_number(track_number)?;
-            block.extend_from_slice(
-                &(i16::try_from(relative)
-                    .map_err(|_| "The Matroska block timestamp is out of range"))?
-                .to_be_bytes()
-            );
-            block.push(if track_number == 1 && keyframe {
-                0x80
-            } else {
-                0
-            });
-            block.extend_from_slice(&data);
-            payload.extend_from_slice(&ebml_element(&[0xa3], &block)?);
+            i16::try_from(relative).map_err(|_| "The Matroska block timestamp is out of range")?;
+            let length = block_length(*track_number, bytes)?;
+            payload = payload
+                .checked_add(1 + ebml_size(length)?.len() + length)
+                .ok_or_else(|| "The Matroska cluster is too large".to_string())?;
         }
-        cluster_bytes.extend_from_slice(&ebml_element(&[0x1f, 0x43, 0xb6, 0x75], &payload)?);
+        cluster_payloads.push(payload);
     }
     let info = [
         ebml_uint_element(&[0x2a, 0xd7, 0xb1], 1_000_000)?,
@@ -3982,12 +4351,14 @@ fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8
         )?
     ]
     .concat();
-    let segment_payload = [
-        ebml_element(&[0x15, 0x49, 0xa9, 0x66], &info)?,
-        ebml_element(&[0x16, 0x54, 0xae, 0x6b], &tracks)?,
-        cluster_bytes
-    ]
-    .concat();
+    let info = ebml_element(&[0x15, 0x49, 0xa9, 0x66], &info)?;
+    let tracks = ebml_element(&[0x16, 0x54, 0xae, 0x6b], &tracks)?;
+    let mut segment_length = info.len() + tracks.len();
+    for payload in &cluster_payloads {
+        segment_length = segment_length
+            .checked_add(4 + ebml_size(*payload)?.len() + payload)
+            .ok_or_else(|| "The Matroska segment is too large".to_string())?;
+    }
     let ebml_header = [
         ebml_uint_element(&[0x42, 0x86], 1)?,
         ebml_uint_element(&[0x42, 0xf7], 1)?,
@@ -3998,30 +4369,59 @@ fn build_matroska(video: WebmVideoTrack, audio: AudioTrackInfo) -> Result<Vec<u8
         ebml_uint_element(&[0x42, 0x85], 2)?
     ]
     .concat();
-    Ok([
-        ebml_element(&[0x1a, 0x45, 0xdf, 0xa3], &ebml_header)?,
-        ebml_element(&[0x18, 0x53, 0x80, 0x67], &segment_payload)?
-    ]
-    .concat())
+    output.write(&ebml_element(&[0x1a, 0x45, 0xdf, 0xa3], &ebml_header)?)?;
+    output.write(&[0x18, 0x53, 0x80, 0x67])?;
+    output.write(&ebml_size(segment_length)?)?;
+    output.write(&info)?;
+    output.write(&tracks)?;
+    for ((base, blocks), payload) in clusters.iter().zip(cluster_payloads) {
+        output.write(&[0x1f, 0x43, 0xb6, 0x75])?;
+        output.write(&ebml_size(payload)?)?;
+        output.write(&ebml_uint_element(&[0xe7], *base)?)?;
+        for (timestamp, track_number, keyframe, bytes) in blocks {
+            let length = block_length(*track_number, bytes)?;
+            let mut header = vec![0xa3];
+            header.extend_from_slice(&ebml_size(length)?);
+            header.extend_from_slice(&ebml_track_number(*track_number)?);
+            header.extend_from_slice(&((timestamp - base) as i16).to_be_bytes());
+            header.push(if *track_number == 1 && *keyframe {
+                0x80
+            } else {
+                0
+            });
+            output.write(&header)?;
+            let file = files
+                .get_mut(bytes.input)
+                .ok_or_else(|| "A media sample refers to an unknown track".to_string())?;
+            output.copy_from(file, bytes.offset, bytes.length)?;
+        }
+    }
+    Ok(())
+}
+
+fn open_track_files(paths: [&PathBuf; 2]) -> Result<[std::fs::File; 2], String> {
+    let open = |path: &PathBuf| {
+        std::fs::File::open(path).map_err(|error| format!("A media track could not be opened: {error}"))
+    };
+    Ok([open(paths[0])?, open(paths[1])?])
 }
 
 /// Mux one VP9/WebM track and one AAC/fMP4 track without external tools.
-pub fn mux_webm_fmp4_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> {
+fn mux_webm_fmp4_tracks(inputs: &[PathBuf], output: &mut MuxOutput) -> Result<(), String> {
     if inputs.len() != 2 {
         return Err("Mixed WebM/fMP4 muxing requires exactly two tracks".into());
     }
-    let first = inputs[0].as_ref();
-    let second = inputs[1].as_ref();
-    let (webm, fmp4) = if first.len() >= 4 && &first[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
-        (first, second)
-    } else if second.len() >= 4 && &second[..4] == [0x1a, 0x45, 0xdf, 0xa3] {
-        (second, first)
+    let (webm, fmp4) = if track_file_kind(&inputs[0])? == TrackFileKind::Webm {
+        (&inputs[0], &inputs[1])
+    } else if track_file_kind(&inputs[1])? == TrackFileKind::Webm {
+        (&inputs[1], &inputs[0])
     } else {
         return Err("Mixed media inputs contain no WebM track".into());
     };
     let video = parse_webm_video(webm, 0)?;
     let audio = parse_fmp4_audio(fmp4, 1)?;
-    build_matroska(
+    let mut files = open_track_files([webm, fmp4])?;
+    write_matroska(
         video,
         AudioTrackInfo {
             codec_id: "A_AAC".into(),
@@ -4030,28 +4430,29 @@ pub fn mux_webm_fmp4_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, Str
             channels: audio.channels,
             samples: audio.samples,
         },
+        &mut files,
+        output
     )
 }
 
 /// Mux one VP9/WebM video track and one WebM audio track (e.g. Opus) without external tools.
-pub fn mux_webm_webm_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, String> {
+fn mux_webm_webm_tracks(inputs: &[PathBuf], output: &mut MuxOutput) -> Result<(), String> {
     if inputs.len() != 2 {
         return Err("WebM/WebM muxing requires exactly two tracks".into());
     }
-    let first = inputs[0].as_ref();
-    let second = inputs[1].as_ref();
-    let first_type = webm_track_type(first)?;
-    let second_type = webm_track_type(second)?;
-    let (video_bytes, audio_bytes) = if first_type == 1 && second_type == 2 {
-        (first, second)
+    let first_type = webm_track_type(&inputs[0])?;
+    let second_type = webm_track_type(&inputs[1])?;
+    let (video_path, audio_path) = if first_type == 1 && second_type == 2 {
+        (&inputs[0], &inputs[1])
     } else if first_type == 2 && second_type == 1 {
-        (second, first)
+        (&inputs[1], &inputs[0])
     } else {
         return Err("WebM tracks must contain one video track and one audio track".into());
     };
-    let video = parse_webm_video(video_bytes, 0)?;
-    let audio = parse_webm_audio(audio_bytes, 1)?;
-    build_matroska(
+    let video = parse_webm_video(video_path, 0)?;
+    let audio = parse_webm_audio(audio_path, 1)?;
+    let mut files = open_track_files([video_path, audio_path])?;
+    write_matroska(
         video,
         AudioTrackInfo {
             codec_id: audio.codec_id,
@@ -4060,5 +4461,7 @@ pub fn mux_webm_webm_tracks<T: AsRef<[u8]>>(inputs: &[T]) -> Result<Vec<u8>, Str
             channels: audio.channels,
             samples: audio.samples,
         },
+        &mut files,
+        output
     )
 }

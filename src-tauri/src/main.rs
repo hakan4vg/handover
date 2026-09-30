@@ -1423,6 +1423,20 @@ fn page_instead_of_file(mime: Option<&str>, disposition: Option<&str>, filename:
     !(lower.ends_with(".html") || lower.ends_with(".htm"))
 }
 
+/// The header check plus the body sniff: a response is a page when either its
+/// headers or its first bytes say HTML and nothing names it as an HTML file.
+/// Every path that turns a response into the job's file asks this one question.
+fn response_is_page(mime: Option<&str>, disposition: Option<&str>, filename: &str, prefix: &[u8]) -> bool {
+    if page_instead_of_file(mime, disposition, filename) {
+        return true;
+    }
+    let names_file = disposition
+        .map(|value| value.to_ascii_lowercase().contains("filename"))
+        .unwrap_or(false);
+    let lower = filename.to_ascii_lowercase();
+    body_looks_like_html(prefix) && !names_file && !(lower.ends_with(".html") || lower.ends_with(".htm"))
+}
+
 fn manifest_mime(mime: Option<&str>) -> bool {
     mime.map(|value| {
         let value = value.to_ascii_lowercase();
@@ -2611,65 +2625,98 @@ async fn acquire_ranges(
             });
             emit_snapshot(&app, &state);
             sleep(Duration::from_secs(3)).await;
+            // The fallback is a new request for the object whose ranges were
+            // verified: it must prove it is still that object and still a
+            // file before it may replace them. It streams into a staging file,
+            // so a rejected fallback leaves the verified ranges on disk.
             let stream_client = http_client();
+            let rejected = |reason: String| format!("{initial_error}; one-stream fallback rejected: {reason}");
             let response = match acquisition_request(&stream_client, &app, &id, &source)
                 .send()
                 .await
             {
                 Ok(response) if response.status().is_success() => response,
-                Ok(response) => {
-                    return Err(format!(
-                        "{initial_error}; one-stream fallback failed: source returned {}",
-                        response.status()
-                    ))
-                }
-                Err(stream_error) => {
-                    return Err(format!(
-                        "{initial_error}; one-stream fallback failed: {stream_error}"
-                    ))
-                }
+                Ok(response) => return Err(rejected(format!("source returned {}", response.status()))),
+                Err(stream_error) => return Err(rejected(stream_error.to_string())),
             };
-            let fallback_mime = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let mut file = File::create(&temp_path).await.map_err(|stream_error| {
-                format!("{initial_error}; one-stream fallback failed: {stream_error}")
-            })?;
+            match partial_response_is_complete(&response) {
+                Ok(Some(length)) if length != total => {
+                    return Err(rejected(format!("the source now reports {length} bytes, not {total}")))
+                }
+                Ok(_) => {}
+                Err(reason) => return Err(rejected(reason)),
+            }
+            if !valid_range_identity(&response, &identity) {
+                return Err(rejected("the resource changed since its ranges were verified".into()));
+            }
+            let fallback_mime = header_string(&response, reqwest::header::CONTENT_TYPE);
+            let fallback_disposition = header_string(&response, reqwest::header::CONTENT_DISPOSITION);
+            let job_name = state
+                .snapshot
+                .lock()
+                .ok()
+                .and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.name.clone()))
+                .unwrap_or_default();
+            if page_instead_of_file(fallback_mime.as_deref(), fallback_disposition.as_deref(), &job_name) {
+                return Err(rejected("the source returned a web page instead of the file".into()));
+            }
+            let staging = format!("{temp_path}.stream");
+            let mut file = File::create(&staging).await.map_err(|error| rejected(error.to_string()))?;
             let mut full_downloaded = 0u64;
+            let mut prefix: Vec<u8> = Vec::new();
+            let mut sniffed = false;
             let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                if !transfer_is_downloading(&app, &id, generation) {
-                    return Ok(());
+            let outcome: Result<(), String> = async {
+                while let Some(chunk) = stream.next().await {
+                    if !transfer_is_downloading(&app, &id, generation) {
+                        return Err(String::new());
+                    }
+                    let bytes = chunk.map_err(|error| rejected(error.to_string()))?;
+                    if !sniffed {
+                        prefix.extend_from_slice(&bytes[..bytes.len().min(BODY_SNIFF_LIMIT.saturating_sub(prefix.len()))]);
+                        if prefix.len() >= BODY_SNIFF_LIMIT {
+                            sniffed = true;
+                            if response_is_page(fallback_mime.as_deref(), fallback_disposition.as_deref(), &job_name, &prefix) {
+                                return Err(rejected("the source returned a web page instead of the file".into()));
+                            }
+                        }
+                    }
+                    file.write_all(&bytes).await.map_err(|error| rejected(error.to_string()))?;
+                    full_downloaded = full_downloaded.saturating_add(bytes.len() as u64);
+                    if !throttle(&app, &id, bytes.len(), generation).await {
+                        return Err(String::new());
+                    }
+                    let progress = full_downloaded as f64 / total as f64 * 100.0;
+                    emit_job(&state, &id, |job| {
+                        job.downloaded = full_downloaded;
+                        job.progress = progress;
+                        job.speed = 0;
+                        job.eta = Some("Retrying as one stream".into());
+                        job.connections = 1;
+                    });
+                    // Same progress bookkeeping as every other streaming path: a
+                    // full snapshot here would rewrite the whole jobs table and
+                    // re-render every row once per network chunk.
+                    emit_progress(&app, &state, &id);
                 }
-                let bytes = chunk.map_err(|stream_error| {
-                    format!("{initial_error}; one-stream fallback failed: {stream_error}")
-                })?;
-                file.write_all(&bytes).await.map_err(|stream_error| {
-                    format!("{initial_error}; one-stream fallback failed: {stream_error}")
-                })?;
-                full_downloaded = full_downloaded.saturating_add(bytes.len() as u64);
-                if !throttle(&app, &id, bytes.len(), generation).await {
-                    return Ok(());
+                if !sniffed && response_is_page(fallback_mime.as_deref(), fallback_disposition.as_deref(), &job_name, &prefix) {
+                    return Err(rejected("the source returned a web page instead of the file".into()));
                 }
-                let progress = full_downloaded as f64 / total as f64 * 100.0;
-                emit_job(&state, &id, |job| {
-                    job.downloaded = full_downloaded;
-                    job.progress = progress;
-                    job.speed = 0;
-                    job.eta = Some("Retrying as one stream".into());
-                    job.connections = 1;
-                });
-                // Same progress bookkeeping as every other streaming path: a
-                // full snapshot here would rewrite the whole jobs table and
-                // re-render every row once per network chunk.
-                emit_progress(&app, &state, &id);
+                if full_downloaded != total {
+                    return Err(rejected(format!("it returned {full_downloaded} bytes, expected {total}")));
+                }
+                file.sync_all().await.map_err(|error| rejected(error.to_string()))
             }
+            .await;
             drop(file);
-            if full_downloaded != total {
-                return Err(format!("{initial_error}; one-stream fallback returned {full_downloaded} bytes, expected {total}"));
+            if let Err(reason) = outcome {
+                let _ = tokio::fs::remove_file(&staging).await;
+                // An empty reason is a pause/cancel: the caller decides.
+                return if reason.is_empty() { Ok(()) } else { Err(reason) };
             }
+            tokio::fs::rename(&staging, &temp_path)
+                .await
+                .map_err(|error| rejected(error.to_string()))?;
             downloaded.store(full_downloaded, Ordering::Relaxed);
             emit_job(&state, &id, |job| {
                 job.downloaded = full_downloaded;
@@ -3471,6 +3518,8 @@ async fn download_track_to_file(
         return Err(format!("track source returned {}", response.status()));
     }
     let expected = partial_response_is_complete(&response)?;
+    let track_mime = header_string(&response, reqwest::header::CONTENT_TYPE);
+    let track_disposition = header_string(&response, reqwest::header::CONTENT_DISPOSITION);
 
     let mut stream = response.bytes_stream();
     let mut prefix_chunks = Vec::new();
@@ -3499,6 +3548,9 @@ async fn download_track_to_file(
     }
     if expected_kind == Some("video") && body_looks_like_audio(&sniff_prefix) {
         return Err("The source returned audio data for the requested video track".into());
+    }
+    if response_is_page(track_mime.as_deref(), track_disposition.as_deref(), "", &sniff_prefix) {
+        return Err("A media track returned a web page instead of media; the site may need its login session".into());
     }
     let mut stream = futures_util::stream::iter(
         prefix_chunks
@@ -3759,12 +3811,13 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 .map(|job| job.selected_segments.clone())
         })
         .unwrap_or_default();
-    // The extension only records bodies it observed on a browser POST, so a
-    // present body means the browser POSTed: replay it before any GET, or a
-    // form page satisfies the acquisition and the real export is lost (F06).
-    // A POST response carries no range probe, so form captures continue as a
-    // single stream — replayability is unknown, and F05 forbids assuming it.
-    let post_first = state
+    // A present body means the browser POSTed (the extension only records
+    // bodies it observed). That POST is the request, and its outcome is final:
+    // falling back to GET asks for something else and used to complete jobs
+    // with a landing page, and replaying it again can repeat the submission's
+    // side effects, so a failed POST is never retried automatically. A GET is
+    // sent once here; the caller's retry loop owns retries.
+    let is_post = state
         .snapshot
         .lock()
         .ok()
@@ -3773,124 +3826,34 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 .jobs
                 .iter()
                 .find(|job| job.id == id)
-                .and_then(|job| job.post_body.clone())
-        });
-    let post_first = match post_first {
-        Some(_) => match post_replay_request(&client, &app, &id, &source) {
-            Some(replay) => match replay.send().await {
-                Ok(posted) if posted.status().is_success() => Some(posted),
-                _ => None,
-            },
-            None => None,
-        },
-        None => None,
+                .map(|job| job.post_body.is_some())
+        })
+        .unwrap_or(false);
+    let request = if is_post {
+        post_replay_request(&client, &app, &id, &source)
+    } else {
+        Some(acquisition_request(&client, &app, &id, &source))
     };
-    let response = match post_first {
-        Some(posted) => posted,
-        None => match acquisition_request(&client, &app, &id, &source)
-        .send()
-        .await
-        {
+    let sent = match request {
+        Some(request) => request.send().await.map_err(|error| error.to_string()),
+        None => Err("The form submission for this download is no longer available".into()),
+    };
+    let response = match sent {
         Ok(response) if response.status().is_success() => response,
-        _ => match acquisition_request(&client, &app, &id, &source)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => response,
-            Ok(_response) if _response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED => {
-                match post_replay_request(&client, &app, &id, &source) {
-                    Some(replay) => match replay.send().await {
-                        Ok(posted) if posted.status().is_success() => posted,
-                        Ok(posted) => {
-                            let retryable = retryable_status(posted.status());
-                            if !transfer_can_continue(&app, &id, generation) {
-                                return false;
-                            }
-                            emit_job(&state, &id, |job| {
-                                job.state = "failed".into();
-                                job.error = Some(format!("Source returned {}", posted.status()));
-                                job.eta = None;
-                                job.events.insert(
-                                    0,
-                                    job_event("Source rejected the acquisition", Some("error"))
-                                );
-                            });
-                            emit_snapshot(&app, &state);
-                            add_notification(&app, &state, &id, "failed");
-                            return retryable;
-                        }
-                        Err(error) => {
-                            if !transfer_can_continue(&app, &id, generation) {
-                                return false;
-                            }
-                            emit_job(&state, &id, |job| {
-                                job.state = "failed".into();
-                                job.error = Some(redact_url_credentials(&error.to_string()));
-                                job.eta = None;
-                                job.events.insert(
-                                    0,
-                                    job_event("Could not connect to source", Some("error"))
-                                );
-                            });
-                            emit_snapshot(&app, &state);
-                            add_notification(&app, &state, &id, "failed");
-                            return true;
-                        }
-                    },
-                    None => {
-                        let retryable = retryable_status(_response.status());
-                        if !transfer_can_continue(&app, &id, generation) {
-                            return false;
-                        }
-                        emit_job(&state, &id, |job| {
-                            job.state = "failed".into();
-                            job.error = Some(format!("Source returned {}", _response.status()));
-                            job.eta = None;
-                            job.events.insert(
-                                0,
-                                job_event("Source rejected the acquisition", Some("error"))
-                            );
-                        });
-                        emit_snapshot(&app, &state);
-                        add_notification(&app, &state, &id, "failed");
-                        return retryable;
-                    }
-                }
+        outcome => {
+            if !transfer_can_continue(&app, &id, generation) {
+                return false;
             }
-            Ok(response) => {
-                let retryable = retryable_status(response.status());
-                if !transfer_can_continue(&app, &id, generation) {
-                    return false;
-                }
-                emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
-                    job.error = Some(format!("Source returned {}", response.status()));
-                    job.eta = None;
-                    job.events.insert(
-                        0,
-                        job_event("Source rejected the acquisition", Some("error"))
-                    );
-                });
-                emit_snapshot(&app, &state);
-                add_notification(&app, &state, &id, "failed");
-                return retryable;
-            }
-            Err(error) => {
-                if !transfer_can_continue(&app, &id, generation) {
-                    return false;
-                }
-                emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
-                    job.error = Some(redact_url_credentials(&error.to_string()));
-                    job.eta = None;
-                    job.events
-                        .insert(0, job_event("Could not connect to source", Some("error")));
-                });
-                emit_snapshot(&app, &state);
-                add_notification(&app, &state, &id, "failed");
-                return true;
-            }
-        }
+            let (error, event, retryable) = match outcome {
+                Ok(response) => (
+                    format!("Source returned {}", response.status()),
+                    if is_post { "Source rejected the form submission" } else { "Source rejected the acquisition" },
+                    !is_post && retryable_status(response.status()),
+                ),
+                Err(error) => (error, "Could not connect to source", !is_post),
+            };
+            mark_acquisition_failed(&app, &state, &id, error, event);
+            return retryable;
         }
     };
     if !transfer_can_continue(&app, &id, generation) {
@@ -4011,7 +3974,9 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         }
         return false;
     }
-    let safe_ranges = supports_safe_initial_ranges(&response, total, response_mime.as_deref());
+    // Ranged workers re-request the source with GET, which a POST response
+    // cannot be rebuilt from: a form capture stays one stream.
+    let safe_ranges = !is_post && supports_safe_initial_ranges(&response, total, response_mime.as_deref());
     let mut stream = response.bytes_stream();
     // Keep a bounded prefix together while sniffing so a manifest marker
     // split across response chunks is still recognized without losing bytes.
@@ -4074,12 +4039,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         }
         return false;
     }
-    if (body_looks_like_html(&sniff_prefix)
-        && !page_disposition.as_deref().map(|value| value.to_ascii_lowercase().contains("filename")).unwrap_or(false)
-        && !job_name.to_ascii_lowercase().ends_with(".html")
-        && !job_name.to_ascii_lowercase().ends_with(".htm"))
-        || page_instead_of_file(response_mime.as_deref(), page_disposition.as_deref(), &job_name)
-    {
+    if response_is_page(response_mime.as_deref(), page_disposition.as_deref(), &job_name, &sniff_prefix) {
         mark_acquisition_failed(
             &app,
             &state,

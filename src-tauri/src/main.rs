@@ -148,7 +148,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -1965,6 +1965,45 @@ fn transfer_is_current(app: &AppHandle, id: &str, generation: u64) -> bool {
     app.state::<CoreState>().transfer_controls.is_current(id, generation)
 }
 
+/// Moving the finished file into place is the point of no return: once the
+/// rename is issued it completes even if its task is aborted, so a pause or
+/// cancel that lands during it would leave a "paused" job whose file is
+/// already published (and a resume would download it again). The move is
+/// claimed only while the job is still wanted, and pause/cancel are declined
+/// while a claim is held (F08). Lock order: publishing, then snapshot.
+struct Publishing<'a> {
+    state: &'a CoreState,
+    id: String,
+}
+
+impl Drop for Publishing<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut publishing) = self.state.publishing.lock() {
+            publishing.remove(&self.id);
+        }
+    }
+}
+
+fn begin_publishing<'a>(state: &'a CoreState, id: &str, still_wanted: impl FnOnce() -> bool) -> Option<Publishing<'a>> {
+    let mut publishing = state.publishing.lock().ok()?;
+    if !still_wanted() {
+        return None;
+    }
+    publishing.insert(id.to_string());
+    Some(Publishing { state, id: id.to_string() })
+}
+
+/// Records why a pause or cancel did not apply; `publishing` is the held claim set.
+fn decline_while_publishing(state: &CoreState, publishing: &std::collections::HashSet<String>, id: &str, action: &str) -> bool {
+    if !publishing.contains(id) {
+        return false;
+    }
+    emit_job(state, id, |job| {
+        job.events.insert(0, job_event(&format!("{action} did not apply: the file was already being saved"), Some("warning")));
+    });
+    true
+}
+
 fn transfer_can_continue(app: &AppHandle, id: &str, generation: u64) -> bool {
     transfer_is_current(app, id, generation) && state_allows_transfer(job_state(app, id).as_deref())
 }
@@ -2929,6 +2968,8 @@ async fn acquire_ranges(
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
+    // Held until the completion below is recorded (F08).
+    let publishing;
     if committed.0 && !committed.1.is_empty() {
         if let Some(parent) = PathBuf::from(&committed.1).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -2963,7 +3004,8 @@ async fn acquire_ranges(
             });
             emit_snapshot(&app, &state);
         }
-        if !transfer_can_continue(&app, &id, generation) {
+        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
+        if publishing.is_none() {
             if reserved {
                 cleanup_reserved_destination(&destination, reservation.as_deref()).await;
             }
@@ -3571,6 +3613,8 @@ async fn acquire_manifest(
                 .map(|job| (job.provisional != Some(true), job.destination.clone()))
         })
         .unwrap_or((false, String::new()));
+    // Held until the completion below is recorded (F08).
+    let publishing;
     if committed.0 && !committed.1.is_empty() {
         let final_path = if track_count > 1 {
             let mux_path = format!("{temp_path}.mux.{}", media_extension(&committed.1));
@@ -3624,7 +3668,8 @@ async fn acquire_manifest(
             });
             emit_snapshot(&app, &state);
         }
-        if !transfer_can_continue(&app, &id, generation) {
+        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
+        if publishing.is_none() {
             if reserved {
                 cleanup_reserved_destination(&destination, reservation.as_deref()).await;
             }
@@ -3886,6 +3931,8 @@ async fn acquire_dual_track(
         })
         .unwrap_or((false, String::new()));
 
+    // Held until the completion below is recorded (F08).
+    let publishing;
     if committed.0 && !committed.1.is_empty() {
         let track_paths = vec![track0_path, track1_path];
         let mux_path = format!("{temp_path}.mux.{}", media_extension(&committed.1));
@@ -3924,7 +3971,8 @@ async fn acquire_dual_track(
             });
             emit_snapshot(&app, &state);
         }
-        if !transfer_can_continue(&app, &id, generation) {
+        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
+        if publishing.is_none() {
             if reserved {
                 cleanup_reserved_destination(&destination, reservation.as_deref()).await;
             }
@@ -4463,6 +4511,8 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 .map(|job| (job.provisional != Some(true), job.destination.clone()))
         })
         .unwrap_or((false, String::new()));
+    // Held until the completion below is recorded (F08).
+    let publishing;
     if committed.0 && !committed.1.is_empty() {
         if let Some(parent) = PathBuf::from(&committed.1).parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -4512,7 +4562,8 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             });
             emit_snapshot(&app, &state);
         }
-        if !transfer_can_continue(&app, &id, generation) {
+        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
+        if publishing.is_none() {
             if reserved {
                 cleanup_reserved_destination(&destination, reservation.as_deref()).await;
             }
@@ -4920,6 +4971,12 @@ fn open_path(path: String) -> Result<(), String> {
 #[tauri::command]
 fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     let _lifecycle = state.lifecycle.lock().ok();
+    let Ok(publishing) = state.publishing.lock() else { return };
+    if decline_while_publishing(state.inner(), &publishing, &id, "Pause") {
+        drop(publishing);
+        emit_snapshot(&app, &state);
+        return;
+    }
     abort_transfer(state.inner(), &id);
     emit_job(&state, &id, |job| {
         if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) {
@@ -5017,6 +5074,12 @@ fn retry_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
 #[tauri::command]
 fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
     let _lifecycle = state.lifecycle.lock().ok();
+    let Ok(publishing) = state.publishing.lock() else { return };
+    if decline_while_publishing(state, &publishing, id, "Cancel") {
+        drop(publishing);
+        emit_snapshot(app, state);
+        return;
+    }
     abort_transfer(state, id);
     let mut temp_path = None;
     if let Ok(mut snapshot) = state.snapshot.lock() {
@@ -5094,6 +5157,12 @@ fn start_window_drag(app: AppHandle, label: String) -> Result<(), String> {
 #[tauri::command]
 fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_file: Option<bool>) {
     let _lifecycle = state.lifecycle.lock().ok();
+    let Ok(publishing) = state.publishing.lock() else { return };
+    if decline_while_publishing(state.inner(), &publishing, &id, "Remove") {
+        drop(publishing);
+        emit_snapshot(&app, &state);
+        return;
+    }
     abort_transfer(state.inner(), &id);
     let mut temporary = None;
     let mut track_cleanup = None;
@@ -5140,9 +5209,13 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
 #[tauri::command]
 fn pause_all(app: AppHandle, state: State<'_, CoreState>) {
     let _lifecycle = state.lifecycle.lock().ok();
+    let Ok(publishing) = state.publishing.lock() else { return };
     let mut ids = Vec::new();
     if let Ok(mut snapshot) = state.snapshot.lock() {
         for job in snapshot.jobs.iter_mut() {
+            if publishing.contains(&job.id) {
+                continue;
+            }
             if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) {
                 ids.push(job.id.clone());
                 job.state = "paused".into();
@@ -5781,7 +5854,8 @@ async fn commit_provisional(
         });
         emit_snapshot(&app, &state);
     }
-    if !commit_still_owned(state.inner(), &id) {
+    let publishing = begin_publishing(&state, &id, || commit_still_owned(state.inner(), &id));
+    if publishing.is_none() {
         if reserved {
             cleanup_reserved_destination(&destination, reservation.as_deref()).await;
         }
@@ -6484,9 +6558,13 @@ fn install_tray(
                 "pause-all" => {
                     let state = app.state::<CoreState>();
                     let _lifecycle = state.lifecycle.lock().ok();
+                    let Ok(publishing) = state.publishing.lock() else { return };
                     let mut ids = Vec::new();
                     if let Ok(mut snapshot) = state.snapshot.lock() {
                         for job in snapshot.jobs.iter_mut() {
+                            if publishing.contains(&job.id) {
+                                continue;
+                            }
                             if ["downloading", "connecting", "finalizing"]
                                 .contains(&job.state.as_str())
                             {
@@ -6688,7 +6766,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());

@@ -41,6 +41,7 @@ PAGE = b"""<!doctype html><meta charset="utf-8"><title>Download Manager e2e</tit
 <li id="b"><a href="/e2e/private-attachment">B. Private export (plain link, server sends it as an attachment, needs sign-in)</a></li>
 <li id="c"><a href="/e2e/public.txt" download>C. Public notes (link with download attribute)</a></li>
 <li id="d"><a href="/e2e/public-big">D. Public 64 MB archive (plain link, attachment)</a></li>
+<li id="e"><button type="button" onclick="document.getElementById('scripted').click()">E. Page script clicks a hidden download link</button><a id="scripted" href="/e2e/scripted.txt" download hidden></a></li>
 </ol>
 """
 
@@ -83,6 +84,9 @@ class Handler(fixture.Handler):
             return self._send(200, b"private export, only for the signed-in session\n" * 2000, {"Content-Type": "text/plain", "Content-Disposition": f'attachment; filename="{name}"'})
         if path == "/e2e/public.txt":
             return self._send(200, b"public notes\n" * 4000, {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="public-notes.txt"'})
+        if path == "/e2e/scripted.txt":
+            return self._send(200, b"scripted download
+" * 1000, {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="scripted-notes.txt"'})
         if path == "/e2e/public-big":
             size = 64 * 1024 * 1024
             return self._serve_file("public-big.bin", 0x5A, size, True, {"Content-Type": "application/octet-stream", "Content-Disposition": 'attachment; filename="public-archive.bin"'})

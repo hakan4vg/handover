@@ -180,6 +180,7 @@ function siteAllowed(): boolean {
 }
 
 function rememberBrowserOwnedClick(event: MouseEvent): void {
+  if (!event.isTrusted) return;
   if (event.defaultPrevented || event.button !== 0 || !(event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) return;
   if (!policy?.interceptDownloads || !siteAllowed()) return;
   const target = event.target;
@@ -200,6 +201,11 @@ function rememberBrowserOwnedClick(event: MouseEvent): void {
 }
 
 function interceptDownloadClick(event: MouseEvent): void {
+  // A click synthesized by page script (anchor.click(), dispatchEvent) is not
+  // the user's download action: leave it to the browser, whose own download
+  // handling (and the downloads-API handoff) applies as for any other page
+  // download, instead of letting the page aim resident fetches directly.
+  if (!event.isTrusted) return;
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   if (policy && (!policy.interceptDownloads || !siteAllowed())) return;
   const target = event.target;
@@ -674,6 +680,9 @@ function ensureButton(): HTMLButtonElement {
   button.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 17v4h14v-4"/></svg>';
   button.setAttribute('aria-label', 'Download this media');
   button.addEventListener('click', (event) => {
+    // Only the user may press it: the button sits in the page's DOM, so page
+    // script could otherwise click it and start resident fetches at will.
+    if (!event.isTrusted) return;
     event.stopPropagation();
     event.preventDefault();
     void capture();

@@ -35,3 +35,7 @@ audit/
 # Local environment (per-developer; see README)
 .env
 .env.*
+
+# End-to-end run artifacts
+e2e/results/
+__pycache__/

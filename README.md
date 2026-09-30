@@ -105,7 +105,18 @@ npm run dev            # UI in mock mode, browser only — no native core
 npm run dev:native     # UI against the native core
 npm run build          # type-check + production frontend build
 npm run build:extension
-npm test               # vitest
+```
+
+## Verifying
+
+There are no unit tests. Behaviour is checked end to end against the real
+resident executable and a local fixture server; each run writes a JSON artifact
+to `e2e/results/`. Quit any running Download Manager first (the bridge port
+must be free).
+
+```bash
+python e2e/native.py            # engine, bridge and extension-worker scenarios
+python e2e/browser_session.py   # real Chrome session with a test page
 ```
 
 Build the desktop application and the portable release folder:

@@ -6,6 +6,10 @@ export interface MediaCandidate {
   tabId: number;
   frameId: number;
   at: number;
+  /** When the request behind this entry started. A player may only be
+   *  credited with requests that *started* after its current source did; a
+   *  slow answer to an older request must not look current (SPEC §6.2.1). */
+  startedAt?: number;
   role: MediaRole;
   kind?: MediaKind;
   contentType?: string;
@@ -52,6 +56,10 @@ export interface MediaSelection {
  *  the resident may fall back to, and the hints that help it resolve variants. */
 export interface MediaCapturePlan extends MediaSelection {
   alternatives: string[];
+}
+
+function beganAt(item: MediaCandidate): number {
+  return item.startedAt ?? item.at;
 }
 
 export function roleFor(url: string, contentType = ''): MediaRole {
@@ -222,7 +230,7 @@ export function chooseMediaSelection(
     item.tabId === tabId &&
     item.frameId === frameId &&
     (!documentId || item.documentId === documentId) &&
-    item.at >= notBefore,
+    beganAt(item) >= notBefore,
   );
   const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
     const allNewest = [...pool].sort((left, right) => right.at - left.at);
@@ -312,7 +320,7 @@ export function rankedMediaCandidates(
     item.tabId === tabId &&
     item.frameId === frameId &&
     now - item.at <= 90_000 &&
-    item.at >= notBefore &&
+    beganAt(item) >= notBefore &&
     item.role !== 'segment' &&
     acquireableSource(item.url) &&
     matchesKind(item, expectedKind),

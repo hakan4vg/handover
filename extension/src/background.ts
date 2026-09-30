@@ -487,7 +487,7 @@ function totalBytesForResponse(details: chrome.webRequest.OnHeadersReceivedDetai
   return Number.isSafeInteger(contentLength) && contentLength > 0 ? contentLength : undefined;
 }
 
-function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey?: string, kind: MediaKind = mediaKindFor(url), contentType = '', totalBytes?: number): void {
+function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey?: string, kind: MediaKind = mediaKindFor(url), contentType = '', totalBytes?: number, startedAt?: number): void {
   if (!isHttp(url)) return;
   pruneMedia();
   const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
@@ -497,10 +497,13 @@ function rememberMedia(url: string, tabId: number, frameId: number, role = roleF
     if (kind !== 'unknown' || !existing.kind) existing.kind = kind;
     if (contentType && !existing.contentType) existing.contentType = contentType;
     if (totalBytes !== undefined) existing.totalBytes = totalBytes;
+    // A later request for the same URL is newer evidence; an older request
+    // answering late is not.
+    if (startedAt !== undefined) existing.startedAt = Math.max(existing.startedAt ?? 0, startedAt);
     existing.at = Date.now();
     return;
   }
-  recentMedia.push({ url, tabId, frameId, at: Date.now(), role, kind, contentType: contentType || undefined, ...(totalBytes === undefined ? {} : { totalBytes }), documentId, playerKey });
+  recentMedia.push({ url, tabId, frameId, at: Date.now(), ...(startedAt === undefined ? {} : { startedAt }), role, kind, contentType: contentType || undefined, ...(totalBytes === undefined ? {} : { totalBytes }), documentId, playerKey });
 }
 
 function mediaCandidateForSource(source: string, tabId?: number, frameId = 0, documentId?: string): MediaCandidate | undefined {
@@ -536,6 +539,29 @@ function mediaFilterDecision(source: string, tabId?: number, frameId = 0, docume
   return { allowed: true, ...(type ? { type } : {}), ...(totalBytes === undefined ? {} : { totalBytes }) };
 }
 
+// Request start times, keyed by request id. Responses are observed when they
+// arrive, which for a slow request can be long after the player switched to a
+// new source; attribution needs when the request began (SPEC §6.2.1).
+const REQUEST_START_MAX = 2_000;
+const requestStartedAt = new Map<string, number>();
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details): undefined => {
+    if (details.tabId < 0 || (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'other')) return undefined;
+    requestStartedAt.set(details.requestId, details.timeStamp);
+    while (requestStartedAt.size > REQUEST_START_MAX) {
+      const oldest = requestStartedAt.keys().next().value;
+      if (oldest === undefined) break;
+      requestStartedAt.delete(oldest);
+    }
+    return undefined;
+  },
+  { urls: ['<all_urls>'] },
+);
+for (const settled of [chrome.webRequest.onCompleted, chrome.webRequest.onErrorOccurred]) {
+  settled.addListener((details: { requestId: string }) => { requestStartedAt.delete(details.requestId); }, { urls: ['<all_urls>'] });
+}
+
 // Observe (never block) response traffic that feeds media elements.
 chrome.webRequest.onResponseStarted.addListener(
   (details) => {
@@ -545,7 +571,7 @@ chrome.webRequest.onResponseStarted.addListener(
     const role = roleFor(details.url);
     const kind = mediaKindFor(details.url);
     if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return;
-    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind);
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind, '', undefined, requestStartedAt.get(details.requestId));
   },
   { urls: ['<all_urls>'] },
 );
@@ -559,7 +585,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     const role = roleFor(details.url, contentType);
     const kind = mediaKindFor(details.url, contentType);
     if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind }, contentType)) return undefined;
-    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind, contentType, totalBytesForResponse(details, role, kind, contentType));
+    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind, contentType, totalBytesForResponse(details, role, kind, contentType), requestStartedAt.get(details.requestId));
     return undefined;
   },
   { urls: ['<all_urls>'] },

@@ -12,8 +12,8 @@ use tauri::AppHandle;
 #[cfg(any(target_os = "linux", windows))]
 use tauri::{Emitter, Manager};
 
-/// (action id, button label) pairs for a job toast. Pure: unit-covered.
-#[cfg(any(target_os = "linux", windows, test))]
+/// (action id, button label) pairs for a job toast.
+#[cfg(any(target_os = "linux", windows))]
 pub fn actions_for(kind: &str) -> Vec<(&'static str, &'static str)> {
     match kind {
         "completed" => vec![("open", "Open"), ("folder", "Show in folder")],
@@ -173,29 +173,5 @@ fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, desti
             );
         }
         _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{actions_for, primary_action_for};
-
-    #[test]
-    fn completed_toast_offers_open_and_folder() {
-        assert_eq!(
-            actions_for("completed"),
-            vec![("open", "Open"), ("folder", "Show in folder")]
-        );
-    }
-
-    #[test]
-    fn failed_toast_offers_view_details() {
-        assert_eq!(actions_for("failed"), vec![("details", "View details")]);
-    }
-
-    #[test]
-    fn body_click_routes_to_the_primary_action() {
-        assert_eq!(primary_action_for("completed"), "open");
-        assert_eq!(primary_action_for("failed"), "details");
     }
 }

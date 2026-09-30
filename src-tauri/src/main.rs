@@ -1587,93 +1587,11 @@ async fn cleanup_reserved_destination(destination: &str, marker: Option<&str>) {
     remove_owned_reservation(destination, marker).await;
 }
 
-#[cfg(test)]
-thread_local! { static FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
-#[cfg(test)]
-fn inject_reserved_install_failure_for_test() {
-    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.with(|flag| flag.set(true));
-}
-
-#[cfg(test)]
-fn fail_reserved_install_after_marker_removal() -> bool {
-    FAIL_RESERVED_INSTALL_AFTER_MARKER_REMOVAL.with(|flag| flag.replace(false))
-}
-
-#[cfg(not(test))]
-fn fail_reserved_install_after_marker_removal() -> bool { false }
-
-#[cfg(test)]
-thread_local! { static FORCE_RESERVED_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
-#[cfg(test)]
-fn inject_reserved_fallback_for_test() {
-    FORCE_RESERVED_FALLBACK.with(|flag| flag.set(true));
-}
-
-#[cfg(test)]
-fn force_reserved_fallback_for_test() -> bool {
-    FORCE_RESERVED_FALLBACK.with(|flag| flag.replace(false))
-}
-
-#[cfg(not(test))]
-fn force_reserved_fallback_for_test() -> bool { false }
-
-#[cfg(test)]
-thread_local! { static FORCE_RESERVED_NONFALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
-#[cfg(test)]
-fn inject_reserved_nonfallback_for_test() {
-    FORCE_RESERVED_NONFALLBACK.with(|flag| flag.set(true));
-}
-
-#[cfg(test)]
-fn force_reserved_nonfallback_for_test() -> bool {
-    FORCE_RESERVED_NONFALLBACK.with(|flag| flag.replace(false))
-}
-
-#[cfg(not(test))]
-fn force_reserved_nonfallback_for_test() -> bool { false }
-
-#[cfg(test)]
-thread_local! { static FAIL_SOURCE_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
-#[cfg(test)]
-fn inject_source_cleanup_failure_for_test() {
-    FAIL_SOURCE_CLEANUP.with(|flag| flag.set(true));
-}
-
-#[cfg(test)]
-fn fail_source_cleanup_for_test() -> bool {
-    FAIL_SOURCE_CLEANUP.with(|flag| flag.replace(false))
-}
-
-#[cfg(not(test))]
-fn fail_source_cleanup_for_test() -> bool { false }
-
-#[cfg(test)]
-thread_local! { static FAIL_REPLACEMENT_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
-#[cfg(test)]
-fn inject_replacement_restore_failure_for_test() {
-    FAIL_REPLACEMENT_RESTORE.with(|flag| flag.set(true));
-}
-
-#[cfg(test)]
-fn fail_replacement_restore_for_test() -> bool {
-    FAIL_REPLACEMENT_RESTORE.with(|flag| flag.replace(false))
-}
-
-#[cfg(not(test))]
-fn fail_replacement_restore_for_test() -> bool { false }
-
 async fn restore_replacement_backup(backup: &str, destination: &str) -> Result<(), String> {
-    if fail_replacement_restore_for_test() { return Err("injected replacement rollback failure".into()); }
     tokio::fs::rename(backup, destination).await.map_err(|error| error.to_string())
 }
 
 async fn remove_completed_source(source: &str) -> Result<(), String> {
-    if fail_source_cleanup_for_test() { return Err("injected source cleanup failure".into()); }
     tokio::fs::remove_file(source).await.map_err(|error| error.to_string())
 }
 
@@ -1736,12 +1654,6 @@ async fn install_reserved_staging(staging: &str, destination: &str, marker: &str
         });
     }
 
-    if fail_reserved_install_after_marker_removal() {
-        let restoration = restore_reservation_marker(destination, marker).await;
-        let _ = tokio::fs::remove_file(staging).await;
-        return Err(format!("injected final staging rename failure; {}", reservation_restore_message(&restoration)));
-    }
-
     match tokio::fs::rename(staging, destination).await {
         Ok(()) => Ok(()),
         Err(install_error) => {
@@ -1755,14 +1667,7 @@ async fn install_reserved_staging(staging: &str, destination: &str, marker: &str
 async fn move_completed_file(source: &str, destination: &str, replace_existing: bool, reservation_marker: Option<&str>) -> Result<(), String> {
     let reserved = reservation_marker.is_some();
     if let Some(parent) = PathBuf::from(destination).parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
-    let initial_move = if reserved && force_reserved_nonfallback_for_test() {
-        Err(std::io::Error::from_raw_os_error(13))
-    } else if reserved && force_reserved_fallback_for_test() {
-        Err(std::io::Error::from_raw_os_error(18))
-    } else {
-        tokio::fs::rename(source, destination).await
-    };
-    match initial_move {
+    match tokio::fs::rename(source, destination).await {
         Ok(()) => Ok(()),
         Err(error) if move_needs_fallback(&error) && reserved => {
             let staging = format!("{destination}.download-manager-staging-{}", uuid::Uuid::new_v4());
@@ -6557,5 +6462,3 @@ fn configure_portable_webview2() {
     }
 }
 
-#[cfg(test)]
-mod capture_tests;

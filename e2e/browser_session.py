@@ -85,8 +85,7 @@ class Handler(fixture.Handler):
         if path == "/e2e/public.txt":
             return self._send(200, b"public notes\n" * 4000, {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="public-notes.txt"'})
         if path == "/e2e/scripted.txt":
-            return self._send(200, b"scripted download
-" * 1000, {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="scripted-notes.txt"'})
+            return self._send(200, b"scripted download\n" * 1000, {"Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="scripted-notes.txt"'})
         if path == "/e2e/public-big":
             size = 64 * 1024 * 1024
             return self._serve_file("public-big.bin", 0x5A, size, True, {"Content-Type": "application/octet-stream", "Content-Disposition": 'attachment; filename="public-archive.bin"'})

@@ -432,6 +432,23 @@ function ordinaryCaptureError(source: string, pageUrl: string): string | undefin
   return undefined;
 }
 
+/** A download the Downloads API reports with no referrer (a rel=noreferrer
+ *  link, a no-referrer policy) still comes from some page, and an excluded
+ *  site must not be bypassed that way. The page is unknown, so the
+ *  download's own site and the focused tab's site stand in for it; a false
+ *  match only leaves the download with the browser. */
+async function excludedWithoutReferrer(source: string): Promise<boolean> {
+  if (!policy.excludedSites.length) return false;
+  const sites = [siteOf(source)];
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tab?.url) sites.push(siteOf(tab.url));
+  } catch {
+    // No tab to consult: the download's own site still applies.
+  }
+  return sites.some((site) => !!site && policy.excludedSites.includes(site));
+}
+
 function mediaCapturePolicyError(pageUrl: string): string | undefined {
   if (!policy.showMediaButtons) return 'media buttons disabled';
   const pageSite = siteOf(pageUrl);
@@ -683,6 +700,9 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     try {
       await decisionPolicyReady();
       if (ordinaryCaptureError(source, item.referrer ?? '')) {
+        return;
+      }
+      if (!item.referrer && await excludedWithoutReferrer(source)) {
         return;
       }
       const postBody = takeFormBody(source);

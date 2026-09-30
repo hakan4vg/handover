@@ -18,13 +18,18 @@ const base = process.argv[2];
 const bundle = await build({ entryPoints: [process.env.DM_EXTENSION_ENTRY ?? path.join(root, 'extension/src/background.ts')], bundle: true, format: 'iife', platform: 'browser', write: false });
 const code = bundle.outputFiles[0].text;
 
-function world({ loseCaptureAnswers = false } = {}) {
+function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined } = {}) {
   const listeners = {};
   const calls = [];
   const outbound = [];
   const on = (name) => ({ addListener: (fn) => { (listeners[name] ??= []).push(fn); } });
   const emit = (name, ...args) => (listeners[name] ?? []).map((fn) => fn(...args));
   const fetchThrough = async (url, options = {}) => {
+    if (excludedSites && url.endsWith('/v1/policy') && (options.method ?? 'GET') === 'GET') {
+      // The resident's settings with an exclusion list, without touching the
+      // running resident that other scenarios share.
+      return new Response(JSON.stringify({ ok: true, policy: { interceptDownloads: true, showMediaButtons: true, excludedSites } }), { headers: { 'Content-Type': 'application/json' } });
+    }
     const message = options.body ? JSON.parse(options.body) : undefined;
     if (message) outbound.push(message);
     const response = await fetch(url, options);
@@ -46,7 +51,7 @@ function world({ loseCaptureAnswers = false } = {}) {
       download: async (options) => { calls.push(['browser-download', options.url]); return 99; },
     },
     storage: { local: { get: async () => ({}), set: async () => {} }, session: { get: async () => ({}), set: async () => {} }, onChanged: on('storage') },
-    tabs: { sendMessage: async () => undefined },
+    tabs: { sendMessage: async () => undefined, query: async () => (activeTabUrl ? [{ id: 1, url: activeTabUrl }] : []) },
   };
   const context = { URL, URLSearchParams, AbortController, setTimeout, clearTimeout, console, crypto: globalThis.crypto, fetch: fetchThrough, chrome };
   vm.runInNewContext(code, context);
@@ -81,6 +86,24 @@ const captures = (w) => w.outbound.filter((m) => m.type === 'capture-acquisition
   const reply = await w.message({ type: 'ordinary-capture', payload: { source: `${base}/login-page.bin`, name: 'x-anchor-handback.pdf', pageUrl: `${base}/page` } }, { tab: { id: 5 }, frameId: 0 });
   check('anchor/handback', 'an intercepted link the resident cannot fetch is downloaded by the browser instead', reply.ok === true && w.calls.some(([call, url]) => call === 'browser-download' && url.endsWith('/login-page.bin')), { reply, calls: w.calls });
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'anchor/handback', source: m.payload.source, captureId: m.payload.captureId })));
+}
+
+// --- 1.10: an empty referrer does not bypass an excluded site ---------------
+{
+  const w = world({ excludedSites: ['127.0.0.1'] }); await settle();
+  await w.determine({ id: 11, url: `${base}/file/range.bin?noref`, finalUrl: `${base}/file/range.bin?noref`, filename: 'x-excluded-source.bin', referrer: '' });
+  check('exclusion/no-referrer-source', 'a download with no referrer from an excluded site is left to the browser', w.calls.length === 0 && captures(w).length === 0, { calls: w.calls, sent: captures(w).length });
+}
+{
+  const w = world({ excludedSites: ['example.com'], activeTabUrl: 'https://www.example.com/reports' }); await settle();
+  await w.determine({ id: 12, url: `${base}/file/range.bin?cdn`, finalUrl: `${base}/file/range.bin?cdn`, filename: 'x-excluded-tab.bin', referrer: '' });
+  check('exclusion/no-referrer-tab', 'a no-referrer download while an excluded site is the focused tab is left to the browser', w.calls.length === 0 && captures(w).length === 0, { calls: w.calls, sent: captures(w).length });
+}
+{
+  const w = world({ excludedSites: ['example.com'], activeTabUrl: 'https://other.test/page' }); await settle();
+  await w.determine({ id: 13, url: `${base}/file/range.bin?allowed`, finalUrl: `${base}/file/range.bin?allowed`, filename: 'x-not-excluded.bin', referrer: '' });
+  check('exclusion/no-referrer-allowed', 'a no-referrer download unrelated to any excluded site is still taken over (control)', w.calls.map(([c]) => c).join(',') === 'pause,cancel', { calls: w.calls });
+  handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'exclusion/no-referrer-allowed', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
 }
 
 // --- F03: a POST body is replayed only when its owner is unambiguous -------

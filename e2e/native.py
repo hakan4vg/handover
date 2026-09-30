@@ -283,6 +283,47 @@ def main() -> int:
         got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
         run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
 
+        # ---- Save durability: the real Add window, driven by UI Automation ----
+        def uia(*args: str) -> tuple[int, str]:
+            done = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "e2e" / "uia.ps1"), *args], capture_output=True, text=True, timeout=90)
+            return done.returncode, done.stdout
+
+        reply = capture("/file/range.bin", "cap-save")
+        ready = False
+        for _ in range(60):
+            code, listing = uia("-List", "-Seconds", "2")
+            if "Ready to save" in listing:
+                ready = True
+                break
+            time.sleep(0.5)
+        lock = sqlite3.connect(db, timeout=0, isolation_level=None)
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            clicked = uia("-Button", "Save")[1].strip()
+            # Each refused write waits out SQLite's busy timeout (5 s) first.
+            code, during = 1, ""
+            for _ in range(30):
+                time.sleep(1)
+                code, during = uia("-List", "-Seconds", "5")
+                if code != 0 or "Saving" not in during:
+                    break
+        finally:
+            lock.execute("ROLLBACK")
+            lock.close()
+        stayed_open = code == 0 and "Save" in during
+        told_why = "Could not record the Save" in during
+        stored = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
+        run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[-12:], "storedProvisional": stored.get("provisional")})
+        uia("-Button", "Save")
+        final = {}
+        for _ in range(40):
+            time.sleep(0.5)
+            final = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
+            if final.get("state") == "completed":
+                break
+        saved_file = Path(final.get("destination", "")).is_file() if final else False
+        run.check("save/retry-after-storage-recovers", "once storage accepts writes again, the same Save completes the download", final.get("state") == "completed" and final.get("provisional") is False and saved_file, {"state": final.get("state"), "provisional": final.get("provisional"), "fileExists": saved_file})
+
         early = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-early"}})
         late = capture("/file/range.bin", "cap-early")
         time.sleep(1)

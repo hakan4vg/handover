@@ -790,8 +790,13 @@ fn emit_snapshot_event(app: &AppHandle, state: &CoreState) -> Result<(), String>
 }
 
 fn emit_snapshot(app: &AppHandle, state: &CoreState) {
-    if let Err(error) = save_snapshot(state).and_then(|_| emit_snapshot_event(app, state)) {
-        eprintln!("Snapshot update failed: {error}");
+    // The windows show the live state even when storage refuses a write;
+    // callers that must not proceed without durability persist explicitly.
+    if let Err(error) = save_snapshot(state) {
+        eprintln!("Snapshot save failed: {error}");
+    }
+    if let Err(error) = emit_snapshot_event(app, state) {
+        eprintln!("Snapshot event failed: {error}");
     }
 }
 
@@ -5662,6 +5667,7 @@ async fn commit_provisional(
         if decision == CommitDecision::Reject {
             return Err("Acquisition is no longer available for commit".into());
         }
+        let before = (job.name.clone(), job.destination.clone(), job.max_connections, job.bandwidth_limit, job.state.clone(), job.eta.clone());
         let name = if input.name.trim().is_empty() {
             job.name.clone()
         } else {
@@ -5719,9 +5725,34 @@ async fn commit_provisional(
             job.destination.clone(),
             collision == "replace",
             job.mode == "segments" || job.mode == "dual-track",
-            job.media_tracks.unwrap_or(1)
+            job.media_tracks.unwrap_or(1),
+            before
         )
     };
+    // Save is acknowledged only once the acceptance is on disk: boot drops
+    // provisional rows, so an unrecorded Save would silently lose the
+    // download after a restart (F21). On failure the job stays provisional
+    // and the Add window stays open with the storage error.
+    if let Err(error) = persist_job(&state, &id) {
+        let (name, destination, max_connections, bandwidth_limit, job_state, eta) = accepted.6.clone();
+        emit_job(&state, &id, |job| {
+            if job.state == "completed" {
+                return;
+            }
+            job.provisional = Some(true);
+            job.name = name;
+            job.destination = destination;
+            job.max_connections = max_connections;
+            job.bandwidth_limit = bandwidth_limit;
+            if job.state == "finalizing" && job_state == "ready" {
+                job.state = job_state;
+                job.eta = eta;
+            }
+            job.events.insert(0, job_event("Save could not be recorded; the download is still waiting", Some("error")));
+        });
+        emit_snapshot(&app, &state);
+        return Err(format!("Could not record the Save: {error}"));
+    }
     emit_snapshot(&app, &state);
     if !accepted.0 {
         close_add_window(&app, &id);

@@ -1,5 +1,4 @@
 import { captureNeedsBrowserRestore, restoreBrowserDownload } from './download-fallback';
-import type { MediaEvidence } from './media-candidates';
 
 // Local copies (not imported): MV3 content scripts must be classic scripts,
 // so they cannot share an ES module chunk with the service worker.
@@ -88,69 +87,7 @@ const observedPlayers = new WeakSet<HTMLMediaElement>();
 const lastPlayerReports = new WeakMap<HTMLMediaElement, number>();
 const lastReportedState = new WeakMap<HTMLMediaElement, string>();
 
-const PAGE_MEDIA_MARKER = 'download-manager-media-v1';
-const PAGE_MEDIA_QUERY = 'dm-media-evidence-query';
-const PAGE_MEDIA_RESPONSE = 'dm-media-evidence-response';
-const PAGE_MEDIA_MAX_URL = 4096;
-const pendingPageEvidence = new Map<string, { resolve: (value: MediaEvidence | undefined) => void; timer: number }>();
-let nextPageEvidenceRequest = 1;
 let nextMediaIdentity = 1;
-
-function pageMediaUrl(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !value || value.length > PAGE_MEDIA_MAX_URL) return undefined;
-  try {
-    const parsed = new URL(value, document.baseURI);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'blob:') return undefined;
-    if (parsed.protocol === 'blob:' && parsed.origin !== location.origin) return undefined;
-    parsed.hash = '';
-    return parsed.href;
-  } catch {
-    return undefined;
-  }
-}
-
-function pageEvidenceFromValue(value: unknown, expectedCurrentSrc?: string): MediaEvidence | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const item = value as Partial<MediaEvidence>;
-  const currentSrc = pageMediaUrl(item.currentSrc);
-  const sourceIdentity = typeof item.sourceIdentity === 'string' && item.sourceIdentity.length <= 256 ? item.sourceIdentity : '';
-  const source = item.source === undefined ? undefined : pageMediaUrl(item.source);
-  const playerKind = item.playerKind === 'audio' || item.playerKind === 'video' ? item.playerKind : undefined;
-  const companionAudio = item.companionAudio === undefined ? undefined : pageMediaUrl(item.companionAudio);
-  // Hints are advisory: keep the ones that resolve to a media URL and drop the
-  // rest. A single unusable entry must not throw away evidence whose source and
-  // identity are perfectly good.
-  const selectedSegments = (Array.isArray(item.selectedSegments) ? item.selectedSegments : [])
-    .map((candidate) => pageMediaUrl(candidate))
-    .filter((candidate): candidate is string => !!candidate)
-    .slice(0, 8);
-  if (!currentSrc || !sourceIdentity || (expectedCurrentSrc && currentSrc !== expectedCurrentSrc) || (source !== undefined && currentSrc.startsWith('http') && source !== currentSrc) || (companionAudio !== undefined && playerKind !== 'video')) return undefined;
-  return { currentSrc, sourceIdentity, ...(source ? { source } : {}), ...(playerKind ? { playerKind } : {}), ...(companionAudio ? { companionAudio } : {}), selectedSegments };
-}
-
-window.addEventListener('message', (event) => {
-  if (event.source !== window || event.origin !== location.origin || !event.data || typeof event.data !== 'object') return;
-  const data = event.data as Record<string, unknown>;
-  if (data.marker !== PAGE_MEDIA_MARKER) return;
-  if (data.type !== PAGE_MEDIA_RESPONSE || typeof data.requestId !== 'string') return;
-  const pending = pendingPageEvidence.get(data.requestId);
-  if (!pending) return;
-  pendingPageEvidence.delete(data.requestId);
-  window.clearTimeout(pending.timer);
-  pending.resolve(pageEvidenceFromValue(data.evidence));
-});
-
-function requestPageEvidence(currentSrc: string, playerKind: 'audio' | 'video'): Promise<MediaEvidence | undefined> {
-  const requestId = `evidence-${nextPageEvidenceRequest++}`;
-  return new Promise((resolve) => {
-    const timer = window.setTimeout(() => {
-      pendingPageEvidence.delete(requestId);
-      resolve(undefined);
-    }, 200);
-    pendingPageEvidence.set(requestId, { resolve, timer });
-    window.postMessage({ marker: PAGE_MEDIA_MARKER, type: PAGE_MEDIA_QUERY, requestId, currentSrc, playerKind }, location.origin);
-  });
-}
 
 function cleanFilename(value: string | null | undefined): string | undefined {
   const leaf = value?.trim().split('/').pop()?.split('\\').pop()?.trim();
@@ -427,12 +364,12 @@ function requestMediaFilter(el: HTMLMediaElement, source: string, key: string): 
     let expires = Date.now() + 3000;
     try {
       const playerKind = el instanceof HTMLAudioElement ? 'audio' : 'video';
-      const evidence = isHttp(source) ? undefined : await requestPageEvidence(source, playerKind);
-      const resolved = isHttp(source) ? source : evidence?.currentSrc === source ? evidence.source : undefined;
-      if (resolved && isHttp(resolved)) {
+      // Filters apply to a source the page names; a blob player's source is
+      // only resolved when it is captured.
+      if (isHttp(source)) {
         const response = await chrome.runtime.sendMessage({
           type: 'check-media-filters',
-          payload: { source: resolved, companionAudio: evidence?.companionAudio, playerKind },
+          payload: { source, playerKind },
         }) as { ok?: boolean; allowed?: boolean; totalBytes?: number; reason?: string } | undefined;
         allowed = response?.allowed !== false;
         if (isHttp(source) && response?.ok && (response.totalBytes !== undefined || response.reason === 'excluded-type')) expires = Infinity;
@@ -801,16 +738,13 @@ async function capture(): Promise<void> {
     button.setAttribute('aria-label', 'Download this media');
   }
   try {
-    const pageEvidence = currentSrc ? await requestPageEvidence(currentSrc, playerKind) : undefined;
-    const directSource = currentSrc.startsWith('http:') || currentSrc.startsWith('https:') ? currentSrc : '';
-    const source = pageEvidence?.source || directSource;
+    const source = currentSrc.startsWith('http:') || currentSrc.startsWith('https:') ? currentSrc : '';
     const response = (await chrome.runtime.sendMessage({
       type: 'media-capture',
       payload: {
         source: isHttp(source) ? source : '',
         currentSrc,
-        mediaIdentity: pageEvidence?.sourceIdentity ?? mediaIdentityFor(el, currentSrc),
-        ...(pageEvidence ? { pageEvidence } : {}),
+        mediaIdentity: mediaIdentityFor(el, currentSrc),
         pageUrl: window.location.href,
         userAgent: navigator.userAgent,
         media: true,
@@ -818,8 +752,8 @@ async function capture(): Promise<void> {
         playerKey: keyFor(el),
         name: captureName(el, source || currentSrc),
       },
-    })) as { ok?: boolean; error?: string };
-    if (!response?.ok) flashError(response?.error);
+    })) as { ok?: boolean; error?: string; reason?: string };
+    if (!response?.ok) flashError(response?.error, response?.reason === 'not-played' ? 'Play first' : undefined);
   } catch {
     flashError();
   } finally {
@@ -828,9 +762,9 @@ async function capture(): Promise<void> {
   }
 }
 
-function flashError(error?: string): void {
+function flashError(error?: string, label = 'Unavailable'): void {
   if (!button) return;
-  button.dataset.label = 'Unavailable';
+  button.dataset.label = label;
   button.title = error || 'Media unavailable';
   button.setAttribute('aria-label', `${button.title}. Retry download`);
 }

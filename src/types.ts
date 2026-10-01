@@ -10,7 +10,7 @@ export type DownloadState =
   | 'completed'
   | 'failed';
 
-export type TransferMode = 'whole-object' | 'segments' | 'single-stream';
+export type TransferMode = 'whole-object' | 'segments' | 'dual-track' | 'single-stream';
 export type FilterKey = 'all' | 'active' | 'paused' | 'completed' | 'failed' | 'media';
 export type SettingsPage = 'general' | 'downloads' | 'browser' | 'network' | 'notifications' | 'appearance';
 

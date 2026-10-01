@@ -17,6 +17,7 @@ import type {
   DownloadAdapter,
   DownloadJob,
   DownloadState,
+  TransferMode,
   FilterKey,
   SettingsPage,
 } from './types';
@@ -42,6 +43,8 @@ const RESUMABLE_STATES: DownloadState[] = ['paused', 'pending'];
 const CANCELLABLE_STATES: DownloadState[] = [...TRANSFER_STATES, ...RESUMABLE_STATES, 'ready'];
 
 const stateIn = (state: DownloadState, states: DownloadState[]) => states.includes(state);
+
+const modeText = (mode: TransferMode) => ({ 'whole-object': 'Byte ranges', segments: 'HLS/DASH segments', 'dual-track': 'Separate video and audio', 'single-stream': 'Single stream' })[mode];
 
 const settingsNav: Array<{ key: SettingsPage; label: string; icon: IconName }> = [
   { key: 'general', label: 'General', icon: 'settings' },
@@ -643,16 +646,16 @@ function Overview({ job }: { job: DownloadJob }) {
   const downloadedText = job.total
     ? `${formatBytes(job.downloaded)} of ${formatBytes(job.total)} (${percent}%)`
     : formatBytes(job.downloaded);
-  return <><div className="inspector-status"><span className={`status-pill ${stateTone(job.state)}`}><span className="status-dot" />{stateText(job.state)}</span><span className="inspector-progress">{percent}%</span></div><SegmentedProgress job={job} /><DetailGrid items={[{ label: 'Status', value: job.error ?? stateText(job.state), tone: stateTone(job.state) }, { label: 'Save to', value: job.destination, copyable: true }, { label: 'Source', value: job.source, copyable: true }, { label: 'File size', value: formatBytes(job.total) }, { label: 'Downloaded', value: downloadedText }, { label: 'Speed', value: formatSpeed(job.state === 'downloading' ? job.speed : 0) }, { label: 'ETA', value: job.state === 'downloading' ? (job.eta ?? '—') : job.state === 'paused' ? 'Paused' : '—' }, { label: 'Connections', value: `${job.state === 'downloading' ? job.connections : 0} of ${job.maxConnections} max` }, { label: 'Transfer mode', value: job.mode === 'whole-object' ? 'Multi-connection byte ranges' : job.mode === 'segments' ? (job.segments ? `HLS/DASH (${job.segments.completed}/${job.segments.total} segments)` : 'HLS/DASH segments') : 'Single stream' }, { label: 'Created', value: formatTime(job.created) }, { label: 'Started', value: job.started ? formatTime(job.started) : 'Not started' }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} /></>;
+  return <><div className="inspector-status"><span className={`status-pill ${stateTone(job.state)}`}><span className="status-dot" />{stateText(job.state)}</span><span className="inspector-progress">{percent}%</span></div><SegmentedProgress job={job} /><DetailGrid items={[{ label: 'Status', value: job.error ?? stateText(job.state), tone: stateTone(job.state) }, { label: 'Save to', value: job.destination, copyable: true }, { label: 'Source', value: job.source, copyable: true }, { label: 'File size', value: formatBytes(job.total) }, { label: 'Downloaded', value: downloadedText }, { label: 'Speed', value: formatSpeed(job.state === 'downloading' ? job.speed : 0) }, { label: 'ETA', value: job.state === 'downloading' ? (job.eta ?? '—') : job.state === 'paused' ? 'Paused' : '—' }, { label: 'Connections', value: `${job.state === 'downloading' ? job.connections : 0} of ${job.maxConnections} max` }, { label: 'Transfer mode', value: modeText(job.mode) }, { label: 'Created', value: formatTime(job.created) }, { label: 'Started', value: job.started ? formatTime(job.started) : 'Not started' }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} /></>;
 }
 
 function NetworkDetails({ job }: { job: DownloadJob }) {
-  return <><SectionTitle icon="network" title="Connection" /><DetailGrid items={[{ label: 'Transfer mode', value: job.mode === 'whole-object' ? 'Whole file · ranges' : job.mode === 'segments' ? 'Ordered segments' : 'Single stream' }, { label: 'Active connections', value: `${job.state === 'downloading' ? job.connections : 0}` }, { label: 'Maximum allowed', value: `${job.maxConnections}` }, { label: 'Bandwidth cap', value: job.bandwidthLimit ? formatSpeed(job.bandwidthLimit) : 'Global setting' }, { label: 'Source', value: job.source, copyable: true }, { label: 'MIME type', value: job.mime ?? 'Detecting' }, { label: 'Resumability', value: job.resumable ? 'Verified' : 'Unknown' }]} /><div className="info-callout"><Icon name="shield" size={16} /><span>Credentials and request context are kept only for this acquisition.</span></div></>;
+  return <><SectionTitle icon="network" title="Connection" /><DetailGrid items={[{ label: 'Transfer mode', value: modeText(job.mode) }, { label: 'Active connections', value: `${job.state === 'downloading' ? job.connections : 0}` }, { label: 'Maximum allowed', value: `${job.maxConnections}` }, { label: 'Bandwidth cap', value: job.bandwidthLimit ? formatSpeed(job.bandwidthLimit) : 'Global setting' }, { label: 'Source', value: job.source, copyable: true }, { label: 'MIME type', value: job.mime ?? 'Detecting' }, { label: 'Resumability', value: job.resumable ? 'Verified' : 'Unknown' }]} /><div className="info-callout"><Icon name="shield" size={16} /><span>Credentials and request context are kept only for this acquisition.</span></div></>;
 }
 
 function MediaDetails({ job }: { job: DownloadJob }) {
   const finalization = job.state === 'finalizing' ? 'In progress' : job.state === 'ready' ? 'Ready' : job.state === 'completed' ? 'Complete' : 'Not started';
-  return <><SectionTitle icon="media" title="Current media" /><DetailGrid items={[{ label: 'Container', value: job.mime ?? 'Detecting' }, { label: 'Acquisition', value: job.mode === 'segments' ? 'Manifest and ordered fragments' : 'Progressive resource' }, { label: 'Container', value: job.mime?.split('/')[1]?.toUpperCase() ?? 'Detecting' }, { label: 'Tracks', value: job.mediaTracks ? `${job.mediaTracks} · ${job.mediaTracks > 1 ? 'separate streams' : 'single stream'}` : 'Detecting' }, { label: 'Segments', value: job.segments ? `${job.segments.completed} of ${job.segments.total}` : 'Not segmented' }, { label: 'Finalization', value: finalization }]} /><div className="info-callout"><Icon name="info" size={16} /><span>The selected source follows the media currently playing in the browser.</span></div></>;
+  return <><SectionTitle icon="media" title="Current media" /><DetailGrid items={[{ label: 'Container', value: job.mime ?? 'Detecting' }, { label: 'Acquisition', value: modeText(job.mode) }, { label: 'Container', value: job.mime?.split('/')[1]?.toUpperCase() ?? 'Detecting' }, { label: 'Tracks', value: job.mediaTracks ? `${job.mediaTracks} · ${job.mediaTracks > 1 ? 'separate streams' : 'single stream'}` : 'Detecting' }, { label: 'Segments', value: job.segments ? `${job.segments.completed} of ${job.segments.total}` : 'Not segmented' }, { label: 'Finalization', value: finalization }]} /><div className="info-callout"><Icon name="info" size={16} /><span>The selected source follows the media currently playing in the browser.</span></div></>;
 }
 
 function FileDetails({ job }: { job: DownloadJob }) {

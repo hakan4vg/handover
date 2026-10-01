@@ -140,6 +140,11 @@ class Handler(fixture.Handler):
         path = self.path.split("?")[0]
         if path.startswith("/metered/"):
             return self._metered(path[len("/metered/"):])
+        # The fixture's fragmented MP4 tracks served whole, as progressive files.
+        if path == "/progressive/video.mp4":
+            return self._raw(200, b"".join(fixture.media_file(f) for f in ("v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s")), {"Content-Type": "video/mp4"})
+        if path == "/progressive/audio.mp4":
+            return self._raw(200, fixture.media_file("a-init.mp4") + fixture.media_file("a-0.m4s"), {"Content-Type": "audio/mp4"})
         if path == "/fallback-html.bin":
             return self._fallback(LOGIN_PAGE, "text/html")
         if path == "/fallback-good.bin":
@@ -264,6 +269,7 @@ def main() -> int:
         "mpd-periods": ("/two-periods.mpd", {"media": True, "playerKind": "video"}),
         "mpd-drm": ("/drm.mpd", {"media": True, "playerKind": "video"}),
         "hls-vod": ("/hls/vod.m3u8", {"media": True, "playerKind": "video"}),
+        "dual": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/audio.mp4"}),
         "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
         "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
     }
@@ -275,6 +281,8 @@ def main() -> int:
     for name, (path, extra) in engine.items():
         job = dict(id=name, name=f"{name}.bin", source=base + path, domain="127.0.0.1", state="connecting", progress=0, downloaded=0, total=None, speed=0, eta=None, connections=0, maxConnections=4, mode="single-stream", media=False, destination=str(out / f"{name}.bin"), tempPath=str(runtime / "data" / "tmp" / f"{name}.part"), resumable=False, mime=None, error=None, created="2026-09-29T19:00:00Z", started=None, completed=None, provisional=False, segments=None, referrer=base + "/page", events=[])
         job.update(extra)
+        if "companionAudio" in extra:
+            job["companionAudio"] = base + extra["companionAudio"]
         con.execute("INSERT INTO jobs VALUES (?, ?, ?)", (name, job["created"], json.dumps(job)))
     # Started later, under a global limit (bandwidth scenario).
     for name, cap in (("cap-own", MIB), ("cap-none", None)):
@@ -358,6 +366,16 @@ def main() -> int:
         run.check("engine/hls-unresolvable-fragment", "a fragment line that cannot be addressed fails the job instead of leaving a silent gap", j["state"] == "failed" and "cannot be resolved" in (j["error"] or ""), evidence("hls-hole"))
         j = job("hls-two-maps")
         run.check("engine/hls-map-switch", "a playlist that switches initialization maps is refused, not assembled under the first map", j["state"] == "failed" and "initialization map" in (j["error"] or ""), evidence("hls-two-maps"))
+
+        j = job("dual")
+        stored = state.get("dual", {})
+        shown = devtools.evaluate("""(async () => {
+          document.querySelector('[aria-label="Select dual.bin"]').click();
+          await new Promise((r) => setTimeout(r, 300));
+          const label = [...document.querySelectorAll('.inspector *')].find((e) => e.children.length === 0 && e.textContent === 'Transfer mode');
+          return label?.parentElement?.textContent ?? null;
+        })()""")
+        run.check("engine/dual-track", "separate video and audio streams complete into one file, are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown))
 
         # ---- bandwidth: a job's own cap under a global limit -----------------
         # Both jobs run together. Rates are measured from the bytes the server

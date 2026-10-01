@@ -4124,6 +4124,8 @@ async fn acquire_dual_track(
     emit_job(&state, &id, |job| {
         job.state = "downloading".into();
         job.mode = "dual-track".into();
+        // Both track files restart on every attempt.
+        job.resumable = false;
         job.media = true;
         job.media_tracks = Some(2);
         job.total = combined_total;

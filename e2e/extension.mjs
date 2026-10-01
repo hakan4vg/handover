@@ -180,19 +180,75 @@ async function lateResponse(startedBeforeSwitchMs) {
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/resident-change-newer', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
 }
 
-// --- the in-page script must not claim names in the page's global scope -----
+// --- no script runs in the page's own JavaScript world -----------------------
 {
-  // Run the built page script in a fresh realm (it may stop early on missing
-  // browser APIs; its top-level declarations are made before it runs), then
-  // compile a page script declaring each short name, as minified sites do.
+  // A script in the page's world shares its globals and can break its scripts
+  // (an unwrapped one once broke Google's account menu); the extension needs
+  // none: the background sees media traffic from every realm.
   const { readFileSync } = await import('node:fs');
-  const pageScript = readFileSync(process.env.DM_PAGE_SCRIPT ?? path.join(root, 'extension/dist/page-media.js'), 'utf8');
-  const realm = vm.createContext({});
-  try { vm.runInContext(pageScript, realm); } catch { /* browser APIs are absent here */ }
-  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
-  const names = [...letters, ...[...letters].flatMap((first) => [...letters, ...'0123456789'].map((second) => first + second))];
-  const clashes = names.filter((name) => { try { vm.runInContext(`let ${name} = 0;`, realm); return false; } catch (error) { return /already been declared/.test(String(error)); } });
-  check('page-script/no-global-names', "a site's own scripts can declare any short top-level name next to the in-page script", clashes.length === 0, { clashes: clashes.slice(0, 20), count: clashes.length });
+  const manifest = JSON.parse(readFileSync(path.join(root, 'extension/manifest.json'), 'utf8'));
+  const inPage = (manifest.content_scripts ?? []).filter((script) => script.world === 'MAIN');
+  check('page-script/none-in-page-world', "no content script runs in the page's own JavaScript world", inPage.length === 0, { mainWorldScripts: inPage.map((script) => script.js) });
+}
+
+// --- media attribution: the clicked player's stream, not the page's latest ---
+// A Vimeo page: the film's manifest, then a muted preview's manifest 260 ms
+// later. A worker fetches the film's variant playlists and segments while it
+// plays; the preview fetches nothing. Both are blob/MSE players.
+const vimeo = (asset, session, tail) => `${base}/vimeo/exp=1790900895~acl=%2F${asset}%2F~hmac=00ff/${asset}/psid=${session}/v2/${tail}`;
+const FILM = ['9c6d66af-d530-4333-9d02-07a74fb89b25', '2194ea3a7339e5a45b55a080d770698c'];
+const PREVIEW = ['d8acfedf-8469-460f-a029-4e4f432e8b81', '4cfc27005a28f11d72859ac2536d6eeb'];
+let mediaRequest = 0;
+function fetched(w, url, at, contentType) {
+  const requestId = `m${++mediaRequest}`;
+  const where = { tabId: 9, frameId: 0, documentId: 'doc-v', type: 'xmlhttprequest', url, requestId };
+  w.emit('beforeRequest', { ...where, method: 'GET', timeStamp: at });
+  w.emit('headers', { ...where, statusCode: 200, responseHeaders: [{ name: 'content-type', value: contentType }] });
+  w.emit('responseStarted', where);
+}
+const sender = { tab: { id: 9 }, frameId: 0, documentId: 'doc-v' };
+const playerState = (w, playerKey, currentSrc, playing) => w.message({ type: 'media-player-state', payload: { playerKey, currentSrc, mediaIdentity: playerKey, playing, visible: true, active: playing, hovered: playing } }, sender);
+const captureFor = (w, playerKey, currentSrc, pageEvidence) => w.message({ type: 'media-capture', payload: { source: '', currentSrc, mediaIdentity: playerKey, pageUrl: `${base}/vimeo-page`, playerKind: 'video', playerKey, name: 'film.mp4', ...(pageEvidence ? { pageEvidence } : {}) } }, sender);
+const filmBlob = 'blob:http://127.0.0.1/film', previewBlob = 'blob:http://127.0.0.1/preview';
+{
+  const w = world(); await settle();
+  await playerState(w, 'film', filmBlob, false);
+  await playerState(w, 'preview', previewBlob, false);
+  const start = Date.now();
+  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), start, 'application/vnd.apple.mpegurl');
+  fetched(w, vimeo(...PREVIEW, 'playlist/av/primary/playlist.m3u8'), start + 260, 'application/vnd.apple.mpegurl');
+  await playerState(w, 'film', filmBlob, true);
+  for (const [i, variant] of ['230c5f2f', 'c378f2e2'].entries()) {
+    fetched(w, vimeo(...FILM, `playlist/av/793d529c/avf/${variant}/media.m3u8`), start + 400 + i, 'application/vnd.apple.mpegurl');
+    for (let n = 0; n < 4; n += 1) fetched(w, vimeo(...FILM, `range/prot/cmFuZ2U9${n}${i}MC02OTU/avf/${variant}-a2f4-47e4-826f-c382d1e14f5b.mp4`) + `?range=${n}`, start + 500 + n * 10 + i, 'video/mp4');
+  }
+  // What the old in-page script answered for this player: every manifest on
+  // the page, the preview's first.
+  const reply = await captureFor(w, 'film', filmBlob, { currentSrc: filmBlob, sourceIdentity: 'source-1', playerKind: 'video', selectedSegments: [vimeo(...PREVIEW, 'playlist/av/primary/playlist.m3u8'), vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8')] });
+  const sent = w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
+  const sentAssets = sent.map((p) => [p.source, ...(p.candidates ?? [])].map((url) => (url.match(/[0-9a-f]{8}-[0-9a-f-]{27}/) ?? ['?'])[0].slice(0, 8)));
+  check('media/clicked-players-stream', "with a preview's manifest loaded last, the button on the playing film captures the film's stream, and no fallback names the preview", sent.length === 1 && sent[0].source.includes(FILM[0]) && sent[0].source.endsWith('playlist.m3u8') && !JSON.stringify(sent[0]).includes(PREVIEW[0]), { reply: { ok: reply.ok, error: reply.error }, sentAssets });
+  handedOver.push(...sent.map((p) => ({ scenario: 'media/clicked-players-stream', source: p.source, captureId: p.captureId, jobId: reply.id })));
+}
+{
+  const w = world(); await settle();
+  await playerState(w, 'film', filmBlob, false);
+  await playerState(w, 'preview', previewBlob, false);
+  const start = Date.now();
+  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), start, 'application/vnd.apple.mpegurl');
+  fetched(w, vimeo(...PREVIEW, 'playlist/av/primary/playlist.m3u8'), start + 260, 'application/vnd.apple.mpegurl');
+  const reply = await captureFor(w, 'film', filmBlob);
+  const sent = w.outbound.filter((m) => m.type === 'media-capture');
+  check('media/play-first', 'before anything plays, two presentations on the page are not guessed between: the button asks to play first', reply.ok === false && reply.reason === 'not-played' && sent.length === 0, { reply, sent: sent.length });
+}
+{
+  const w = world(); await settle();
+  await playerState(w, 'film', filmBlob, false);
+  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), Date.now(), 'application/vnd.apple.mpegurl');
+  const reply = await captureFor(w, 'film', filmBlob);
+  const sent = w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
+  check('media/single-presentation', 'a page with one presentation resolves even before playback', sent.length === 1 && sent[0].source.includes(FILM[0]), { reply: { ok: reply.ok, error: reply.error }, sent: sent.map((p) => p.source.slice(-40)) });
+  handedOver.push(...sent.map((p) => ({ scenario: 'media/single-presentation', source: p.source, captureId: p.captureId, jobId: reply.id })));
 }
 
 console.log(JSON.stringify({ scenarios, handedOver }));

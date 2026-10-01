@@ -1,5 +1,5 @@
 import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, APP_CAPTURE_TIMEOUT_MS, APP_MEDIA_CAPTURE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
-import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
+import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
@@ -337,67 +337,11 @@ function cleanMediaUrl(value: unknown): string | undefined {
   }
 }
 
-function cleanMediaEvidence(value: unknown, expectedKind?: Exclude<MediaKind, 'unknown'>, pageUrl?: string): MediaEvidence | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const item = value as Partial<MediaEvidence>;
-  if (typeof item.currentSrc !== 'string' || item.currentSrc.length === 0 || item.currentSrc.length > MEDIA_EVIDENCE_URL_MAX) return undefined;
-  if (typeof item.sourceIdentity !== 'string' || item.sourceIdentity.length === 0 || item.sourceIdentity.length > MEDIA_EVIDENCE_ID_MAX) return undefined;
-  let currentSrc: string | undefined;
-  if (item.currentSrc.startsWith('blob:')) {
-    try {
-      const parsed = new URL(item.currentSrc);
-      const pageOrigin = pageUrl ? new URL(pageUrl).origin : '';
-      if (parsed.protocol !== 'blob:' || (pageOrigin && pageOrigin !== 'null' && parsed.origin !== pageOrigin)) return undefined;
-      currentSrc = parsed.href;
-    } catch {
-      return undefined;
-    }
-  } else {
-    currentSrc = cleanMediaUrl(item.currentSrc);
-  }
-  const source = item.source === undefined ? undefined : cleanMediaUrl(item.source);
-  const playerKind = item.playerKind === 'audio' || item.playerKind === 'video' ? item.playerKind : undefined;
-  const companionAudio = item.companionAudio === undefined ? undefined : cleanMediaUrl(item.companionAudio);
-  if (!currentSrc || (expectedKind && playerKind && expectedKind !== playerKind) || (source !== undefined && !item.currentSrc.startsWith('blob:') && source !== currentSrc) || (item.source !== undefined && !source) || (item.companionAudio !== undefined && !companionAudio) || (companionAudio !== undefined && (expectedKind ?? playerKind) !== 'video')) return undefined;
-  // Hints are advisory. A URL that is neither a manifest nor a representation
-  // is dropped; it must never invalidate the source the page did name — during
-  // steady-state playback the hint list is mostly segments, and one segment
-  // entry used to discard otherwise exact evidence.
-  const selectedSegments = (Array.isArray(item.selectedSegments) ? item.selectedSegments : [])
-      .map((candidate) => cleanMediaUrl(candidate))
-      .filter((candidate): candidate is string => !!candidate)
-      .filter((candidate) => {
-        const role = roleFor(candidate);
-        return role === 'manifest' || (role === 'unknown' && isLikelyRepresentation(candidate));
-      })
-      .slice(0, 8);
-  return { currentSrc, sourceIdentity: item.sourceIdentity, ...(source ? { source } : {}), ...(playerKind ? { playerKind } : {}), ...(companionAudio ? { companionAudio } : {}), selectedSegments };
-}
-
 function observedKind(url: string, tabId: number, frameId: number, documentId?: string): MediaKind {
   const candidate = [...recentMedia]
     .filter((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId)
     .sort((left, right) => right.at - left.at)[0];
   return candidate ? (candidate.kind && candidate.kind !== 'unknown' ? candidate.kind : mediaKindFor(url, candidate.contentType)) : mediaKindFor(url);
-}
-
-function rememberEvidence(evidence: MediaEvidence, tabId: number, frameId: number, documentId: string | undefined, playerKey: string | undefined, expectedKind?: Exclude<MediaKind, 'unknown'>): void {
-  const sourceKind = evidence.playerKind ?? expectedKind ?? (evidence.source ? mediaKindFor(evidence.source) : 'unknown');
-  if (evidence.source) rememberMedia(evidence.source, tabId, frameId, roleFor(evidence.source), documentId, playerKey, sourceKind);
-  if (evidence.companionAudio) rememberMedia(evidence.companionAudio, tabId, frameId, roleFor(evidence.companionAudio), documentId, playerKey, 'audio');
-  for (const hint of evidence.selectedSegments) rememberMedia(hint, tabId, frameId, roleFor(hint), documentId, playerKey, mediaKindFor(hint));
-}
-
-function selectionFromEvidence(evidence: MediaEvidence | undefined, expectedKind?: Exclude<MediaKind, 'unknown'>): { source: string; selectedSegments: string[]; companionAudio?: string } | undefined {
-  if (!evidence?.source || !isHttp(evidence.source)) return undefined;
-  const sourceKind = mediaKindFor(evidence.source);
-  if (expectedKind && sourceKind !== 'unknown' && sourceKind !== expectedKind) return undefined;
-  const selection: { source: string; selectedSegments: string[]; companionAudio?: string } = {
-    source: roleFor(evidence.source) === 'unknown' ? normalizeChunkUrl(evidence.source) : evidence.source,
-    selectedSegments: evidence.selectedSegments.slice(0, 8),
-  };
-  if (expectedKind === 'video' && evidence.companionAudio && roleFor(evidence.source) === 'unknown') selection.companionAudio = normalizeChunkUrl(evidence.companionAudio);
-  return selection;
 }
 
 function rememberPlayer(payload: Record<string, unknown>, tabId: number, frameId: number, documentId?: string): void {
@@ -855,32 +799,22 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const documentId = sender.documentId;
       const expectedKind = payload.playerKind === 'audio' || payload.playerKind === 'video' ? payload.playerKind : undefined;
       const playerKey = typeof payload.playerKey === 'string' && payload.playerKey.length <= 128 ? payload.playerKey : undefined;
-      const evidence = cleanMediaEvidence(payload.pageEvidence, expectedKind, pageUrl);
-      const sourceIdentity = evidence?.sourceIdentity ?? (typeof payload.mediaIdentity === 'string' && payload.mediaIdentity.length <= MEDIA_EVIDENCE_ID_MAX ? payload.mediaIdentity : undefined);
+      const sourceIdentity = typeof payload.mediaIdentity === 'string' && payload.mediaIdentity.length <= MEDIA_EVIDENCE_ID_MAX ? payload.mediaIdentity : undefined;
       const scope = sender.tab?.id === undefined ? undefined : mediaScope(sender.tab.id, sender.frameId ?? 0, documentId, playerKey, sourceIdentity);
       if (sender.tab?.id !== undefined) invalidateOtherResolvedMedia(sender.tab.id, sender.frameId ?? 0, documentId, playerKey, sourceIdentity);
+      // A player with an http(s) source names it; a blob/MSE player's source
+      // is read from the tab's traffic below.
       let source = typeof payload.source === 'string' ? cleanMediaUrl(payload.source) ?? '' : '';
       let selectedSegments: string[] = [];
       let companionAudio: string | undefined;
-      if (sender.tab?.id !== undefined && evidence) {
-        rememberEvidence(evidence, sender.tab.id, sender.frameId ?? 0, documentId, playerKey, expectedKind);
-        const exact = selectionFromEvidence(evidence, expectedKind);
-        if (exact) {
-          source = exact.source;
-          selectedSegments = exact.selectedSegments;
-          companionAudio = exact.companionAudio;
-        }
-      }
       const directKind = isHttp(source) && sender.tab?.id !== undefined
         ? observedKind(source, sender.tab.id, sender.frameId ?? 0, documentId)
         : mediaKindFor(source);
       if (expectedKind && directKind !== 'unknown' && directKind !== expectedKind && roleFor(source) !== 'manifest') source = '';
       if (isHttp(source) && roleFor(source) === 'unknown') source = normalizeChunkUrl(source);
       let candidates: string[] = [];
+      let unresolved: 'not-played' | 'not-found' | undefined;
       if (!isHttp(source) && sender.tab?.id !== undefined) {
-        // Exact page evidence did not name a source. Ask the tab's observed
-        // traffic instead: while exactly one player is playing, that traffic is
-        // its media, whatever realm fetched it.
         const plan = planMediaCapture(
           recentMedia,
           recentPlayers,
@@ -891,10 +825,14 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
           Date.now(),
           expectedKind,
         );
-        source = plan?.source ?? '';
-        selectedSegments = plan?.selectedSegments ?? [];
-        companionAudio = plan?.companionAudio;
-        candidates = plan?.alternatives ?? [];
+        if ('unresolved' in plan) {
+          unresolved = plan.unresolved;
+        } else {
+          source = plan.source;
+          selectedSegments = plan.selectedSegments;
+          companionAudio = plan.companionAudio;
+          candidates = plan.alternatives;
+        }
       }
       if (!isHttp(source) && scope !== undefined) {
         const remembered = takeResolvedMedia(scope);
@@ -908,7 +846,9 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         rememberResolvedMedia(scope, source, selectedSegments, companionAudio);
       }
       if (!isHttp(source)) {
-        reply({ ok: false, error: 'no downloadable media found for this player' });
+        reply(unresolved === 'not-played'
+          ? { ok: false, reason: 'not-played', error: 'Start playback first, so the video it plays can be told apart from others on the page' }
+          : { ok: false, error: 'no downloadable media found for this player' });
         return;
       }
       const filterResult = mediaFilterDecision(source, sender.tab?.id, sender.frameId ?? 0, documentId, '', companionAudio);

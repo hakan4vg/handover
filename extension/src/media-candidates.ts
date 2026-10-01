@@ -37,15 +37,6 @@ export interface MediaPlayerEvidence {
   srcAt?: number;
 }
 
-export interface MediaEvidence {
-  currentSrc: string;
-  sourceIdentity: string;
-  source?: string;
-  playerKind?: Exclude<MediaKind, 'unknown'>;
-  companionAudio?: string;
-  selectedSegments: string[];
-}
-
 export interface MediaSelection {
   source: string;
   selectedSegments: string[];
@@ -183,7 +174,9 @@ export function normalizeChunkUrl(url: string): string {
 }
 
 function activeRepresentationHints(candidates: MediaCandidate[]): string[] {
-  const representations = candidates.filter((item) => item.role === 'unknown' && isLikelyRepresentation(item.url, item.contentType));
+  const representations = [...candidates]
+    .filter((item) => item.role === 'unknown' && isLikelyRepresentation(item.url, item.contentType))
+    .sort((left, right) => right.at - left.at);
   if (!representations.length) return [];
   const newestByKind = new Map<Exclude<MediaKind, 'unknown'>, MediaCandidate>();
   for (const item of representations) {
@@ -196,14 +189,6 @@ function activeRepresentationHints(candidates: MediaCandidate[]): string[] {
     .map((item) => normalizeChunkUrl(item.url));
 }
 
-export function choosePlayerEvidence(players: MediaPlayerEvidence[], tabId: number, frameId: number, now = Date.now(), documentId?: string): MediaPlayerEvidence | undefined {
-  const fresh = players.filter((item) => item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId) && now - item.at <= 15_000);
-  return [...fresh].sort((left, right) => {
-    const rank = (item: MediaPlayerEvidence) => Number(item.active) * 8 + Number(item.hovered) * 4 + Number(item.playing) * 2 + Number(item.visible);
-    return rank(right) - rank(left) || right.at - left.at;
-  })[0];
-}
-
 function matchesKind(candidate: MediaCandidate, expectedKind?: Exclude<MediaKind, 'unknown'>): boolean {
   if (!expectedKind) return true;
   const kind = candidate.kind && candidate.kind !== 'unknown'
@@ -212,165 +197,90 @@ function matchesKind(candidate: MediaCandidate, expectedKind?: Exclude<MediaKind
   return kind === 'unknown' || kind === expectedKind;
 }
 
-export function chooseMediaSelection(
-  candidates: MediaCandidate[],
-  tabId: number,
-  frameId: number,
-  playerKey?: string,
-  documentId?: string,
-  expectedKind?: Exclude<MediaKind, 'unknown'>,
-  notBefore = 0,
-): MediaSelection | undefined {
-  // Ownership is per frame, not per tab: a cross-origin embedded player may
-  // only inherit traffic observed in its own frame. The previous
-  // `item.frameId === 0` clause let a host page's media be attributed to an
-  // embedded player (proven live: an inline YouTube embed downloading the
-  // Reddit post's video).
-  const scoped = candidates.filter((item) =>
-    item.tabId === tabId &&
-    item.frameId === frameId &&
-    (!documentId || item.documentId === documentId) &&
-    beganAt(item) >= notBefore,
-  );
-  const chooseFromPool = (pool: MediaCandidate[]): MediaSelection | undefined => {
-    const allNewest = [...pool].sort((left, right) => right.at - left.at);
-    const newest = allNewest.filter((item) => matchesKind(item, expectedKind));
-    const manifests = newest.filter((item) => item.role === 'manifest');
-    const mediaManifests = manifests.filter((item) => !isSubtitlePlaylist(item.url));
-    const manifest = mediaManifests.find((item) => isLikelyMasterManifest(item.url)) ?? mediaManifests[0] ?? manifests[0];
-
-    if (manifest) {
-      const childManifests = mediaManifests
-        .filter((item) => item.url !== manifest.url)
-        .slice(0, 4)
-        .map((item) => normalizeChunkUrl(item.url));
-      const hints = activeRepresentationHints(newest).slice(0, 8);
-      return {
-        source: normalizeChunkUrl(manifest.url),
-        selectedSegments: [...childManifests, ...hints].slice(0, 8),
-      };
-    }
-
-    if (pool.some((item) => item.role === 'segment')) return undefined;
-
-    // A byte-range fragment is a slice with a seconds-long signature: usable as
-    // a hint, never as the thing a job is built on.
-    const acquireable = (item: MediaCandidate) => acquireableSource(item.url);
-
-    const videoCandidates = newest.filter((item) => item.role !== 'segment' && acquireable(item) && (item.kind === 'video' || (item.kind !== 'audio' && mediaKindFor(item.url, item.contentType) === 'video')) && (item.kind === 'video' || isLikelyRepresentation(item.url, item.contentType)));
-    const audioPool = expectedKind === 'video' ? allNewest : newest;
-    const audioCandidates = audioPool.filter((item) => item.role !== 'segment' && acquireable(item) && (item.kind === 'audio' || mediaKindFor(item.url, item.contentType) === 'audio') && (item.kind === 'audio' || isLikelyRepresentation(item.url, item.contentType)));
-    const untypedCandidates = newest.filter((item) => item.role !== 'segment' && acquireable(item) && isLikelyRepresentation(item.url, item.contentType) && !videoCandidates.includes(item) && !audioCandidates.includes(item));
-
-    if (expectedKind === 'audio') {
-      const primaryAudio = audioCandidates[0] ?? untypedCandidates.find((item) => mediaKindFor(item.url, item.contentType) !== 'video');
-      return primaryAudio ? { source: normalizeChunkUrl(primaryAudio.url), selectedSegments: [] } : undefined;
-    }
-
-    const primaryVideo = videoCandidates[0] ?? untypedCandidates.find((item) => mediaKindFor(item.url, item.contentType) !== 'audio');
-    if (!primaryVideo) {
-      if (expectedKind === 'video') return undefined;
-      const primaryAudio = audioCandidates[0] ?? untypedCandidates[0];
-      return primaryAudio ? { source: normalizeChunkUrl(primaryAudio.url), selectedSegments: [] } : undefined;
-    }
-
-    const companionAudio = audioCandidates[0];
-    return {
-      source: normalizeChunkUrl(primaryVideo.url),
-      selectedSegments: [],
-      ...(companionAudio ? { companionAudio: normalizeChunkUrl(companionAudio.url) } : {}),
-    };
-  };
-
-  if (!playerKey) return chooseFromPool(scoped);
-  const owned = scoped.filter((item) => item.playerKey === playerKey);
-  if (!owned.length) return undefined;
-  return chooseFromPool(owned);
-}
-
-export function chooseMediaCandidate(candidates: MediaCandidate[], tabId: number, frameId: number, playerKey?: string, documentId?: string): string | undefined {
-  return chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId)?.source;
-}
-
-/**
- * Media this player plausibly owns, ranked best-first.
- *
- * A player whose bytes arrive through MSE/blob gives us no URL of its own, and
- * the requests that produced those bytes may have been issued by a realm no
- * content script can instrument (a worker, a cache-backed service worker, a
- * player library). What is always observable is the network traffic of the tab,
- * so ownership is decided by elimination: while exactly one player in the tab is
- * playing and visible, the media fetched for that tab is that player's media.
- *
- * Ranking prefers the player's own document, then manifests (a manifest is the
- * only thing that can rebuild an ordered presentation), then representations by
- * recency. Subtitles and segments are never handed over as the source.
- */
-export function rankedMediaCandidates(
-  candidates: MediaCandidate[],
-  tabId: number,
-  frameId: number,
-  documentId?: string,
-  expectedKind?: Exclude<MediaKind, 'unknown'>,
-  now = Date.now(),
-  limit = 6,
-  notBefore = 0,
-): string[] {
-  const pool = candidates.filter((item) =>
-    item.tabId === tabId &&
-    item.frameId === frameId &&
-    now - item.at <= 90_000 &&
-    beganAt(item) >= notBefore &&
-    item.role !== 'segment' &&
-    acquireableSource(item.url) &&
-    matchesKind(item, expectedKind),
-  );
-  const own = pool.filter((item) => !documentId || item.documentId === documentId);
-  const ordered = (items: MediaCandidate[]) => [...items].sort((left, right) => right.at - left.at);
-  const manifests = (items: MediaCandidate[]) => {
-    const found = ordered(items.filter((item) => item.role === 'manifest'));
-    const media = found.filter((item) => !isSubtitlePlaylist(item.url));
-    return [...media.filter((item) => isLikelyMasterManifest(item.url)), ...media.filter((item) => !isLikelyMasterManifest(item.url)), ...found];
-  };
-  // Own-document traffic ranks first, then the rest of this frame's observed
-  // traffic. It is never widened to the tab: another frame's media does not
-  // belong to this player (SPEC §6.2.1).
-  const representations = (items: MediaCandidate[]) => ordered(items.filter((item) =>
-    item.role === 'unknown' && isLikelyRepresentation(item.url, item.contentType)));
-
-  const ranked = [
-    ...manifests(own),
-    ...representations(own),
-    ...manifests(pool.filter((item) => !own.includes(item))),
-    ...representations(pool.filter((item) => !own.includes(item))),
-  ];
-  const seen = new Set<string>();
-  const urls: string[] = [];
-  for (const item of ranked) {
-    const url = normalizeChunkUrl(item.url);
-    if (seen.has(url)) continue;
-    seen.add(url);
-    urls.push(url);
-    if (urls.length >= limit) break;
+/** Path segments that name one presentation: an asset id, a session id, a
+ *  hash. Long and mixing letters with digits once a file extension is set
+ *  aside, unlike `v2`, `avf` or `playlist.m3u8`. A manifest, its variant playlists and its segments share them;
+ *  another video on the same page does not. */
+function identifyingSegments(url: string): Set<string> {
+  try {
+    return new Set(new URL(url).pathname.split('/')
+      .map((part) => part.replace(/\.[a-z0-9]{2,5}$/i, ''))
+      .filter((part) => part.length >= 8 && /\d/.test(part) && /[a-z]/i.test(part)));
+  } catch {
+    return new Set();
   }
-  return urls;
 }
 
-/** Whether the given player is the only thing playing and visible in the tab,
- *  which is what makes tab-wide network traffic attributable to it. */
-export function isSolePlayingPlayer(players: MediaPlayerEvidence[], tabId: number, frameId: number, playerKey: string, documentId?: string, now = Date.now()): boolean {
-  const playing = players.filter((item) =>
-    item.tabId === tabId && now - item.at <= 15_000 && item.playing && item.visible);
-  if (playing.length !== 1) return false;
-  const only = playing[0];
-  return only.playerKey === playerKey && only.frameId === frameId && (!documentId || only.documentId === documentId);
+function sharedCount(left: Set<string>, right: Set<string>): number {
+  let count = 0;
+  for (const part of left) if (right.has(part)) count += 1;
+  return count;
 }
+
+/** One presentation's traffic: its manifests, and the requests (segments,
+ *  representations) that belong to it. */
+interface Stream {
+  manifests: MediaCandidate[];
+  ids: Set<string>;
+  members: MediaCandidate[];
+  /** when the latest of its non-manifest requests began */
+  activeAt: number;
+}
+
+function streamsOf(pool: MediaCandidate[]): Stream[] {
+  const streams: Stream[] = [];
+  const manifests = [...pool]
+    .filter((item) => item.role === 'manifest' && !isSubtitlePlaylist(item.url))
+    .sort((left, right) => beganAt(left) - beganAt(right));
+  for (const manifest of manifests) {
+    const ids = identifyingSegments(manifest.url);
+    const stream = ids.size ? streams.find((item) => sharedCount(item.ids, ids) > 0) : undefined;
+    if (stream) {
+      stream.manifests.push(manifest);
+      for (const id of ids) stream.ids.add(id);
+    } else {
+      streams.push({ manifests: [manifest], ids, members: [], activeAt: 0 });
+    }
+  }
+  for (const item of pool) {
+    if (item.role === 'manifest') continue;
+    const ids = identifyingSegments(item.url);
+    let best: Stream | undefined;
+    let bestCount = 0;
+    for (const stream of streams) {
+      const count = sharedCount(stream.ids, ids);
+      if (count > bestCount) {
+        best = stream;
+        bestCount = count;
+      }
+    }
+    if (!best) continue;
+    best.members.push(item);
+    best.activeAt = Math.max(best.activeAt, beganAt(item));
+  }
+  return streams;
+}
+
+/** A stream's source: its multivariant manifest when one was seen. */
+function streamSource(stream: Stream): MediaCandidate {
+  return stream.manifests.find((item) => isLikelyMasterManifest(item.url)) ?? stream.manifests[0];
+}
+
+export type MediaCapturePlanResult = MediaCapturePlan | { unresolved: 'not-played' | 'not-found' };
 
 /**
- * The capture plan for one player: exact/owned evidence first, then the
- * ownership-by-elimination fallback for players whose bytes the page pipeline
- * cannot see. Both paths come from the same ranking, so the source, the
- * alternatives and the hints can never disagree.
+ * The capture plan for the player the user clicked.
+ *
+ * Which stream belongs to which player is read from the tab's network traffic,
+ * which the extension sees whatever realm fetched it (page, worker, service
+ * worker). A page often holds several presentations (a preview, an ad, the
+ * next video); the one this player plays is the one whose segments the tab
+ * keeps fetching after the player's current source appeared. A paused preview
+ * fetches nothing.
+ *
+ * When nothing has been fetched for any stream yet (the player has not
+ * started), a page with a single presentation still resolves; with several,
+ * the user is asked to play first rather than handed a guess.
  */
 export function planMediaCapture(
   candidates: MediaCandidate[],
@@ -381,12 +291,12 @@ export function planMediaCapture(
   documentId?: string,
   now = Date.now(),
   expectedKind?: Exclude<MediaKind, 'unknown'>,
-): MediaCapturePlan | undefined {
+): MediaCapturePlanResult {
   // A player can only own traffic that happened after its current source
   // appeared: without this, a YouTube SPA navigation re-uses the previous
-  // video's URL, and a Reddit page's video can be attributed to an embedded
-  // player it does not belong to. 2 s of slack covers requests that started
-  // just before the source flipped.
+  // video's URL. 2 s of slack covers requests that started just before the
+  // source flipped. Ownership is per frame: another frame's media does not
+  // belong to this player (an inline embed is not the host page's video).
   const clicked = players.find((item) =>
     item.playerKey === playerKey &&
     item.tabId === tabId &&
@@ -394,22 +304,53 @@ export function planMediaCapture(
     (!documentId || item.documentId === documentId),
   );
   const notBefore = clicked?.srcAt !== undefined ? Math.max(0, clicked.srcAt - 2_000) : 0;
-  const exact = chooseMediaSelection(candidates, tabId, frameId, playerKey, documentId, expectedKind, notBefore);
-  if (exact?.source) {
-    const alternatives = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now, 6, notBefore)
-      .filter((url) => url !== normalizeChunkUrl(exact.source));
-    return { ...exact, alternatives: alternatives.slice(0, 5) };
+  const unresolved = { unresolved: clicked?.playing ? 'not-found' : 'not-played' } as const;
+  const scoped = candidates.filter((item) =>
+    item.tabId === tabId &&
+    item.frameId === frameId &&
+    (!documentId || !item.documentId || item.documentId === documentId) &&
+    beganAt(item) >= notBefore,
+  );
+  const pool = scoped.filter((item) => matchesKind(item, expectedKind));
+
+  const streams = streamsOf(pool);
+  if (streams.length) {
+    const active = streams.filter((stream) => stream.activeAt > 0).sort((left, right) => right.activeAt - left.activeAt);
+    const stream = active[0] ?? (streams.length === 1 ? streams[0] : undefined);
+    if (!stream) return unresolved;
+    const source = streamSource(stream);
+    const variants = stream.manifests
+      .filter((item) => item !== source)
+      .sort((left, right) => right.at - left.at)
+      .map((item) => normalizeChunkUrl(item.url));
+    const hints = [...variants, ...activeRepresentationHints(stream.members)].slice(0, 8);
+    return { source: normalizeChunkUrl(source.url), selectedSegments: hints, alternatives: variants.slice(0, 5) };
   }
-  if (!playerKey || !isSolePlayingPlayer(players, tabId, frameId, playerKey, documentId, now)) return undefined;
-  const ranked = rankedMediaCandidates(candidates, tabId, frameId, documentId, expectedKind, now, 6, notBefore);
-  if (!ranked.length) return undefined;
-  // The pool's own ordering already put manifests before representations, so the
-  // head is the source and the tail is what the resident may try next.
-  const [source, ...rest] = ranked;
-  // Hints steer variant choice, so they only apply to a manifest source; a
-  // progressive source is acquired exactly as handed over.
-  const hints = roleFor(source) === 'manifest'
-    ? rest.filter((url) => roleFor(url) === 'unknown' && isLikelyRepresentation(url)).slice(0, 8)
-    : [];
-  return { source, selectedSegments: hints, alternatives: rest.slice(0, 5) };
+
+  // No manifest: progressive media. The tab's traffic is this player's only
+  // while it is the one playing.
+  const playing = players.filter((item) => item.tabId === tabId && now - item.at <= 15_000 && item.playing && item.visible);
+  const sole = playing.length === 1 && playing[0].playerKey === playerKey && playing[0].frameId === frameId;
+  if (!sole) return unresolved;
+  const newest = (items: MediaCandidate[]) => [...items].sort((left, right) => right.at - left.at);
+  const acquireable = (item: MediaCandidate) => item.role !== 'segment' && acquireableSource(item.url);
+  const ofKind = (item: MediaCandidate, kind: Exclude<MediaKind, 'unknown'>) =>
+    (item.kind === kind || (item.kind !== (kind === 'video' ? 'audio' : 'video') && mediaKindFor(item.url, item.contentType) === kind)) &&
+    (item.kind === kind || isLikelyRepresentation(item.url, item.contentType));
+  const video = newest(pool).filter((item) => acquireable(item) && ofKind(item, 'video'));
+  // A video's separate audio track is the other half of the same player.
+  const audio = newest(scoped).filter((item) => acquireable(item) && ofKind(item, 'audio'));
+  const untyped = newest(pool).filter((item) => acquireable(item) && isLikelyRepresentation(item.url, item.contentType) && !video.includes(item) && !audio.includes(item));
+  if (expectedKind === 'audio') {
+    const primary = audio[0] ?? untyped.find((item) => mediaKindFor(item.url, item.contentType) !== 'video');
+    return primary ? { source: normalizeChunkUrl(primary.url), selectedSegments: [], alternatives: [] } : { unresolved: 'not-found' };
+  }
+  const primary = video[0] ?? untyped.find((item) => mediaKindFor(item.url, item.contentType) !== 'audio');
+  if (!primary) return { unresolved: 'not-found' };
+  return {
+    source: normalizeChunkUrl(primary.url),
+    selectedSegments: [],
+    alternatives: [],
+    ...(audio[0] ? { companionAudio: normalizeChunkUrl(audio[0].url) } : {}),
+  };
 }

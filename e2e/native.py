@@ -482,9 +482,9 @@ def main() -> int:
         uia_timeouts: list[tuple[str, ...]] = []
 
         def uia(*args: str) -> tuple[int, str]:
-            # UI Automation can block on WebView2 windows (seen on this machine
-            # with no change to the app). A hung call is a failed attempt, and
-            # after two the Save scenarios fail fast instead of waiting it out.
+            # UI Automation blocks on WebView2 windows while the Windows session
+            # is locked. A hung call is a failed attempt, and after two the Save
+            # scenarios fail fast instead of waiting it out.
             if len(uia_timeouts) >= 2:
                 return 1, ""
             try:

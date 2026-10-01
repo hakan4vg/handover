@@ -34,7 +34,8 @@ const filterLabels: Array<{ key: FilterKey; label: string; icon: IconName }> = [
  *  activity counters always mean the same thing: bytes are moving or being
  *  assembled. A job waiting for the user to save it is not one of them. */
 const TRANSFER_STATES: DownloadState[] = ['connecting', 'downloading', 'finalizing'];
-const PAUSABLE_STATES: DownloadState[] = TRANSFER_STATES;
+/** Finalizing assembles bytes already on disk; the core does not pause it. */
+const PAUSABLE_STATES: DownloadState[] = ['connecting', 'downloading'];
 const RESUMABLE_STATES: DownloadState[] = ['paused', 'pending'];
 /** Acquisitions the manager can still cancel. A provisional waiting to be saved
  *  is one of them: cancelling is how the user discards it. */

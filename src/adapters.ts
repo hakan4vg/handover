@@ -244,7 +244,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async pauseAll() {
-    this.snapshot.jobs = this.snapshot.jobs.map((job) => ['downloading', 'connecting', 'finalizing'].includes(job.state) ? { ...job, state: 'paused' as const, speed: 0, connections: 0, events: [event('Paused with Pause All', 'warning'), ...job.events] } : job);
+    this.snapshot.jobs = this.snapshot.jobs.map((job) => ['downloading', 'connecting'].includes(job.state) ? { ...job, state: 'paused' as const, speed: 0, connections: 0, events: [event('Paused with Pause All', 'warning'), ...job.events] } : job);
     this.emit();
   }
 

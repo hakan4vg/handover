@@ -691,8 +691,7 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
                             }
                             DestinationReservationRecovery::Completed => {
                                 job.destination_reservation = None;
-                                if ["connecting", "downloading", "finalizing"]
-                                    .contains(&job.state.as_str())
+                                if TRANSFER_STATES.contains(&job.state.as_str())
                                 {
                                     complete_job(&mut job);
                                     let _ = std::fs::remove_file(&job.temp_path);
@@ -819,7 +818,7 @@ fn tray_status_text(active: usize, aggregate_speed: u64) -> String {
 
 fn refresh_tray(app: &AppHandle, state: &CoreState) {
     let status = state.snapshot.lock().ok().map(|snapshot| {
-        let active = snapshot.jobs.iter().filter(|job| ["downloading", "connecting", "finalizing"].contains(&job.state.as_str())).count();
+        let active = snapshot.jobs.iter().filter(|job| TRANSFER_STATES.contains(&job.state.as_str())).count();
         tray_status_text(active, snapshot.aggregate_speed)
     });
     if let Some(text) = status {
@@ -1394,6 +1393,13 @@ fn valid_range_identity(response: &reqwest::Response, expected: &ResourceIdentit
     let last_modified = header_string(response, reqwest::header::LAST_MODIFIED);
     expected.etag.as_ref().map_or(true, |value| etag.as_ref() == Some(value)) && expected.last_modified.as_ref().map_or(true, |value| last_modified.as_ref() == Some(value))
 }
+
+/// States a transfer runs in.
+const TRANSFER_STATES: [&str; 3] = ["connecting", "downloading", "finalizing"];
+/// Finalizing is local assembly of bytes already on disk, so it is not
+/// pausable: recovery then always finishes it from disk instead of asking a
+/// source that may have expired.
+const PAUSABLE_STATES: [&str; 2] = ["connecting", "downloading"];
 
 fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) {
     // The job log is a bounded human-readable history (newest first), never a
@@ -5311,18 +5317,60 @@ fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
         emit_snapshot(&app, &state);
         return;
     }
-    abort_transfer(state.inner(), &id);
-    emit_job(&state, &id, |job| {
-        if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) {
-            job.state = "paused".into();
-            job.speed = 0;
-            job.connections = 0;
-            job.eta = Some("Paused".into());
-            job.events
-                .insert(0, job_event("Paused by user", Some("warning")));
-        }
-    });
+    let mut paused = false;
+    emit_job(&state, &id, |job| paused = pause_in_place(job, "Paused by user"));
+    if paused {
+        abort_transfer(state.inner(), &id);
+    }
     emit_snapshot(&app, &state);
+}
+
+fn pause_in_place(job: &mut DownloadJob, event: &str) -> bool {
+    if !PAUSABLE_STATES.contains(&job.state.as_str()) {
+        return false;
+    }
+    job.state = "paused".into();
+    job.speed = 0;
+    job.connections = 0;
+    job.eta = Some("Paused".into());
+    job.events.insert(0, job_event(event, Some("warning")));
+    true
+}
+
+/// Pause every running transfer. Shared by the manager's Pause All and the
+/// tray's, like `resume_all_jobs`.
+fn pause_all_jobs(app: &AppHandle, event: &str) {
+    let state = app.state::<CoreState>();
+    let _lifecycle = state.lifecycle.lock().ok();
+    let Ok(publishing) = state.publishing.lock() else { return };
+    let mut ids = Vec::new();
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        for job in snapshot.jobs.iter_mut() {
+            if !publishing.contains(&job.id) && pause_in_place(job, event) {
+                ids.push(job.id.clone());
+            }
+        }
+    }
+    drop(publishing);
+    for id in ids {
+        abort_transfer(state.inner(), &id);
+    }
+    emit_snapshot(app, &state);
+}
+
+fn resume_all_jobs(app: &AppHandle, event: &str) {
+    let state = app.state::<CoreState>();
+    let _lifecycle = state.lifecycle.lock().ok();
+    let sources = state
+        .snapshot
+        .lock()
+        .ok()
+        .map(|mut snapshot| plan_resume_all(&mut snapshot, event, |id| transfer_is_active(state.inner(), id)))
+        .unwrap_or_default();
+    emit_snapshot(app, &state);
+    for (id, source) in sources {
+        let _ = spawn_transfer(app, state.inner(), id, source);
+    }
 }
 
 /// Flip every paused/pending job back to transferring and return the
@@ -5541,47 +5589,13 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
 }
 
 #[tauri::command]
-fn pause_all(app: AppHandle, state: State<'_, CoreState>) {
-    let _lifecycle = state.lifecycle.lock().ok();
-    let Ok(publishing) = state.publishing.lock() else { return };
-    let mut ids = Vec::new();
-    if let Ok(mut snapshot) = state.snapshot.lock() {
-        for job in snapshot.jobs.iter_mut() {
-            if publishing.contains(&job.id) {
-                continue;
-            }
-            if ["downloading", "connecting", "finalizing"].contains(&job.state.as_str()) {
-                ids.push(job.id.clone());
-                job.state = "paused".into();
-                job.speed = 0;
-                job.connections = 0;
-                job.eta = Some("Paused".into());
-            }
-        }
-    }
-    for id in ids {
-        abort_transfer(state.inner(), &id);
-    }
-    emit_snapshot(&app, &state);
+fn pause_all(app: AppHandle) {
+    pause_all_jobs(&app, "Paused by user");
 }
 
 #[tauri::command]
-fn resume_all(app: AppHandle, state: State<'_, CoreState>) {
-    let _lifecycle = state.lifecycle.lock().ok();
-    let sources = state
-        .snapshot
-        .lock()
-        .ok()
-        .map(|mut snapshot| {
-            plan_resume_all(&mut snapshot, "Resumed", |id| {
-                transfer_is_active(state.inner(), id)
-            })
-        })
-        .unwrap_or_default();
-    emit_snapshot(&app, &state);
-    for (id, source) in sources {
-        let _ = spawn_transfer(&app, state.inner(), id, source);
-    }
+fn resume_all(app: AppHandle) {
+    resume_all_jobs(&app, "Resumed");
 }
 
 fn start_provisional(
@@ -6939,56 +6953,8 @@ fn install_tray(
                         let _ = window.set_focus();
                     }
                 }
-                "pause-all" => {
-                    let state = app.state::<CoreState>();
-                    let _lifecycle = state.lifecycle.lock().ok();
-                    let Ok(publishing) = state.publishing.lock() else { return };
-                    let mut ids = Vec::new();
-                    if let Ok(mut snapshot) = state.snapshot.lock() {
-                        for job in snapshot.jobs.iter_mut() {
-                            if publishing.contains(&job.id) {
-                                continue;
-                            }
-                            if ["downloading", "connecting", "finalizing"]
-                                .contains(&job.state.as_str())
-                            {
-                                ids.push(job.id.clone());
-                                job.state = "paused".into();
-                                job.speed = 0;
-                                job.connections = 0;
-                                job.eta = Some("Paused".into());
-                                job.events.insert(
-                                    0,
-                                    job_event("Paused from the system tray", Some("warning")),
-                                );
-                            }
-                        }
-                    }
-                    for id in ids {
-                        abort_transfer(state.inner(), &id);
-                    }
-                    emit_snapshot(app, &state);
-                }
-                "resume-all" => {
-                    let state = app.state::<CoreState>();
-                    let _lifecycle = state.lifecycle.lock().ok();
-                    let sources = state
-                        .snapshot
-                        .lock()
-                        .ok()
-                        .map(|mut snapshot| {
-                            plan_resume_all(
-                                &mut snapshot,
-                                "Resumed from the system tray",
-                                |id| transfer_is_active(state.inner(), id),
-                            )
-                        })
-                        .unwrap_or_default();
-                    emit_snapshot(app, &state);
-                    for (id, source) in sources {
-                        let _ = spawn_transfer(app, state.inner(), id, source);
-                    }
-                }
+                "pause-all" => pause_all_jobs(app, "Paused from the system tray"),
+                "resume-all" => resume_all_jobs(app, "Resumed from the system tray"),
                 "browser-integration" => {
                     let state = app.state::<CoreState>();
                     let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
@@ -7149,7 +7115,7 @@ fn main() {
             let initial_snapshot = snapshot_from_database(&database, settings);
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
-            let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && ["connecting", "downloading", "finalizing"].contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
+            let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && TRANSFER_STATES.contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
             app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;

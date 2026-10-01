@@ -37,6 +37,8 @@ from pathlib import Path
 
 import psutil
 
+import devtools
+
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "e2e" / "results"
 CACHE = ROOT / "e2e" / ".media-cache"
@@ -122,6 +124,22 @@ class BigMedia:
 
 
 BIG: BigMedia | None = None
+BIG_MANIFEST_REQUESTS = 0
+
+# Waits for the large job to start assembling, asks to pause it, and reports
+# the state a moment later. Runs inside the manager window.
+PAUSE_WHILE_FINALIZING = """(async () => {
+  const invoke = window.__TAURI_INTERNALS__.invoke;
+  const state = async () => (await invoke('get_snapshot')).jobs.find((job) => job.id === 'large')?.state;
+  const until = Date.now() + 600000;
+  while (Date.now() < until && await state() !== 'finalizing') await new Promise((r) => setTimeout(r, 20));
+  if (await state() !== 'finalizing') return { seenFinalizing: false };
+  await invoke('pause_job', { id: 'large' });
+  await new Promise((r) => setTimeout(r, 300));
+  const after = await state();
+  if (after === 'paused') await invoke('resume_job', { id: 'large' });
+  return { seenFinalizing: true, stateAfterPause: after };
+})()"""
 
 
 class Handler(fixture.Handler):
@@ -146,6 +164,8 @@ class Handler(fixture.Handler):
                 return self._raw(file.read_bytes(), kind)
             return self._send_bytes(b"missing fixture", 404)
         if path == "/big/manifest.mpd" and BIG:
+            global BIG_MANIFEST_REQUESTS
+            BIG_MANIFEST_REQUESTS += 1
             return self._raw(BIG.manifest(), "application/dash+xml")
         if path == "/big/v-init.mp4" and BIG:
             return self._raw(BIG.init, "video/mp4")
@@ -242,8 +262,22 @@ def main() -> int:
 
     log = open(runtime / "app.log", "w", encoding="utf-8")
     started = time.time()
-    app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     process = psutil.Process(app.pid)
+    pause_attempt: dict = {}
+
+    def attempt_pause() -> None:
+        for _ in range(60):
+            try:
+                pause_attempt.update(devtools.evaluate(PAUSE_WHILE_FINALIZING, timeout=660))
+                pause_attempt.pop("error", None)
+                return
+            except Exception as error:  # the window may not be up yet
+                pause_attempt["error"] = str(error)
+                time.sleep(0.5)
+
+    if BIG:
+        threading.Thread(target=attempt_pause, daemon=True).start()
     run = Run()
     peak_private = 0
     timeline: list[dict] = []
@@ -304,6 +338,8 @@ def main() -> int:
         if name == "large":
             ok = evidence["state"] == "completed" and evidence.get("bytes", 0) >= BIG.count * BIG_SEGMENT
             run.check(scenario, f"a {reaches} download completes", ok, evidence)
+            declined = pause_attempt.get("seenFinalizing") is True and pause_attempt.get("stateAfterPause") == "finalizing"
+            run.check("mux/pause-while-finalizing", "Pause is declined while media is being assembled: the job finishes from disk and its manifest is asked for only once", ok and declined and BIG_MANIFEST_REQUESTS == 1, {**pause_attempt, "manifestRequests": BIG_MANIFEST_REQUESTS})
             ceiling = 512
             run.check("mux/large-memory", f"muxing {BIG.count * BIG_SEGMENT // MIB} MiB of media keeps the resident's peak commit under {ceiling} MiB (it grows with the header count, not the media size)", ok and memory_evidence["peakCommitMiB"] < ceiling, {**memory_evidence, "mediaMiB": BIG.count * BIG_SEGMENT // MIB})
         else:

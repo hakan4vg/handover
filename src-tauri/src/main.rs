@@ -127,6 +127,10 @@ struct AppSettings {
     intercept_downloads: bool,
     show_media_buttons: bool,
     excluded_sites: Vec<String>,
+    /// When the browser policy (the three fields above) last changed, in Unix
+    /// milliseconds. The extension keeps the same stamp; the newer side wins.
+    #[serde(default)]
+    policy_updated_at: u64,
     bandwidth_limit: Option<u64>,
     bandwidth_unit: String,
     max_connections: u32,
@@ -376,6 +380,7 @@ fn default_settings() -> AppSettings {
         intercept_downloads: true,
         show_media_buttons: true,
         excluded_sites: vec![],
+        policy_updated_at: 0,
         bandwidth_limit: None,
         bandwidth_unit: "MB/s".into(),
         max_connections: 8,
@@ -392,12 +397,8 @@ fn default_settings() -> AppSettings {
 
 type BrowserPolicy = (bool, bool, Vec<String>);
 
-fn browser_policy_root() -> PathBuf {
-    app_data_root()
-}
-
-fn browser_policy_value(policy: &BrowserPolicy) -> Value {
-    json!({ "interceptDownloads": policy.0, "showMediaButtons": policy.1, "excludedSites": policy.2 })
+fn browser_policy_value(settings: &AppSettings) -> Value {
+    json!({ "interceptDownloads": settings.intercept_downloads, "showMediaButtons": settings.show_media_buttons, "excludedSites": settings.excluded_sites, "updatedAt": settings.policy_updated_at })
 }
 
 fn normalize_policy_site(value: &str) -> String {
@@ -434,20 +435,6 @@ fn browser_policy_from_value(value: &Value) -> Option<BrowserPolicy> {
     let media = payload.get("showMediaButtons").and_then(Value::as_bool)?;
     let excluded = payload.get("excludedSites").and_then(Value::as_array)?.iter().filter_map(Value::as_str).map(normalize_policy_site).filter(|site| !site.is_empty()).collect::<Vec<_>>();
     Some((intercept, media, excluded))
-}
-
-fn write_browser_policy(root: &Path, policy: &BrowserPolicy) -> Result<(), String> {
-    // The JSON file is a coherence cache for the browser side, never a second
-    // authority: failures propagate so callers roll back instead of diverging
-    // silently (F14).
-    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
-    let contents = serde_json::to_string(&browser_policy_value(policy)).map_err(|error| error.to_string())?;
-    std::fs::write(root.join("browser-policy.json"), contents).map_err(|error| error.to_string())
-}
-
-fn load_browser_policy(root: &Path) -> Option<BrowserPolicy> {
-    let contents = std::fs::read_to_string(root.join("browser-policy.json")).ok()?;
-    browser_policy_from_value(&serde_json::from_str(&contents).ok()?)
 }
 
 fn settings_policy(settings: &AppSettings) -> BrowserPolicy {
@@ -506,26 +493,6 @@ fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
         }
     }
     serde_json::from_value(merged).unwrap_or_else(|_| current.clone())
-}
-
-fn apply_browser_policy(app: &AppHandle, state: &CoreState, policy: BrowserPolicy) -> Result<(), String> {
-    let previous = state
-        .snapshot
-        .lock()
-        .map(|snapshot| settings_policy(&snapshot.settings))
-        .map_err(|_| "State unavailable".to_string())?;
-    write_browser_policy(&browser_policy_root(), &policy)?;
-    let patch = json!({
-        "interceptDownloads": policy.0,
-        "showMediaButtons": policy.1,
-        "excludedSites": policy.2,
-    });
-    if let Err(error) = update_settings_snapshot(state, &patch) {
-        let _ = write_browser_policy(&browser_policy_root(), &previous);
-        return Err(error);
-    }
-    sync_tray_checks(app, policy.0, policy.1);
-    emit_snapshot_event(app, state)
 }
 
 fn cleanup_media_track_files(temp_path: &str) {
@@ -6317,6 +6284,11 @@ fn update_settings_snapshot(state: &CoreState, patch: &Value) -> Result<Option<(
         let Value::Object(entries) = payload else { return Ok(None); };
         let previous = snapshot.clone();
         snapshot.settings = apply_settings_patch(&snapshot.settings, &Value::Object(entries.clone()));
+        if !entries.contains_key("policyUpdatedAt") && settings_policy(&snapshot.settings) != settings_policy(&previous.settings) {
+            snapshot.settings.policy_updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        }
         (
             previous,
             (snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons, snapshot.settings.start_at_sign_in),
@@ -6340,16 +6312,6 @@ fn update_settings(
     else {
         return Ok(());
     };
-    write_browser_policy(
-        &browser_policy_root(),
-        &settings_policy(
-            &state
-                .snapshot
-                .lock()
-                .map_err(|_| "State unavailable".to_string())?
-                .settings,
-        ),
-    )?;
     sync_tray_checks(&app, intercept_downloads, show_media_buttons);
     // Touch the OS startup entry only when its setting changed: theme tweaks
     // and folder keystrokes must not rewrite system state (F14).
@@ -6508,37 +6470,6 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         name_is_hint: payload.get("nameIsHint").and_then(Value::as_bool).unwrap_or(false),
         destination: None
     })
-}
-
-fn capture_input_from_args(args: &[String]) -> Option<ProvisionalInput> {
-    let index = args.iter().position(|value| value == "--capture")?;
-    let raw = args.get(index + 1)?;
-    let message: Value = serde_json::from_str(raw).ok()?;
-    provisional_input_from_message(&message)
-}
-
-fn policy_from_args(args: &[String]) -> Option<BrowserPolicy> {
-    let index = args.iter().position(|value| value == "--policy")?;
-    let raw = args.get(index + 1)?;
-    browser_policy_from_value(&serde_json::from_str(raw).ok()?)
-}
-
-fn commit_from_args(args: &[String]) -> Option<(String, CommitInput)> {
-    let index = args.iter().position(|value| value == "--commit")?;
-    let raw = args.get(index + 1)?;
-    let message: Value = serde_json::from_str(raw).ok()?;
-    let payload = message.get("payload").unwrap_or(&message);
-    let id = payload.get("id").and_then(Value::as_str)?.to_string();
-    let input = serde_json::from_value(payload.get("input")?.clone()).ok()?;
-    Some((id, input))
-}
-
-fn spawn_commit(app: AppHandle, id: String, input: CommitInput) {
-    let state_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = state_app.state::<CoreState>();
-        let _ = commit_provisional(app, state, id, input).await;
-    });
 }
 
 /// Loopback hosts the bridge accepts. The listener binds 127.0.0.1, but the
@@ -6762,37 +6693,34 @@ async fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response 
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/health") => bridge_respond(&request, 200, json!({ "ok": true })),
         ("GET", "/v1/policy") => {
-            // The SQLite-backed snapshot is the single authority while
-            // running; the JSON cache is only a fallback (F14).
-            let policy = app.state::<CoreState>()
-                .snapshot
-                .lock()
-                .map(|snapshot| settings_policy(&snapshot.settings))
-                .unwrap_or_else(|_| {
-                    load_browser_policy(&browser_policy_root()).unwrap_or((true, true, Vec::new()))
-                });
-            bridge_respond(
-                &request,
-                200,
-                json!({ "ok": true, "policy": browser_policy_value(&policy) })
-            )
+            let Ok(snapshot) = app.state::<CoreState>().snapshot.lock().map(|snapshot| browser_policy_value(&snapshot.settings)) else {
+                return bridge_reject(&request, 503, "settings unavailable");
+            };
+            bridge_respond(&request, 200, json!({ "ok": true, "policy": snapshot }))
         }
         ("POST", "/v1/policy") => {
             let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
                 return bridge_reject(&request, 400, "invalid policy");
             };
-            let Some(policy) = browser_policy_from_value(&message) else {
+            let Some((intercept, media, excluded)) = browser_policy_from_value(&message) else {
                 return bridge_reject(&request, 400, "invalid policy");
             };
+            let payload = message.get("payload").unwrap_or(&message);
+            let updated_at = payload.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
             let state = app.state::<CoreState>();
-            if let Err(error) = apply_browser_policy(&app, state.inner(), policy.clone()) {
-                return bridge_reject(&request, 500, &format!("could not persist policy: {error}"));
+            let current = state.snapshot.lock().map(|snapshot| snapshot.settings.policy_updated_at).unwrap_or(u64::MAX);
+            // An older policy (changed in the browser before a newer change
+            // here) is not applied; the answer carries the newer one.
+            if updated_at >= current {
+                let patch = json!({ "interceptDownloads": intercept, "showMediaButtons": media, "excludedSites": excluded, "policyUpdatedAt": updated_at });
+                if let Err(error) = update_settings(app.clone(), state.clone(), patch) {
+                    return bridge_reject(&request, 500, &format!("could not persist policy: {error}"));
+                }
             }
-            bridge_respond(
-                &request,
-                200,
-                json!({ "ok": true, "policy": browser_policy_value(&policy) })
-            )
+            let Ok(policy) = state.snapshot.lock().map(|snapshot| browser_policy_value(&snapshot.settings)) else {
+                return bridge_reject(&request, 503, "settings unavailable");
+            };
+            bridge_respond(&request, 200, json!({ "ok": true, "policy": policy }))
         }
         ("POST", "/v1/capture") => {
             let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
@@ -6894,7 +6822,7 @@ fn tray_toggle_next(current: (bool, bool), which: &str) -> (bool, bool) {
 
 // Keeps the native tray checkmarks coherent with Settings (SPEC §12: one
 // policy, not two copies). Called from every writer of the two flags — the
-// tray toggle arms, update_settings, apply_browser_policy — because neither
+// tray toggle arm and update_settings (which bridge policy updates use) — because neither
 // direction propagates on its own: Tauri check items keep whatever checked
 // state they were built or last set with, and Settings-panel changes never
 // reach the tray menu. Handles are stored at install time; before that (or
@@ -6951,65 +6879,19 @@ fn install_tray(
                 }
                 "pause-all" => pause_all_jobs(app, "Paused from the system tray"),
                 "resume-all" => resume_all_jobs(app, "Resumed from the system tray"),
-                "browser-integration" => {
+                "browser-integration" | "media-buttons" => {
                     let state = app.state::<CoreState>();
-                    let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
-                        let previous = (
-                            snapshot.settings.intercept_downloads,
-                            snapshot.settings.show_media_buttons,
-                        );
-                        let next = tray_toggle_next(previous, "browser-integration");
-                        snapshot.settings.intercept_downloads = next.0;
-                        snapshot.settings.show_media_buttons = next.1;
-                        // A cache write failure rolls the toggle back: the menu
-                        // must never disagree with durable state (F14).
-                        if let Err(error) = write_browser_policy(
-                            &browser_policy_root(),
-                            &settings_policy(&snapshot.settings),
-                        ) {
-                            eprintln!("Browser policy cache unavailable: {error}");
-                            snapshot.settings.intercept_downloads = previous.0;
-                            snapshot.settings.show_media_buttons = previous.1;
-                            None
-                        } else {
-                            Some(next)
+                    let current = state.snapshot.lock().ok().map(|snapshot| (snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons));
+                    if let Some(current) = current {
+                        let (intercept, media) = tray_toggle_next(current, id);
+                        if let Err(error) = update_settings(app.clone(), state, json!({ "interceptDownloads": intercept, "showMediaButtons": media })) {
+                            eprintln!("Browser policy update unavailable: {error}");
                         }
-                    } else {
-                        None
-                    };
-                    if let Some((intercept, media)) = checks {
-                        sync_tray_checks(app, intercept, media);
                     }
-                    emit_snapshot(app, &state);
-                }
-                "media-buttons" => {
-                    let state = app.state::<CoreState>();
-                    let checks = if let Ok(mut snapshot) = state.snapshot.lock() {
-                        let previous = (
-                            snapshot.settings.intercept_downloads,
-                            snapshot.settings.show_media_buttons,
-                        );
-                        let next = tray_toggle_next(previous, "media-buttons");
-                        snapshot.settings.intercept_downloads = next.0;
-                        snapshot.settings.show_media_buttons = next.1;
-                        if let Err(error) = write_browser_policy(
-                            &browser_policy_root(),
-                            &settings_policy(&snapshot.settings),
-                        ) {
-                            eprintln!("Browser policy cache unavailable: {error}");
-                            snapshot.settings.intercept_downloads = previous.0;
-                            snapshot.settings.show_media_buttons = previous.1;
-                            None
-                        } else {
-                            Some(next)
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some((intercept, media)) = checks {
-                        sync_tray_checks(app, intercept, media);
+                    // A refused change puts the checkmarks back.
+                    if let Ok(snapshot) = app.state::<CoreState>().snapshot.lock() {
+                        sync_tray_checks(app, snapshot.settings.intercept_downloads, snapshot.settings.show_media_buttons);
                     }
-                    emit_snapshot(app, &state);
                 }
                 "bandwidth" => {
                     if let Some(window) = app.get_webview_window("main") {
@@ -7039,20 +6921,7 @@ fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(policy) = policy_from_args(&argv) {
-                let state = app.state::<CoreState>();
-                if let Err(error) = apply_browser_policy(app, state.inner(), policy) {
-                    eprintln!("Browser policy update unavailable: {error}");
-                }
-            } else if let Some((id, input)) = commit_from_args(&argv) {
-                spawn_commit(app.clone(), id, input);
-            } else if let Some(input) = capture_input_from_args(&argv) {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
-                let state = app.state::<CoreState>();
-                let _ = start_provisional(app.clone(), state.inner(), input, true, None);
-            } else if argv.iter().any(|value| value == "--startup") {
+            if argv.iter().any(|value| value == "--startup") {
                 let show_manager = app
                     .state::<CoreState>()
                     .snapshot
@@ -7093,19 +6962,7 @@ fn main() {
             restrict_file(&root.join("download-manager.db"));
             database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT);").map_err(|error| error.to_string())?;
             let stored_settings: Result<String, _> = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0));
-            let mut settings = stored_settings.as_deref().map(settings_from_stored).unwrap_or_else(|_| default_settings());
-            if stored_settings.is_err() {
-                // Fresh database (first boot, portable move): the JSON cache
-                // seeds policy once. Afterwards SQLite is the authority and
-                // the cache is rewritten from it, never the reverse (F14).
-                if let Some(policy) = load_browser_policy(&root) {
-                    settings.intercept_downloads = policy.0;
-                    settings.show_media_buttons = policy.1;
-                    settings.excluded_sites = policy.2;
-                }
-            } else if let Err(error) = write_browser_policy(&root, &settings_policy(&settings)) {
-                eprintln!("Browser policy cache unavailable: {error}");
-            }
+            let settings = stored_settings.as_deref().map(settings_from_stored).unwrap_or_else(|_| default_settings());
             let show_manager_at_startup = settings.show_manager_at_sign_in;
             if let Err(error) = startup::sync(settings.start_at_sign_in) { eprintln!("Startup registration unavailable: {error}"); }
             let initial_snapshot = snapshot_from_database(&database, settings);
@@ -7126,19 +6983,7 @@ fn main() {
                     }
                 });
             }
-            if let Some(policy) = policy_from_args(&launch_args) {
-                let state = app.state::<CoreState>();
-                if let Err(error) = apply_browser_policy(app.handle(), state.inner(), policy) {
-                    eprintln!("Browser policy update unavailable: {error}");
-                }
-            } else if let Some((id, input)) = commit_from_args(&launch_args) {
-                if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
-                spawn_commit(app.handle().clone(), id, input);
-            } else if let Some(input) = capture_input_from_args(&launch_args) {
-                if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
-                let state = app.state::<CoreState>();
-                let _ = start_provisional(app.handle().clone(), state.inner(), input, true, None);
-            } else if launch_args.iter().any(|value| value == "--startup") && !show_manager_at_startup {
+            if launch_args.iter().any(|value| value == "--startup") && !show_manager_at_startup {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
             } else if launch_args.iter().any(|value| value == "--startup") {
                 if let Some(window) = app.get_webview_window("main") { let _ = window.show(); }

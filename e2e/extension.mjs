@@ -18,7 +18,7 @@ const base = process.argv[2];
 const bundle = await build({ entryPoints: [process.env.DM_EXTENSION_ENTRY ?? path.join(root, 'extension/src/background.ts')], bundle: true, format: 'iife', platform: 'browser', write: false });
 const code = bundle.outputFiles[0].text;
 
-function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined } = {}) {
+function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {} } = {}) {
   const listeners = {};
   const calls = [];
   const outbound = [];
@@ -50,7 +50,7 @@ function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl 
       cancel: async (id) => { calls.push(['cancel', id]); },
       download: async (options) => { calls.push(['browser-download', options.url]); return 99; },
     },
-    storage: { local: { get: async () => ({}), set: async () => {} }, session: { get: async () => ({}), set: async () => {} }, onChanged: on('storage') },
+    storage: { local: { get: async (key) => (key in stored ? { [key]: stored[key] } : {}), set: async (items) => { Object.assign(stored, items); } }, session: { get: async () => ({}), set: async () => {} }, onChanged: on('storage') },
     tabs: { sendMessage: async () => undefined, query: async () => (activeTabUrl ? [{ id: 1, url: activeTabUrl }] : []) },
   };
   const context = { URL, URLSearchParams, AbortController, setTimeout, clearTimeout, console, crypto: globalThis.crypto, fetch: fetchThrough, chrome };
@@ -160,6 +160,24 @@ async function lateResponse(startedBeforeSwitchMs) {
   check('epoch/fresh-request', 'a manifest requested after the source switch is still captured (control)', reply.ok === true && sent[0]?.payload?.source?.endsWith('/hls/vod.m3u8'), { reply, sent: sent.map((m) => m.payload.source) });
   handedOver.push(...sent.map((m) => ({ scenario: 'epoch/fresh-request', source: m.payload.source, captureId: m.payload.captureId, jobId: reply.id })));
   void w;
+}
+
+// --- A1.4: the browser policy side changed last wins ---------------------------
+{
+  // Interception was turned off in the popup while the resident was stopped.
+  const w = world({ stored: { 'dm-policy': { interceptDownloads: false, showMediaButtons: true, excludedSites: [], updatedAt: Date.now() } } }); await settle();
+  await w.determine({ id: 21, url: `${base}/file/range.bin?offline-off`, finalUrl: `${base}/file/range.bin?offline-off`, filename: 'x-offline-off.bin', referrer: `${base}/page` });
+  const resident = await (await fetch('http://127.0.0.1:38217/v1/policy')).json();
+  check('policy/browser-change-while-stopped', 'interception turned off in the browser while the resident was stopped stays off, and the resident takes the change', w.calls.length === 0 && captures(w).length === 0 && resident.policy?.interceptDownloads === false, { calls: w.calls, residentPolicy: resident.policy });
+  await w.message({ type: 'update-policy', patch: { interceptDownloads: true } }, {});
+  handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/browser-change-while-stopped', source: m.payload.source, captureId: m.payload.captureId })));
+}
+{
+  // A change in the manager after the browser's last change wins over it.
+  const w = world({ stored: { 'dm-policy': { interceptDownloads: false, showMediaButtons: true, excludedSites: [], updatedAt: 1 } } }); await settle();
+  await w.determine({ id: 22, url: `${base}/file/range.bin?manager-newer`, finalUrl: `${base}/file/range.bin?manager-newer`, filename: 'x-manager-newer.bin', referrer: `${base}/page` });
+  check('policy/resident-change-newer', "an older browser-side setting gives way to the resident's newer one (control)", w.calls.map(([c]) => c).join(',') === 'pause,cancel', { calls: w.calls });
+  handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/resident-change-newer', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
 }
 
 console.log(JSON.stringify({ scenarios, handedOver }));

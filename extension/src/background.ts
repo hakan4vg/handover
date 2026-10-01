@@ -175,6 +175,7 @@ async function loadPolicy(): Promise<void> {
         interceptDownloads: saved.interceptDownloads ?? DEFAULT_POLICY.interceptDownloads,
         showMediaButtons: saved.showMediaButtons ?? DEFAULT_POLICY.showMediaButtons,
         excludedSites: Array.isArray(saved.excludedSites) ? saved.excludedSites : [],
+        updatedAt: typeof saved.updatedAt === 'number' ? saved.updatedAt : 0,
       };
     }
     policyLoadError = '';
@@ -201,27 +202,40 @@ async function saveMediaFilters(next: MediaFilterSettings = mediaFilters): Promi
   await chrome.storage.local.set({ [MEDIA_FILTERS_KEY]: next });
 }
 
-function adoptResidentPolicy(response: unknown): boolean {
+function residentPolicy(response: unknown): BrowserPolicy | null {
   const remote = (response as { policy?: Partial<BrowserPolicy> } | undefined)?.policy;
-  if (!remote || typeof remote.interceptDownloads !== 'boolean') return false;
-  const next = {
+  if (!remote || typeof remote.interceptDownloads !== 'boolean') return null;
+  return {
     interceptDownloads: remote.interceptDownloads,
     showMediaButtons: remote.showMediaButtons ?? policy.showMediaButtons,
     excludedSites: Array.isArray(remote.excludedSites)
       ? remote.excludedSites.filter((site): site is string => typeof site === 'string')
       : policy.excludedSites,
+    updatedAt: typeof remote.updatedAt === 'number' ? remote.updatedAt : 0,
   };
+}
+
+async function adoptPolicy(next: BrowserPolicy): Promise<void> {
   const changed = next.interceptDownloads !== policy.interceptDownloads
     || next.showMediaButtons !== policy.showMediaButtons
+    || next.updatedAt !== policy.updatedAt
     || next.excludedSites.length !== policy.excludedSites.length
     || next.excludedSites.some((site, index) => site !== policy.excludedSites[index]);
   policy = next;
-  return changed;
+  if (changed) await savePolicy();
 }
 
-async function syncPolicyFromResident(): Promise<void> {
-  const response = await sendApp({ type: 'get-policy' });
-  if (adoptResidentPolicy(response)) await savePolicy();
+/** Both sides keep the policy; the one changed last wins. A change made here
+ *  while the resident was not running is sent to it now. */
+async function syncPolicyWithResident(): Promise<void> {
+  const remote = residentPolicy(await sendApp({ type: 'get-policy' }));
+  if (!remote) return;
+  if (remote.updatedAt >= policy.updatedAt) {
+    await adoptPolicy(remote);
+    return;
+  }
+  const answer = residentPolicy(await sendApp({ type: 'update-policy', payload: policy }));
+  if (answer) await adoptPolicy(answer);
 }
 
 let residentPolicySync: Promise<void> | null = null;
@@ -230,7 +244,7 @@ let residentPolicySyncedAt = 0;
 async function refreshResidentPolicy(): Promise<void> {
   if (Date.now() - residentPolicySyncedAt < 1000) return;
   if (!residentPolicySync) {
-    residentPolicySync = syncPolicyFromResident()
+    residentPolicySync = syncPolicyWithResident()
       .then(() => { residentPolicySyncedAt = Date.now(); })
       .finally(() => { residentPolicySync = null; });
   }
@@ -795,7 +809,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     } else if (type === 'update-policy') {
       const patch = (message as { patch?: Partial<BrowserPolicy> }).patch ?? {};
       const previous = policy;
-      const next: BrowserPolicy = { ...policy, excludedSites: [...policy.excludedSites] };
+      const next: BrowserPolicy = { ...policy, excludedSites: [...policy.excludedSites], updatedAt: Date.now() };
       if (typeof patch.interceptDownloads === 'boolean') next.interceptDownloads = patch.interceptDownloads;
       if (typeof patch.showMediaButtons === 'boolean') next.showMediaButtons = patch.showMediaButtons;
       if (Array.isArray(patch.excludedSites)) {
@@ -809,8 +823,13 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       }
       policy = next;
       policyLoadError = '';
-      await sendApp({ type: 'update-policy', payload: policy });
-      residentPolicySyncedAt = Date.now();
+      try {
+        const answer = residentPolicy(await sendApp({ type: 'update-policy', payload: policy }));
+        if (answer) await adoptPolicy(answer);
+        residentPolicySyncedAt = Date.now();
+      } catch {
+        // The resident is not running: it takes this policy when it next answers.
+      }
       reply({ ok: true, policy });
     } else if (type === 'ordinary-capture') {
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};

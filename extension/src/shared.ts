@@ -10,6 +10,9 @@ export interface BrowserPolicy {
   interceptDownloads: boolean;
   showMediaButtons: boolean;
   excludedSites: string[];
+  /** Unix ms of the last change; the resident keeps the same stamp and the
+   *  side changed last wins. */
+  updatedAt: number;
 }
 
 export interface MediaFilterSettings {
@@ -21,6 +24,7 @@ export const DEFAULT_POLICY: BrowserPolicy = {
   interceptDownloads: true,
   showMediaButtons: true,
   excludedSites: [],
+  updatedAt: 0,
 };
 
 export const DEFAULT_MEDIA_FILTERS: MediaFilterSettings = {

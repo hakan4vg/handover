@@ -199,6 +199,15 @@ class Handler(fixture.Handler):
         return self._raw(403, b"")
 
 
+# What the Add window's closeSurface() does: destroy(), else close(). It runs
+# after the evaluation returns, since the window may take the connection away.
+CLOSE_SURFACE = """(() => {
+  const invoke = window.__TAURI_INTERNALS__.invoke, label = window.__TAURI_INTERNALS__.metadata.currentWindow.label;
+  setTimeout(() => invoke('plugin:window|destroy', { label }).catch(() => invoke('plugin:window|close', { label })).catch(() => {}), 50);
+  return label;
+})()"""
+
+
 def zone_identifier(path: Path) -> str | None:
     try:
         return Path(f"{path}:Zone.Identifier").read_text(encoding="utf-8", errors="replace")
@@ -470,8 +479,19 @@ def main() -> int:
         run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
 
         # ---- Save durability: the real Add window, driven by UI Automation ----
+        uia_timeouts: list[tuple[str, ...]] = []
+
         def uia(*args: str) -> tuple[int, str]:
-            done = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "e2e" / "uia.ps1"), *args], capture_output=True, text=True, timeout=90)
+            # UI Automation can block on WebView2 windows (seen on this machine
+            # with no change to the app). A hung call is a failed attempt, and
+            # after two the Save scenarios fail fast instead of waiting it out.
+            if len(uia_timeouts) >= 2:
+                return 1, ""
+            try:
+                done = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "e2e" / "uia.ps1"), *args], capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                uia_timeouts.append(args)
+                return 1, ""
             return done.returncode, done.stdout
 
         reply = capture("/file/range.bin", "cap-save")
@@ -499,7 +519,7 @@ def main() -> int:
         stayed_open = code == 0 and "Save" in during
         told_why = "Could not record the Save" in during
         stored = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
-        run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[:16], "storedProvisional": stored.get("provisional")})
+        run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[:16], "storedProvisional": stored.get("provisional"), "uiaTimeouts": len(uia_timeouts)})
         uia("-Button", "Save")
         final = {}
         for _ in range(40):
@@ -509,6 +529,27 @@ def main() -> int:
                 break
         saved_file = Path(final.get("destination", "")).is_file() if final else False
         run.check("save/retry-after-storage-recovers", "once storage accepts writes again, the same Save completes the download", final.get("state") == "completed" and final.get("provisional") is False and saved_file, {"state": final.get("state"), "provisional": final.get("provisional"), "fileExists": saved_file})
+
+        # The Add window closed the way its X closes it when the job has not
+        # reached the window yet.
+        reply = capture("/file/range.bin", "cap-closed")
+        closing = None
+        for _ in range(40):
+            try:
+                closing = devtools.evaluate(CLOSE_SURFACE, timeout=10, page=f"window=add&id={reply.get('id')}$")
+                break
+            except Exception as error:
+                closing = str(error)
+                time.sleep(0.25)
+        time.sleep(1.5)
+        try:
+            still_open = devtools.evaluate("document.title", timeout=10, page=f"window=add&id={reply.get('id')}$") is not None
+        except Exception:
+            still_open = False
+        leftovers = job_ids_for("cap-closed")
+        run.check("bridge/add-window-closed", "the Add window's own close works, and closing it unsaved discards the capture", reply.get("ok") is True and not still_open and not leftovers, {"reply": reply, "window": closing, "stillOpen": still_open, "leftoverJobs": leftovers})
+        for i in leftovers:
+            bridge({"type": "cancel-acquisition", "payload": {"id": i}})
 
         early = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-early"}})
         late = capture("/file/range.bin", "cap-early")

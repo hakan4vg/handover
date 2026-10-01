@@ -16,9 +16,12 @@ def environment() -> dict[str, str]:
     return {**os.environ, "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": f"--remote-debugging-port={PORT}"}
 
 
-def evaluate(expression: str, timeout: float = 60):
-    """Evaluate an expression in the manager window; return its JSON value."""
-    done = subprocess.run(["node", str(CDP), str(PORT), "tauri.localhost", expression], capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+MANAGER = r"^http://tauri\.localhost/$"
+
+
+def evaluate(expression: str, timeout: float = 60, page: str = MANAGER):
+    """Evaluate an expression in a window (the manager by default); return its JSON value."""
+    done = subprocess.run(["node", str(CDP), str(PORT), page, expression], capture_output=True, text=True, encoding="utf-8", timeout=timeout)
     if done.returncode != 0:
         raise RuntimeError(done.stderr.strip() or "DevTools evaluation failed")
     return json.loads(done.stdout)

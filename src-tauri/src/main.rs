@@ -5818,8 +5818,11 @@ fn open_add_window(app: &AppHandle, id: &str) -> Result<(), String> {
         .map_err(|error| format!("Could not open Add Download window: {error}"))?;
     let close_handle = app.clone();
     let close_id = id.to_string();
+    // Destroyed covers every way the window goes away, including the UI's
+    // destroy(), which skips CloseRequested. Closing it unsaved discards the
+    // capture; after Save the job is no longer provisional and stays.
     window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { .. } = event {
+        if let WindowEvent::Destroyed = event {
             let state = close_handle.state::<CoreState>();
             let is_provisional = state
                 .snapshot

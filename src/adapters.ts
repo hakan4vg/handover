@@ -313,6 +313,12 @@ class MockAdapter implements DownloadAdapter {
     this.emit();
   }
 
+  async pairingCode() { return '482 913'; }
+
+  async answerPairing() { this.snapshot = { ...this.snapshot, pairedBrowsers: (this.snapshot.pairedBrowsers ?? 0) + 1 }; this.emit(); }
+
+  async forgetPairings() { this.snapshot = { ...this.snapshot, pairedBrowsers: 0 }; this.emit(); }
+
   async reattachJob(id: string) {
     this.update(id, (job) => ({ ...job, state: 'connecting', error: undefined, eta: 'Reattaching…', events: [event('Waiting for a renewed browser source'), ...job.events] }));
     window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'downloading', speed: 10.1 * 1024 ** 2, connections: Math.min(3, job.maxConnections), eta: '2m left', events: [event('Source reattached', 'success'), ...job.events] })), 1100);
@@ -359,6 +365,9 @@ class NativeAdapter implements DownloadAdapter {
   commitProvisional(id: string, input: { name: string; destination: string; maxConnections?: number; bandwidthLimit?: number | null }) { return this.command<void>('commit_provisional', { id, input }); }
   updateSettings(patch: Partial<AppSettings>) { return this.command<void>('update_settings', { patch: sanitizeSettingsPatch(patch) }); }
   reattachJob(id: string) { return this.command<void>('reattach_job', { id }); }
+  pairingCode(id: string) { return this.command<string | null>('pairing_code', { id }); }
+  answerPairing(id: string, allow: boolean) { return this.command<void>('answer_pairing', { id, allow }); }
+  forgetPairings() { return this.command<void>('forget_pairings'); }
 }
 
 export function createAdapter(): DownloadAdapter {

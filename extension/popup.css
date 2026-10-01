@@ -240,3 +240,6 @@ svg { display: block; }
   }
   html, body { background: #181a1e; }
 }
+
+.popup-pairing { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 10px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); font-size: 12px; }
+.popup-pairing[hidden] { display: none; }

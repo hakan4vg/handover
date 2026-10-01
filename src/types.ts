@@ -103,6 +103,7 @@ export interface AppSnapshot {
   aggregateSpeed: number;
   notifications: NotificationItem[];
   bridgeAvailable?: boolean;
+  pairedBrowsers?: number;
 }
 
 export interface DownloadAdapter {
@@ -121,4 +122,7 @@ export interface DownloadAdapter {
   // null = clear back to the global setting, number = set cap in bytes/sec.
   updateSettings(patch: Partial<AppSettings>): Promise<void>;
   reattachJob(id: string): Promise<void>;
+  pairingCode(id: string): Promise<string | null>;
+  answerPairing(id: string, allow: boolean): Promise<void>;
+  forgetPairings(): Promise<void>;
 }

@@ -1,7 +1,10 @@
+import { open as openSealed, seal, type Pairing } from './sealed';
 import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, APP_CAPTURE_TIMEOUT_MS, APP_MEDIA_CAPTURE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
 import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
 
 const POLICY_KEY = 'dm-policy';
+const PAIRING_KEY = 'dm-pairing';
+const PAIRING_DECLINED_KEY = 'dm-pairing-declined';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
 
 // Bounded ring of recent media-ish traffic per tab. M0 proof vehicle for the
@@ -263,25 +266,108 @@ async function decisionPolicyReady(): Promise<void> {
   }
 }
 
-async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<unknown> {
-  const type = (message as { type?: string })?.type;
-  const route = type === 'get-policy' ? '/v1/policy' : type === 'open-manager' ? '/v1/manager' : type === 'update-policy' ? '/v1/policy' : '/v1/capture';
+// ---- pairing --------------------------------------------------------------
+// Nothing reaches the app until the user has approved this browser in the
+// app once. Until then every download stays with the browser.
+
+type PairingState = { state: 'paired' } | { state: 'unpaired' } | { state: 'waiting'; code: string } | { state: 'declined' };
+
+let pairing: Pairing | null = null;
+let pairingState: PairingState = { state: 'unpaired' };
+let pairingTask: Promise<void> | null = null;
+let pairingTriedAt = 0;
+
+async function loadPairing(): Promise<void> {
+  try {
+    const stored = (await chrome.storage.local.get(PAIRING_KEY))[PAIRING_KEY] as Partial<Pairing> | undefined;
+    if (typeof stored?.keyId === 'string' && typeof stored.key === 'string') {
+      pairing = { keyId: stored.keyId, key: stored.key };
+      pairingState = { state: 'paired' };
+    } else if ((await chrome.storage.session.get(PAIRING_DECLINED_KEY))[PAIRING_DECLINED_KEY]) {
+      pairingState = { state: 'declined' };
+    }
+  } catch {
+    pairing = null;
+  }
+}
+
+async function bridgePost(path: string, body: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${APP_BRIDGE_ORIGIN}${route}`, {
-      method: type === 'get-policy' ? 'GET' : 'POST',
-      headers: type === 'get-policy' ? undefined : { 'Content-Type': 'application/json' },
-      body: type === 'get-policy' ? undefined : JSON.stringify(message),
-      signal: controller.signal,
-    });
-    const payload = await response.json() as unknown;
-    if (!response.ok && typeof payload === 'object' && payload !== null && 'error' in payload) return payload;
-    return payload;
-  } catch {
-    return { ok: false, unanswered: true, error: 'Download Manager is not running' };
+    return await fetch(`${APP_BRIDGE_ORIGIN}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: typeof body === 'string' ? body : JSON.stringify(body), signal: controller.signal });
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** Ask the app to pair. The app opens a window with a code that the popup
+ *  shows too; the user allows it there. Without `asked`, a pairing the user
+ *  declined (this browser session) or one tried moments ago is not repeated. */
+function startPairing(asked = false): Promise<void> {
+  if (pairingTask) return pairingTask;
+  if (!asked && (pairingState.state === 'declined' || Date.now() - pairingTriedAt < 10_000)) return Promise.resolve();
+  pairingTriedAt = Date.now();
+  pairingTask = (async () => {
+    const request = crypto.randomUUID();
+    try {
+      const begun = await (await bridgePost('/v1/pair', { request })).json() as { ok?: boolean; code?: string };
+      if (!begun.ok || typeof begun.code !== 'string') return;
+      pairingState = { state: 'waiting', code: begun.code };
+      await chrome.storage.session.remove(PAIRING_DECLINED_KEY).catch(() => undefined);
+      for (const until = Date.now() + 125_000; Date.now() < until;) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const status = await (await bridgePost('/v1/pair/status', { request })).json() as { state?: string; keyId?: string; key?: string };
+        if (status.state === 'waiting') continue;
+        if (status.state === 'approved' && typeof status.keyId === 'string' && typeof status.key === 'string') {
+          pairing = { keyId: status.keyId, key: status.key };
+          await chrome.storage.local.set({ [PAIRING_KEY]: pairing });
+          pairingState = { state: 'paired' };
+          residentPolicySyncedAt = 0;
+          void refreshResidentPolicy().catch(() => undefined);
+        } else if (status.state === 'denied') {
+          pairingState = { state: 'declined' };
+          await chrome.storage.session.set({ [PAIRING_DECLINED_KEY]: true }).catch(() => undefined);
+        }
+        return;
+      }
+    } catch {
+      // The app is not running: pairing starts again on the next contact.
+    } finally {
+      if (pairingState.state === 'waiting') pairingState = { state: 'unpaired' };
+    }
+  })().finally(() => { pairingTask = null; });
+  return pairingTask;
+}
+
+async function forgetPairing(): Promise<void> {
+  pairing = null;
+  pairingState = { state: 'unpaired' };
+  await chrome.storage.local.remove(PAIRING_KEY).catch(() => undefined);
+}
+
+/** Send one message to the paired app and return its answer. No answer, an
+ *  answer that does not open under the pairing key, or no pairing at all are
+ *  all "unanswered": the caller leaves the download with the browser. */
+async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<unknown> {
+  const current = pairing;
+  if (!current) {
+    void startPairing();
+    return { ok: false, unanswered: true, unpaired: true, error: 'Not paired with Download Manager' };
+  }
+  try {
+    const { body, nonce } = await seal(current, message);
+    const response = await bridgePost('/v1/message', body, timeoutMs);
+    const envelope = await response.json() as { paired?: boolean; error?: string };
+    if (response.status === 401 && envelope.paired === false) {
+      // The app no longer knows this key (forgotten there): pair again.
+      await forgetPairing();
+      void startPairing();
+      return { ok: false, unanswered: true, unpaired: true, error: 'Not paired with Download Manager' };
+    }
+    return await openSealed(current, nonce, envelope);
+  } catch {
+    return { ok: false, unanswered: true, error: 'Download Manager did not answer' };
   }
 }
 
@@ -441,6 +527,7 @@ function cleanFilename(value: unknown): string | undefined {
 function ordinaryCaptureError(source: string, pageUrl: string): string | undefined {
   const pageSite = siteOf(pageUrl);
   if (!policy.interceptDownloads) return 'ordinary interception disabled';
+  if (!pairing) { void startPairing(); return 'not paired'; }
   if (pageSite && policy.excludedSites.includes(pageSite)) return 'site excluded';
   if (!isHttp(source)) return 'invalid source';
   return undefined;
@@ -465,6 +552,7 @@ async function excludedWithoutReferrer(source: string): Promise<boolean> {
 
 function mediaCapturePolicyError(pageUrl: string): string | undefined {
   if (!policy.showMediaButtons) return 'media buttons disabled';
+  if (!pairing) { void startPairing(); return 'not paired'; }
   const pageSite = siteOf(pageUrl);
   if (pageSite && policy.excludedSites.includes(pageSite)) return 'site excluded';
   return undefined;
@@ -775,7 +863,15 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       }
       const includeMediaFilters = (message as { includeMediaFilters?: boolean })?.includeMediaFilters === true;
       const extra = includeMediaFilters ? { mediaFilters } : {};
-      reply(policyLoadError ? { ok: false, error: policyLoadError, policy, ...extra } : { ok: true, policy, ...extra });
+      reply(policyLoadError ? { ok: false, error: policyLoadError, policy, pairing: pairingState, ...extra } : { ok: true, policy, pairing: pairingState, ...extra });
+    } else if (type === 'pair') {
+      await pairingReady;
+      void startPairing(true);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      reply({ ok: true, pairing: pairingState });
+    } else if (type === 'get-pairing') {
+      await pairingReady;
+      reply({ ok: true, pairing: pairingState });
     } else if (type === 'get-media-filters') {
       await mediaFiltersReady;
       reply({ ok: true, mediaFilters });
@@ -942,7 +1038,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
 
 policyReady = loadPolicy();
 mediaFiltersReady = loadMediaFilters();
-void policyReady
+const pairingReady = loadPairing();
+void Promise.all([policyReady, pairingReady])
   .then(() => refreshResidentPolicy())
   .catch(() => undefined);
 void hydrateResolvedMedia();

@@ -349,3 +349,7 @@ html[data-runtime="native"] .manager-body { height: calc(100vh - 48px); min-heig
 
 .add-content-inner { min-width: 0; display: flow-root; }
 .add-content::-webkit-scrollbar { display: none; }
+
+.pair-window .add-content p { margin: 0; font-size: 12px; }
+.pair-window .pair-code { display: block; margin: 14px 0 8px; font-size: 26px; font-weight: 650; letter-spacing: .08em; font-variant-numeric: tabular-nums; }
+.pair-window .pair-hint { color: var(--muted); font-size: 11px; }

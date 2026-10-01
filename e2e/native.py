@@ -21,6 +21,7 @@ import collections
 import datetime as dt
 import importlib.util
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -34,6 +35,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import devtools
+import sealed
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "e2e" / "results"
@@ -225,16 +227,12 @@ class Run:
 
 
 EXTENSION_ORIGIN = "chrome-extension://joniainjojgbpnjjclallmfbdgnebgbe"
+PAIRING: dict = {}
 
 
-def bridge(message: dict, timeout: float = 30, origin: str | None = None) -> dict:
-    headers = {"Content-Type": "application/json", **({"Origin": origin} if origin else {})}
-    request = urllib.request.Request(f"{BRIDGE}/v1/capture", data=json.dumps(message).encode(), headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return {"_status": response.status, **json.loads(response.read() or b"{}")}
-    except urllib.error.HTTPError as error:
-        return {"_status": error.code, **json.loads(error.read() or b"{}")}
+def bridge(message: dict, timeout: float = 30) -> dict:
+    """One message to the resident over the paired, sealed channel."""
+    return sealed.message(PAIRING, message, timeout)
 
 
 def main() -> int:
@@ -444,11 +442,36 @@ def main() -> int:
 
         # Only the browser extension with the pinned ID (and local non-browser
         # clients, which send no Origin) may use the bridge.
-        probe = {"type": "cancel-acquisition", "payload": {"captureId": "origin-probe"}}
-        other = bridge(probe, origin="chrome-extension://abcdefghijklmnopabcdefghijklmnop")
-        page = bridge(probe, origin="https://example.com")
-        ours = bridge(probe, origin=EXTENSION_ORIGIN)
-        run.check("bridge/extension-origin-pinned", "another extension and a web page are refused; the extension with the pinned ID is accepted", other["_status"] == 403 and page["_status"] == 403 and ours["_status"] == 200, {"otherExtension": other, "webPage": page, "ours": ours})
+        probe = {"request": "origin-probe-0000000000"}
+        other = sealed.post("/v1/pair/status", probe, {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"})[0]
+        page = sealed.post("/v1/pair/status", probe, {"Origin": "https://example.com"})[0]
+        ours = sealed.post("/v1/pair/status", probe, {"Origin": EXTENSION_ORIGIN})[0]
+        run.check("bridge/extension-origin-pinned", "another extension and a web page are refused; the extension with the pinned ID is accepted", other == 403 and page == 403 and ours == 200, {"otherExtension": other, "webPage": page, "ours": ours})
+
+        # ---- pairing and the sealed channel --------------------------------
+        declined = sealed.pair(allow=False)
+        run.check("pairing/declined", "a pairing the user declines yields no key", declined.get("state") == "denied" and "key" not in declined, {k: v for k, v in declined.items() if k != "key"})
+        PAIRING.update(sealed.pair(allow=True))
+        run.check("pairing/approved", "a pairing the user allows yields a key, once", PAIRING.get("state") == "approved" and len(PAIRING.get("key", "")) == 44 and sealed.post("/v1/pair/status", {"request": PAIRING.get("request")})[1].get("state") == "unknown", {k: v for k, v in PAIRING.items() if k != "key"})
+        probe_message = {"type": "cancel-acquisition", "payload": {"captureId": "sealed-probe"}}
+        plain_status, plain = sealed.post("/v1/message", probe_message)
+        legacy_status, _ = sealed.post("/v1/capture", probe_message)
+        run.check("sealed/plain-refused", "an unsealed message is refused, and the old unsealed routes are gone", plain_status == 400 and legacy_status == 404, {"plain": [plain_status, plain], "legacyRoute": legacy_status})
+        stranger = {"keyId": "0000000000000000", "key": PAIRING["key"]}
+        status, answer = sealed.post("/v1/message", sealed.seal(stranger, probe_message)[0])
+        run.check("sealed/unknown-key", "a message under a key the app never paired is told to pair", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
+        body, nonce = sealed.seal(PAIRING, probe_message)
+        first, envelope = sealed.post("/v1/message", body)
+        again, _ = sealed.post("/v1/message", body)
+        stale, _ = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message, sent_at=time.time() - 300)[0])
+        run.check("sealed/replay-and-stale", "a replayed or five-minute-old message is refused", first == 200 and again == 400 and stale == 400, {"first": first, "replayed": again, "stale": stale})
+        opened = sealed.open_answer(PAIRING, nonce, envelope)
+        try:
+            sealed.open_answer(PAIRING, sealed.seal(PAIRING, probe_message)[1], envelope)
+            rebound = True
+        except Exception:
+            rebound = False
+        run.check("sealed/answer-bound", "the answer opens only for the request it answers", opened.get("ok") is True and not rebound, {"opened": opened, "opensForAnotherRequest": rebound})
 
         reply = capture("/file/range.bin", "cap-viable")
         run.check("bridge/viable", "a fetchable capture is accepted with a job id", reply.get("ok") is True and isinstance(reply.get("id"), str), {"reply": reply})
@@ -572,7 +595,7 @@ def main() -> int:
             bridge({"type": "cancel-acquisition", "payload": {"id": i}})
 
         # ---- extension worker scenarios (real background.ts, real bridge) ------
-        worker = subprocess.run(["node", str(ROOT / "e2e" / "extension.mjs"), base], capture_output=True, text=True, encoding="utf-8", timeout=240)
+        worker = subprocess.run(["node", str(ROOT / "e2e" / "extension.mjs"), base], capture_output=True, text=True, encoding="utf-8", timeout=240, env={**os.environ, "DM_PAIRING": json.dumps({"keyId": PAIRING["keyId"], "key": PAIRING["key"]})})
         try:
             report = json.loads(worker.stdout.strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError):
@@ -589,6 +612,11 @@ def main() -> int:
             elif not item.get("jobId"):
                 run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
             bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
+
+        # Forgetting pairings in Settings: the old key stops working.
+        devtools.invoke("forget_pairings")
+        status, answer = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message)[0])
+        run.check("pairing/forget", "after Forget in Settings the browser's key is refused and it must pair again", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
     finally:
         app.terminate()
         try:

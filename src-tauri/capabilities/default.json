@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Permissions for the Download Manager desktop window",
-  "windows": ["main", "add-*"],
+  "windows": ["main", "add-*", "pair-*"],
   "permissions": ["core:default", "core:window:default", "dialog:default", "notification:default"]
 }

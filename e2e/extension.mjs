@@ -15,25 +15,29 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const base = process.argv[2];
+// The pairing native.py made with the running resident.
+const PAIRING = JSON.parse(process.env.DM_PAIRING ?? 'null');
 const bundle = await build({ entryPoints: [process.env.DM_EXTENSION_ENTRY ?? path.join(root, 'extension/src/background.ts')], bundle: true, format: 'iife', platform: 'browser', write: false });
 const code = bundle.outputFiles[0].text;
 
-function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {} } = {}) {
+function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {}, paired = true, answer = null } = {}) {
+  if (paired && PAIRING && !stored['dm-pairing']) stored['dm-pairing'] = PAIRING;
   const listeners = {};
   const calls = [];
   const outbound = [];
   const on = (name) => ({ addListener: (fn) => { (listeners[name] ??= []).push(fn); } });
   const emit = (name, ...args) => (listeners[name] ?? []).map((fn) => fn(...args));
   const fetchThrough = async (url, options = {}) => {
-    if (excludedSites && url.endsWith('/v1/policy') && (options.method ?? 'GET') === 'GET') {
+    if (answer && url.includes('/v1/') && !url.includes('/v1/pair')) return answer(url, options);
+    const message = options.body && url.endsWith('/v1/message') ? await openRequest(options.body) : options.body ? JSON.parse(options.body) : undefined;
+    if (message) outbound.push(message);
+    if (excludedSites && message?.type === 'get-policy') {
       // The resident's settings with an exclusion list, without touching the
       // running resident that other scenarios share.
-      return new Response(JSON.stringify({ ok: true, policy: { interceptDownloads: true, showMediaButtons: true, excludedSites } }), { headers: { 'Content-Type': 'application/json' } });
+      return sealedAnswer(options.body, { ok: true, policy: { interceptDownloads: true, showMediaButtons: true, excludedSites, updatedAt: 0 } });
     }
-    const message = options.body ? JSON.parse(options.body) : undefined;
-    if (message) outbound.push(message);
     const response = await fetch(url, options);
-    if (loseCaptureAnswers && message?.type !== 'cancel-acquisition' && url.endsWith('/v1/capture')) {
+    if (loseCaptureAnswers && message?.type === 'capture-acquisition') {
       // The resident received and acted on the request; its answer is lost.
       await response.text();
       throw new TypeError('connection reset before the answer arrived');
@@ -53,11 +57,39 @@ function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl 
     storage: { local: { get: async (key) => (key in stored ? { [key]: stored[key] } : {}), set: async (items) => { Object.assign(stored, items); } }, session: { get: async () => ({}), set: async () => {} }, onChanged: on('storage') },
     tabs: { sendMessage: async () => undefined, query: async () => (activeTabUrl ? [{ id: 1, url: activeTabUrl }] : []) },
   };
-  const context = { URL, URLSearchParams, AbortController, setTimeout, clearTimeout, console, crypto: globalThis.crypto, fetch: fetchThrough, chrome };
+  const context = { URL, URLSearchParams, AbortController, setTimeout, clearTimeout, console, crypto: globalThis.crypto, fetch: fetchThrough, chrome, TextEncoder, TextDecoder, btoa, atob, Response };
   vm.runInNewContext(code, context);
   const message = (payload, sender) => new Promise((resolve) => { emit('message', payload, sender, resolve); });
   const determine = (item) => new Promise((resolve) => { emit('determining', item, resolve); });
   return { emit, calls, outbound, message, determine };
+}
+
+// The harness reads what the worker sends (and can answer for the resident)
+// with the same pairing key.
+const subtle = globalThis.crypto.subtle;
+const keyFor = async () => subtle.importKey('raw', Buffer.from(PAIRING.key, 'base64'), 'AES-GCM', false, ['encrypt', 'decrypt']);
+async function openRequest(body) {
+  const { iv, data } = JSON.parse(body);
+  const plain = await subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(iv, 'base64'), additionalData: new TextEncoder().encode('dm-bridge-1 request') }, await keyFor(), Buffer.from(data, 'base64'));
+  return JSON.parse(new TextDecoder().decode(plain)).message;
+}
+async function sealedAnswer(requestBody, value) {
+  const nonce = JSON.parse(requestBody).iv;
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const data = await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode('dm-bridge-1 response ' + nonce) }, await keyFor(), new TextEncoder().encode(JSON.stringify(value)));
+  return new Response(JSON.stringify({ iv: Buffer.from(iv).toString('base64'), data: Buffer.from(data).toString('base64') }), { headers: { 'Content-Type': 'application/json' } });
+}
+
+/** Ask the running resident directly, over the paired channel. */
+async function askResident(message) {
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const plain = new TextEncoder().encode(JSON.stringify({ t: Date.now(), message }));
+  const data = await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode('dm-bridge-1 request') }, await keyFor(), plain);
+  const nonce = Buffer.from(iv).toString('base64');
+  const response = await fetch('http://127.0.0.1:38217/v1/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ k: PAIRING.keyId, iv: nonce, data: Buffer.from(data).toString('base64') }) });
+  const envelope = await response.json();
+  const opened = await subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(envelope.iv, 'base64'), additionalData: new TextEncoder().encode('dm-bridge-1 response ' + nonce) }, await keyFor(), Buffer.from(envelope.data, 'base64'));
+  return JSON.parse(new TextDecoder().decode(opened));
 }
 
 const scenarios = [];
@@ -167,7 +199,7 @@ async function lateResponse(startedBeforeSwitchMs) {
   // Interception was turned off in the popup while the resident was stopped.
   const w = world({ stored: { 'dm-policy': { interceptDownloads: false, showMediaButtons: true, excludedSites: [], updatedAt: Date.now() } } }); await settle();
   await w.determine({ id: 21, url: `${base}/file/range.bin?offline-off`, finalUrl: `${base}/file/range.bin?offline-off`, filename: 'x-offline-off.bin', referrer: `${base}/page` });
-  const resident = await (await fetch('http://127.0.0.1:38217/v1/policy')).json();
+  const resident = await askResident({ type: 'get-policy' });
   check('policy/browser-change-while-stopped', 'interception turned off in the browser while the resident was stopped stays off, and the resident takes the change', w.calls.length === 0 && captures(w).length === 0 && resident.policy?.interceptDownloads === false, { calls: w.calls, residentPolicy: resident.policy });
   await w.message({ type: 'update-policy', patch: { interceptDownloads: true } }, {});
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/browser-change-while-stopped', source: m.payload.source, captureId: m.payload.captureId })));
@@ -178,6 +210,20 @@ async function lateResponse(startedBeforeSwitchMs) {
   await w.determine({ id: 22, url: `${base}/file/range.bin?manager-newer`, finalUrl: `${base}/file/range.bin?manager-newer`, filename: 'x-manager-newer.bin', referrer: `${base}/page` });
   check('policy/resident-change-newer', "an older browser-side setting gives way to the resident's newer one (control)", w.calls.map(([c]) => c).join(',') === 'pause,cancel', { calls: w.calls });
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/resident-change-newer', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
+}
+
+// --- pairing: nothing is handed to an app that is not the paired one ---------
+{
+  // Something else answers on the port: it says "ok", unsealed.
+  const w = world({ answer: async () => new Response(JSON.stringify({ ok: true, id: 'impostor-job' }), { headers: { 'Content-Type': 'application/json' } }) }); await settle();
+  await w.determine({ id: 31, url: `${base}/file/range.bin?impostor`, finalUrl: `${base}/file/range.bin?impostor`, filename: 'x-impostor.bin', referrer: `${base}/page` });
+  check('pairing/impostor-answer', "an answer that is not sealed by the paired app counts as no answer: the browser's copy resumes", w.calls.map(([c]) => c).join(',') === 'pause,resume', { calls: w.calls });
+}
+{
+  const w = world({ paired: false }); await settle();
+  await w.determine({ id: 32, url: `${base}/file/range.bin?unpaired`, finalUrl: `${base}/file/range.bin?unpaired`, filename: 'x-unpaired.bin', referrer: `${base}/page` });
+  await settle(300);
+  check('pairing/unpaired', 'an unpaired extension leaves the download untouched and sends nothing but a pairing request', w.calls.length === 0 && w.outbound.every((m) => m.request), { calls: w.calls, sent: w.outbound });
 }
 
 console.log(JSON.stringify({ scenarios, handedOver }));

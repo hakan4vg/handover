@@ -5288,6 +5288,16 @@ fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     emit_snapshot(&app, &state);
 }
 
+/// A resumed job continues from its own source and stops waiting for a
+/// renewed one.
+fn forget_reattach(state: &CoreState, ids: &[&str]) {
+    if let Ok(mut target) = state.reattach_target.lock() {
+        if target.as_deref().is_some_and(|waiting| ids.contains(&waiting)) {
+            *target = None;
+        }
+    }
+}
+
 fn pause_in_place(job: &mut DownloadJob, event: &str) -> bool {
     if !PAUSABLE_STATES.contains(&job.state.as_str()) {
         return false;
@@ -5330,6 +5340,7 @@ fn resume_all_jobs(app: &AppHandle, event: &str) {
         .ok()
         .map(|mut snapshot| plan_resume_all(&mut snapshot, event, |id| transfer_is_active(state.inner(), id)))
         .unwrap_or_default();
+    forget_reattach(state.inner(), &sources.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
     emit_snapshot(app, &state);
     for (id, source) in sources {
         let _ = spawn_transfer(app, state.inner(), id, source);
@@ -5376,6 +5387,7 @@ fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     else {
         return;
     };
+    forget_reattach(state.inner(), &[id.as_str()]);
     emit_job(&state, &id, |job| {
         if ["paused", "pending"].contains(&job.state.as_str()) {
             job.state = "downloading".into();
@@ -6323,7 +6335,10 @@ fn update_settings(
 
 #[tauri::command]
 fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
-    let exists = state
+    // Only a stopped download waits for a renewed source: a running one would
+    // keep transferring under a "waiting" state, a completed one has nothing
+    // left to fetch.
+    let stopped = state
         .snapshot
         .lock()
         .ok()
@@ -6331,10 +6346,10 @@ fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
             snapshot
                 .jobs
                 .iter()
-                .any(|job| job.id == id && job.provisional != Some(true))
+                .any(|job| job.id == id && job.provisional != Some(true) && ["paused", "pending", "failed"].contains(&job.state.as_str()))
         })
         .unwrap_or(false);
-    if exists {
+    if stopped && !transfer_is_active(state.inner(), &id) {
         if let Ok(mut target) = state.reattach_target.lock() {
             *target = Some(id.clone());
         }

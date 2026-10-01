@@ -383,8 +383,9 @@ def main() -> int:
         # burst and the socket buffers filling).
         global_mib, cap_mib = 4, 1
         devtools.invoke("update_settings", {"patch": {"bandwidthLimit": global_mib, "bandwidthUnit": "MB/s"}})
-        devtools.evaluate("""(async () => {
+        reattach = devtools.evaluate("""(async () => {
           const invoke = window.__TAURI_INTERNALS__.invoke;
+          const state = async (id) => (await invoke('get_snapshot')).jobs.find((job) => job.id === id).state;
           await invoke('resume_job', { id: 'cap-own' });
           await invoke('resume_job', { id: 'cap-none' });
           const started = performance.now();
@@ -393,7 +394,13 @@ def main() -> int:
             if (other.state !== 'downloading' && other.state !== 'connecting') break;
             await new Promise((r) => setTimeout(r, 100));
           }
+          // Reattach asked of a running and of a completed download.
+          await invoke('reattach_job', { id: 'cap-own' });
+          await invoke('reattach_job', { id: 'range' });
+          await new Promise((r) => setTimeout(r, 300));
+          const after = { running: await state('cap-own'), completed: await state('range') };
           await invoke('pause_job', { id: 'cap-own' });
+          return after;
         })()""", timeout=60)
         devtools.invoke("update_settings", {"patch": {"bandwidthLimit": None}})
         sent = list(METER)
@@ -407,6 +414,7 @@ def main() -> int:
                 rates["seconds"] = round(end - begin, 2)
         own_ok = 0 < rates.get("cap-own", 99) <= cap_mib * 1.2
         total_ok = global_mib * 0.75 <= rates.get("cap-own", 0) + rates.get("cap-none", 0) <= global_mib * 1.2
+        run.check("engine/reattach-stopped-only", "Reattach leaves a running and a completed download as they are", reattach == {"running": "downloading", "completed": "completed"}, {"after": reattach})
         run.check("engine/job-cap-under-global-limit", f"with a {global_mib} MiB/s global limit, a job capped at {cap_mib} MiB/s never exceeds its cap while the two together still use the global limit", own_ok and total_ok, {"MiBps": rates})
 
         # ---- bridge scenarios ------------------------------------------------

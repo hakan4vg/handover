@@ -6506,15 +6506,16 @@ fn bridge_host_allowed(host: &Option<String>) -> bool {
     matches!(bare.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
 }
 
-/// Browsers always attach Origin to cross-origin fetches and pages cannot
-/// suppress it, so a present non-extension Origin proves a web caller (F01).
-/// Absent Origin means a non-browser local client (fixtures, harnesses);
-/// those stay allowed behind the loopback bind.
+/// The browser extension's origin. Its ID is fixed by the public key in
+/// extension/manifest.json.
+const EXTENSION_ORIGIN: &str = "chrome-extension://joniainjojgbpnjjclallmfbdgnebgbe";
+
+/// Browsers always attach Origin to cross-origin fetches and neither pages nor
+/// other extensions can forge it, so any Origin but ours is refused (F01).
+/// Absent Origin means a non-browser local client (fixtures, harnesses); those
+/// stay allowed behind the loopback bind.
 fn bridge_origin_allowed(origin: &Option<String>) -> bool {
-    match origin.as_deref() {
-        None => true,
-        Some(origin) => origin.starts_with("chrome-extension://"),
-    }
+    origin.as_deref().is_none_or(|origin| origin == EXTENSION_ORIGIN)
 }
 
 fn bridge_caller_allowed(request: &ipc::Request) -> bool {
@@ -6523,10 +6524,7 @@ fn bridge_caller_allowed(request: &ipc::Request) -> bool {
 
 /// Validated extension origin to reflect in CORS headers, if any (F01).
 fn bridge_allow_origin(request: &ipc::Request) -> Option<String> {
-    match request.origin.as_deref() {
-        Some(origin) if origin.starts_with("chrome-extension://") => Some(origin.to_string()),
-        _ => None,
-    }
+    request.origin.as_deref().filter(|origin| *origin == EXTENSION_ORIGIN).map(str::to_string)
 }
 
 fn bridge_json_content(request: &ipc::Request) -> bool {

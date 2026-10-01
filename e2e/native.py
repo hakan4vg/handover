@@ -224,13 +224,17 @@ class Run:
         print(f"{'PASS' if ok else 'FAIL'}  {scenario}  - {guards}")
 
 
-def bridge(message: dict, timeout: float = 30) -> dict:
-    request = urllib.request.Request(f"{BRIDGE}/v1/capture", data=json.dumps(message).encode(), headers={"Content-Type": "application/json"}, method="POST")
+EXTENSION_ORIGIN = "chrome-extension://joniainjojgbpnjjclallmfbdgnebgbe"
+
+
+def bridge(message: dict, timeout: float = 30, origin: str | None = None) -> dict:
+    headers = {"Content-Type": "application/json", **({"Origin": origin} if origin else {})}
+    request = urllib.request.Request(f"{BRIDGE}/v1/capture", data=json.dumps(message).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read() or b"{}")
+            return {"_status": response.status, **json.loads(response.read() or b"{}")}
     except urllib.error.HTTPError as error:
-        return json.loads(error.read() or b"{}")
+        return {"_status": error.code, **json.loads(error.read() or b"{}")}
 
 
 def main() -> int:
@@ -437,6 +441,14 @@ def main() -> int:
 
         def job_ids_for(capture_id: str) -> list[str]:
             return [j["id"] for j in jobs().values() if j.get("name") == f"{capture_id}.bin" and j.get("provisional")]
+
+        # Only the browser extension with the pinned ID (and local non-browser
+        # clients, which send no Origin) may use the bridge.
+        probe = {"type": "cancel-acquisition", "payload": {"captureId": "origin-probe"}}
+        other = bridge(probe, origin="chrome-extension://abcdefghijklmnopabcdefghijklmnop")
+        page = bridge(probe, origin="https://example.com")
+        ours = bridge(probe, origin=EXTENSION_ORIGIN)
+        run.check("bridge/extension-origin-pinned", "another extension and a web page are refused; the extension with the pinned ID is accepted", other["_status"] == 403 and page["_status"] == 403 and ours["_status"] == 200, {"otherExtension": other, "webPage": page, "ours": ours})
 
         reply = capture("/file/range.bin", "cap-viable")
         run.check("bridge/viable", "a fetchable capture is accepted with a job id", reply.get("ok") is True and isinstance(reply.get("id"), str), {"reply": reply})

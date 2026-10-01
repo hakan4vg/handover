@@ -180,4 +180,19 @@ async function lateResponse(startedBeforeSwitchMs) {
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/resident-change-newer', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
 }
 
+// --- the in-page script must not claim names in the page's global scope -----
+{
+  // Run the built page script in a fresh realm (it may stop early on missing
+  // browser APIs; its top-level declarations are made before it runs), then
+  // compile a page script declaring each short name, as minified sites do.
+  const { readFileSync } = await import('node:fs');
+  const pageScript = readFileSync(process.env.DM_PAGE_SCRIPT ?? path.join(root, 'extension/dist/page-media.js'), 'utf8');
+  const realm = vm.createContext({});
+  try { vm.runInContext(pageScript, realm); } catch { /* browser APIs are absent here */ }
+  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
+  const names = [...letters, ...[...letters].flatMap((first) => [...letters, ...'0123456789'].map((second) => first + second))];
+  const clashes = names.filter((name) => { try { vm.runInContext(`let ${name} = 0;`, realm); return false; } catch (error) { return /already been declared/.test(String(error)); } });
+  check('page-script/no-global-names', "a site's own scripts can declare any short top-level name next to the in-page script", clashes.length === 0, { clashes: clashes.slice(0, 20), count: clashes.length });
+}
+
 console.log(JSON.stringify({ scenarios, handedOver }));

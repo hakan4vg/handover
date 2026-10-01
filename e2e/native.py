@@ -246,6 +246,7 @@ def main() -> int:
             return 2
     if not args.no_build and not args.exe:
         subprocess.run(["cargo", "build", "--manifest-path", str(ROOT / "src-tauri" / "Cargo.toml")], check=True)
+        subprocess.run(["node", str(ROOT / "node_modules" / "vite" / "bin" / "vite.js"), "build", "--config", str(ROOT / "extension" / "vite.config.ts")], check=True, cwd=ROOT)
 
     runtime = Path(tempfile.mkdtemp(prefix="dm-e2e-"))
     (runtime / "data").mkdir()

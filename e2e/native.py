@@ -57,6 +57,9 @@ counts: collections.Counter = collections.Counter()
 # server sends them, per job.
 METERED = bytes(range(256)) * (32 * MIB // 256)
 METER: list[tuple[float, str, int]] = []
+# Cookie scenarios: every request under /ck/ is logged with its Cookie header.
+SESSION = "ck-" + os.urandom(8).hex()
+COOKIE_LOG: list[tuple[float, str, str, str]] = []
 
 # Server pacing (F22): the first request for each range or segment is told
 # to come back in a second; a retry inside that second is counted as early.
@@ -137,9 +140,48 @@ class Handler(fixture.Handler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
+    def _cookie_route(self, path: str):
+        """Routes that need the browser's session cookie, like a logged-in site."""
+        header = self.headers.get("Cookie", "")
+        COOKIE_LOG.append((time.time(), path, self.headers.get("Host", ""), header))
+        jar = dict(part.strip().split("=", 1) for part in header.split(";") if "=" in part)
+        if path == "/ck/hop.bin":
+            # A redirect to another host (localhost is not 127.0.0.1).
+            return self._raw(302, b"", {"Location": f"http://localhost:{self.server.server_port}/ck/landing.bin"})
+        if path == "/ck/landing.bin":
+            return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream"})
+        if jar.get("session") != SESSION:
+            return self._raw(403, b"login required")
+        if path == "/ck/gated.bin":
+            size, seed, _ = fixture.FILES["range.bin"]
+            return self._serve_file("range.bin", seed, size, True)
+        if path == "/ck/confirm.bin":
+            # A confirmation step: the server sets a cookie and redirects back.
+            if jar.get("confirm") != "yes":
+                return self._raw(302, b"", {"Location": "/ck/confirm.bin?step=2", "Set-Cookie": "confirm=yes; Path=/ck"})
+            return self._raw(200, EXPORT_BYTES, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=confirm.csv"})
+        if path == "/ck/slow.bin":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(FALLBACK_BYTES)))
+            self.end_headers()
+            try:
+                for at in range(0, len(FALLBACK_BYTES), 64 * 1024):
+                    self.wfile.write(FALLBACK_BYTES[at:at + 64 * 1024])
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return None
+        if path.startswith("/ck/hls/"):
+            self.path = "/hls/" + self.path[len("/ck/hls/"):]
+            return fixture.Handler.do_GET(self)
+        return self._raw(404, b"missing")
+
     def do_GET(self):  # noqa: N802
         self._count("GET")
         path = self.path.split("?")[0]
+        if path.startswith("/ck/"):
+            return self._cookie_route(path)
         if path.startswith("/metered/"):
             return self._metered(path[len("/metered/"):])
         # The fixture's fragmented MP4 tracks served whole, as progressive files.
@@ -513,6 +555,72 @@ def main() -> int:
         got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
         run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
 
+        # ---- browser cookies (SPEC §16) ------------------------------------
+        now = time.time()
+
+        def cookie(name: str, value: str, **extra) -> dict:
+            return {"name": name, "value": value, "domain": "127.0.0.1", "hostOnly": True, "path": "/", "secure": False, "httpOnly": True, "sameSite": "lax", **extra}
+
+        session = cookie("session", SESSION)
+        # Loopback counts as a secure context (Chromium's rule, and the jar's),
+        # so a Secure cookie is sent here; on a plain-http public host it is not.
+        never = [
+            cookie("otherpath", "p-" + SESSION, path="/elsewhere"),
+            cookie("expired", "e-" + SESSION, expirationDate=now - 60),
+        ]
+        cross_page = f"http://localhost:{server.server_port}/page"
+
+        def take(kind: str, path: str, name: str, cookies: list, page: str | None = None, extra: dict | None = None) -> dict:
+            payload = {"source": base + path, "name": name, "pageUrl": page or base + "/page", "captureId": "cap-" + name, "requireViable": True, "cookies": cookies, **(extra or {})}
+            return bridge({"type": kind, "payload": payload}, timeout=60)
+
+        def commit_and_wait(job_id: str, name: str) -> dict:
+            devtools.invoke("commit_provisional", {"id": job_id, "input": {"name": name, "destination": str(out / name)}})
+            for _ in range(120):
+                time.sleep(0.25)
+                found = jobs().get(job_id, {})
+                if found.get("state") in ("completed", "failed"):
+                    return found
+            return jobs().get(job_id, {})
+
+        def cookies_sent(prefix: str, since: float = 0) -> list[str]:
+            return [header for at, path, _, header in COOKIE_LOG if path.startswith(prefix) and at >= since]
+
+        def leaked(headers: list[str]) -> list[str]:
+            return [name for name in ("otherpath", "expired", "strict", "laxonly") if any(f"{name}=" in header for header in headers)]
+
+        reply = take("capture-acquisition", "/ck/gated.bin", "ck-gated.bin", [session, cookie("secureonly", "s-" + SESSION, secure=True), *never, cookie("strict", "t-" + SESSION, sameSite="strict")], page=cross_page)
+        done = commit_and_wait(reply.get("id", ""), "ck-gated.bin") if reply.get("ok") else {}
+        sent = cookies_sent("/ck/gated.bin")
+        data = (out / "ck-gated.bin").read_bytes() if (out / "ck-gated.bin").is_file() else b""
+        run.check("cookies/logged-in-download", "a download that needs the browser's session completes byte-exact, every request (each range worker) carrying the session cookie", reply.get("ok") is True and done.get("state") == "completed" and data == RANGE_BYTES and sent and all(f"session={SESSION}" in header for header in sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "withSession": sum(f"session={SESSION}" in header for header in sent)})
+        run.check("cookies/scoped-like-chromium", "cookies Chromium would not send here stay behind (another path, expired, Strict from another site's page), while a Secure one goes to loopback as Chromium sends it", not leaked(sent) and all("secureonly=" in header for header in sent), {"leaked": leaked(sent), "secureOnLoopback": all("secureonly=" in header for header in sent)})
+
+        reply = take("capture-acquisition", "/ck/hop.bin", "ck-hop.bin", [session])
+        done = commit_and_wait(reply.get("id", ""), "ck-hop.bin") if reply.get("ok") else {}
+        landing = [(host, header) for _, path, host, header in COOKIE_LOG if path == "/ck/landing.bin"]
+        run.check("cookies/redirect-to-another-host", "a redirect to another host carries none of the original host's cookies", done.get("state") == "completed" and landing and all(SESSION not in header for _, header in landing), {"reply": reply, "state": done.get("state"), "landing": landing})
+
+        reply = take("capture-acquisition", "/ck/confirm.bin", "ck-confirm.csv", [session])
+        done = commit_and_wait(reply.get("id", ""), "ck-confirm.csv") if reply.get("ok") else {}
+        confirmed = [header for header in cookies_sent("/ck/confirm.bin") if "confirm=yes" in header]
+        run.check("cookies/set-by-server", "a cookie the server sets along the way (a confirmation step) is kept for that download", done.get("state") == "completed" and bool(confirmed), {"reply": reply, "state": done.get("state"), "requestsWithConfirm": len(confirmed)})
+
+        reply = take("media-capture", "/ck/hls/vod.m3u8", "ck-media.ts", [cookie("session", SESSION, sameSite="no_restriction"), cookie("laxonly", "l-" + SESSION)], page=cross_page, extra={"playerKind": "video"})
+        done = commit_and_wait(reply.get("id", ""), "ck-media.ts") if reply.get("ok") else {}
+        sent = cookies_sent("/ck/hls/")
+        run.check("cookies/media-from-another-site", "a gated HLS stream played on another site completes with its SameSite=None session on every request, and without its Lax cookie", done.get("state") == "completed" and len(sent) > 2 and all(f"session={SESSION}" in header for header in sent) and not leaked(sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "leaked": leaked(sent)})
+
+        exposed = {
+            "uiSnapshot": SESSION in json.dumps(devtools.invoke("get_snapshot")),
+            "database": any(SESSION.encode() in path.read_bytes() for path in (runtime / "data").glob("download-manager.db*")),
+            "appLog": SESSION in log_path.read_text(encoding="utf-8", errors="replace"),
+        }
+        run.check("cookies/never-exposed", "cookie values reach neither the UI, nor the database in readable form, nor the log", not any(exposed.values()), exposed)
+        with sqlite3.connect(db) as connection:
+            rows = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+        run.check("cookies/erased-when-done", "once those downloads complete, their cookies are gone from storage", rows == 0, {"credentialRows": rows})
+
         # ---- Save durability: the real Add window, driven by UI Automation ----
         uia_timeouts: list[tuple[str, ...]] = []
 
@@ -612,6 +720,39 @@ def main() -> int:
             elif not item.get("jobId"):
                 run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
             bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
+
+        # ---- cookies across a restart -------------------------------------
+        reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])
+        slow_id = reply.get("id", "")
+        devtools.invoke("commit_provisional", {"id": slow_id, "input": {"name": "ck-slow.bin", "destination": str(out / "ck-slow.bin")}})
+        devtools.invoke("pause_job", {"id": slow_id})
+        time.sleep(1)
+        with sqlite3.connect(db) as connection:
+            row = connection.execute("SELECT payload FROM credentials WHERE id = ?", (slow_id,)).fetchone()
+        stored = row[0] if row else ""
+        paused_state = jobs().get(slow_id, {}).get("state")
+        app.terminate()
+        app.wait(timeout=15)
+        log.close()
+        log = open(log_path, "a", encoding="utf-8")
+        app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        restarted = time.time()
+        for _ in range(60):
+            try:
+                devtools.invoke("resume_job", {"id": slow_id}, timeout=10)
+                break
+            except Exception:
+                time.sleep(0.5)
+        done = {}
+        for _ in range(120):
+            time.sleep(0.25)
+            done = jobs().get(slow_id, {})
+            if done.get("state") in ("completed", "failed"):
+                break
+        after = cookies_sent("/ck/slow.bin", since=restarted)
+        with sqlite3.connect(db) as connection:
+            remaining = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+        run.check("cookies/survive-restart", "a committed download's cookies are kept protected (DPAPI) on disk, carry it through an app restart, and are erased when it completes", paused_state == "paused" and stored.startswith("dpapi1:") and SESSION not in stored and done.get("state") == "completed" and bool(after) and all(f"session={SESSION}" in header for header in after) and remaining == 0, {"pausedState": paused_state, "storedProtected": stored.startswith("dpapi1:"), "storedReadable": SESSION in stored, "state": done.get("state"), "requestsAfterRestart": len(after), "credentialRowsAfter": remaining})
 
         # Forgetting pairings in Settings: the old key stops working.
         devtools.invoke("forget_pairings")

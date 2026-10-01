@@ -20,10 +20,11 @@ const PAIRING = JSON.parse(process.env.DM_PAIRING ?? 'null');
 const bundle = await build({ entryPoints: [process.env.DM_EXTENSION_ENTRY ?? path.join(root, 'extension/src/background.ts')], bundle: true, format: 'iife', platform: 'browser', write: false });
 const code = bundle.outputFiles[0].text;
 
-function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {}, paired = true, answer = null } = {}) {
+function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {}, paired = true, answer = null, browserCookies = [] } = {}) {
   if (paired && PAIRING && !stored['dm-pairing']) stored['dm-pairing'] = PAIRING;
   const listeners = {};
   const calls = [];
+  const cookieQueries = [];
   const outbound = [];
   const on = (name) => ({ addListener: (fn) => { (listeners[name] ??= []).push(fn); } });
   const emit = (name, ...args) => (listeners[name] ?? []).map((fn) => fn(...args));
@@ -55,13 +56,15 @@ function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl 
       download: async (options) => { calls.push(['browser-download', options.url]); return 99; },
     },
     storage: { local: { get: async (key) => (key in stored ? { [key]: stored[key] } : {}), set: async (items) => { Object.assign(stored, items); } }, session: { get: async () => ({}), set: async () => {} }, onChanged: on('storage') },
+    // Chromium's cookie store: answers by host, as chrome.cookies.getAll({ url }) does.
+    cookies: { getAll: async (details) => { cookieQueries.push(details); const host = new URL(details.url).hostname; return details.partitionKey ? [] : browserCookies.filter((c) => c.domain.replace(/^\./, '') === host); } },
     tabs: { sendMessage: async () => undefined, query: async () => (activeTabUrl ? [{ id: 1, url: activeTabUrl }] : []) },
   };
   const context = { URL, URLSearchParams, AbortController, setTimeout, clearTimeout, console, crypto: globalThis.crypto, fetch: fetchThrough, chrome, TextEncoder, TextDecoder, btoa, atob, Response };
   vm.runInNewContext(code, context);
   const message = (payload, sender) => new Promise((resolve) => { emit('message', payload, sender, resolve); });
   const determine = (item) => new Promise((resolve) => { emit('determining', item, resolve); });
-  return { emit, calls, outbound, message, determine };
+  return { emit, calls, outbound, message, determine, cookieQueries };
 }
 
 // The harness reads what the worker sends (and can answer for the resident)
@@ -210,6 +213,20 @@ async function lateResponse(startedBeforeSwitchMs) {
   await w.determine({ id: 22, url: `${base}/file/range.bin?manager-newer`, finalUrl: `${base}/file/range.bin?manager-newer`, filename: 'x-manager-newer.bin', referrer: `${base}/page` });
   check('policy/resident-change-newer', "an older browser-side setting gives way to the resident's newer one (control)", w.calls.map(([c]) => c).join(',') === 'pause,cancel', { calls: w.calls });
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/resident-change-newer', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
+}
+
+// --- cookies: only the download's own, never the jar --------------------------
+{
+  const browserCookies = [
+    { name: 'session', value: 'v1', domain: '127.0.0.1', hostOnly: true, path: '/', secure: false, httpOnly: true, sameSite: 'lax' },
+    { name: 'tracker', value: 'v2', domain: '.unrelated.example', hostOnly: false, path: '/', secure: true, httpOnly: false, sameSite: 'no_restriction' },
+  ];
+  const w = world({ browserCookies }); await settle();
+  await w.determine({ id: 41, url: `${base}/file/range.bin?cookies`, finalUrl: `${base}/file/range.bin?cookies`, filename: 'x-cookies.bin', referrer: `${base}/page` });
+  const sent = captures(w)[0]?.payload?.cookies ?? [];
+  const asked = w.cookieQueries.map((q) => q.url);
+  check('cookies/only-the-downloads-own', "the capture carries the cookies for the download's own URL and nothing else from the browser's jar", sent.length === 1 && sent[0].name === 'session' && asked.every((url) => url.includes('/file/range.bin?cookies')), { sent: sent.map((c) => c.name), asked });
+  handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'cookies/only-the-downloads-own', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
 }
 
 // --- pairing: nothing is handed to an app that is not the paired one ---------

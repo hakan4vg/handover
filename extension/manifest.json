@@ -5,7 +5,7 @@
   "description": "Hands browser acquisitions to the resident Download Manager application.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoIf1o8RkUvDg05kqDwaUt6b8iBQhR5jaRPOEUTmKYsPRtjRTZ4xmykoVoYKDChNHax9ivO7cQxMzKPCAc3yXHQjf1GaUZtBBqIijI0u+ZMU+25vnUVxn41NJLwNWWK3msaA4cJ+BAWD4AvRcaoUBNfwLWZMh6NCKeS92KGZg5P3EKXEbclwtgUzqbeCekqg+N9TlpYDMqWCUGYXsI+n6PSJ+KNYeSKOP3+nNtf6+J9u/UP7UWmXdRJkMN8kTmspkBufRJFA0F9S39Wn9z6uvdjgYkQREslHcgdUz29CGPWrn95P6dat71pHFbuxX7J+avivK5JNIygiUhzr/9dSVpwIDAQAB",
-  "permissions": ["storage", "downloads", "webRequest"],
+  "permissions": ["storage", "downloads", "webRequest", "cookies"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1/*"],
   "background": {
     "service_worker": "background.js",

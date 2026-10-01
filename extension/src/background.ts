@@ -4,6 +4,8 @@ import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkU
 
 const POLICY_KEY = 'dm-policy';
 const PAIRING_KEY = 'dm-pairing';
+/** The app takes at most this many cookies per capture. */
+const COOKIE_LIMIT = 150;
 const PAIRING_DECLINED_KEY = 'dm-pairing-declined';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
 
@@ -371,6 +373,28 @@ async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Pro
   }
 }
 
+/** The cookies Chromium holds for these URLs (and, for a page's own
+ *  partition, its partitioned ones): never the whole jar. The app narrows them
+ *  to what Chromium would send for each request (SameSite, path, Secure) and
+ *  keeps them only for this download. */
+async function cookiesFor(urls: string[], pageUrl?: string): Promise<Array<Record<string, unknown>>> {
+  let partitionKey: { topLevelSite: string } | undefined;
+  try {
+    if (pageUrl && isHttp(pageUrl)) partitionKey = { topLevelSite: new URL(pageUrl).origin };
+  } catch {
+    partitionKey = undefined;
+  }
+  const found = new Map<string, chrome.cookies.Cookie>();
+  for (const url of new Set(urls.filter(isHttp))) {
+    const lists = await Promise.all([
+      chrome.cookies.getAll({ url }).catch(() => []),
+      partitionKey ? chrome.cookies.getAll({ url, partitionKey }).catch(() => []) : Promise.resolve([]),
+    ]);
+    for (const cookie of lists.flat()) found.set(`${cookie.name}\t${cookie.domain}\t${cookie.path}\t${JSON.stringify(cookie.partitionKey ?? null)}`, cookie);
+  }
+  return [...found.values()].slice(0, COOKIE_LIMIT).map(({ name, value, domain, hostOnly, path, secure, httpOnly, sameSite, expirationDate }) => ({ name, value, domain, hostOnly, path, secure, httpOnly, sameSite, expirationDate }));
+}
+
 type HandOverReply = { ok?: boolean; id?: string; error?: string; handback?: boolean; unanswered?: boolean };
 
 /** Hands one capture to the resident under a fresh capture id. When no answer
@@ -379,7 +403,9 @@ type HandOverReply = { ok?: boolean; id?: string; error?: string; handback?: boo
  *  only owner. The resident honours a cancel that overtakes its create. */
 async function handOver(type: 'capture-acquisition' | 'media-capture', payload: Record<string, unknown>, timeoutMs: number): Promise<HandOverReply> {
   const captureId = crypto.randomUUID();
-  const reply = ((await sendApp({ type, payload: { ...payload, captureId } }, timeoutMs)) ?? {}) as HandOverReply;
+  const urls = [payload.source, payload.companionAudio, ...(Array.isArray(payload.candidates) ? payload.candidates : [])].filter((url): url is string => typeof url === 'string');
+  const cookies = await cookiesFor(urls, typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined);
+  const reply = ((await sendApp({ type, payload: { ...payload, captureId, ...(cookies.length ? { cookies } : {}) } }, timeoutMs)) ?? {}) as HandOverReply;
   if (reply.unanswered) void sendApp({ type: 'cancel-acquisition', payload: { captureId } });
   return reply;
 }

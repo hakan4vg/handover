@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod credentials;
 mod ipc;
 mod lifecycle;
 mod media;
@@ -153,7 +154,7 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool, paired_browsers: usize }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings>, credentials: Mutex<std::collections::HashMap<String, credentials::Credentials>> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -278,7 +279,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool, #[serde(default)] destination: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool, #[serde(default)] destination: Option<String>, #[serde(default)] cookies: Vec<credentials::CapturedCookie> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -731,7 +732,45 @@ fn save_snapshot(state: &CoreState) -> Result<(), String> {
     for (id, created, payload) in jobs {
         transaction.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", params![id, created, payload]).map_err(|error| format!("Could not persist job {id}: {error}"))?;
     }
+    // Cookies live exactly as long as an unfinished job that needs them: a
+    // completed, removed or discarded job's are erased here, in memory and on
+    // disk. A committed job's are stored (DPAPI) so it resumes after a
+    // restart; a provisional capture's stay in memory only.
+    if let Ok(mut held) = state.credentials.lock() {
+        held.retain(|id, _| snapshot.jobs.iter().any(|job| job.id == *id && job.state != "completed"));
+        transaction.execute("DELETE FROM credentials", []).map_err(|error| format!("Could not replace credentials: {error}"))?;
+        for (id, credentials) in held.iter_mut() {
+            let committed = snapshot.jobs.iter().any(|job| job.id == *id && job.provisional != Some(true));
+            if !committed || credentials.cookies.is_empty() {
+                continue;
+            }
+            let payload = serde_json::to_string(&credentials.cookies).map_err(|error| format!("Could not serialize credentials: {error}"))?;
+            transaction.execute("INSERT INTO credentials (id, payload) VALUES (?1, ?2)", params![id, protect::protect_field(&payload)]).map_err(|error| format!("Could not persist credentials: {error}"))?;
+        }
+    }
     transaction.commit().map_err(|error| format!("Could not commit snapshot: {error}"))
+}
+
+/// The cookies Chromium would send for this capture become the job's.
+fn set_credentials(state: &CoreState, id: &str, input: &ProvisionalInput) {
+    let navigation = input.media != Some(true);
+    let cookies = credentials::admit(input.cookies.clone(), input.referrer.as_deref(), navigation);
+    if let Ok(mut held) = state.credentials.lock() {
+        held.insert(id.to_string(), credentials::Credentials::new(cookies));
+    }
+}
+
+fn load_credentials(database: &Connection) -> std::collections::HashMap<String, credentials::Credentials> {
+    let mut held = std::collections::HashMap::new();
+    let Ok(mut statement) = database.prepare("SELECT id, payload FROM credentials") else { return held };
+    let Ok(rows) = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) else { return held };
+    for (id, payload) in rows.flatten() {
+        // Protected for another user or machine: the job runs without them
+        // and Reattach brings fresh ones.
+        let Some(cookies) = protect::unprotect_field(&payload).ok().and_then(|plain| serde_json::from_str::<Vec<credentials::CapturedCookie>>(&plain).ok()) else { continue };
+        held.insert(id, credentials::Credentials::new(cookies));
+    }
+    held
 }
 
 fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
@@ -1490,8 +1529,19 @@ fn format_bytes(value: Option<u64>) -> String {
     format!("{value} B")
 }
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30)).user_agent("Download Manager/0.1").build().unwrap_or_else(|_| reqwest::Client::new())
+/// The HTTP client for one job's requests. Every job has its own cookie jar:
+/// the browser cookies captured for it, plus whatever its servers set along
+/// the way, picked per request and per redirect hop (credentials.rs).
+fn job_client(app: &AppHandle, id: &str) -> reqwest::Client {
+    let jar = app.state::<CoreState>().credentials.lock().ok().map(|mut jobs| {
+        jobs.entry(id.to_string()).or_insert_with(|| credentials::Credentials::new(Vec::new())).jar.clone()
+    });
+    let builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30)).user_agent("Download Manager/0.1");
+    let builder = match jar {
+        Some(jar) => builder.cookie_provider(jar),
+        None => builder,
+    };
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 // SPEC §5.1 request-context replay under §16 scoping: the capture page is
@@ -2813,7 +2863,7 @@ async fn acquire_ranges(
     let total_ranges = ranges.len() as u64;
     // One client per job: connection-pool and TLS-session reuse across every
     // chunk instead of a fresh handshake per worker (F08).
-    let shared_client = std::sync::Arc::new(http_client());
+    let shared_client = std::sync::Arc::new(job_client(&app, &id));
     let mut transfers = futures_util::stream::iter(ranges.into_iter().map(|(start, end)| {
         let client = shared_client.clone();
         let source = source.clone();
@@ -2957,7 +3007,7 @@ async fn acquire_ranges(
             );
         });
         emit_snapshot(&app, &state);
-        let fallback_client = http_client();
+        let fallback_client = job_client(&app, &id);
         let mut fallback_error = None;
         // Give a rate-limiting server a short quiet period before switching to
         // one connection. The range probe and the failed workers have already
@@ -3046,7 +3096,7 @@ async fn acquire_ranges(
             // verified: it must prove it is still that object and still a
             // file before it may replace them. It streams into a staging file,
             // so a rejected fallback leaves the verified ranges on disk.
-            let stream_client = http_client();
+            let stream_client = job_client(&app, &id);
             let rejected = |reason: String| format!("{initial_error}; one-stream fallback rejected: {reason}");
             let response = match acquisition_request(&stream_client, &app, &id, &source)
                 .send()
@@ -3342,7 +3392,7 @@ async fn acquire_manifest(
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
-    let client = http_client();
+    let client = job_client(&app, &id);
     let mut manifest_source = source;
     let mut manifest_body = body;
     let mut hls_track_sources = None;
@@ -4053,7 +4103,7 @@ async fn acquire_dual_track(
         return Ok(());
     }
     let state = app.state::<CoreState>();
-    let client = http_client();
+    let client = job_client(&app, &id);
     let (temp_path, replace_existing) = state
         .snapshot
         .lock()
@@ -4253,7 +4303,7 @@ async fn acquire_dual_track(
 
 async fn acquire_once(app: AppHandle, id: String, source: String, generation: u64) -> bool {
     let state = app.state::<CoreState>();
-    let client = http_client();
+    let client = job_client(&app, &id);
     let selected_segments = state
         .snapshot
         .lock()
@@ -5021,7 +5071,7 @@ async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> Result
     let (referrer, _, user_agent) = job_context(app, id);
     let mut chosen = source.clone();
     if !url_implies_media(&source) || fragment_source {
-        let client = http_client();
+        let client = job_client(app, id);
         let pool = std::iter::once(source.clone()).chain(candidates.iter().cloned());
         for url in pool.take(MAX_SOURCE_PROBES) {
             // A fragment is never a verdict, only a hint that something else
@@ -5654,6 +5704,7 @@ fn start_provisional(
                     })
                     .unwrap_or(false);
             if accepted {
+                set_credentials(state, &target_id, &input);
                 emit_snapshot(&app, state);
                 if let (Some(sender), Ok(mut pending)) = (viability.take(), state.viability.lock()) {
                     pending.insert(target_id.clone(), sender);
@@ -5669,6 +5720,7 @@ fn start_provisional(
         }
     }
     let id = format!("provisional-{}", Uuid::new_v4());
+    set_credentials(state, &id, &input);
     // A link's download attribute or the URL only suggest a name; the
     // server's own filename outranks both, as it does in Chromium.
     // Manual Add may name the destination up front; it is the user's choice
@@ -6487,7 +6539,13 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         post_body,
         user_agent,
         name_is_hint: payload.get("nameIsHint").and_then(Value::as_bool).unwrap_or(false),
-        destination: None
+        destination: None,
+        // One malformed entry drops that cookie, not the rest.
+        cookies: payload
+            .get("cookies")
+            .and_then(Value::as_array)
+            .map(|cookies| cookies.iter().take(credentials::MAX_COOKIES).filter_map(|cookie| serde_json::from_value(cookie.clone()).ok()).collect())
+            .unwrap_or_default()
     })
 }
 
@@ -7109,8 +7167,9 @@ fn main() {
             main_window.build().map_err(|error| error.to_string())?;
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             restrict_file(&root.join("download-manager.db"));
-            database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT); CREATE TABLE IF NOT EXISTS pairings (key_id TEXT PRIMARY KEY, secret TEXT NOT NULL, created_at TEXT NOT NULL);").map_err(|error| error.to_string())?;
+            database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT); CREATE TABLE IF NOT EXISTS pairings (key_id TEXT PRIMARY KEY, secret TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
             let paired_keys = load_pairings(&database);
+            let stored_credentials = load_credentials(&database);
             let stored_settings: Result<String, _> = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0));
             let settings = stored_settings.as_deref().map(settings_from_stored).unwrap_or_else(|_| default_settings());
             let show_manager_at_startup = settings.show_manager_at_sign_in;
@@ -7120,7 +7179,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && TRANSFER_STATES.contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());

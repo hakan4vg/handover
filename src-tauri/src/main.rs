@@ -2129,73 +2129,67 @@ fn spawn_transfer(app: &AppHandle, state: &CoreState, id: String, source: String
 // SPEC §8.6: a per-job cap constrains the job inside the global limit — the
 // binding rate is the minimum of the two. Non-positive values are ignored so
 // a zero can never wedge a transfer.
-fn effective_rate(global_bps: Option<f64>, job_bps: Option<f64>) -> Option<f64> {
-    match (global_bps.filter(|rate| *rate > 0.0), job_bps.filter(|rate| *rate > 0.0)) {
-        (Some(global), Some(job)) => Some(global.min(job)),
-        (Some(global), None) => Some(global),
-        (None, Some(job)) => Some(job),
-        (None, None) => None,
-    }
-}
-
-fn bucket_wait(bucket: &mut BandwidthBucket, rate: f64, capacity: f64, remaining: &mut f64) -> Option<f64> {
+/// Add the tokens accrued since the last refill, holding at most a second's
+/// worth (and never less than 64 KiB, so one network chunk always fits).
+fn refill(bucket: &mut BandwidthBucket, rate: f64) {
     let now = std::time::Instant::now();
-    bucket.tokens = (bucket.tokens + now.duration_since(bucket.updated).as_secs_f64().max(0.0) * rate).min(capacity);
+    bucket.tokens = (bucket.tokens + now.duration_since(bucket.updated).as_secs_f64() * rate).min(rate.max(64.0 * 1024.0));
     bucket.updated = now;
-    let take = bucket.tokens.min(*remaining);
-    bucket.tokens -= take;
-    *remaining -= take;
-    if *remaining <= 0.0 { None } else { Some(*remaining / rate) }
 }
 
 async fn throttle(app: &AppHandle, id: &str, bytes: usize, generation: u64) -> bool {
-    // Shared-bucket pacing with ~100ms responsiveness: take available tokens,
-    // sleep only until enough accrue, and re-check job state every slice so
+    // Token-bucket pacing with ~100ms responsiveness: take what is available,
+    // sleep only until more accrues, and re-check job state every slice so
     // Pause/Cancel take effect promptly even mid-chunk. Returns false when
     // the job left "downloading" (caller must stop).
     //
-    // The global bucket paces the aggregate across all jobs. A job with its
-    // own cap draws from the global bucket at the binding (minimum) rate when
-    // a global limit exists, so both constraints hold; with no global limit
-    // it draws from a per-job bucket shared by that job's workers, so the cap
-    // is not multiplied by the connection count.
+    // The global limit is one bucket every job draws from, refilled at the
+    // global rate. A job's own cap is a second bucket shared by that job's
+    // workers, refilled at the job's rate. Bytes are taken from both, so each
+    // limit holds on its own.
     let (global, job) = app.state::<CoreState>().snapshot.lock().ok().map(|snapshot| {
         let global = snapshot.settings.bandwidth_limit.map(|value| {
             let multiplier = match snapshot.settings.bandwidth_unit.as_str() { "GB/s" => 1024f64 * 1024f64 * 1024f64, "MB/s" => 1024f64 * 1024f64, _ => 1024f64 };
             value as f64 * multiplier
         });
         let job = snapshot.jobs.iter().find(|item| item.id == id).and_then(|item| item.bandwidth_limit.map(|value| value as f64));
-        (global, job)
+        (global.filter(|rate| *rate > 0.0), job.filter(|rate| *rate > 0.0))
     }).unwrap_or((None, None));
-    let Some(rate) = effective_rate(global, job) else {
-        // No binding rate: drop any stale per-job bucket (cap was cleared).
+    if job.is_none() {
+        // The cap was cleared: drop its bucket.
         if let Ok(mut buckets) = app.state::<CoreState>().job_bandwidth.lock() { buckets.remove(id); }
-        return transfer_can_continue(app, id, generation);
-    };
-    let use_global = global.is_some_and(|limit| limit > 0.0);
-    if !use_global {
-        if let Ok(mut buckets) = app.state::<CoreState>().job_bandwidth.lock() {
-            buckets.entry(id.to_string()).or_insert(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() });
+        if global.is_none() {
+            return transfer_can_continue(app, id, generation);
         }
     }
-    let capacity = rate.max(64.0 * 1024.0);
     let mut remaining = bytes as f64;
     while remaining > 0.0 {
         if !transfer_can_continue(app, id, generation) { return false; }
         let wait = {
             let state = app.state::<CoreState>();
-            if use_global {
-                let Ok(mut bucket) = state.bandwidth.lock() else { return false; };
-                bucket_wait(&mut bucket, rate, capacity, &mut remaining)
-            } else {
-                let Ok(mut buckets) = state.job_bandwidth.lock() else { return false; };
-                let Some(bucket) = buckets.get_mut(id) else { return false; };
-                bucket_wait(bucket, rate, capacity, &mut remaining)
+            let Ok(mut shared) = state.bandwidth.lock() else { return false; };
+            let Ok(mut buckets) = state.job_bandwidth.lock() else { return false; };
+            let mut limits: Vec<(&mut BandwidthBucket, f64)> = Vec::with_capacity(2);
+            if let Some(rate) = global {
+                limits.push((&mut *shared, rate));
             }
+            if let Some(rate) = job {
+                let own = buckets.entry(id.to_string()).or_insert(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() });
+                limits.push((own, rate));
+            }
+            let mut take = remaining;
+            for (bucket, rate) in limits.iter_mut() {
+                refill(bucket, *rate);
+                take = take.min(bucket.tokens);
+            }
+            remaining -= take;
+            limits.iter_mut().fold(0.0f64, |wait, (bucket, rate)| {
+                bucket.tokens -= take;
+                wait.max((remaining - bucket.tokens).max(0.0) / *rate)
+            })
         };
-        match wait {
-            None => { return transfer_can_continue(app, id, generation); }
-            Some(wait) => sleep(Duration::from_secs_f64(wait.min(0.1))).await,
+        if remaining > 0.0 {
+            sleep(Duration::from_secs_f64(wait.clamp(0.001, 0.1))).await;
         }
     }
     transfer_can_continue(app, id, generation)

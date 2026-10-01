@@ -33,6 +33,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import devtools
+
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "e2e" / "results"
 BRIDGE = "http://127.0.0.1:38217"
@@ -49,6 +51,10 @@ LOGIN_PAGE = b"<!DOCTYPE html><html>login required</html>"
 EXPORT_BYTES = b"id,account\n1,requested-export\n"
 NAMED_BYTES = b"named by the server\n" * 64
 counts: collections.Counter = collections.Counter()
+# Bandwidth scenario: a large range-capable file whose bytes are timed as the
+# server sends them, per job.
+METERED = bytes(range(256)) * (32 * MIB // 256)
+METER: list[tuple[float, str, int]] = []
 
 # Server pacing (F22): the first request for each range or segment is told
 # to come back in a second; a retry inside that second is counted as early.
@@ -109,9 +115,31 @@ class Handler(fixture.Handler):
         body = stream_body + b" " * (size - len(stream_body)) if len(stream_body) < size else stream_body
         return self._raw(200, body, {"Content-Type": stream_type})
 
+    def _metered(self, tag: str) -> None:
+        start, end = 0, len(METERED) - 1
+        rng = self.headers.get("Range", "")
+        if rng.startswith("bytes="):
+            first, _, last = rng[6:].partition("-")
+            start, end = int(first), min(int(last) if last else end, end)
+        self.send_response(206 if rng else 200)
+        self.send_header("Accept-Ranges", "bytes")
+        if rng:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(METERED)}")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        try:
+            for at in range(start, end + 1, 64 * 1024):
+                piece = METERED[at:min(at + 64 * 1024, end + 1)]
+                self.wfile.write(piece)
+                METER.append((time.time(), tag, len(piece)))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
     def do_GET(self):  # noqa: N802
         self._count("GET")
         path = self.path.split("?")[0]
+        if path.startswith("/metered/"):
+            return self._metered(path[len("/metered/"):])
         if path == "/fallback-html.bin":
             return self._fallback(LOGIN_PAGE, "text/html")
         if path == "/fallback-good.bin":
@@ -195,20 +223,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the isolated runtime folder")
+    parser.add_argument("--exe", help="resident build to run (default: target/debug)")
     args = parser.parse_args()
 
     with socket.socket() as probe:
         if probe.connect_ex(("127.0.0.1", 38217)) == 0:
             print("Port 38217 is in use: quit the running Download Manager first.")
             return 2
-    if not args.no_build:
+    if not args.no_build and not args.exe:
         subprocess.run(["cargo", "build", "--manifest-path", str(ROOT / "src-tauri" / "Cargo.toml")], check=True)
 
     runtime = Path(tempfile.mkdtemp(prefix="dm-e2e-"))
     (runtime / "data").mkdir()
     out = runtime / "out"
     exe = runtime / "download-manager.exe"
-    shutil.copy2(ROOT / "src-tauri" / "target" / "debug" / "download-manager.exe", exe)
+    shutil.copy2(Path(args.exe) if args.exe else ROOT / "src-tauri" / "target" / "debug" / "download-manager.exe", exe)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -247,12 +276,16 @@ def main() -> int:
         job = dict(id=name, name=f"{name}.bin", source=base + path, domain="127.0.0.1", state="connecting", progress=0, downloaded=0, total=None, speed=0, eta=None, connections=0, maxConnections=4, mode="single-stream", media=False, destination=str(out / f"{name}.bin"), tempPath=str(runtime / "data" / "tmp" / f"{name}.part"), resumable=False, mime=None, error=None, created="2026-09-29T19:00:00Z", started=None, completed=None, provisional=False, segments=None, referrer=base + "/page", events=[])
         job.update(extra)
         con.execute("INSERT INTO jobs VALUES (?, ?, ?)", (name, job["created"], json.dumps(job)))
+    # Started later, under a global limit (bandwidth scenario).
+    for name, cap in (("cap-own", MIB), ("cap-none", None)):
+        job = dict(id=name, name=f"{name}.bin", source=f"{base}/metered/{name}", domain="127.0.0.1", state="paused", progress=0, downloaded=0, total=None, speed=0, eta=None, connections=0, maxConnections=4, mode="single-stream", media=False, destination=str(out / f"{name}.bin"), tempPath=str(runtime / "data" / "tmp" / f"{name}.part"), resumable=False, mime=None, error=None, created="2026-09-29T19:00:00Z", started=None, completed=None, provisional=False, segments=None, referrer=base + "/page", events=[], bandwidthLimit=cap)
+        con.execute("INSERT INTO jobs VALUES (?, ?, ?)", (name, job["created"], json.dumps(job)))
     con.commit()
     con.close()
 
     log_path = runtime / "app.log"
     log = open(log_path, "w", encoding="utf-8")
-    app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     run = Run()
 
     def jobs() -> dict[str, dict]:
@@ -325,6 +358,38 @@ def main() -> int:
         run.check("engine/hls-unresolvable-fragment", "a fragment line that cannot be addressed fails the job instead of leaving a silent gap", j["state"] == "failed" and "cannot be resolved" in (j["error"] or ""), evidence("hls-hole"))
         j = job("hls-two-maps")
         run.check("engine/hls-map-switch", "a playlist that switches initialization maps is refused, not assembled under the first map", j["state"] == "failed" and "initialization map" in (j["error"] or ""), evidence("hls-two-maps"))
+
+        # ---- bandwidth: a job's own cap under a global limit -----------------
+        # Both jobs run together. Rates are measured from the bytes the server
+        # sent while both ran, skipping the first two seconds (a full bucket's
+        # burst and the socket buffers filling).
+        global_mib, cap_mib = 4, 1
+        devtools.invoke("update_settings", {"patch": {"bandwidthLimit": global_mib, "bandwidthUnit": "MB/s"}})
+        devtools.evaluate("""(async () => {
+          const invoke = window.__TAURI_INTERNALS__.invoke;
+          await invoke('resume_job', { id: 'cap-own' });
+          await invoke('resume_job', { id: 'cap-none' });
+          const started = performance.now();
+          while (performance.now() - started < 40000) {
+            const other = (await invoke('get_snapshot')).jobs.find((job) => job.id === 'cap-none');
+            if (other.state !== 'downloading' && other.state !== 'connecting') break;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          await invoke('pause_job', { id: 'cap-own' });
+        })()""", timeout=60)
+        devtools.invoke("update_settings", {"patch": {"bandwidthLimit": None}})
+        sent = list(METER)
+        rates: dict = {}
+        if sent:
+            begin = sent[0][0] + 2.0
+            end = max((at for at, tag, _ in sent if tag == "cap-none"), default=begin)
+            if end - begin >= 2.0:
+                for tag in ("cap-own", "cap-none"):
+                    rates[tag] = round(sum(n for at, t, n in sent if t == tag and begin <= at <= end) / (end - begin) / MIB, 2)
+                rates["seconds"] = round(end - begin, 2)
+        own_ok = 0 < rates.get("cap-own", 99) <= cap_mib * 1.2
+        total_ok = global_mib * 0.75 <= rates.get("cap-own", 0) + rates.get("cap-none", 0) <= global_mib * 1.2
+        run.check("engine/job-cap-under-global-limit", f"with a {global_mib} MiB/s global limit, a job capped at {cap_mib} MiB/s never exceeds its cap while the two together still use the global limit", own_ok and total_ok, {"MiBps": rates})
 
         # ---- bridge scenarios ------------------------------------------------
         def capture(path: str, capture_id: str, viable: bool = True) -> dict:

@@ -1372,6 +1372,8 @@ struct ParsedTrack {
     trex: Vec<u8>,
     track_id: u32,
     timescale: u32,
+    /// The track's handler: `vide`, `soun`, ...
+    handler: [u8; 4],
     fragments: Vec<ParsedFragment>,
     /// First emsg/prft box between fragments (the Matroska audio path refuses these).
     auxiliary_box: Option<[u8; 4]>
@@ -1812,6 +1814,10 @@ fn parse_fragmented_track(path: &Path, track_index: usize) -> Result<ParsedTrack
     let mdia_children = child_boxes(data, mdia, &format!("{context} mdia"))?;
     let mdhd = exactly_one_box(&mdia_children, *b"mdhd", &format!("{context} mdia"))?;
     let timescale = mdhd_timescale(data, mdhd, &format!("{context} mdhd"))?;
+    let hdlr = exactly_one_box(&mdia_children, *b"hdlr", &format!("{context} mdia"))?;
+    let (_, _, hdlr_payload) = full_box_header(data, hdlr, &format!("{context} hdlr"))?;
+    // version and flags, pre_defined, then handler_type
+    let handler = read_u32_at(data, hdlr_payload + 8, &format!("{context} hdlr"))?.to_be_bytes();
     let mvex = matching_boxes(&moov_children, *b"mvex");
     if mvex.len() != 1 {
         return Err(format!("{context} is not a fragmented MP4 initialization"));
@@ -1904,6 +1910,7 @@ fn parse_fragmented_track(path: &Path, track_index: usize) -> Result<ParsedTrack
         trex: trex_bytes,
         track_id,
         timescale,
+        handler,
         fragments,
         auxiliary_box
     })
@@ -2311,6 +2318,11 @@ fn mux_fmp4_tracks(inputs: &[PathBuf], output: &mut MuxOutput) -> Result<(), Str
     let mut tracks = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.iter().enumerate() {
         tracks.push(parse_fragmented_track(input, index)?);
+    }
+    // What a track holds is read from the track, not from the server's
+    // Content-Type: audio-only MP4 is commonly served as video/mp4.
+    if tracks.iter().skip(1).any(|track| &track.handler == b"vide") {
+        return Err("the companion source holds video, not audio".into());
     }
     let initialization = build_muxed_initialization(&mut tracks)?;
     let mut references = Vec::new();

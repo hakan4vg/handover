@@ -613,7 +613,7 @@ function ensureButton(): HTMLButtonElement {
     buttonStyle = existing instanceof HTMLStyleElement ? existing : document.createElement('style');
     buttonStyle.id = BUTTON_STYLE_ID;
     buttonStyle.textContent = `
-#${BUTTON_ID}{all:initial;box-sizing:border-box;position:fixed;z-index:2147483647;display:inline-flex;align-items:center;justify-content:center;height:26px;min-width:26px;padding:5px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:rgba(20,24,30,.32);color:#fff;font:500 11px/1.2 system-ui,sans-serif;cursor:pointer;opacity:.38;backdrop-filter:blur(4px);transition:opacity .16s,background .16s;overflow:hidden}
+#${BUTTON_ID}{all:initial;box-sizing:border-box;position:fixed;z-index:2147483647;display:inline-flex;align-items:center;justify-content:center;height:26px;min-width:26px;padding:5px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:rgba(20,24,30,.55);color:#fff;font:500 11px/1.2 system-ui,sans-serif;cursor:pointer;opacity:.8;backdrop-filter:blur(4px);transition:opacity .16s,background .16s;overflow:hidden}
 #${BUTTON_ID} svg{display:block;flex:0 0 14px;width:14px;height:14px;pointer-events:none}
 #${BUTTON_ID}::after{content:attr(data-label);display:block;max-width:0;margin-left:0;opacity:0;white-space:nowrap;overflow:hidden;transition:max-width .16s,margin-left .16s,opacity .16s}
 #${BUTTON_ID}:hover,#${BUTTON_ID}:focus-visible{opacity:1;background:rgba(20,24,30,.82)}

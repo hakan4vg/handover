@@ -145,6 +145,9 @@ class Handler(fixture.Handler):
             return self._raw(200, b"".join(fixture.media_file(f) for f in ("v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s")), {"Content-Type": "video/mp4"})
         if path == "/progressive/audio.mp4":
             return self._raw(200, fixture.media_file("a-init.mp4") + fixture.media_file("a-0.m4s"), {"Content-Type": "audio/mp4"})
+        if path == "/progressive/audio-labelled-video.mp4":
+            # Audio-only MP4 served as video/mp4, as v.redd.it serves its audio.
+            return self._raw(200, fixture.media_file("a-init.mp4") + fixture.media_file("a-0.m4s"), {"Content-Type": "video/mp4"})
         if path == "/fallback-html.bin":
             return self._fallback(LOGIN_PAGE, "text/html")
         if path == "/fallback-good.bin":
@@ -280,6 +283,8 @@ def main() -> int:
         "mpd-drm": ("/drm.mpd", {"media": True, "playerKind": "video"}),
         "hls-vod": ("/hls/vod.m3u8", {"media": True, "playerKind": "video"}),
         "dual": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/audio.mp4"}),
+        "dual-labelled": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/audio-labelled-video.mp4"}),
+        "dual-two-videos": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/video.mp4?as-companion"}),
         "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
         "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
     }
@@ -386,6 +391,11 @@ def main() -> int:
           return label?.parentElement?.textContent ?? null;
         })()""")
         run.check("engine/dual-track", "separate video and audio streams complete into one file, are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown))
+
+        j = job("dual-labelled")
+        run.check("engine/dual-track-audio-labelled-video", "an audio track served as video/mp4 is still the audio: the two tracks complete into one file", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp", evidence("dual-labelled"))
+        j = job("dual-two-videos")
+        run.check("engine/dual-track-two-videos", "a companion that holds video, not audio, fails the job with that reason instead of muxing two pictures", j["state"] == "failed" and "holds video, not audio" in (j["error"] or ""), evidence("dual-two-videos"))
 
         # ---- bandwidth: a job's own cap under a global limit -----------------
         # Both jobs run together. Rates are measured from the bytes the server

@@ -251,4 +251,20 @@ const filmBlob = 'blob:http://127.0.0.1/film', previewBlob = 'blob:http://127.0.
   handedOver.push(...sent.map((p) => ({ scenario: 'media/single-presentation', source: p.source, captureId: p.captureId, jobId: reply.id })));
 }
 
+{
+  // The player is noticed late (it sits in a shadow root, or is only noticed
+  // on hover): the page loaded its manifest seconds before the extension saw
+  // the player's source. Its segments keep coming while it plays.
+  const w = world(); await settle();
+  const start = Date.now();
+  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), start - 8_000, 'application/vnd.apple.mpegurl');
+  fetched(w, vimeo(...FILM, 'playlist/av/793d529c/avf/230c5f2f/media.m3u8'), start - 7_500, 'application/vnd.apple.mpegurl');
+  await playerState(w, 'film', filmBlob, true);
+  for (let n = 0; n < 3; n += 1) fetched(w, vimeo(...FILM, `range/prot/cmFuZ2U9${n}MC02OTU/avf/230c5f2f-a2f4-47e4-826f-c382d1e14f5b.mp4`) + `?range=${n}`, Date.now() + n, 'video/mp4');
+  const reply = await captureFor(w, 'film', filmBlob);
+  const sent = w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
+  check('media/noticed-late', "a player noticed seconds after its manifest loaded still captures that manifest, not the segments it is fetching", sent.length === 1 && sent[0].source.includes(FILM[0]) && sent[0].source.endsWith('playlist.m3u8'), { reply: { ok: reply.ok, error: reply.error, reason: reply.reason }, sent: sent.map((p) => p.source.slice(-60)) });
+  handedOver.push(...sent.map((p) => ({ scenario: 'media/noticed-late', source: p.source, captureId: p.captureId, jobId: reply.id })));
+}
+
 console.log(JSON.stringify({ scenarios, handedOver }));

@@ -135,6 +135,9 @@ struct AppSettings {
     default_folder: String,
     #[serde(default = "default_collision_behavior")]
     collision_behavior: String,
+    /// Where partial files live. None: next to the file they become.
+    #[serde(default)]
+    temp_folder: Option<String>,
     intercept_downloads: bool,
     show_media_buttons: bool,
     excluded_sites: Vec<String>,
@@ -383,8 +386,29 @@ fn app_data_root() -> PathBuf {
 /// database and the WebView2 profile, so moving or renaming the product folder
 /// moves all of its state together. It is deliberately not a setting: a portable
 /// product must not scatter parts of a download into the user profile.
+/// The app's own temp folder. New downloads no longer use it (see
+/// `temp_path_for`); jobs created before keep their parts here.
 fn temp_root() -> PathBuf {
     app_data_root().join("tmp")
+}
+
+/// Where a job's partial file lives: the temp folder the user chose, else
+/// next to the file it becomes, so finishing is a rename on the same volume
+/// and never a copy. Named after the file and the job: it reads as the
+/// download it is and never collides with the finished file.
+fn temp_path_for(settings: &AppSettings, destination: &str, id: &str) -> String {
+    let destination = Path::new(destination);
+    let folder = settings
+        .temp_folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|folder| !folder.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| destination.parent().filter(|parent| parent.is_absolute()).map(Path::to_path_buf))
+        .unwrap_or_else(temp_root);
+    let stem = destination.file_name().and_then(|name| name.to_str()).unwrap_or("download").chars().take(160).collect::<String>();
+    let tag = id.rsplit('-').next().filter(|tag| !tag.is_empty()).unwrap_or(id);
+    folder.join(format!("{stem}.{tag}.part")).to_string_lossy().into_owned()
 }
 
 fn default_settings() -> AppSettings {
@@ -396,6 +420,7 @@ fn default_settings() -> AppSettings {
         close_behavior: "tray".into(),
         default_folder: default_folder.to_string_lossy().into_owned(),
         collision_behavior: default_collision_behavior(),
+        temp_folder: None,
         intercept_downloads: true,
         show_media_buttons: true,
         excluded_sites: vec![],
@@ -494,6 +519,7 @@ fn valid_setting_value(key: &str, value: &Value) -> bool {
         "maxRetries" => value.as_u64().is_some_and(|count| count <= 20),
         "theme" => matches!(value.as_str(), Some("system" | "light" | "dark")),
         "density" => matches!(value.as_str(), Some("comfortable" | "compact")),
+        "tempFolder" => value.is_null() || value.as_str().is_some_and(|folder| Path::new(folder.trim()).is_absolute()),
         _ => true,
     }
 }
@@ -501,7 +527,10 @@ fn valid_setting_value(key: &str, value: &Value) -> bool {
 fn apply_settings_patch(current: &AppSettings, patch: &Value) -> AppSettings {
     let Value::Object(entries) = patch else { return current.clone(); };
     let mut merged = serde_json::to_value(current).unwrap_or(Value::Null);
+    let unset = Value::Null;
     for (key, value) in entries {
+        // A cleared temp folder field means "next to the file", not a path.
+        let value = if key == "tempFolder" && value.as_str().is_some_and(|text| text.trim().is_empty()) { &unset } else { value };
         if !valid_setting_value(key, value) { continue; }
         if key == "defaultFolder" && value.as_str().is_some_and(|text| text.trim().is_empty()) { continue; }
         let previous = if let Value::Object(ref mut base) = merged { base.insert(key.clone(), value.clone()) } else { break; };
@@ -564,7 +593,6 @@ fn sweep_temp_root(temp_root: &Path, jobs: &[DownloadJob]) {
     }
 }
 
-#[cfg(windows)]
 fn copy_directory(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
@@ -579,10 +607,13 @@ fn copy_directory(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
+/// Move one artifact: a rename on the same volume, else copy then delete.
 fn relocate_temp_artifact(from: &Path, to: &Path) -> bool {
-    if from == to || !from.exists() || to.exists() {
+    if from == to || !from.exists() {
         return true;
+    }
+    if to.exists() {
+        return false;
     }
     if let Some(parent) = to.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -595,55 +626,56 @@ fn relocate_temp_artifact(from: &Path, to: &Path) -> bool {
             let _ = std::fs::remove_dir_all(from);
             return true;
         }
+        let _ = std::fs::remove_dir_all(to);
     } else if std::fs::copy(from, to).is_ok() {
         let _ = std::fs::remove_file(from);
         return true;
     }
+    let _ = std::fs::remove_file(to);
     false
 }
 
-#[cfg(windows)]
-fn relocate_job_temp_artifacts(job: &mut DownloadJob, temp_folder: &Path) {
-    let old_path = PathBuf::from(&job.temp_path);
-    let new_path = temp_folder.join(format!("{}.part", job.id));
+/// Move a job's partial file and everything named after it (`.segments`,
+/// `.track-NN`, `.mux.*`) to `new_path`. Only for a job with no transfer
+/// running. False when the partial file itself could not be moved: the job
+/// then keeps its old path.
+fn move_temp_artifacts(old_path: &Path, new_path: &Path) -> bool {
     if old_path == new_path {
-        return;
+        return true;
     }
-    if relocate_temp_artifact(&old_path, &new_path) {
-        relocate_temp_artifact(
-            &PathBuf::from(format!("{}.segments", old_path.display())),
-            &PathBuf::from(format!("{}.segments", new_path.display()))
-        );
-        if let (Some(old_parent), Some(old_name), Some(new_parent), Some(new_name)) = (
-            old_path.parent(),
-            old_path.file_name(),
-            new_path.parent(),
-            new_path.file_name()
-        ) {
-            let prefix = format!("{}.", old_name.to_string_lossy());
-            if let Ok(entries) = std::fs::read_dir(old_parent) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    let Some(suffix) = name.strip_prefix(&prefix) else {
-                        continue;
-                    };
-                    relocate_temp_artifact(
-                        &entry.path(),
-                        &new_parent.join(format!("{}.{}", new_name.to_string_lossy(), suffix))
-                    );
-                }
+    if !relocate_temp_artifact(old_path, new_path) {
+        return false;
+    }
+    if let (Some(old_parent), Some(old_name), Some(new_parent), Some(new_name)) =
+        (old_path.parent(), old_path.file_name(), new_path.parent(), new_path.file_name())
+    {
+        let prefix = format!("{}.", old_name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(old_parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(suffix) = name.strip_prefix(&prefix) else { continue };
+                relocate_temp_artifact(&entry.path(), &new_parent.join(format!("{}.{}", new_name.to_string_lossy(), suffix)));
             }
         }
-        job.temp_path = new_path.to_string_lossy().into_owned();
     }
+    true
+}
+
+/// Remove a job's temp artifacts off the calling thread: commands run on the
+/// UI thread, and a slow volume (an HDD still writing, a network share) must
+/// not freeze every window while it catches up.
+fn discard_temp_artifacts(temp_path: String) {
+    std::thread::spawn(move || {
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir_all(format!("{temp_path}.segments"));
+        cleanup_media_track_files(&temp_path);
+    });
 }
 
 fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSnapshot {
     let mut jobs = Vec::new();
     let mut unlistable = Vec::new();
-    #[cfg(windows)]
-    let temp_folder = temp_root();
     if let Ok(mut statement) = database.prepare("SELECT id, payload FROM jobs ORDER BY created_at DESC")
     {
         if let Ok(rows) = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
@@ -663,8 +695,6 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
                             job.events.insert(0, job_event("Saved source is unavailable on this machine — the folder may have moved. Use Reattach download.", Some("warning")));
                         }
                     }
-                    #[cfg(windows)]
-                    relocate_job_temp_artifacts(&mut job, &temp_folder);
                     if let Some(marker) = job.destination_reservation.clone() {
                         match reconcile_destination_reservation(
                             Path::new(&job.destination),
@@ -2837,10 +2867,13 @@ async fn acquire_ranges(
     completed_ranges = completed_ranges
         .into_iter()
         .fold(Vec::new(), |ranges, range| merge_range(&ranges, range));
+    // The file grows as ranges land (it is not preallocated), so it resumes
+    // when it holds every range the job claims, at a length the source
+    // still has.
     let mut can_resume = !completed_ranges.is_empty()
         && tokio::fs::metadata(&temp_path)
             .await
-            .map(|metadata| metadata.len() == total)
+            .map(|metadata| metadata.len() <= total && completed_ranges.iter().all(|range| range.end < metadata.len()))
             .unwrap_or(false);
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
@@ -2866,15 +2899,12 @@ async fn acquire_ranges(
             .write_all(&first)
             .await
             .map_err(|error| error.to_string())?;
-        if !transfer_can_continue(&app, &id, generation) {
-            return Ok(());
-        }
-        initial
-            .set_len(total)
-            .await
-            .map_err(|error| error.to_string())?;
+        // No preallocation: on exFAT (and FAT32) sizing the file up front
+        // makes Windows write zeros over all of it before a byte of the
+        // download lands, minutes for a large file on a hard drive. Each range
+        // extends the file as it is written instead.
         // The initial useful response is claimed as a completed range only
-        // after the bytes and preallocation are durable (F10).
+        // after the bytes are durable (F10).
         initial
             .sync_all()
             .await
@@ -3284,6 +3314,11 @@ async fn acquire_ranges(
             emit_snapshot(&app, &state);
         }
         return Ok(());
+    }
+    // Every range is written, so the file ends where the source does.
+    let written = tokio::fs::metadata(&temp_path).await.map(|metadata| metadata.len()).map_err(|error| error.to_string())?;
+    if written != total {
+        return Err(format!("The partial file holds {written} bytes, not {total}"));
     }
     let committed = state
         .snapshot
@@ -5735,7 +5770,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
         snapshot.notifications.retain(|item| item.job_id != id);
         if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { job.state = "failed".into(); job.error = Some("Cancelled by user".into()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Cancelled by user", Some("warning"))); }
     }
-    if let Some(path) = temp_path { let _ = std::fs::remove_file(&path); let _ = std::fs::remove_dir_all(format!("{path}.segments")); cleanup_media_track_files(&path); }
+    if let Some(path) = temp_path { discard_temp_artifacts(path); }
     if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(id); }
     emit_snapshot(app, state);
 }
@@ -5841,11 +5876,9 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
         let _ = database.execute("DELETE FROM jobs WHERE id = ?1", params![id]);
     }
     if let Some(path) = temporary {
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(format!("{path}.segments"));
-    }
-    if let Some(path) = track_cleanup {
-        cleanup_media_track_files(&path);
+        discard_temp_artifacts(path);
+    } else if let Some(path) = track_cleanup {
+        std::thread::spawn(move || cleanup_media_track_files(&path));
     }
     if let Some(dest) = destination_to_delete {
         let _ = std::fs::remove_file(&dest);
@@ -5972,7 +6005,7 @@ fn start_provisional(
         .map(str::to_string);
     let adopt_response_name = chosen_destination.is_none()
         && (input.name_is_hint || input.name.as_deref().map_or(true, |value| value.trim().is_empty()));
-    let (name, destination, temp_folder, max_connections, bandwidth_limit) = {
+    let (name, destination, temp_path, max_connections, bandwidth_limit) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable")?;
         let name = input
             .name
@@ -6005,10 +6038,11 @@ fn start_provisional(
             }
             .unwrap_or(snapshot.settings.max_connections)
         );
+        let temp_path = temp_path_for(&snapshot.settings, &destination, &id);
         (
             name,
             destination,
-            temp_root().to_string_lossy().into_owned(),
+            temp_path,
             max_connections,
             if overrides { input.bandwidth_limit } else { None }
         )
@@ -6033,10 +6067,7 @@ fn start_provisional(
         media,
         media_tracks: None,
         destination,
-        temp_path: Path::new(&temp_folder)
-            .join(format!("{id}.part"))
-            .to_string_lossy()
-            .into_owned(),
+        temp_path,
         resumable: false,
         mime: None,
         error: None,
@@ -6213,6 +6244,80 @@ fn commit_still_owned(state: &CoreState, id: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// After Save chose another folder, the partial file follows the download
+/// there (unless the user set a temp folder), so finishing stays a rename on
+/// one volume. A running transfer is paused for the move and resumed from the
+/// moved file. A transfer that cannot resume (bytes on disk, no verified
+/// ranges) keeps its file where it is: it moves when the download finishes.
+async fn follow_destination(app: AppHandle, id: String) {
+    let state = app.state::<CoreState>();
+    let plan = state.snapshot.lock().ok().and_then(|snapshot| {
+        let job = snapshot.jobs.iter().find(|job| job.id == id)?;
+        let temp_folder_set = snapshot.settings.temp_folder.as_deref().is_some_and(|folder| !folder.trim().is_empty());
+        let target = temp_path_for(&snapshot.settings, &job.destination, &job.id);
+        let moves = !temp_folder_set
+            && Path::new(&target).parent() != Path::new(&job.temp_path).parent()
+            && (job.resumable || job.downloaded == 0)
+            && (PAUSABLE_STATES.contains(&job.state.as_str()) || ["paused", "pending"].contains(&job.state.as_str()));
+        moves.then(|| (job.temp_path.clone(), target))
+    });
+    let Some((old_path, new_path)) = plan else { return };
+    let mut paused_here = false;
+    if transfer_is_active(state.inner(), &id) {
+        {
+            let _lifecycle = state.lifecycle.lock().ok();
+            let Ok(publishing) = state.publishing.lock() else { return };
+            if publishing.contains(&id) {
+                return;
+            }
+            emit_job(&state, &id, |job| {
+                paused_here = pause_in_place(job, "Moving the partial file to the download folder");
+                if paused_here {
+                    job.note = Some("Moving".into());
+                }
+            });
+            if paused_here {
+                abort_transfer(state.inner(), &id);
+            }
+        }
+        if !paused_here {
+            return;
+        }
+        emit_snapshot(&app, &state);
+    }
+    // Never move a file a transfer may still be writing.
+    let idle = commit_wait_for_transfer_idle(state.inner(), &id).await;
+    let moved = idle && {
+        let (from, to) = (PathBuf::from(&old_path), PathBuf::from(&new_path));
+        tauri::async_runtime::spawn_blocking(move || move_temp_artifacts(&from, &to)).await.unwrap_or(false)
+    };
+    emit_job(&state, &id, |job| {
+        if moved {
+            job.temp_path = new_path.clone();
+        } else {
+            job.events.insert(0, job_event("The partial file stays where it is until the download finishes", Some("warning")));
+        }
+    });
+    let _ = persist_job(&state, &id);
+    if paused_here {
+        let _lifecycle = state.lifecycle.lock().ok();
+        let source = state.snapshot.lock().ok().and_then(|snapshot| {
+            snapshot.jobs.iter().find(|job| job.id == id && job.state == "paused").map(|job| job.source.clone())
+        });
+        if let Some(source) = source.filter(|_| !transfer_is_active(state.inner(), &id)) {
+            emit_job(&state, &id, |job| {
+                job.state = "downloading".into();
+                job.connections = 1;
+                job.note = Some("Resuming".into());
+            });
+            emit_snapshot(&app, &state);
+            let _ = spawn_transfer(&app, state.inner(), id.clone(), source);
+            return;
+        }
+    }
+    emit_snapshot(&app, &state);
 }
 
 async fn commit_wait_for_transfer_idle(state: &CoreState, id: &str) -> bool {
@@ -6395,6 +6500,7 @@ async fn commit_provisional(
     emit_snapshot(&app, &state);
     if !accepted.0 {
         close_add_window(&app, &id);
+        tauri::async_runtime::spawn(follow_destination(app.clone(), id.clone()));
         return Ok(());
     }
     if !commit_still_owned(state.inner(), &id) {

@@ -34,6 +34,7 @@ const defaults: AppSettings = {
   showManagerAtSignIn: true,
   closeBehavior: 'tray',
   defaultFolder: mockDefaultFolder,
+  tempFolder: null,
   collisionBehavior: 'rename',
   interceptDownloads: true,
   showMediaButtons: true,
@@ -78,6 +79,7 @@ function persistSettings(settings: AppSettings) {
 export function sanitizeSettingsPatch(patch: Partial<AppSettings>): Partial<AppSettings> {
   const next = { ...patch };
   if (typeof next.defaultFolder === 'string' && next.defaultFolder.trim().length === 0) delete next.defaultFolder;
+  if (typeof next.tempFolder === 'string' && next.tempFolder.trim().length === 0) next.tempFolder = null;
   if (next.closeBehavior !== undefined && !['tray', 'exit'].includes(next.closeBehavior)) delete next.closeBehavior;
   if (next.collisionBehavior !== undefined && !['rename', 'replace'].includes(next.collisionBehavior)) delete next.collisionBehavior;
   if (next.bandwidthLimit !== undefined && next.bandwidthLimit !== null && (!Number.isInteger(next.bandwidthLimit) || next.bandwidthLimit <= 0)) delete next.bandwidthLimit;

@@ -73,6 +73,8 @@ export interface AppSettings {
   showManagerAtSignIn: boolean;
   closeBehavior: 'tray' | 'exit';
   defaultFolder: string;
+  /** Where unfinished downloads are kept; null keeps them next to the file. */
+  tempFolder: string | null;
   collisionBehavior: 'rename' | 'replace';
   interceptDownloads: boolean;
   showMediaButtons: boolean;

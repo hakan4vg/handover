@@ -57,7 +57,7 @@ const settingsNav: Array<{ key: SettingsPage; label: string; icon: IconName }> =
 ];
 
 const settingsKeys: Array<keyof AppSettings> = [
-  'startAtSignIn', 'showManagerAtSignIn', 'closeBehavior', 'defaultFolder',
+  'startAtSignIn', 'showManagerAtSignIn', 'closeBehavior', 'defaultFolder', 'tempFolder',
   'collisionBehavior', 'interceptDownloads', 'showMediaButtons', 'excludedSites',
   'bandwidthLimit', 'bandwidthUnit', 'maxConnections', 'perDownloadOverrides',
   'retryAutomatically', 'maxRetries', 'completionNotifications', 'failureNotifications',
@@ -776,7 +776,7 @@ function GeneralSettings({ settings, update }: { settings: AppSettings; update: 
 }
 
 function DownloadSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
-  return <><SettingsHeading title="Downloads" /><SettingCard><FieldHeading title="Default download folder" description="All downloads will be saved to this folder." /><PathField label="Default download folder" value={settings.defaultFolder} onChange={(defaultFolder) => update({ defaultFolder })} /></SettingCard><SettingCard><FieldHeading title="File name collisions" description="Choose how to handle an existing file with the same name." /><Select label="File name collisions" value={settings.collisionBehavior} onChange={(collisionBehavior) => update({ collisionBehavior: collisionBehavior as AppSettings['collisionBehavior'] })} options={[['rename', 'Create a numbered copy'], ['replace', 'Replace existing file']]} /></SettingCard></>;
+  return <><SettingsHeading title="Downloads" /><SettingCard><FieldHeading title="Default download folder" description="All downloads will be saved to this folder." /><PathField label="Default download folder" value={settings.defaultFolder} onChange={(defaultFolder) => update({ defaultFolder })} /></SettingCard><SettingCard><FieldHeading title="Temporary folder" description="Where unfinished downloads are kept. Empty keeps them next to the file." /><PathField label="Temporary folder" optional placeholder="Next to the file" browseFrom={settings.defaultFolder} value={settings.tempFolder ?? ''} onChange={(tempFolder) => update({ tempFolder: tempFolder || null })} /></SettingCard><SettingCard><FieldHeading title="File name collisions" description="Choose how to handle an existing file with the same name." /><Select label="File name collisions" value={settings.collisionBehavior} onChange={(collisionBehavior) => update({ collisionBehavior: collisionBehavior as AppSettings['collisionBehavior'] })} options={[['rename', 'Create a numbered copy'], ['replace', 'Replace existing file']]} /></SettingCard></>;
 }
 
 function BrowserSettings({ settings, update, pairedBrowsers, forgetPairings }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void; pairedBrowsers: number; forgetPairings: () => void }) {
@@ -885,7 +885,7 @@ function FieldHeading({ title, description }: { title: string; description?: str
   return <div className="field-heading"><strong>{title}</strong>{description && <span>{description}</span>}</div>;
 }
 
-function PathField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function PathField({ label, value, onChange, optional = false, placeholder, browseFrom }: { label: string; value: string; onChange: (value: string) => void; optional?: boolean; placeholder?: string; browseFrom?: string }) {
   const [draft, setDraft] = useState(value);
   const [isFocused, setIsFocused] = useState(false);
   const lastExternalValue = useRef(value);
@@ -896,7 +896,7 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
   }, [value, isFocused]);
   const commit = (candidate: string) => {
     const next = candidate.trim();
-    if (!next) {
+    if (!next && !optional) {
       setDraft(value);
       return;
     }
@@ -904,13 +904,13 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
     if (next !== value) onChange(next);
   };
   const browse = async () => {
-    const dir = await pickFolder(draft);
+    const dir = await pickFolder(draft || browseFrom);
     if (dir) {
       setDraft(dir);
       onChange(dir);
     }
   };
-  return <div className="path-field"><input aria-label={label} value={draft} onFocus={() => setIsFocused(true)} onChange={(event) => setDraft(event.target.value)} onBlur={(event) => { setIsFocused(false); commit(event.currentTarget.value); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { setDraft(value); event.currentTarget.value = value; } }} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
+  return <div className="path-field"><input aria-label={label} value={draft} placeholder={placeholder} onFocus={() => setIsFocused(true)} onChange={(event) => setDraft(event.target.value)} onBlur={(event) => { setIsFocused(false); commit(event.currentTarget.value); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { setDraft(value); event.currentTarget.value = value; } }} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
 }
 
 function Select({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<[string, string]> }) {

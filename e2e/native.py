@@ -822,6 +822,47 @@ def main() -> int:
                 run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
             bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
 
+        # ---- where partial files live ------------------------------------
+        # Next to the file they become, unless the user set a temp folder;
+        # the file grows as ranges land instead of being sized up front
+        # (sizing it makes exFAT write zeros over all of it first).
+        def wait_job(job_id: str, until, seconds: float = 30) -> dict:
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                found = next((j for j in devtools.invoke("get_snapshot")["jobs"] if j["id"] == job_id), {})
+                if until(found):
+                    return found
+                time.sleep(0.2)
+            return next((j for j in devtools.invoke("get_snapshot")["jobs"] if j["id"] == job_id), {})
+
+        folder_a, folder_b = out / "temp-a", out / "temp-b"
+        folder_a.mkdir(exist_ok=True)
+        app_tmp_before = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
+        moving_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-move", "name": "temp-move.bin", "destination": str(folder_a / "temp-move.bin"), "bandwidthLimit": 512 * 1024}})
+        running = wait_job(moving_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > 2 * MIB)
+        part = Path(running.get("tempPath", ""))
+        part_size = part.stat().st_size if part.is_file() else None
+        app_tmp_after = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
+        run.check("temp/next-to-target", "with no temp folder set, the partial file sits next to the file it becomes, not in the app's folder", part.parent == folder_a and part.is_file() and part.name.startswith("temp-move.bin.") and app_tmp_after == app_tmp_before, {"tempPath": str(part), "appTmpNew": sorted(set(app_tmp_after) - set(app_tmp_before))})
+        run.check("engine/no-preallocation", "the partial file grows as ranges land: it is never sized to the whole download up front", part_size is not None and part_size < len(METERED), {"partSize": part_size, "total": len(METERED), "downloaded": running.get("downloaded")})
+        devtools.invoke("commit_provisional", {"id": moving_id, "input": {"name": "temp-move.bin", "destination": str(folder_b / "temp-move.bin"), "bandwidthLimit": None}})
+        moved = wait_job(moving_id, lambda j: Path(j.get("tempPath", "")).parent == folder_b or j.get("state") in ("completed", "failed"))
+        done = wait_job(moving_id, lambda j: j.get("state") in ("completed", "failed"), 60)
+        final = folder_b / "temp-move.bin"
+        left = sorted(p.name for folder in (folder_a, folder_b) for p in folder.glob("*.part*"))
+        run.check("temp/follows-save", "Save to another folder moves the partial file there and the download resumes from it: byte-exact, nothing left behind", Path(moved.get("tempPath", "")).parent == folder_b and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and not left, {"tempPathAfterSave": moved.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "leftovers": left, "events": [e.get("message") for e in done.get("events", [])][:6]})
+
+        explicit = runtime / "explicit-temp"
+        devtools.invoke("update_settings", {"patch": {"tempFolder": str(explicit)}})
+        explicit_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-explicit", "name": "temp-explicit.bin", "destination": str(folder_a / "temp-explicit.bin"), "bandwidthLimit": 512 * 1024}})
+        running = wait_job(explicit_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > MIB)
+        devtools.invoke("commit_provisional", {"id": explicit_id, "input": {"name": "temp-explicit.bin", "destination": str(folder_b / "temp-explicit.bin"), "bandwidthLimit": None}})
+        done = wait_job(explicit_id, lambda j: j.get("state") in ("completed", "failed"), 60)
+        final = folder_b / "temp-explicit.bin"
+        devtools.invoke("update_settings", {"patch": {"tempFolder": ""}})
+        cleared = devtools.invoke("get_snapshot")["settings"].get("tempFolder")
+        run.check("temp/explicit-folder", "a temp folder the user set holds the partial file even when Save picks another folder; clearing the setting goes back to next-to-the-file", Path(running.get("tempPath", "")).parent == explicit and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and cleared is None and not list(explicit.glob("*")), {"tempPath": running.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "clearedSetting": cleared, "explicitLeft": [p.name for p in explicit.glob("*")]})
+
         # ---- cookies across a restart -------------------------------------
         reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])
         slow_id = reply.get("id", "")

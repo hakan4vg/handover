@@ -339,15 +339,22 @@ def zone_identifier(path: Path) -> str | None:
         return None
 
 
+# What --only selects. Each is one stretch of the run below; areas that need
+# a paired channel bring the pairing area with them.
+AREAS = ("engine", "bandwidth", "bridge", "pairing", "cookies", "save", "extension", "temp", "ui", "restart")
+NEEDS_PAIRING = ("bridge", "cookies", "save", "extension", "restart")
+
+
 class Run:
     def __init__(self) -> None:
         self.results: list[dict] = []
         self.started = time.monotonic()
+        self.area = ""
 
     def check(self, scenario: str, guards: str, ok: bool, evidence: dict) -> None:
         # Seconds since the run started, so slow scenarios show in the artifact.
         at = round(time.monotonic() - self.started, 1)
-        self.results.append({"scenario": scenario, "guards": guards, "pass": bool(ok), "at": at, "evidence": evidence})
+        self.results.append({"scenario": scenario, "area": self.area, "guards": guards, "pass": bool(ok), "at": at, "evidence": evidence})
         print(f"{'PASS' if ok else 'FAIL'}  {at:6.1f}s  {scenario}  - {guards}")
 
 
@@ -364,22 +371,43 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the isolated runtime folder")
-    parser.add_argument("--exe", help="resident build to run (default: target/debug)")
+    parser.add_argument("--exe", help="resident build to run (default: the debug build in Cargo's target directory)")
+    parser.add_argument("--only", help=f"comma-separated areas to run: {', '.join(AREAS)}")
     args = parser.parse_args()
+    only = {area.strip() for area in (args.only or "").split(",") if area.strip()}
+    unknown = only - set(AREAS)
+    if unknown:
+        print(f"Unknown area(s): {', '.join(sorted(unknown))}. Areas: {', '.join(AREAS)}")
+        return 2
+    if only & set(NEEDS_PAIRING):
+        only.add("pairing")
+
+    def wants(area: str) -> bool:
+        return not only or area in only
 
     with socket.socket() as probe:
         if probe.connect_ex(("127.0.0.1", 38217)) == 0:
             print("Port 38217 is in use: quit the running Download Manager first.")
             return 2
     if not args.no_build and not args.exe:
-        subprocess.run(["cargo", "build", "--manifest-path", str(ROOT / "src-tauri" / "Cargo.toml")], check=True)
+        # From src-tauri, so a local src-tauri/.cargo/config.toml applies.
+        subprocess.run(["cargo", "build"], check=True, cwd=ROOT / "src-tauri")
         subprocess.run(["node", str(ROOT / "node_modules" / "vite" / "bin" / "vite.js"), "build", "--config", str(ROOT / "extension" / "vite.config.ts")], check=True, cwd=ROOT)
 
-    runtime = Path(tempfile.mkdtemp(prefix="dm-e2e-"))
+    # DM_TEST_ROOT puts the isolated runtime somewhere fast and easy to clear.
+    test_root = os.environ.get("DM_TEST_ROOT")
+    if test_root:
+        Path(test_root).mkdir(parents=True, exist_ok=True)
+    runtime = Path(tempfile.mkdtemp(prefix="dm-e2e-", dir=test_root or None))
     (runtime / "data").mkdir()
     out = runtime / "out"
     exe = runtime / "download-manager.exe"
-    shutil.copy2(Path(args.exe) if args.exe else ROOT / "src-tauri" / "target" / "debug" / "download-manager.exe", exe)
+    if args.exe:
+        built = Path(args.exe)
+    else:
+        metadata = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", str(ROOT / "src-tauri" / "Cargo.toml")], capture_output=True, text=True, check=True, cwd=ROOT / "src-tauri")
+        built = Path(json.loads(metadata.stdout)["target_directory"]) / "debug" / "download-manager.exe"
+    shutil.copy2(built, exe)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -414,12 +442,16 @@ def main() -> int:
         "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
         "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
     }
+    # Engine jobs start with the app. Without the engine area, "range" alone is
+    # seeded when bandwidth (it reattaches it) or ui (it needs a job that does
+    # not change) runs.
+    seeded = engine if wants("engine") else {name: engine[name] for name in ("range",) if wants("bandwidth") or wants("ui")}
     parts = runtime / "data" / "tmp" / "recover-media.part.segments"
     for track, files in (("00", ["v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s"]), ("01", ["a-init.mp4", "a-0.m4s"])):
         (parts / track).mkdir(parents=True)
         for index, file in enumerate(files):
             (parts / track / f"{index:08}.part").write_bytes(fixture.media_file(file))
-    for name, (path, extra) in engine.items():
+    for name, (path, extra) in seeded.items():
         job = dict(id=name, name=f"{name}.bin", source=base + path, domain="127.0.0.1", state="connecting", progress=0, downloaded=0, total=None, speed=0, eta=None, connections=0, maxConnections=4, mode="single-stream", media=False, destination=str(out / f"{name}.bin"), tempPath=str(runtime / "data" / "tmp" / f"{name}.part"), resumable=False, mime=None, error=None, created="2026-09-29T19:00:00Z", started=None, completed=None, provisional=False, segments=None, referrer=base + "/page", events=[])
         job.update(extra)
         if "companionAudio" in extra:
@@ -443,7 +475,7 @@ def main() -> int:
 
     try:
         # ---- engine scenarios ------------------------------------------------
-        deadline = time.time() + 60
+        deadline = time.time() + (60 if seeded else 0)
         state: dict[str, dict] = {}
         while time.time() < deadline:
             time.sleep(0.5)
@@ -451,9 +483,10 @@ def main() -> int:
                 state = jobs()
             except sqlite3.Error:
                 continue
-            if all(state.get(n, {}).get("state") in ("completed", "failed") for n in engine):
+            if all(state.get(n, {}).get("state") in ("completed", "failed") for n in seeded):
                 break
-        time.sleep(1)
+        if seeded:
+            time.sleep(1)
         state = jobs()
 
         def job(name: str) -> dict:
@@ -475,129 +508,133 @@ def main() -> int:
         def evidence(name: str, **extra) -> dict:
             return {k: v for k, v in {**job(name), **extra}.items() if k != "_data"}
 
-        for name, expected in (("range", RANGE_BYTES), ("redirect", RANGE_BYTES), ("single", NO_RANGE_BYTES)):
-            j = job(name)
-            run.check(f"engine/{name}", "an ordinary download completes byte-exact", j["state"] == "completed" and j["_data"] == expected, evidence(name))
-        j = job("range")
-        run.check("engine/mark-of-the-web", "a completed file carries its internet origin (Zone.Identifier ZoneId=3)", bool(j["zone"]) and "ZoneId=3" in j["zone"], evidence("range"))
-        j = job("fallback-html")
-        run.check("engine/fallback-html", "the one-stream fallback must not complete with a login page", j["state"] == "failed" and j["_data"] is None, evidence("fallback-html"))
-        j = job("fallback-good")
-        run.check("engine/fallback-good", "a valid one-stream fallback still completes byte-exact", j["state"] == "completed" and j["_data"] == FALLBACK_BYTES, evidence("fallback-good"))
-        posts = counts[("/post-reject.bin", "POST", "")]
-        gets = sum(v for (p, m, _), v in counts.items() if p == "/post-reject.bin" and m == "GET")
-        j = job("post-reject")
-        run.check("engine/post-reject", "a rejected POST fails with its status, is not downgraded to GET, and is not replayed", j["state"] == "failed" and j["_data"] is None and "403" in (j["error"] or "") and gets == 0 and posts == 1, evidence("post-reject", posts=posts, gets=gets))
-        gets_ok = sum(v for (p, m, _), v in counts.items() if p == "/post-ok.bin" and m == "GET")
-        j = job("post-ok")
-        run.check("engine/post-ok", "an accepted POST completes with the POST response and never issues a GET", j["state"] == "completed" and j["_data"] == EXPORT_BYTES and gets_ok == 0, evidence("post-ok", gets=gets_ok))
-        j = job("zero-mpd")
-        run.check("engine/zero-duration-mpd", "a malformed manifest fails visibly instead of leaving the job stuck connecting", j["state"] == "failed" and bool(j["error"]), evidence("zero-mpd"))
+        if wants("engine"):
+            run.area = "engine"
+            for name, expected in (("range", RANGE_BYTES), ("redirect", RANGE_BYTES), ("single", NO_RANGE_BYTES)):
+                j = job(name)
+                run.check(f"engine/{name}", "an ordinary download completes byte-exact", j["state"] == "completed" and j["_data"] == expected, evidence(name))
+            j = job("range")
+            run.check("engine/mark-of-the-web", "a completed file carries its internet origin (Zone.Identifier ZoneId=3)", bool(j["zone"]) and "ZoneId=3" in j["zone"], evidence("range"))
+            j = job("fallback-html")
+            run.check("engine/fallback-html", "the one-stream fallback must not complete with a login page", j["state"] == "failed" and j["_data"] is None, evidence("fallback-html"))
+            j = job("fallback-good")
+            run.check("engine/fallback-good", "a valid one-stream fallback still completes byte-exact", j["state"] == "completed" and j["_data"] == FALLBACK_BYTES, evidence("fallback-good"))
+            posts = counts[("/post-reject.bin", "POST", "")]
+            gets = sum(v for (p, m, _), v in counts.items() if p == "/post-reject.bin" and m == "GET")
+            j = job("post-reject")
+            run.check("engine/post-reject", "a rejected POST fails with its status, is not downgraded to GET, and is not replayed", j["state"] == "failed" and j["_data"] is None and "403" in (j["error"] or "") and gets == 0 and posts == 1, evidence("post-reject", posts=posts, gets=gets))
+            gets_ok = sum(v for (p, m, _), v in counts.items() if p == "/post-ok.bin" and m == "GET")
+            j = job("post-ok")
+            run.check("engine/post-ok", "an accepted POST completes with the POST response and never issues a GET", j["state"] == "completed" and j["_data"] == EXPORT_BYTES and gets_ok == 0, evidence("post-ok", gets=gets_ok))
+            j = job("zero-mpd")
+            run.check("engine/zero-duration-mpd", "a malformed manifest fails visibly instead of leaving the job stuck connecting", j["state"] == "failed" and bool(j["error"]), evidence("zero-mpd"))
 
-        for name, expect, guards in (
-            ("mpd-dynamic", "Live media", "a live MPD is refused even when its type attribute is written with spaces"),
-            ("mpd-periods", "more than one Period", "a multi-Period MPD is refused instead of stretching each Period into its own track"),
-            ("mpd-drm", "DRM-protected", "a DRM-protected MPD is refused instead of saving undecryptable bytes"),
-        ):
-            j = job(name)
-            run.check(f"engine/{name}", guards, j["state"] == "failed" and expect in (j["error"] or "") and j["_data"] is None, evidence(name))
+            for name, expect, guards in (
+                ("mpd-dynamic", "Live media", "a live MPD is refused even when its type attribute is written with spaces"),
+                ("mpd-periods", "more than one Period", "a multi-Period MPD is refused instead of stretching each Period into its own track"),
+                ("mpd-drm", "DRM-protected", "a DRM-protected MPD is refused instead of saving undecryptable bytes"),
+            ):
+                j = job(name)
+                run.check(f"engine/{name}", guards, j["state"] == "failed" and expect in (j["error"] or "") and j["_data"] is None, evidence(name))
 
-        j = job("recover-media")
-        asked = sum(v for (p, _, _), v in counts.items() if p == "/gone.mpd")
-        run.check("engine/recover-finalizing-from-disk", "a media job that stopped while finalizing is finished from its downloaded fragments, without asking the expired source again", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and asked == 0, evidence("recover-media", sourceRequests=asked))
+            j = job("recover-media")
+            asked = sum(v for (p, _, _), v in counts.items() if p == "/gone.mpd")
+            run.check("engine/recover-finalizing-from-disk", "a media job that stopped while finalizing is finished from its downloaded fragments, without asking the expired source again", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and asked == 0, evidence("recover-media", sourceRequests=asked))
 
-        j = job("paced-range")
-        run.check("engine/paced-range", "range workers told Retry-After wait it out: the download completes byte-exact with no retry inside the server's window", j["state"] == "completed" and j["_data"] == RANGE_BYTES and PACING_EARLY["range"] == 0, evidence("paced-range", earlyRetries=PACING_EARLY["range"], pacedRanges=sum(1 for k in PACING_FIRST if k.startswith("bytes="))))
-        j = job("cut-range")
-        resumed = [(start, end, half) for start, end, half in CUT_RANGES if f"bytes={half}-{end}" in CUT_REQUESTS]
-        run.check("engine/range-cut-resumes", "a range whose connection drops half way is asked again only from where it stopped, and the download completes byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and bool(CUT_RANGES) and len(resumed) == len(CUT_RANGES), evidence("cut-range", cutRanges=len(CUT_RANGES), resumedFromCut=len(resumed), requests=CUT_REQUESTS[:12]))
-        j = job("quiet-range")
-        later = [r for r in QUIET_REQUESTS if r.startswith("bytes=") and not r.startswith("bytes=0-")]
-        run.check("engine/range-unadvertised", "a server that serves byte ranges without saying Accept-Ranges still gets a parallel, resumable download, byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and j["mode"] == "whole-object" and bool(later), evidence("quiet-range", requests=QUIET_REQUESTS[:12]))
-        first_again = [r for r in QUIET_REQUESTS if r.startswith("bytes=0-") and r != "bytes=0-0"]
-        run.check("engine/first-response-reused", "a ranged download takes the start of the file from its first response: the only other request from byte 0 is a one-byte probe", j["mode"] == "whole-object" and QUIET_REQUESTS.count("bytes=0-0") == 1 and not first_again, evidence("quiet-range", firstAgain=first_again, requests=QUIET_REQUESTS[:12]))
-        j = job("paced-hls")
-        run.check("engine/paced-hls", "media segments told Retry-After wait it out: the playlist completes with no retry inside the server's window", j["state"] == "completed" and bool(j["bytes"]) and PACING_EARLY["hls"] == 0, evidence("paced-hls", earlyRetries=PACING_EARLY["hls"]))
+            j = job("paced-range")
+            run.check("engine/paced-range", "range workers told Retry-After wait it out: the download completes byte-exact with no retry inside the server's window", j["state"] == "completed" and j["_data"] == RANGE_BYTES and PACING_EARLY["range"] == 0, evidence("paced-range", earlyRetries=PACING_EARLY["range"], pacedRanges=sum(1 for k in PACING_FIRST if k.startswith("bytes="))))
+            j = job("cut-range")
+            resumed = [(start, end, half) for start, end, half in CUT_RANGES if f"bytes={half}-{end}" in CUT_REQUESTS]
+            run.check("engine/range-cut-resumes", "a range whose connection drops half way is asked again only from where it stopped, and the download completes byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and bool(CUT_RANGES) and len(resumed) == len(CUT_RANGES), evidence("cut-range", cutRanges=len(CUT_RANGES), resumedFromCut=len(resumed), requests=CUT_REQUESTS[:12]))
+            j = job("quiet-range")
+            later = [r for r in QUIET_REQUESTS if r.startswith("bytes=") and not r.startswith("bytes=0-")]
+            run.check("engine/range-unadvertised", "a server that serves byte ranges without saying Accept-Ranges still gets a parallel, resumable download, byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and j["mode"] == "whole-object" and bool(later), evidence("quiet-range", requests=QUIET_REQUESTS[:12]))
+            first_again = [r for r in QUIET_REQUESTS if r.startswith("bytes=0-") and r != "bytes=0-0"]
+            run.check("engine/first-response-reused", "a ranged download takes the start of the file from its first response: the only other request from byte 0 is a one-byte probe", j["mode"] == "whole-object" and QUIET_REQUESTS.count("bytes=0-0") == 1 and not first_again, evidence("quiet-range", firstAgain=first_again, requests=QUIET_REQUESTS[:12]))
+            j = job("paced-hls")
+            run.check("engine/paced-hls", "media segments told Retry-After wait it out: the playlist completes with no retry inside the server's window", j["state"] == "completed" and bool(j["bytes"]) and PACING_EARLY["hls"] == 0, evidence("paced-hls", earlyRetries=PACING_EARLY["hls"]))
 
-        j = job("hls-vod")
-        run.check("engine/hls-vod", "an ordinary finite HLS playlist still assembles (control)", j["state"] == "completed" and bool(j["bytes"]), evidence("hls-vod"))
-        j = job("hls-hole")
-        run.check("engine/hls-unresolvable-fragment", "a fragment line that cannot be addressed fails the job instead of leaving a silent gap", j["state"] == "failed" and "cannot be resolved" in (j["error"] or ""), evidence("hls-hole"))
-        j = job("hls-two-maps")
-        run.check("engine/hls-map-switch", "a playlist that switches initialization maps is refused, not assembled under the first map", j["state"] == "failed" and "initialization map" in (j["error"] or ""), evidence("hls-two-maps"))
+            j = job("hls-vod")
+            run.check("engine/hls-vod", "an ordinary finite HLS playlist still assembles (control)", j["state"] == "completed" and bool(j["bytes"]), evidence("hls-vod"))
+            j = job("hls-hole")
+            run.check("engine/hls-unresolvable-fragment", "a fragment line that cannot be addressed fails the job instead of leaving a silent gap", j["state"] == "failed" and "cannot be resolved" in (j["error"] or ""), evidence("hls-hole"))
+            j = job("hls-two-maps")
+            run.check("engine/hls-map-switch", "a playlist that switches initialization maps is refused, not assembled under the first map", j["state"] == "failed" and "initialization map" in (j["error"] or ""), evidence("hls-two-maps"))
 
-        j = job("dual")
-        stored = state.get("dual", {})
-        shown = devtools.evaluate("""(async () => {
-          document.querySelector('[aria-label="Select dual.bin"]').click();
-          await new Promise((r) => setTimeout(r, 300));
-          const label = [...document.querySelectorAll('.inspector *')].find((e) => e.children.length === 0 && e.textContent === 'Transfer mode');
-          return label?.parentElement?.textContent ?? null;
-        })()""")
-        run.check("engine/dual-track", "separate video and audio streams complete into one regular MP4 (indexed, no fragments), are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and top_boxes(j["_data"]) == ["ftyp", "moov", "mdat"] and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown, boxes=top_boxes(j["_data"])))
+            j = job("dual")
+            stored = state.get("dual", {})
+            shown = devtools.evaluate("""(async () => {
+              document.querySelector('[aria-label="Select dual.bin"]').click();
+              await new Promise((r) => setTimeout(r, 300));
+              const label = [...document.querySelectorAll('.inspector *')].find((e) => e.children.length === 0 && e.textContent === 'Transfer mode');
+              return label?.parentElement?.textContent ?? null;
+            })()""")
+            run.check("engine/dual-track", "separate video and audio streams complete into one regular MP4 (indexed, no fragments), are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and top_boxes(j["_data"]) == ["ftyp", "moov", "mdat"] and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown, boxes=top_boxes(j["_data"])))
 
-        j = job("dual-labelled")
-        run.check("engine/dual-track-audio-labelled-video", "an audio track served as video/mp4 is still the audio: the two tracks complete into one file", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp", evidence("dual-labelled"))
-        j = job("dual-two-videos")
-        run.check("engine/dual-track-two-videos", "a companion that holds video, not audio, fails the job with that reason instead of muxing two pictures", j["state"] == "failed" and "holds video, not audio" in (j["error"] or ""), evidence("dual-two-videos"))
+            j = job("dual-labelled")
+            run.check("engine/dual-track-audio-labelled-video", "an audio track served as video/mp4 is still the audio: the two tracks complete into one file", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp", evidence("dual-labelled"))
+            j = job("dual-two-videos")
+            run.check("engine/dual-track-two-videos", "a companion that holds video, not audio, fails the job with that reason instead of muxing two pictures", j["state"] == "failed" and "holds video, not audio" in (j["error"] or ""), evidence("dual-two-videos"))
 
         # ---- bandwidth: a job's own cap under a global limit -----------------
-        # Both jobs run together. Rates are measured from the bytes the server
-        # sent while both ran, skipping the first two seconds (a full bucket's
-        # burst and the socket buffers filling).
-        global_mib, cap_mib = 4, 1
-        devtools.invoke("update_settings", {"patch": {"bandwidthLimit": global_mib, "bandwidthUnit": "MB/s"}})
-        reattach = devtools.evaluate("""(async () => {
-          const invoke = window.__TAURI_INTERNALS__.invoke;
-          const state = async (id) => (await invoke('get_snapshot')).jobs.find((job) => job.id === id).state;
-          await invoke('resume_job', { id: 'cap-own' });
-          await invoke('resume_job', { id: 'cap-none' });
-          const started = performance.now();
-          // What the app reports for the capped job once it has run a while.
-          const reported = [];
-          while (performance.now() - started < 40000) {
-            const jobs = (await invoke('get_snapshot')).jobs;
-            const other = jobs.find((job) => job.id === 'cap-none');
-            const own = jobs.find((job) => job.id === 'cap-own');
-            if (own.state === 'downloading' && performance.now() - started > 3000) reported.push({ speed: own.speed, etaSeconds: own.etaSeconds ?? null, note: own.note ?? null, total: own.total ?? null });
-            if (other.state !== 'downloading' && other.state !== 'connecting') break;
-            await new Promise((r) => setTimeout(r, 100));
-          }
-          // Reattach asked of a running and of a completed download.
-          await invoke('reattach_job', { id: 'cap-own' });
-          await invoke('reattach_job', { id: 'range' });
-          await new Promise((r) => setTimeout(r, 300));
-          const after = { running: await state('cap-own'), completed: await state('range') };
-          await invoke('pause_job', { id: 'cap-own' });
-          return { after, reported };
-        })()""", timeout=60)
-        devtools.invoke("update_settings", {"patch": {"bandwidthLimit": None}})
-        reported = (reattach or {}).get("reported") or []
-        reattach = (reattach or {}).get("after")
-        # Once bytes flow: the status note is gone, and over the later half of
-        # the run the speed is about the cap and the time left a number.
-        flowing = [item for item in reported if item["speed"] > 0]
-        steady = flowing[len(flowing) // 2:]
-        speeds = sorted(item["speed"] for item in steady)
-        median = speeds[len(speeds) // 2] / 1024 ** 2 if speeds else 0
-        run.check("engine/speed-reported", "a download capped at 1 MiB/s reports about that speed, a number of seconds left, and no leftover status note",
-                  len(steady) >= 5 and 0.75 <= median <= 1.25
-                  and all(item["note"] is None for item in flowing)
-                  and all(isinstance(item["etaSeconds"], int) and item["etaSeconds"] > 0 for item in steady if item["total"]),
-                  {"samples": len(reported), "flowing": len(flowing), "median_mib_s": round(median, 3), "speeds_kib": [item["speed"] // 1024 for item in reported], "last": reported[-2:]})
-        sent = list(METER)
-        rates: dict = {}
-        if sent:
-            begin = sent[0][0] + 2.0
-            end = max((at for at, tag, _ in sent if tag == "cap-none"), default=begin)
-            if end - begin >= 2.0:
-                for tag in ("cap-own", "cap-none"):
-                    rates[tag] = round(sum(n for at, t, n in sent if t == tag and begin <= at <= end) / (end - begin) / MIB, 2)
-                rates["seconds"] = round(end - begin, 2)
-        own_ok = 0 < rates.get("cap-own", 99) <= cap_mib * 1.2
-        total_ok = global_mib * 0.75 <= rates.get("cap-own", 0) + rates.get("cap-none", 0) <= global_mib * 1.2
-        run.check("engine/reattach-stopped-only", "Reattach leaves a running and a completed download as they are", reattach == {"running": "downloading", "completed": "completed"}, {"after": reattach})
-        run.check("engine/job-cap-under-global-limit", f"with a {global_mib} MiB/s global limit, a job capped at {cap_mib} MiB/s never exceeds its cap while the two together still use the global limit", own_ok and total_ok, {"MiBps": rates})
+        if wants("bandwidth"):
+            run.area = "bandwidth"
+            # Both jobs run together. Rates are measured from the bytes the server
+            # sent while both ran, skipping the first two seconds (a full bucket's
+            # burst and the socket buffers filling).
+            global_mib, cap_mib = 4, 1
+            devtools.invoke("update_settings", {"patch": {"bandwidthLimit": global_mib, "bandwidthUnit": "MB/s"}})
+            reattach = devtools.evaluate("""(async () => {
+              const invoke = window.__TAURI_INTERNALS__.invoke;
+              const state = async (id) => (await invoke('get_snapshot')).jobs.find((job) => job.id === id).state;
+              await invoke('resume_job', { id: 'cap-own' });
+              await invoke('resume_job', { id: 'cap-none' });
+              const started = performance.now();
+              // What the app reports for the capped job once it has run a while.
+              const reported = [];
+              while (performance.now() - started < 40000) {
+                const jobs = (await invoke('get_snapshot')).jobs;
+                const other = jobs.find((job) => job.id === 'cap-none');
+                const own = jobs.find((job) => job.id === 'cap-own');
+                if (own.state === 'downloading' && performance.now() - started > 3000) reported.push({ speed: own.speed, etaSeconds: own.etaSeconds ?? null, note: own.note ?? null, total: own.total ?? null });
+                if (other.state !== 'downloading' && other.state !== 'connecting') break;
+                await new Promise((r) => setTimeout(r, 100));
+              }
+              // Reattach asked of a running and of a completed download.
+              await invoke('reattach_job', { id: 'cap-own' });
+              await invoke('reattach_job', { id: 'range' });
+              await new Promise((r) => setTimeout(r, 300));
+              const after = { running: await state('cap-own'), completed: await state('range') };
+              await invoke('pause_job', { id: 'cap-own' });
+              return { after, reported };
+            })()""", timeout=60)
+            devtools.invoke("update_settings", {"patch": {"bandwidthLimit": None}})
+            reported = (reattach or {}).get("reported") or []
+            reattach = (reattach or {}).get("after")
+            # Once bytes flow: the status note is gone, and over the later half of
+            # the run the speed is about the cap and the time left a number.
+            flowing = [item for item in reported if item["speed"] > 0]
+            steady = flowing[len(flowing) // 2:]
+            speeds = sorted(item["speed"] for item in steady)
+            median = speeds[len(speeds) // 2] / 1024 ** 2 if speeds else 0
+            run.check("engine/speed-reported", "a download capped at 1 MiB/s reports about that speed, a number of seconds left, and no leftover status note",
+                      len(steady) >= 5 and 0.75 <= median <= 1.25
+                      and all(item["note"] is None for item in flowing)
+                      and all(isinstance(item["etaSeconds"], int) and item["etaSeconds"] > 0 for item in steady if item["total"]),
+                      {"samples": len(reported), "flowing": len(flowing), "median_mib_s": round(median, 3), "speeds_kib": [item["speed"] // 1024 for item in reported], "last": reported[-2:]})
+            sent = list(METER)
+            rates: dict = {}
+            if sent:
+                begin = sent[0][0] + 2.0
+                end = max((at for at, tag, _ in sent if tag == "cap-none"), default=begin)
+                if end - begin >= 2.0:
+                    for tag in ("cap-own", "cap-none"):
+                        rates[tag] = round(sum(n for at, t, n in sent if t == tag and begin <= at <= end) / (end - begin) / MIB, 2)
+                    rates["seconds"] = round(end - begin, 2)
+            own_ok = 0 < rates.get("cap-own", 99) <= cap_mib * 1.2
+            total_ok = global_mib * 0.75 <= rates.get("cap-own", 0) + rates.get("cap-none", 0) <= global_mib * 1.2
+            run.check("engine/reattach-stopped-only", "Reattach leaves a running and a completed download as they are", reattach == {"running": "downloading", "completed": "completed"}, {"after": reattach})
+            run.check("engine/job-cap-under-global-limit", f"with a {global_mib} MiB/s global limit, a job capped at {cap_mib} MiB/s never exceeds its cap while the two together still use the global limit", own_ok and total_ok, {"MiBps": rates})
 
         # ---- bridge scenarios ------------------------------------------------
         def capture(path: str, capture_id: str, viable: bool = True) -> dict:
@@ -611,87 +648,93 @@ def main() -> int:
         def job_ids_for(capture_id: str) -> list[str]:
             return [j["id"] for j in jobs().values() if j.get("name") == f"{capture_id}.bin" and j.get("provisional")]
 
-        # Only the browser extension with the pinned ID (and local non-browser
-        # clients, which send no Origin) may use the bridge.
-        probe = {"request": "origin-probe-0000000000"}
-        other = sealed.post("/v1/pair/status", probe, {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"})[0]
-        page = sealed.post("/v1/pair/status", probe, {"Origin": "https://example.com"})[0]
-        ours = sealed.post("/v1/pair/status", probe, {"Origin": EXTENSION_ORIGIN})[0]
-        run.check("bridge/extension-origin-pinned", "another extension and a web page are refused; the extension with the pinned ID is accepted", other == 403 and page == 403 and ours == 200, {"otherExtension": other, "webPage": page, "ours": ours})
+        if wants("bridge"):
+            run.area = "bridge"
+            # Only the browser extension with the pinned ID (and local non-browser
+            # clients, which send no Origin) may use the bridge.
+            probe = {"request": "origin-probe-0000000000"}
+            other = sealed.post("/v1/pair/status", probe, {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"})[0]
+            page = sealed.post("/v1/pair/status", probe, {"Origin": "https://example.com"})[0]
+            ours = sealed.post("/v1/pair/status", probe, {"Origin": EXTENSION_ORIGIN})[0]
+            run.check("bridge/extension-origin-pinned", "another extension and a web page are refused; the extension with the pinned ID is accepted", other == 403 and page == 403 and ours == 200, {"otherExtension": other, "webPage": page, "ours": ours})
 
         # ---- pairing and the sealed channel --------------------------------
-        declined = sealed.pair(allow=False)
-        run.check("pairing/declined", "a pairing the user declines yields no key", declined.get("state") == "denied" and "key" not in declined, {k: v for k, v in declined.items() if k != "key"})
-        # Allow on a request a newer one replaced (or that expired) records
-        # nothing, and says so instead of closing as if it had paired.
-        stale, fresh = (base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=").replace("_", "-") for _ in range(2))
-        sealed.post("/v1/pair", {"request": stale})
-        sealed.post("/v1/pair", {"request": fresh})
-        stale_answer = devtools.evaluate(f"window.__TAURI_INTERNALS__.invoke('answer_pairing', {{ id: {json.dumps(stale)}, allow: true }}).then(() => ({{ ok: true }}), (error) => ({{ error: String(error) }}))")
-        stale_status = sealed.post("/v1/pair/status", {"request": stale})[1].get("state")
-        devtools.invoke("answer_pairing", {"id": fresh, "allow": False})
-        run.check("pairing/stale-allow", "allowing a request that was replaced reports that it expired and pairs nothing", "expired" in (stale_answer.get("error") or "") and stale_status == "unknown", {"answer": stale_answer, "staleStatus": stale_status})
-        PAIRING.update(sealed.pair(allow=True))
-        run.check("pairing/approved", "a pairing the user allows yields a key, once", PAIRING.get("state") == "approved" and len(PAIRING.get("key", "")) == 44 and sealed.post("/v1/pair/status", {"request": PAIRING.get("request")})[1].get("state") == "unknown", {k: v for k, v in PAIRING.items() if k != "key"})
         probe_message = {"type": "cancel-acquisition", "payload": {"captureId": "sealed-probe"}}
-        plain_status, plain = sealed.post("/v1/message", probe_message)
-        legacy_status, _ = sealed.post("/v1/capture", probe_message)
-        run.check("sealed/plain-refused", "an unsealed message is refused, and the old unsealed routes are gone", plain_status == 400 and legacy_status == 404, {"plain": [plain_status, plain], "legacyRoute": legacy_status})
-        stranger = {"keyId": "0000000000000000", "key": PAIRING["key"]}
-        status, answer = sealed.post("/v1/message", sealed.seal(stranger, probe_message)[0])
-        run.check("sealed/unknown-key", "a message under a key the app never paired is told to pair", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
-        body, nonce = sealed.seal(PAIRING, probe_message)
-        first, envelope = sealed.post("/v1/message", body)
-        again, _ = sealed.post("/v1/message", body)
-        stale, _ = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message, sent_at=time.time() - 300)[0])
-        run.check("sealed/replay-and-stale", "a replayed or five-minute-old message is refused", first == 200 and again == 400 and stale == 400, {"first": first, "replayed": again, "stale": stale})
-        opened = sealed.open_answer(PAIRING, nonce, envelope)
-        try:
-            sealed.open_answer(PAIRING, sealed.seal(PAIRING, probe_message)[1], envelope)
-            rebound = True
-        except Exception:
-            rebound = False
-        run.check("sealed/answer-bound", "the answer opens only for the request it answers", opened.get("ok") is True and not rebound, {"opened": opened, "opensForAnotherRequest": rebound})
+        if wants("pairing"):
+            run.area = "pairing"
+            declined = sealed.pair(allow=False)
+            run.check("pairing/declined", "a pairing the user declines yields no key", declined.get("state") == "denied" and "key" not in declined, {k: v for k, v in declined.items() if k != "key"})
+            # Allow on a request a newer one replaced (or that expired) records
+            # nothing, and says so instead of closing as if it had paired.
+            stale, fresh = (base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=").replace("_", "-") for _ in range(2))
+            sealed.post("/v1/pair", {"request": stale})
+            sealed.post("/v1/pair", {"request": fresh})
+            stale_answer = devtools.evaluate(f"window.__TAURI_INTERNALS__.invoke('answer_pairing', {{ id: {json.dumps(stale)}, allow: true }}).then(() => ({{ ok: true }}), (error) => ({{ error: String(error) }}))")
+            stale_status = sealed.post("/v1/pair/status", {"request": stale})[1].get("state")
+            devtools.invoke("answer_pairing", {"id": fresh, "allow": False})
+            run.check("pairing/stale-allow", "allowing a request that was replaced reports that it expired and pairs nothing", "expired" in (stale_answer.get("error") or "") and stale_status == "unknown", {"answer": stale_answer, "staleStatus": stale_status})
+            PAIRING.update(sealed.pair(allow=True))
+            run.check("pairing/approved", "a pairing the user allows yields a key, once", PAIRING.get("state") == "approved" and len(PAIRING.get("key", "")) == 44 and sealed.post("/v1/pair/status", {"request": PAIRING.get("request")})[1].get("state") == "unknown", {k: v for k, v in PAIRING.items() if k != "key"})
+            plain_status, plain = sealed.post("/v1/message", probe_message)
+            legacy_status, _ = sealed.post("/v1/capture", probe_message)
+            run.check("sealed/plain-refused", "an unsealed message is refused, and the old unsealed routes are gone", plain_status == 400 and legacy_status == 404, {"plain": [plain_status, plain], "legacyRoute": legacy_status})
+            stranger = {"keyId": "0000000000000000", "key": PAIRING["key"]}
+            status, answer = sealed.post("/v1/message", sealed.seal(stranger, probe_message)[0])
+            run.check("sealed/unknown-key", "a message under a key the app never paired is told to pair", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
+            body, nonce = sealed.seal(PAIRING, probe_message)
+            first, envelope = sealed.post("/v1/message", body)
+            again, _ = sealed.post("/v1/message", body)
+            stale, _ = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message, sent_at=time.time() - 300)[0])
+            run.check("sealed/replay-and-stale", "a replayed or five-minute-old message is refused", first == 200 and again == 400 and stale == 400, {"first": first, "replayed": again, "stale": stale})
+            opened = sealed.open_answer(PAIRING, nonce, envelope)
+            try:
+                sealed.open_answer(PAIRING, sealed.seal(PAIRING, probe_message)[1], envelope)
+                rebound = True
+            except Exception:
+                rebound = False
+            run.check("sealed/answer-bound", "the answer opens only for the request it answers", opened.get("ok") is True and not rebound, {"opened": opened, "opensForAnotherRequest": rebound})
 
-        reply = capture("/file/range.bin", "cap-viable")
-        run.check("bridge/viable", "a fetchable capture is accepted with a job id", reply.get("ok") is True and isinstance(reply.get("id"), str), {"reply": reply})
-        run.check("bridge/lookup-is-live", "the harness can see a live provisional job by name (guards the negative checks below)", job_ids_for("cap-viable") == [reply.get("id")], {"found": job_ids_for("cap-viable")})
-        dup = capture("/file/range.bin", "cap-viable")
-        run.check("bridge/duplicate-capture-id", "a repeated capture id returns the same job, never a second owner", dup.get("id") == reply.get("id"), {"first": reply, "second": dup})
-        cancel = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-viable"}})
-        time.sleep(1)
-        run.check("bridge/cancel-by-capture-id", "cancelling by capture id removes the provisional job", cancel.get("ok") is True and reply.get("id") not in jobs(), {"cancel": cancel})
-
-        for path, label in (("/cookie.bin", "session-gated 403"), ("/login-page.bin", "HTML login page")):
-            started = time.time()
-            capture_id = "cap-" + label.replace(" ", "-")
-            reply = capture(path, capture_id)
+        if wants("bridge"):
+            run.area = "bridge"
+            reply = capture("/file/range.bin", "cap-viable")
+            run.check("bridge/viable", "a fetchable capture is accepted with a job id", reply.get("ok") is True and isinstance(reply.get("id"), str), {"reply": reply})
+            run.check("bridge/lookup-is-live", "the harness can see a live provisional job by name (guards the negative checks below)", job_ids_for("cap-viable") == [reply.get("id")], {"found": job_ids_for("cap-viable")})
+            dup = capture("/file/range.bin", "cap-viable")
+            run.check("bridge/duplicate-capture-id", "a repeated capture id returns the same job, never a second owner", dup.get("id") == reply.get("id"), {"first": reply, "second": dup})
+            cancel = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-viable"}})
             time.sleep(1)
-            leftovers = job_ids_for(capture_id)
-            run.check(f"bridge/handback {label}", f"a {label} is handed back to the browser and leaves no job behind", reply.get("ok") is False and reply.get("handback") is True and not leftovers, {"reply": reply, "seconds": round(time.time() - started, 2), "leftoverJobs": leftovers})
+            run.check("bridge/cancel-by-capture-id", "cancelling by capture id removes the provisional job", cancel.get("ok") is True and reply.get("id") not in jobs(), {"cancel": cancel})
 
-        # Chromium's naming precedence: server filename > download attribute > URL.
-        def named(path: str, capture_id: str, name: str | None, hint: bool) -> str | None:
-            payload = {"source": base + path, "pageUrl": base + "/page", "captureId": capture_id, "requireViable": True, **({"name": name} if name else {}), **({"nameIsHint": True} if hint else {})}
-            reply = bridge({"type": "capture-acquisition", "payload": payload})
-            found = None
-            for _ in range(20):
-                time.sleep(0.25)
-                found = jobs().get(reply.get("id") or "", {}).get("name")
-                if found and found != name:
-                    break
-            bridge({"type": "cancel-acquisition", "payload": {"captureId": capture_id}})
-            return found
-        got = named("/named/plain.bin", "cap-name-hint", "hint-from-link.bin", True)
-        run.check("bridge/name-server-beats-hint", "a link's name is a hint: the server's Content-Disposition filename wins", got == "server; plain.bin", {"name": got})
-        got = named("/named/star.bin", "cap-name-star", None, False)
-        run.check("bridge/name-rfc8187", "with no name at all, an RFC 8187 filename* is decoded and preferred over filename", got == "server été.bin", {"name": got})
-        got = named("/url-named/My%20Report%20%C3%A9t%C3%A9.bin", "cap-name-url", None, False)
-        run.check("bridge/name-url-decoded", "a name taken from the URL is percent-decoded, as a browser saves it", got == "My Report été.bin", {"name": got})
-        got = named("/url-named/" + "a" * 300 + ".bin", "cap-name-long", None, False)
-        run.check("bridge/name-length-capped", "an overlong name is shortened to a Windows-safe length and keeps its extension", bool(got) and len(got) <= 180 and got.endswith(".bin"), {"name": got, "length": len(got or "")})
-        got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
-        run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
+            for path, label in (("/cookie.bin", "session-gated 403"), ("/login-page.bin", "HTML login page")):
+                started = time.time()
+                capture_id = "cap-" + label.replace(" ", "-")
+                reply = capture(path, capture_id)
+                time.sleep(1)
+                leftovers = job_ids_for(capture_id)
+                run.check(f"bridge/handback {label}", f"a {label} is handed back to the browser and leaves no job behind", reply.get("ok") is False and reply.get("handback") is True and not leftovers, {"reply": reply, "seconds": round(time.time() - started, 2), "leftoverJobs": leftovers})
+
+            # Chromium's naming precedence: server filename > download attribute > URL.
+            def named(path: str, capture_id: str, name: str | None, hint: bool) -> str | None:
+                payload = {"source": base + path, "pageUrl": base + "/page", "captureId": capture_id, "requireViable": True, **({"name": name} if name else {}), **({"nameIsHint": True} if hint else {})}
+                reply = bridge({"type": "capture-acquisition", "payload": payload})
+                found = None
+                for _ in range(20):
+                    time.sleep(0.25)
+                    found = jobs().get(reply.get("id") or "", {}).get("name")
+                    if found and found != name:
+                        break
+                bridge({"type": "cancel-acquisition", "payload": {"captureId": capture_id}})
+                return found
+            got = named("/named/plain.bin", "cap-name-hint", "hint-from-link.bin", True)
+            run.check("bridge/name-server-beats-hint", "a link's name is a hint: the server's Content-Disposition filename wins", got == "server; plain.bin", {"name": got})
+            got = named("/named/star.bin", "cap-name-star", None, False)
+            run.check("bridge/name-rfc8187", "with no name at all, an RFC 8187 filename* is decoded and preferred over filename", got == "server été.bin", {"name": got})
+            got = named("/url-named/My%20Report%20%C3%A9t%C3%A9.bin", "cap-name-url", None, False)
+            run.check("bridge/name-url-decoded", "a name taken from the URL is percent-decoded, as a browser saves it", got == "My Report été.bin", {"name": got})
+            got = named("/url-named/" + "a" * 300 + ".bin", "cap-name-long", None, False)
+            run.check("bridge/name-length-capped", "an overlong name is shortened to a Windows-safe length and keeps its extension", bool(got) and len(got) <= 180 and got.endswith(".bin"), {"name": got, "length": len(got or "")})
+            got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
+            run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
 
         # ---- browser cookies (SPEC §16) ------------------------------------
         now = time.time()
@@ -727,37 +770,39 @@ def main() -> int:
         def leaked(headers: list[str]) -> list[str]:
             return [name for name in ("otherpath", "expired", "strict", "laxonly") if any(f"{name}=" in header for header in headers)]
 
-        reply = take("capture-acquisition", "/ck/gated.bin", "ck-gated.bin", [session, cookie("secureonly", "s-" + SESSION, secure=True), *never, cookie("strict", "t-" + SESSION, sameSite="strict")], page=cross_page)
-        done = commit_and_wait(reply.get("id", ""), "ck-gated.bin") if reply.get("ok") else {}
-        sent = cookies_sent("/ck/gated.bin")
-        data = (out / "ck-gated.bin").read_bytes() if (out / "ck-gated.bin").is_file() else b""
-        run.check("cookies/logged-in-download", "a download that needs the browser's session completes byte-exact, every request (each range worker) carrying the session cookie", reply.get("ok") is True and done.get("state") == "completed" and data == RANGE_BYTES and sent and all(f"session={SESSION}" in header for header in sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "withSession": sum(f"session={SESSION}" in header for header in sent)})
-        run.check("cookies/scoped-like-chromium", "cookies Chromium would not send here stay behind (another path, expired, Strict from another site's page), while a Secure one goes to loopback as Chromium sends it", not leaked(sent) and all("secureonly=" in header for header in sent), {"leaked": leaked(sent), "secureOnLoopback": all("secureonly=" in header for header in sent)})
+        if wants("cookies"):
+            run.area = "cookies"
+            reply = take("capture-acquisition", "/ck/gated.bin", "ck-gated.bin", [session, cookie("secureonly", "s-" + SESSION, secure=True), *never, cookie("strict", "t-" + SESSION, sameSite="strict")], page=cross_page)
+            done = commit_and_wait(reply.get("id", ""), "ck-gated.bin") if reply.get("ok") else {}
+            sent = cookies_sent("/ck/gated.bin")
+            data = (out / "ck-gated.bin").read_bytes() if (out / "ck-gated.bin").is_file() else b""
+            run.check("cookies/logged-in-download", "a download that needs the browser's session completes byte-exact, every request (each range worker) carrying the session cookie", reply.get("ok") is True and done.get("state") == "completed" and data == RANGE_BYTES and sent and all(f"session={SESSION}" in header for header in sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "withSession": sum(f"session={SESSION}" in header for header in sent)})
+            run.check("cookies/scoped-like-chromium", "cookies Chromium would not send here stay behind (another path, expired, Strict from another site's page), while a Secure one goes to loopback as Chromium sends it", not leaked(sent) and all("secureonly=" in header for header in sent), {"leaked": leaked(sent), "secureOnLoopback": all("secureonly=" in header for header in sent)})
 
-        reply = take("capture-acquisition", "/ck/hop.bin", "ck-hop.bin", [session])
-        done = commit_and_wait(reply.get("id", ""), "ck-hop.bin") if reply.get("ok") else {}
-        landing = [(host, header) for _, path, host, header in COOKIE_LOG if path == "/ck/landing.bin"]
-        run.check("cookies/redirect-to-another-host", "a redirect to another host carries none of the original host's cookies", done.get("state") == "completed" and landing and all(SESSION not in header for _, header in landing), {"reply": reply, "state": done.get("state"), "landing": landing})
+            reply = take("capture-acquisition", "/ck/hop.bin", "ck-hop.bin", [session])
+            done = commit_and_wait(reply.get("id", ""), "ck-hop.bin") if reply.get("ok") else {}
+            landing = [(host, header) for _, path, host, header in COOKIE_LOG if path == "/ck/landing.bin"]
+            run.check("cookies/redirect-to-another-host", "a redirect to another host carries none of the original host's cookies", done.get("state") == "completed" and landing and all(SESSION not in header for _, header in landing), {"reply": reply, "state": done.get("state"), "landing": landing})
 
-        reply = take("capture-acquisition", "/ck/confirm.bin", "ck-confirm.csv", [session])
-        done = commit_and_wait(reply.get("id", ""), "ck-confirm.csv") if reply.get("ok") else {}
-        confirmed = [header for header in cookies_sent("/ck/confirm.bin") if "confirm=yes" in header]
-        run.check("cookies/set-by-server", "a cookie the server sets along the way (a confirmation step) is kept for that download", done.get("state") == "completed" and bool(confirmed), {"reply": reply, "state": done.get("state"), "requestsWithConfirm": len(confirmed)})
+            reply = take("capture-acquisition", "/ck/confirm.bin", "ck-confirm.csv", [session])
+            done = commit_and_wait(reply.get("id", ""), "ck-confirm.csv") if reply.get("ok") else {}
+            confirmed = [header for header in cookies_sent("/ck/confirm.bin") if "confirm=yes" in header]
+            run.check("cookies/set-by-server", "a cookie the server sets along the way (a confirmation step) is kept for that download", done.get("state") == "completed" and bool(confirmed), {"reply": reply, "state": done.get("state"), "requestsWithConfirm": len(confirmed)})
 
-        reply = take("media-capture", "/ck/hls/vod.m3u8", "ck-media.ts", [cookie("session", SESSION, sameSite="no_restriction"), cookie("laxonly", "l-" + SESSION)], page=cross_page, extra={"playerKind": "video"})
-        done = commit_and_wait(reply.get("id", ""), "ck-media.ts") if reply.get("ok") else {}
-        sent = cookies_sent("/ck/hls/")
-        run.check("cookies/media-from-another-site", "a gated HLS stream played on another site completes with its SameSite=None session on every request, and without its Lax cookie", done.get("state") == "completed" and len(sent) > 2 and all(f"session={SESSION}" in header for header in sent) and not leaked(sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "leaked": leaked(sent)})
+            reply = take("media-capture", "/ck/hls/vod.m3u8", "ck-media.ts", [cookie("session", SESSION, sameSite="no_restriction"), cookie("laxonly", "l-" + SESSION)], page=cross_page, extra={"playerKind": "video"})
+            done = commit_and_wait(reply.get("id", ""), "ck-media.ts") if reply.get("ok") else {}
+            sent = cookies_sent("/ck/hls/")
+            run.check("cookies/media-from-another-site", "a gated HLS stream played on another site completes with its SameSite=None session on every request, and without its Lax cookie", done.get("state") == "completed" and len(sent) > 2 and all(f"session={SESSION}" in header for header in sent) and not leaked(sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "leaked": leaked(sent)})
 
-        exposed = {
-            "uiSnapshot": SESSION in json.dumps(devtools.invoke("get_snapshot")),
-            "database": any(SESSION.encode() in path.read_bytes() for path in (runtime / "data").glob("download-manager.db*")),
-            "appLog": SESSION in log_path.read_text(encoding="utf-8", errors="replace"),
-        }
-        run.check("cookies/never-exposed", "cookie values reach neither the UI, nor the database in readable form, nor the log", not any(exposed.values()), exposed)
-        with sqlite3.connect(db) as connection:
-            rows = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
-        run.check("cookies/erased-when-done", "once those downloads complete, their cookies are gone from storage", rows == 0, {"credentialRows": rows})
+            exposed = {
+                "uiSnapshot": SESSION in json.dumps(devtools.invoke("get_snapshot")),
+                "database": any(SESSION.encode() in path.read_bytes() for path in (runtime / "data").glob("download-manager.db*")),
+                "appLog": SESSION in log_path.read_text(encoding="utf-8", errors="replace"),
+            }
+            run.check("cookies/never-exposed", "cookie values reach neither the UI, nor the database in readable form, nor the log", not any(exposed.values()), exposed)
+            with sqlite3.connect(db) as connection:
+                rows = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+            run.check("cookies/erased-when-done", "once those downloads complete, their cookies are gone from storage", rows == 0, {"credentialRows": rows})
 
         # ---- Save durability: the real Add window, driven by UI Automation ----
         uia_timeouts: list[tuple[str, ...]] = []
@@ -775,107 +820,113 @@ def main() -> int:
                 return 1, ""
             return done.returncode, done.stdout
 
-        reply = capture("/file/range.bin", "cap-save")
-        ready = False
-        for _ in range(60):
-            code, listing = uia("-List", "-Seconds", "2")
-            if "Ready to save" in listing:
-                ready = True
-                break
-            time.sleep(0.5)
-        lock = sqlite3.connect(db, timeout=0, isolation_level=None)
-        lock.execute("BEGIN EXCLUSIVE")
-        try:
-            clicked = uia("-Button", "Save")[1].strip()
-            # Each refused write waits out SQLite's busy timeout (5 s) first.
-            code, during = 1, ""
-            for _ in range(30):
-                time.sleep(1)
-                code, during = uia("-List", "-Seconds", "5")
-                if code != 0 or "Could not record the Save" in during:
+        if wants("save"):
+            run.area = "save"
+            reply = capture("/file/range.bin", "cap-save")
+            ready = False
+            for _ in range(60):
+                code, listing = uia("-List", "-Seconds", "2")
+                if "Ready to save" in listing:
+                    ready = True
                     break
-        finally:
-            lock.execute("ROLLBACK")
-            lock.close()
-        stayed_open = code == 0 and "Save" in during
-        told_why = "Could not record the Save" in during
-        stored = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
-        run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[:16], "storedProvisional": stored.get("provisional"), "uiaTimeouts": len(uia_timeouts)})
-        uia("-Button", "Save")
-        final = {}
-        for _ in range(40):
-            time.sleep(0.5)
-            final = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
-            if final.get("state") == "completed":
-                break
-        saved_file = Path(final.get("destination", "")).is_file() if final else False
-        run.check("save/retry-after-storage-recovers", "once storage accepts writes again, the same Save completes the download", final.get("state") == "completed" and final.get("provisional") is False and saved_file, {"state": final.get("state"), "provisional": final.get("provisional"), "fileExists": saved_file})
-
-        # The Add window closed the way its X closes it when the job has not
-        # reached the window yet.
-        reply = capture("/file/range.bin", "cap-closed")
-        closing = None
-        for _ in range(40):
+                time.sleep(0.5)
+            lock = sqlite3.connect(db, timeout=0, isolation_level=None)
+            lock.execute("BEGIN EXCLUSIVE")
             try:
-                closing = devtools.evaluate(CLOSE_SURFACE, timeout=10, page=f"window=add&id={reply.get('id')}$")
-                break
-            except Exception as error:
-                closing = str(error)
-                time.sleep(0.25)
-        time.sleep(1.5)
-        try:
-            still_open = devtools.evaluate("document.title", timeout=10, page=f"window=add&id={reply.get('id')}$") is not None
-        except Exception:
-            still_open = False
-        leftovers = job_ids_for("cap-closed")
-        run.check("bridge/add-window-closed", "the Add window's own close works, and closing it unsaved discards the capture", reply.get("ok") is True and not still_open and not leftovers, {"reply": reply, "window": closing, "stillOpen": still_open, "leftoverJobs": leftovers})
-        for i in leftovers:
-            bridge({"type": "cancel-acquisition", "payload": {"id": i}})
+                clicked = uia("-Button", "Save")[1].strip()
+                # Each refused write waits out SQLite's busy timeout (5 s) first.
+                code, during = 1, ""
+                for _ in range(30):
+                    time.sleep(1)
+                    code, during = uia("-List", "-Seconds", "5")
+                    if code != 0 or "Could not record the Save" in during:
+                        break
+            finally:
+                lock.execute("ROLLBACK")
+                lock.close()
+            stayed_open = code == 0 and "Save" in during
+            told_why = "Could not record the Save" in during
+            stored = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
+            run.check("save/unrecorded-save-is-not-acknowledged", "when the Save cannot be written, the Add window stays open with the storage error and the job stays provisional", ready and stayed_open and told_why and stored.get("provisional") is True, {"reply": reply, "ready": ready, "clicked": clicked, "windowAfter": during.splitlines()[:16], "storedProvisional": stored.get("provisional"), "uiaTimeouts": len(uia_timeouts)})
+            uia("-Button", "Save")
+            final = {}
+            for _ in range(40):
+                time.sleep(0.5)
+                final = next((j for j in jobs().values() if j.get("name") == "cap-save.bin"), {})
+                if final.get("state") == "completed":
+                    break
+            saved_file = Path(final.get("destination", "")).is_file() if final else False
+            run.check("save/retry-after-storage-recovers", "once storage accepts writes again, the same Save completes the download", final.get("state") == "completed" and final.get("provisional") is False and saved_file, {"state": final.get("state"), "provisional": final.get("provisional"), "fileExists": saved_file})
 
-        early = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-early"}})
-        late = capture("/file/range.bin", "cap-early")
-        time.sleep(1)
-        leftovers = job_ids_for("cap-early")
-        run.check("bridge/cancel-before-create", "a timeout cancel that arrives first stops the late create from leaving an orphan owner", late.get("ok") is False and not leftovers, {"cancel": early, "create": late, "leftoverJobs": leftovers})
-        for i in leftovers:
-            bridge({"type": "cancel-acquisition", "payload": {"id": i}})
+        if wants("bridge"):
+            run.area = "bridge"
+            # The Add window closed the way its X closes it when the job has not
+            # reached the window yet.
+            reply = capture("/file/range.bin", "cap-closed")
+            closing = None
+            for _ in range(40):
+                try:
+                    closing = devtools.evaluate(CLOSE_SURFACE, timeout=10, page=f"window=add&id={reply.get('id')}$")
+                    break
+                except Exception as error:
+                    closing = str(error)
+                    time.sleep(0.25)
+            time.sleep(1.5)
+            try:
+                still_open = devtools.evaluate("document.title", timeout=10, page=f"window=add&id={reply.get('id')}$") is not None
+            except Exception:
+                still_open = False
+            leftovers = job_ids_for("cap-closed")
+            run.check("bridge/add-window-closed", "the Add window's own close works, and closing it unsaved discards the capture", reply.get("ok") is True and not still_open and not leftovers, {"reply": reply, "window": closing, "stillOpen": still_open, "leftoverJobs": leftovers})
+            for i in leftovers:
+                bridge({"type": "cancel-acquisition", "payload": {"id": i}})
+
+            early = bridge({"type": "cancel-acquisition", "payload": {"captureId": "cap-early"}})
+            late = capture("/file/range.bin", "cap-early")
+            time.sleep(1)
+            leftovers = job_ids_for("cap-early")
+            run.check("bridge/cancel-before-create", "a timeout cancel that arrives first stops the late create from leaving an orphan owner", late.get("ok") is False and not leftovers, {"cancel": early, "create": late, "leftoverJobs": leftovers})
+            for i in leftovers:
+                bridge({"type": "cancel-acquisition", "payload": {"id": i}})
 
         # ---- extension worker scenarios (real background.ts, real bridge) ------
-        worker = subprocess.run(["node", str(ROOT / "e2e" / "extension.mjs"), base], capture_output=True, text=True, encoding="utf-8", timeout=240, env={**os.environ, "DM_PAIRING": json.dumps({"keyId": PAIRING["keyId"], "key": PAIRING["key"]})})
-        try:
-            report = json.loads(worker.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError):
-            report = {"scenarios": [], "handedOver": []}
-            run.check("extension/harness", "the worker harness ran", False, {"stdout": worker.stdout[-2000:], "stderr": worker.stderr[-2000:]})
-        for item in report["scenarios"]:
-            run.check(f"extension/{item['scenario']}", item["guards"], item["pass"], item["evidence"])
-        time.sleep(1.5)
-        stored = jobs()
-        # A capture whose source the app decides: wait until its job has
-        # downloaded (or failed), then check what it settled on.
-        for item in report["handedOver"]:
-            expect = item.get("expect")
-            if not expect:
-                continue
-            job_id, settled = item.get("jobId"), {}
-            for _ in range(120):
-                # The app's own view: sources are stored encrypted.
-                snapshot = devtools.invoke("get_snapshot") or {}
-                settled = next((j for j in snapshot.get("jobs", []) if j.get("id") == job_id), {})
-                if settled.get("state") in ("ready", "completed", "failed"):
-                    break
-                time.sleep(0.25)
-            fetched = sorted({path for (path, _, _) in counts if any(path.startswith(prefix) for prefix in expect.get("notRequested", []))})
-            ok = settled.get("state") in expect["states"] and (settled.get("source") or "").endswith(expect.get("source", "")) and expect.get("error", "") in (settled.get("error") or "") and not fetched
-            run.check(f"extension/{item['scenario']} app", expect["guards"], ok, {"state": settled.get("state"), "source": settled.get("source"), "error": settled.get("error"), "events": [event.get("message") for event in settled.get("events", [])][:4], "requestedButShouldNotBe": fetched})
-        stored = jobs()
-        for item in report["handedOver"]:
-            owners = [j["id"] for j in stored.values() if j.get("name") == item.get("name") and j.get("provisional")]
-            if item.get("expectJob"):
-                run.check(f"extension/{item['scenario']} resident owner", "an accepted handoff leaves exactly one resident owner", len(owners) == 1, {"name": item.get("name"), "owners": owners})
-            elif not item.get("jobId"):
-                run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
-            bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
+        if wants("extension"):
+            run.area = "extension"
+            worker = subprocess.run(["node", str(ROOT / "e2e" / "extension.mjs"), base], capture_output=True, text=True, encoding="utf-8", timeout=240, env={**os.environ, "DM_PAIRING": json.dumps({"keyId": PAIRING["keyId"], "key": PAIRING["key"]})})
+            try:
+                report = json.loads(worker.stdout.strip().splitlines()[-1])
+            except (IndexError, json.JSONDecodeError):
+                report = {"scenarios": [], "handedOver": []}
+                run.check("extension/harness", "the worker harness ran", False, {"stdout": worker.stdout[-2000:], "stderr": worker.stderr[-2000:]})
+            for item in report["scenarios"]:
+                run.check(f"extension/{item['scenario']}", item["guards"], item["pass"], item["evidence"])
+            time.sleep(1.5)
+            stored = jobs()
+            # A capture whose source the app decides: wait until its job has
+            # downloaded (or failed), then check what it settled on.
+            for item in report["handedOver"]:
+                expect = item.get("expect")
+                if not expect:
+                    continue
+                job_id, settled = item.get("jobId"), {}
+                for _ in range(120):
+                    # The app's own view: sources are stored encrypted.
+                    snapshot = devtools.invoke("get_snapshot") or {}
+                    settled = next((j for j in snapshot.get("jobs", []) if j.get("id") == job_id), {})
+                    if settled.get("state") in ("ready", "completed", "failed"):
+                        break
+                    time.sleep(0.25)
+                fetched = sorted({path for (path, _, _) in counts if any(path.startswith(prefix) for prefix in expect.get("notRequested", []))})
+                ok = settled.get("state") in expect["states"] and (settled.get("source") or "").endswith(expect.get("source", "")) and expect.get("error", "") in (settled.get("error") or "") and not fetched
+                run.check(f"extension/{item['scenario']} app", expect["guards"], ok, {"state": settled.get("state"), "source": settled.get("source"), "error": settled.get("error"), "events": [event.get("message") for event in settled.get("events", [])][:4], "requestedButShouldNotBe": fetched})
+            stored = jobs()
+            for item in report["handedOver"]:
+                owners = [j["id"] for j in stored.values() if j.get("name") == item.get("name") and j.get("provisional")]
+                if item.get("expectJob"):
+                    run.check(f"extension/{item['scenario']} resident owner", "an accepted handoff leaves exactly one resident owner", len(owners) == 1, {"name": item.get("name"), "owners": owners})
+                elif not item.get("jobId"):
+                    run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
+                bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
 
         # ---- where partial files live ------------------------------------
         # Next to the file they become, unless the user set a temp folder;
@@ -890,90 +941,96 @@ def main() -> int:
                 time.sleep(0.2)
             return next((j for j in devtools.invoke("get_snapshot")["jobs"] if j["id"] == job_id), {})
 
-        folder_a, folder_b = out / "temp-a", out / "temp-b"
-        folder_a.mkdir(exist_ok=True)
-        app_tmp_before = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
-        moving_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-move", "name": "temp-move.bin", "destination": str(folder_a / "temp-move.bin"), "bandwidthLimit": 512 * 1024}})
-        running = wait_job(moving_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > 2 * MIB)
-        part = Path(running.get("tempPath", ""))
-        part_size = part.stat().st_size if part.is_file() else None
-        app_tmp_after = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
-        run.check("temp/next-to-target", "with no temp folder set, the partial file sits next to the file it becomes, not in the app's folder", part.parent == folder_a and part.is_file() and part.name.startswith("temp-move.bin.") and app_tmp_after == app_tmp_before, {"tempPath": str(part), "appTmpNew": sorted(set(app_tmp_after) - set(app_tmp_before))})
-        run.check("engine/no-preallocation", "the partial file grows as ranges land: it is never sized to the whole download up front", part_size is not None and part_size < len(METERED), {"partSize": part_size, "total": len(METERED), "downloaded": running.get("downloaded")})
-        devtools.invoke("commit_provisional", {"id": moving_id, "input": {"name": "temp-move.bin", "destination": str(folder_b / "temp-move.bin"), "bandwidthLimit": None}})
-        moved = wait_job(moving_id, lambda j: Path(j.get("tempPath", "")).parent == folder_b or j.get("state") in ("completed", "failed"))
-        done = wait_job(moving_id, lambda j: j.get("state") in ("completed", "failed"), 60)
-        final = folder_b / "temp-move.bin"
-        left = sorted(p.name for folder in (folder_a, folder_b) for p in folder.glob("*.part*"))
-        run.check("temp/follows-save", "Save to another folder moves the partial file there and the download resumes from it: byte-exact, nothing left behind", Path(moved.get("tempPath", "")).parent == folder_b and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and not left, {"tempPathAfterSave": moved.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "leftovers": left, "events": [e.get("message") for e in done.get("events", [])][:6]})
+        if wants("temp"):
+            run.area = "temp"
+            folder_a, folder_b = out / "temp-a", out / "temp-b"
+            folder_a.mkdir(exist_ok=True)
+            app_tmp_before = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
+            moving_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-move", "name": "temp-move.bin", "destination": str(folder_a / "temp-move.bin"), "bandwidthLimit": 512 * 1024}})
+            running = wait_job(moving_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > 2 * MIB)
+            part = Path(running.get("tempPath", ""))
+            part_size = part.stat().st_size if part.is_file() else None
+            app_tmp_after = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
+            run.check("temp/next-to-target", "with no temp folder set, the partial file sits next to the file it becomes, not in the app's folder", part.parent == folder_a and part.is_file() and part.name.startswith("temp-move.bin.") and app_tmp_after == app_tmp_before, {"tempPath": str(part), "appTmpNew": sorted(set(app_tmp_after) - set(app_tmp_before))})
+            run.check("engine/no-preallocation", "the partial file grows as ranges land: it is never sized to the whole download up front", part_size is not None and part_size < len(METERED), {"partSize": part_size, "total": len(METERED), "downloaded": running.get("downloaded")})
+            devtools.invoke("commit_provisional", {"id": moving_id, "input": {"name": "temp-move.bin", "destination": str(folder_b / "temp-move.bin"), "bandwidthLimit": None}})
+            moved = wait_job(moving_id, lambda j: Path(j.get("tempPath", "")).parent == folder_b or j.get("state") in ("completed", "failed"))
+            done = wait_job(moving_id, lambda j: j.get("state") in ("completed", "failed"), 60)
+            final = folder_b / "temp-move.bin"
+            left = sorted(p.name for folder in (folder_a, folder_b) for p in folder.glob("*.part*"))
+            run.check("temp/follows-save", "Save to another folder moves the partial file there and the download resumes from it: byte-exact, nothing left behind", Path(moved.get("tempPath", "")).parent == folder_b and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and not left, {"tempPathAfterSave": moved.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "leftovers": left, "events": [e.get("message") for e in done.get("events", [])][:6]})
 
-        explicit = runtime / "explicit-temp"
-        devtools.invoke("update_settings", {"patch": {"tempFolder": str(explicit)}})
-        explicit_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-explicit", "name": "temp-explicit.bin", "destination": str(folder_a / "temp-explicit.bin"), "bandwidthLimit": 512 * 1024}})
-        running = wait_job(explicit_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > MIB)
-        devtools.invoke("commit_provisional", {"id": explicit_id, "input": {"name": "temp-explicit.bin", "destination": str(folder_b / "temp-explicit.bin"), "bandwidthLimit": None}})
-        done = wait_job(explicit_id, lambda j: j.get("state") in ("completed", "failed"), 60)
-        final = folder_b / "temp-explicit.bin"
-        devtools.invoke("update_settings", {"patch": {"tempFolder": ""}})
-        cleared = devtools.invoke("get_snapshot")["settings"].get("tempFolder")
-        run.check("temp/explicit-folder", "a temp folder the user set holds the partial file even when Save picks another folder; clearing the setting goes back to next-to-the-file", Path(running.get("tempPath", "")).parent == explicit and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and cleared is None and not list(explicit.glob("*")), {"tempPath": running.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "clearedSetting": cleared, "explicitLeft": [p.name for p in explicit.glob("*")]})
+            explicit = runtime / "explicit-temp"
+            devtools.invoke("update_settings", {"patch": {"tempFolder": str(explicit)}})
+            explicit_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-explicit", "name": "temp-explicit.bin", "destination": str(folder_a / "temp-explicit.bin"), "bandwidthLimit": 512 * 1024}})
+            running = wait_job(explicit_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > MIB)
+            devtools.invoke("commit_provisional", {"id": explicit_id, "input": {"name": "temp-explicit.bin", "destination": str(folder_b / "temp-explicit.bin"), "bandwidthLimit": None}})
+            done = wait_job(explicit_id, lambda j: j.get("state") in ("completed", "failed"), 60)
+            final = folder_b / "temp-explicit.bin"
+            devtools.invoke("update_settings", {"patch": {"tempFolder": ""}})
+            cleared = devtools.invoke("get_snapshot")["settings"].get("tempFolder")
+            run.check("temp/explicit-folder", "a temp folder the user set holds the partial file even when Save picks another folder; clearing the setting goes back to next-to-the-file", Path(running.get("tempPath", "")).parent == explicit and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and cleared is None and not list(explicit.glob("*")), {"tempPath": running.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "clearedSetting": cleared, "explicitLeft": [p.name for p in explicit.glob("*")]})
 
         # ---- updates to the windows carry only what changed -------------------
-        captured = devtools.evaluate("""(async () => {
-          const internals = window.__TAURI_INTERNALS__;
-          const seen = [];
-          const handler = internals.transformCallback((event) => seen.push(event.payload));
-          await internals.invoke('plugin:event|listen', { event: 'state-delta', target: { kind: 'Any' }, handler });
-          const before = (await internals.invoke('get_snapshot')).settings.density;
-          await internals.invoke('update_settings', { patch: { density: before === 'compact' ? 'comfortable' : 'compact' } });
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          await internals.invoke('update_settings', { patch: { density: before } });
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          const snapshot = await internals.invoke('get_snapshot');
-          return { jobsInList: snapshot.jobs.length, revision: snapshot.revision, updates: seen.map((delta) => ({ revision: delta.revision, jobs: delta.jobs.length, settings: delta.settings ? delta.settings.density : null })) };
-        })()""")
-        updates = captured.get("updates", [])
-        with_settings = [update for update in updates if update["settings"]]
-        revisions = [update["revision"] for update in updates]
-        run.check("ui/updates-carry-changes", "a settings change reaches the windows as an update with the new settings and none of the unchanged jobs, numbered in order", captured.get("jobsInList", 0) > 0 and len(with_settings) >= 2 and all(update["jobs"] == 0 for update in with_settings) and revisions == sorted(revisions) and captured.get("revision", 0) >= max(revisions or [0]), captured)
+        if wants("ui"):
+            run.area = "ui"
+            captured = devtools.evaluate("""(async () => {
+              const internals = window.__TAURI_INTERNALS__;
+              const seen = [];
+              const handler = internals.transformCallback((event) => seen.push(event.payload));
+              await internals.invoke('plugin:event|listen', { event: 'state-delta', target: { kind: 'Any' }, handler });
+              const before = (await internals.invoke('get_snapshot')).settings.density;
+              await internals.invoke('update_settings', { patch: { density: before === 'compact' ? 'comfortable' : 'compact' } });
+              await new Promise((resolve) => setTimeout(resolve, 500));
+              await internals.invoke('update_settings', { patch: { density: before } });
+              await new Promise((resolve) => setTimeout(resolve, 500));
+              const snapshot = await internals.invoke('get_snapshot');
+              return { jobsInList: snapshot.jobs.length, revision: snapshot.revision, updates: seen.map((delta) => ({ revision: delta.revision, jobs: delta.jobs.length, settings: delta.settings ? delta.settings.density : null })) };
+            })()""")
+            updates = captured.get("updates", [])
+            with_settings = [update for update in updates if update["settings"]]
+            revisions = [update["revision"] for update in updates]
+            run.check("ui/updates-carry-changes", "a settings change reaches the windows as an update with the new settings and none of the unchanged jobs, numbered in order", captured.get("jobsInList", 0) > 0 and len(with_settings) >= 2 and all(update["jobs"] == 0 for update in with_settings) and revisions == sorted(revisions) and captured.get("revision", 0) >= max(revisions or [0]), captured)
 
         # ---- cookies across a restart -------------------------------------
-        reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])
-        slow_id = reply.get("id", "")
-        devtools.invoke("commit_provisional", {"id": slow_id, "input": {"name": "ck-slow.bin", "destination": str(out / "ck-slow.bin")}})
-        devtools.invoke("pause_job", {"id": slow_id})
-        time.sleep(1)
-        with sqlite3.connect(db) as connection:
-            row = connection.execute("SELECT payload FROM credentials WHERE id = ?", (slow_id,)).fetchone()
-        stored = row[0] if row else ""
-        paused_state = jobs().get(slow_id, {}).get("state")
-        app.terminate()
-        app.wait(timeout=15)
-        log.close()
-        log = open(log_path, "a", encoding="utf-8")
-        app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        restarted = time.time()
-        for _ in range(60):
-            try:
-                devtools.invoke("resume_job", {"id": slow_id}, timeout=10)
-                break
-            except Exception:
-                time.sleep(0.5)
-        done = {}
-        for _ in range(120):
-            time.sleep(0.25)
-            done = jobs().get(slow_id, {})
-            if done.get("state") in ("completed", "failed"):
-                break
-        after = cookies_sent("/ck/slow.bin", since=restarted)
-        with sqlite3.connect(db) as connection:
-            remaining = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
-        run.check("cookies/survive-restart", "a committed download's cookies are kept protected (DPAPI) on disk, carry it through an app restart, and are erased when it completes", paused_state == "paused" and stored.startswith("dpapi1:") and SESSION not in stored and done.get("state") == "completed" and bool(after) and all(f"session={SESSION}" in header for header in after) and remaining == 0, {"pausedState": paused_state, "storedProtected": stored.startswith("dpapi1:"), "storedReadable": SESSION in stored, "state": done.get("state"), "requestsAfterRestart": len(after), "credentialRowsAfter": remaining})
+        if wants("restart"):
+            run.area = "restart"
+            reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])
+            slow_id = reply.get("id", "")
+            devtools.invoke("commit_provisional", {"id": slow_id, "input": {"name": "ck-slow.bin", "destination": str(out / "ck-slow.bin")}})
+            devtools.invoke("pause_job", {"id": slow_id})
+            time.sleep(1)
+            with sqlite3.connect(db) as connection:
+                row = connection.execute("SELECT payload FROM credentials WHERE id = ?", (slow_id,)).fetchone()
+            stored = row[0] if row else ""
+            paused_state = jobs().get(slow_id, {}).get("state")
+            app.terminate()
+            app.wait(timeout=15)
+            log.close()
+            log = open(log_path, "a", encoding="utf-8")
+            app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            restarted = time.time()
+            for _ in range(60):
+                try:
+                    devtools.invoke("resume_job", {"id": slow_id}, timeout=10)
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            done = {}
+            for _ in range(120):
+                time.sleep(0.25)
+                done = jobs().get(slow_id, {})
+                if done.get("state") in ("completed", "failed"):
+                    break
+            after = cookies_sent("/ck/slow.bin", since=restarted)
+            with sqlite3.connect(db) as connection:
+                remaining = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+            run.check("cookies/survive-restart", "a committed download's cookies are kept protected (DPAPI) on disk, carry it through an app restart, and are erased when it completes", paused_state == "paused" and stored.startswith("dpapi1:") and SESSION not in stored and done.get("state") == "completed" and bool(after) and all(f"session={SESSION}" in header for header in after) and remaining == 0, {"pausedState": paused_state, "storedProtected": stored.startswith("dpapi1:"), "storedReadable": SESSION in stored, "state": done.get("state"), "requestsAfterRestart": len(after), "credentialRowsAfter": remaining})
 
-        # Forgetting pairings in Settings: the old key stops working.
-        devtools.invoke("forget_pairings")
-        status, answer = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message)[0])
-        run.check("pairing/forget", "after Forget in Settings the browser's key is refused and it must pair again", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
+            # Forgetting pairings in Settings: the old key stops working.
+            devtools.invoke("forget_pairings")
+            status, answer = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message)[0])
+            run.check("pairing/forget", "after Forget in Settings the browser's key is refused and it must pair again", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
     finally:
         app.terminate()
         try:
@@ -987,7 +1044,7 @@ def main() -> int:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     dirty = bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True).stdout.strip())
-    artifact = {"run": stamp, "commit": commit, "dirtyTree": dirty, "passed": sum(r["pass"] for r in run.results), "failed": sum(not r["pass"] for r in run.results), "scenarios": run.results, "serverRequests": {f"{p} {m} {r}".strip(): v for (p, m, r), v in sorted(counts.items())}, "appLog": log_path.read_text(encoding="utf-8", errors="replace")[-4000:]}
+    artifact = {"run": stamp, "commit": commit, "dirtyTree": dirty, "areas": sorted(only) or "all", "passed": sum(r["pass"] for r in run.results), "failed": sum(not r["pass"] for r in run.results), "scenarios": run.results, "serverRequests": {f"{p} {m} {r}".strip(): v for (p, m, r), v in sorted(counts.items())}, "appLog": log_path.read_text(encoding="utf-8", errors="replace")[-4000:]}
     target = RESULTS / f"native-{stamp}.json"
     target.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     print(f"\n{artifact['passed']} passed, {artifact['failed']} failed -> {target.relative_to(ROOT)}")

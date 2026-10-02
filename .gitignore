@@ -35,6 +35,7 @@ audit/
 # Local environment (per-developer; see README)
 .env
 .env.*
+src-tauri/.cargo/
 
 # End-to-end run artifacts
 e2e/results/

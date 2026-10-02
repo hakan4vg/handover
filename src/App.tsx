@@ -4,7 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, currentMonitor, LogicalSize, LogicalPosition } from '@tauri-apps/api/window';
 import { open as openFolderDialog } from '@tauri-apps/plugin-dialog';
-import { createAdapter, formatBytes, formatSpeed } from './adapters';
+import { createAdapter, formatBytes, formatDuration, formatSpeed } from './adapters';
+import appIcon from './assets/app-icon.png';
 import { BANDWIDTH_UNITS, bandwidthToBps, bpsToParts, type BandwidthUnit } from './bandwidth';
 import { fileKind, type FileKind } from './file-kind';
 import { Icon, type IconName } from './icons';
@@ -49,14 +50,14 @@ const modeText = (mode: TransferMode) => ({ 'whole-object': 'Byte ranges', segme
 const settingsNav: Array<{ key: SettingsPage; label: string; icon: IconName }> = [
   { key: 'general', label: 'General', icon: 'settings' },
   { key: 'downloads', label: 'Downloads', icon: 'download' },
-  { key: 'browser', label: 'Browser Integration', icon: 'globe' },
+  { key: 'browser', label: 'Browser Integration', icon: 'browser' },
   { key: 'network', label: 'Network', icon: 'network' },
   { key: 'notifications', label: 'Notifications', icon: 'bell' },
   { key: 'appearance', label: 'Appearance', icon: 'palette' },
 ];
 
 const settingsKeys: Array<keyof AppSettings> = [
-  'startAtSignIn', 'showManagerAtSignIn', 'closeBehavior', 'defaultFolder',
+  'startAtSignIn', 'showManagerAtSignIn', 'closeBehavior', 'defaultFolder', 'tempFolder',
   'collisionBehavior', 'interceptDownloads', 'showMediaButtons', 'excludedSites',
   'bandwidthLimit', 'bandwidthUnit', 'maxConnections', 'perDownloadOverrides',
   'retryAutomatically', 'maxRetries', 'completionNotifications', 'failureNotifications',
@@ -123,7 +124,7 @@ function App() {
 }
 
 function Loading() {
-  return <div className="loading-screen"><div className="loading-mark"><Icon name="download" size={23} /></div><span>Connecting to Download Manager…</span></div>;
+  return <div className="loading-screen"><img className="loading-logo" src={appIcon} width={40} height={40} alt="" /><span>Connecting to Download Manager…</span></div>;
 }
 
 function Disconnected({ message }: { message: string }) {
@@ -133,7 +134,7 @@ function Disconnected({ message }: { message: string }) {
 export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot: AppSnapshot }) {
   const [filter, setFilter] = useState<FilterKey>(() => new URLSearchParams(window.location.search).has('settings') ? 'settings' as FilterKey : 'all');
   const [settingsPage, setSettingsPage] = useState<SettingsPage>(() => settingsPageFromSearch(window.location.search));
-  const [selectedId, setSelectedId] = useState(() => new URLSearchParams(window.location.search).get('job') ?? 'job-2');
+  const [selectedId, setSelectedId] = useState(() => new URLSearchParams(window.location.search).get('job') ?? '');
   const [addWindowId, setAddWindowId] = useState<string | null>(null);
   const [showManualAdd, setShowManualAdd] = useState(false);
   const [contextJobId, setContextJobId] = useState<string | null>(null);
@@ -187,6 +188,18 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
       setFilter('all');
       setSelectedId(id);
       setInspectorOpen(true);
+    }).then((fn) => { dispose = fn; }).catch(() => undefined);
+    return () => dispose?.();
+  }, []);
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let dispose: (() => void) | undefined;
+    listen<SettingsPage>('open-settings', (event) => {
+      setFilter('settings' as FilterKey);
+      setSettingsPage(event.payload);
+      dismissMenus();
+      setContextJobId(null);
     }).then((fn) => { dispose = fn; }).catch(() => undefined);
     return () => dispose?.();
   }, []);
@@ -254,7 +267,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
   return (
     <div className="desktop-shell" style={{ '--accent': stableSettings.accent } as CSSProperties} data-density={stableSettings.density} data-theme={stableSettings.theme}>
       <div className="titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}>
-        <div className="product-title"><span className="product-logo"><Icon name="download" size={18} /></span><span>Download Manager</span></div>
+        <div className="product-title"><img className="product-logo" src={appIcon} width={18} height={18} alt="" /><span>Download Manager</span></div>
         <WindowControls />
       </div>
       <div className="manager-body">
@@ -276,7 +289,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
                  <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <KeyboardMenu className="toolbar-menu" label="Manager options" onDismiss={() => setMoreOpen(false)}><button role="menuitem" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={15} /> Settings</button><button role="menuitem" onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></KeyboardMenu>}</div>
               </div>
             </div>
-            <div className="workspace-columns">
+            <div className={`workspace-columns${selected && inspectorOpen ? '' : ' no-inspector'}`}>
               <section className="download-list" aria-label="Downloads">
                  <div className="list-header"><span>Downloads</span><div className="list-header-actions"><button className="subtle-button" aria-haspopup="menu" aria-expanded={sortOpen} onClick={() => { setSortOpen(!sortOpen); setMoreOpen(false); }}><Icon name="sort" size={15} /> Sort <Icon name="chevron-down" size={13} /></button>{sortOpen && <SortMenu value={sortBy} onChange={(value) => { setSortBy(value); setSortOpen(false); }} onDismiss={() => setSortOpen(false)} />}</div></div>
                 <div className="rows">
@@ -284,9 +297,9 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
                 </div>
                 {contextJob && <JobContextMenu job={contextJob} adapter={adapter} onClose={() => setContextJobId(null)} onNotice={showNotice} />}
               </section>
-              {selected && (inspectorOpen ? <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} /> : <button className="inspector-reopen" onClick={() => setInspectorOpen(true)} aria-label="Open inspector"><Icon name="chevron-left" size={17} /><span>Details</span></button>)}
+              {selected && inspectorOpen && <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} />}
             </div>
-             <div className="manager-statusbar"><div className="aggregate-status"><span>{active.length} active</span><span>·</span><span>{formatSpeed(active.length > 0 ? snapshot.aggregateSpeed : 0)}</span></div><span className="status-live">Live transfer state</span></div>
+             <div className="manager-statusbar"><div className="aggregate-status"><span>{active.length} active</span><span>·</span><span>{formatSpeed(active.length > 0 ? snapshot.aggregateSpeed : 0)}</span></div></div>
           </main>
         )}
       </div>
@@ -358,6 +371,27 @@ export async function openLocalPath(path: string): Promise<string | undefined> {
   }
 }
 
+/** Shows the file selected in its folder, or the folder when the file is not
+ *  there yet. */
+export async function revealLocalPath(path: string): Promise<string | undefined> {
+  if (!(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) return openLocalPath(path.slice(0, Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'))));
+  try {
+    await invoke('reveal_path', { path });
+    return undefined;
+  } catch (reason) {
+    return errorMessage(reason, 'Could not show the file in its folder.');
+  }
+}
+
+/** What a transfer is doing instead of plain downloading, or how long it has
+ *  left at the current speed. */
+export function timeLeftText(job: DownloadJob): string | undefined {
+  // The state label already says "Paused" or "Finalizing".
+  if (job.note && job.note !== stateText(job.state)) return job.note;
+  if (job.state === 'downloading' && job.etaSeconds) return `${formatDuration(job.etaSeconds)} left`;
+  return undefined;
+}
+
 export async function copySourceUrl(source: string): Promise<string | undefined> {
   try {
     if (!navigator.clipboard) return 'Clipboard is unavailable.';
@@ -390,7 +424,7 @@ function titleFor(filter: FilterKey) {
 }
 
 function SidebarItem({ icon, label, count, active, onClick }: { icon: IconName; label: string; count?: number; active: boolean; onClick: () => void }) {
-  return <button className={`sidebar-item ${active ? 'selected' : ''}`} aria-current={active ? 'page' : undefined} onClick={onClick}><Icon name={icon} size={18} /><span>{label}</span>{count !== undefined && <span className="nav-count">{count}</span>}</button>;
+  return <button className={`sidebar-item ${active ? 'selected' : ''}`} aria-current={active ? 'page' : undefined} onClick={onClick}><Icon name={icon} size={20} filled={active} /><span>{label}</span>{count !== undefined && <span className="nav-count">{count}</span>}</button>;
 }
 
 function KeyboardMenu({ className, label, onDismiss, children }: { className: string; label: string; onDismiss?: () => void; children: ReactNode }) {
@@ -454,13 +488,16 @@ export function rowFieldsEqual(previous: DownloadRowProps, next: DownloadRowProp
     && before.downloaded === after.downloaded
     && before.total === after.total
     && before.speed === after.speed
-    && before.eta === after.eta
+    && before.note === after.note
+    && before.etaSeconds === after.etaSeconds
+    && before.error === after.error
     && before.connections === after.connections;
 }
 
 export const DownloadRow = memo(function DownloadRow({ job, selected, menuOpen = false, onSelect, onPause, onResume, onRetry, onMenu }: DownloadRowProps) {
-  const showsConnections = stateIn(job.state, [...TRANSFER_STATES, ...RESUMABLE_STATES]);
+  const showsConnections = stateIn(job.state, TRANSFER_STATES);
   const stateLabel = stateText(job.state);
+  const timeLeft = timeLeftText(job);
   // One decision per row, so the control, its icon, and its accessible name can
   // never disagree. A job waiting for the user's confirmation has no transfer to
   // stop, so it offers no pause control at all.
@@ -477,9 +514,13 @@ export const DownloadRow = memo(function DownloadRow({ job, selected, menuOpen =
       <div className="row-title-line"><strong title={job.name}>{job.name}</strong><span className={`state ${stateTone(job.state)}`}>{stateLabel}</span></div>
       <div className="row-source"><Icon name="globe" size={12} />{job.domain}</div>
       <div className="progress-track"><span className={`progress-fill ${stateTone(job.state)}`} style={{ width: `${job.progress}%` }} /></div>
-      <div className="row-meta"><span>{formatBytes(job.downloaded)}{job.total ? ` / ${formatBytes(job.total)}` : ''}</span><span>{job.eta ?? (job.state === 'completed' ? 'Completed' : '—')}</span>{showsConnections && <span>{job.connections ? `${job.connections} connection${job.connections === 1 ? '' : 's'}` : 'No active connections'}</span>}</div>
+      <div className="row-meta">{job.state === 'failed' && job.error
+        ? <span className="row-error" title={job.error}>{job.error}</span>
+        : job.state === 'completed'
+          ? <span>{formatBytes(job.total ?? job.downloaded)}</span>
+          : <><span>{formatBytes(job.downloaded)}{job.total ? ` / ${formatBytes(job.total)}` : ''}</span>{timeLeft && <span>{timeLeft}</span>}{showsConnections && job.connections > 0 && <span>{`${job.connections} connection${job.connections === 1 ? '' : 's'}`}</span>}</>}</div>
     </div>
-    <div className="row-speed">{job.state === 'downloading' && job.speed ? formatSpeed(job.speed) : job.state === 'completed' ? formatBytes(job.total) : '—'}</div>
+    <div className="row-speed">{job.state === 'downloading' && job.speed ? formatSpeed(job.speed) : ''}</div>
     <div className="row-actions">{action && <button className="row-action" aria-label={action.label} onClick={(event) => { event.stopPropagation(); action.run(); }}><Icon name={action.icon} size={16} /></button>}<button className="row-action" aria-haspopup="menu" aria-expanded={menuOpen} aria-label={`More actions for ${job.name}`} onClick={(event) => { event.stopPropagation(); onMenu(); }}><Icon name="more" size={16} /></button></div>
   </article>;
 }, rowFieldsEqual);
@@ -558,8 +599,10 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
     void openLocalPath(path).then((error) => { if (error) setPathError(error); });
   };
   const openFile = () => openPath(job.destination);
-  const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  const openFolder = () => openPath(folder);
+  const showInFolder = () => {
+    setPathError('');
+    void revealLocalPath(job.destination).then((error) => { if (error) setPathError(error); });
+  };
   // Only a completed download put a file at its destination; every other state
   // has a plan there, which may be a file the user already had.
   const ownsDestination = job.state === 'completed';
@@ -578,7 +621,7 @@ export function Inspector({ job, adapter, onClose }: { job: DownloadJob; adapter
       setRemoving(false);
     }
   };
-  return <aside className="inspector"><div className="inspector-tabs" role="tablist" aria-label="Download details">{inspectorTabs.map((item) => <button disabled={item === 'Media' && !job.media} key={item} id={tabId(item)} role="tab" aria-selected={tab === item} aria-controls={panelId} tabIndex={tab === item ? 0 : -1} className={tab === item ? 'active' : ''} onClick={() => setTab(item)} onKeyDown={(event) => handleTabKeyDown(event, availableTabs.indexOf(item))}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll" id={panelId} role="tabpanel" tabIndex={0} aria-labelledby={tabId(tab)}><div className="inspector-heading"><FileIcon kind={fileKind(job.name, job.mime)} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile} title="Open file"><Icon name="open" size={18} /><span className="sr-only">Open file</span></button><button className="button" disabled={job.state !== 'completed'} onClick={openFolder} title="Open containing folder"><Icon name="folder" size={18} /><span className="sr-only">Open containing folder</span></button><button className="button" disabled={removing} onClick={() => void remove(false)} title="Remove from list"><Icon name="close" size={18} /><span className="sr-only">{removing ? 'Removing…' : 'Remove'}</span></button><button className="button danger-button" disabled={removing || !ownsDestination} title={ownsDestination ? 'Delete file from disk and remove from list' : 'Only a completed download can delete its file'} onClick={() => void remove(true)}><Icon name="delete" size={18} /><span className="sr-only">Delete file</span></button></div></aside>;
+  return <aside className="inspector"><div className="inspector-tabs" role="tablist" aria-label="Download details">{inspectorTabs.map((item) => <button disabled={item === 'Media' && !job.media} key={item} id={tabId(item)} role="tab" aria-selected={tab === item} aria-controls={panelId} tabIndex={tab === item ? 0 : -1} className={tab === item ? 'active' : ''} onClick={() => setTab(item)} onKeyDown={(event) => handleTabKeyDown(event, availableTabs.indexOf(item))}>{item}</button>)}<button className="icon-button inspector-close" aria-label="Close inspector" onClick={onClose}><Icon name="close" size={15} /></button></div><div className="inspector-scroll" id={panelId} role="tabpanel" tabIndex={0} aria-labelledby={tabId(tab)}><div className="inspector-heading"><FileIcon kind={fileKind(job.name, job.mime)} /><div><h2>{job.name}</h2><span>{job.domain}</span></div></div>{tab === 'Overview' && <Overview job={job} />}{tab === 'Network' && <NetworkDetails job={job} />}{tab === 'Media' && <MediaDetails job={job} />}{tab === 'Files' && <FileDetails job={job} />}{tab === 'Log' && <JobLog job={job} />}</div><div className="inspector-actions">{pathError && <div className="form-error" role="alert"><Icon name="error" size={14} />{pathError}</div>}{removeError && <div className="form-error" role="alert"><Icon name="error" size={14} />{removeError}</div>}<button className="button" disabled={job.state !== 'completed'} onClick={openFile} title="Open file"><Icon name="open" size={18} /><span className="sr-only">Open file</span></button><button className="button" onClick={showInFolder} title="Show in folder"><Icon name="folder-open" size={18} /><span className="sr-only">Show in folder</span></button><button className="button" disabled={removing} onClick={() => void remove(false)} title="Remove from list"><Icon name="remove" size={18} /><span className="sr-only">{removing ? 'Removing…' : 'Remove'}</span></button><button className="button danger-button" disabled={removing || !ownsDestination} title={ownsDestination ? 'Delete file from disk and remove from list' : 'Only a completed download can delete its file'} onClick={() => void remove(true)}><Icon name="delete" size={18} /><span className="sr-only">Delete file</span></button></div></aside>;
 }
 
 function DetailGrid({ items }: { items: Array<{ label: string; value: string; tone?: string; copyable?: boolean }> }) {
@@ -648,20 +691,21 @@ function Overview({ job }: { job: DownloadJob }) {
   const downloadedText = job.total
     ? `${formatBytes(job.downloaded)} of ${formatBytes(job.total)} (${percent}%)`
     : formatBytes(job.downloaded);
-  return <><div className="inspector-status"><span className={`status-pill ${stateTone(job.state)}`}><span className="status-dot" />{stateText(job.state)}</span><span className="inspector-progress">{percent}%</span></div><SegmentedProgress job={job} /><DetailGrid items={[{ label: 'Status', value: job.error ?? stateText(job.state), tone: stateTone(job.state) }, { label: 'Save to', value: job.destination, copyable: true }, { label: 'Source', value: job.source, copyable: true }, { label: 'File size', value: formatBytes(job.total) }, { label: 'Downloaded', value: downloadedText }, { label: 'Speed', value: formatSpeed(job.state === 'downloading' ? job.speed : 0) }, { label: 'ETA', value: job.state === 'downloading' ? (job.eta ?? '—') : job.state === 'paused' ? 'Paused' : '—' }, { label: 'Connections', value: `${job.state === 'downloading' ? job.connections : 0} of ${job.maxConnections} max` }, { label: 'Transfer mode', value: modeText(job.mode) }, { label: 'Created', value: formatTime(job.created) }, { label: 'Started', value: job.started ? formatTime(job.started) : 'Not started' }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} /></>;
+  return <><div className="inspector-status"><span className={`status-pill ${stateTone(job.state)}`}><span className="status-dot" />{stateText(job.state)}</span><span className="inspector-progress">{percent}%</span></div><SegmentedProgress job={job} /><DetailGrid items={[{ label: 'Status', value: job.error ?? stateText(job.state), tone: stateTone(job.state) }, { label: 'Save to', value: job.destination, copyable: true }, { label: 'Source', value: job.source, copyable: true }, { label: 'File size', value: formatBytes(job.total) }, { label: 'Downloaded', value: downloadedText }, { label: 'Speed', value: formatSpeed(job.state === 'downloading' ? job.speed : 0) }, { label: 'Time left', value: timeLeftText(job) ?? '—' }, { label: 'Connections', value: job.state === 'downloading' ? `${job.connections} of ${job.maxConnections}` : `Up to ${job.maxConnections}` }, { label: 'Transfer mode', value: modeText(job.mode) }, { label: 'Created', value: formatTime(job.created) }, { label: 'Started', value: job.started ? formatTime(job.started) : 'Not started' }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} /></>;
 }
 
 function NetworkDetails({ job }: { job: DownloadJob }) {
-  return <><SectionTitle icon="network" title="Connection" /><DetailGrid items={[{ label: 'Transfer mode', value: modeText(job.mode) }, { label: 'Active connections', value: `${job.state === 'downloading' ? job.connections : 0}` }, { label: 'Maximum allowed', value: `${job.maxConnections}` }, { label: 'Bandwidth cap', value: job.bandwidthLimit ? formatSpeed(job.bandwidthLimit) : 'Global setting' }, { label: 'Source', value: job.source, copyable: true }, { label: 'MIME type', value: job.mime ?? 'Detecting' }, { label: 'Resumability', value: job.resumable ? 'Verified' : 'Unknown' }]} /><div className="info-callout"><Icon name="shield" size={16} /><span>Credentials and request context are kept only for this acquisition.</span></div></>;
+  return <><SectionTitle icon="network" title="Connection" /><DetailGrid items={[{ label: 'Transfer mode', value: modeText(job.mode) }, { label: 'Active connections', value: job.state === 'downloading' ? `${job.connections}` : '—' }, { label: 'Maximum allowed', value: `${job.maxConnections}` }, { label: 'Bandwidth cap', value: job.bandwidthLimit ? formatSpeed(job.bandwidthLimit) : 'Global setting' }, { label: 'Source', value: job.source, copyable: true }, { label: 'MIME type', value: job.mime ?? (stateIn(job.state, TRANSFER_STATES) ? 'Detecting' : '—') }, { label: 'Resumable', value: job.resumable ? 'Yes' : 'No' }]} /></>;
 }
 
 function MediaDetails({ job }: { job: DownloadJob }) {
   const finalization = job.state === 'finalizing' ? 'In progress' : job.state === 'ready' ? 'Ready' : job.state === 'completed' ? 'Complete' : 'Not started';
-  return <><SectionTitle icon="media" title="Current media" /><DetailGrid items={[{ label: 'Container', value: job.mime ?? 'Detecting' }, { label: 'Acquisition', value: modeText(job.mode) }, { label: 'Container', value: job.mime?.split('/')[1]?.toUpperCase() ?? 'Detecting' }, { label: 'Tracks', value: job.mediaTracks ? `${job.mediaTracks} · ${job.mediaTracks > 1 ? 'separate streams' : 'single stream'}` : 'Detecting' }, { label: 'Segments', value: job.segments ? `${job.segments.completed} of ${job.segments.total}` : 'Not segmented' }, { label: 'Finalization', value: finalization }]} /><div className="info-callout"><Icon name="info" size={16} /><span>The selected source follows the media currently playing in the browser.</span></div></>;
+  const detecting = stateIn(job.state, TRANSFER_STATES) ? 'Detecting' : '—';
+  return <><SectionTitle icon="media" title="Media" /><DetailGrid items={[{ label: 'Container', value: job.mime?.split('/')[1]?.toUpperCase() ?? detecting }, { label: 'Acquisition', value: modeText(job.mode) }, { label: 'Tracks', value: job.mediaTracks ? `${job.mediaTracks} · ${job.mediaTracks > 1 ? 'separate video and audio' : 'single stream'}` : detecting }, { label: 'Segments', value: job.segments ? `${job.segments.completed} of ${job.segments.total}` : 'Not segmented' }, { label: 'Finalization', value: finalization }]} /></>;
 }
 
 function FileDetails({ job }: { job: DownloadJob }) {
-  return <><SectionTitle icon="folder" title="Managed files" /><DetailGrid items={[{ label: 'Output', value: job.destination, copyable: true }, { label: 'Temporary data', value: job.tempPath, copyable: true }, { label: 'Size on disk', value: formatBytes(job.downloaded) }, { label: 'Resource identity', value: job.resumable ? 'Verified from source' : 'Not established' }]} /></>;
+  return <><SectionTitle icon="folder" title="Managed files" /><DetailGrid items={[{ label: 'Output', value: job.destination, copyable: true }, { label: 'Temporary data', value: job.tempPath, copyable: true }]} /></>;
 }
 
 function JobLog({ job }: { job: DownloadJob }) {
@@ -684,8 +728,7 @@ export function JobContextMenu({ job, adapter, onClose, onNotice }: { job: Downl
   // relabelled the row as failed only duplicated that.
   const canCancel = job.provisional === true && stateIn(job.state, CANCELLABLE_STATES);
   const ownsDestination = job.state === 'completed';
-  const folder = job.destination.slice(0, Math.max(job.destination.lastIndexOf('\\'), job.destination.lastIndexOf('/')));
-  return <KeyboardMenu className="context-menu" label={`Actions for ${job.name}`} onDismiss={onClose}>{(canPause || canResume) && <MenuAction icon={canPause ? 'pause' : 'play'} label={canPause ? 'Pause' : 'Resume'} onClick={() => run(() => canPause ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{canCancel && <MenuAction icon="close" label="Cancel" onClick={() => run(() => adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(() => adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder" label="Open containing folder" onClick={() => { void openLocalPath(folder).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.provisional !== true && stateIn(job.state, [...RESUMABLE_STATES, 'failed']) && <MenuAction icon="link" label="Reattach download" onClick={() => run(() => adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="delete" label="Remove from list" onClick={() => run(() => adapter.removeJob(job.id), 'Removed from list')} />}{ownsDestination && <MenuAction danger icon="delete" label="Delete file from disk" onClick={() => run(() => adapter.removeJob(job.id, true), 'File deleted from disk')} />}</KeyboardMenu>;
+  return <KeyboardMenu className="context-menu" label={`Actions for ${job.name}`} onDismiss={onClose}>{(canPause || canResume) && <MenuAction icon={canPause ? 'pause' : 'play'} label={canPause ? 'Pause' : 'Resume'} onClick={() => run(() => canPause ? adapter.pauseJob(job.id) : adapter.resumeJob(job.id))} />}{canCancel && <MenuAction icon="close" label="Cancel" onClick={() => run(() => adapter.cancelJob(job.id), 'Download cancelled')} />}{job.state === 'failed' && <MenuAction icon="refresh" label="Retry" onClick={() => run(() => adapter.retryJob(job.id), 'Retrying download')} />}{job.state === 'completed' && <MenuAction icon="open" label="Open file" onClick={() => { void openLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="folder-open" label="Show in folder" onClick={() => { void revealLocalPath(job.destination).then((error) => { if (error) onNotice(error, 'error'); onClose(); }); }} />}{<MenuAction icon="copy" label="Copy source URL" onClick={() => { void copySourceUrl(job.source).then((error) => { if (error) onNotice(error, 'error'); else onNotice('Source URL copied', 'success'); onClose(); }); }} />}{job.provisional !== true && stateIn(job.state, [...RESUMABLE_STATES, 'failed']) && <MenuAction icon="link" label="Reattach download" onClick={() => run(() => adapter.reattachJob(job.id), 'Waiting for renewed source')} />}{<div className="menu-divider" />}{<MenuAction danger icon="remove" label="Remove from list" onClick={() => run(() => adapter.removeJob(job.id), 'Removed from list')} />}{ownsDestination && <MenuAction danger icon="delete" label="Delete file from disk" onClick={() => run(() => adapter.removeJob(job.id, true), 'File deleted from disk')} />}</KeyboardMenu>;
 }
 
 function MenuAction({ icon, label, danger, onClick }: { icon: IconName; label: string; danger?: boolean; onClick: () => void }) {
@@ -716,12 +759,12 @@ function SettingsHeading({ title, description }: { title: string; description?: 
   return <div className="settings-heading"><h1>{title}</h1>{description && <p>{description}</p>}</div>;
 }
 
-function SettingToggle({ icon, title, description, checked, onChange }: { icon?: IconName; title: string; description?: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  return <div className="setting-line">{icon && <Icon name={icon} size={20} />}<div className="setting-copy"><strong>{title}</strong>{description && <span>{description}</span>}</div><Toggle label={title} checked={checked} onChange={onChange} /></div>;
+function SettingToggle({ icon, title, description, checked, disabled = false, onChange }: { icon?: IconName; title: string; description?: string; checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
+  return <div className={`setting-line ${disabled ? 'disabled' : ''}`}>{icon && <Icon name={icon} size={20} />}<div className="setting-copy"><strong>{title}</strong>{description && <span>{description}</span>}</div><Toggle label={title} checked={checked} disabled={disabled} onChange={onChange} /></div>;
 }
 
-function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
-  return <button role="switch" aria-checked={checked} aria-label={label} className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}><span /></button>;
+function Toggle({ label, checked, disabled = false, onChange }: { label: string; checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
+  return <button role="switch" aria-checked={checked} aria-label={label} disabled={disabled} className={`toggle ${checked ? 'on' : ''}`} onClick={() => onChange(!checked)}><span /></button>;
 }
 
 function SettingCard({ children, className = '' }: { children: ReactNode; className?: string }) {
@@ -729,17 +772,17 @@ function SettingCard({ children, className = '' }: { children: ReactNode; classN
 }
 
 function GeneralSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
-  return <><SettingsHeading title="General" /><SettingCard><SettingToggle icon="power" title="Start download service at sign-in" description="Run the download service in the background when you sign in." checked={settings.startAtSignIn} onChange={(startAtSignIn) => update({ startAtSignIn })} /><SettingToggle icon="window" title="Start manager UI at sign-in" description="Launch the manager interface automatically when you sign in." checked={settings.showManagerAtSignIn} onChange={(showManagerAtSignIn) => update({ showManagerAtSignIn })} /><div className="setting-line"><Icon name="power" size={20} /><div className="setting-copy"><strong>Close button behavior</strong><span>Choose what happens when the main window close button is clicked.</span></div><Select label="Close button behavior" value={settings.closeBehavior} onChange={(value) => update({ closeBehavior: value as AppSettings['closeBehavior'] })} options={[['tray', 'Minimize to tray'], ['exit', 'Exit application']]} /></div></SettingCard></>;
+  return <><SettingsHeading title="General" /><SettingCard><SettingToggle icon="power" title="Start download service at sign-in" description="Run the download service in the background when you sign in." checked={settings.startAtSignIn} onChange={(startAtSignIn) => update({ startAtSignIn })} /><SettingToggle icon="window" title="Open the manager at sign-in" description="Also show the manager window when the service starts at sign-in." checked={settings.startAtSignIn && settings.showManagerAtSignIn} disabled={!settings.startAtSignIn} onChange={(showManagerAtSignIn) => update({ showManagerAtSignIn })} /><div className="setting-line"><Icon name="power" size={20} /><div className="setting-copy"><strong>Close button behavior</strong><span>Choose what happens when the main window close button is clicked.</span></div><Select label="Close button behavior" value={settings.closeBehavior} onChange={(value) => update({ closeBehavior: value as AppSettings['closeBehavior'] })} options={[['tray', 'Minimize to tray'], ['exit', 'Exit application']]} /></div></SettingCard></>;
 }
 
 function DownloadSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
-  return <><SettingsHeading title="Downloads" /><SettingCard><FieldHeading title="Default download folder" description="All downloads will be saved to this folder." /><PathField label="Default download folder" value={settings.defaultFolder} onChange={(defaultFolder) => update({ defaultFolder })} /></SettingCard><SettingCard><FieldHeading title="File name collisions" description="Choose how to handle an existing file with the same name." /><Select label="File name collisions" value={settings.collisionBehavior} onChange={(collisionBehavior) => update({ collisionBehavior: collisionBehavior as AppSettings['collisionBehavior'] })} options={[['rename', 'Create a numbered copy'], ['replace', 'Replace existing file']]} /></SettingCard></>;
+  return <><SettingsHeading title="Downloads" /><SettingCard><FieldHeading title="Default download folder" description="All downloads will be saved to this folder." /><PathField label="Default download folder" value={settings.defaultFolder} onChange={(defaultFolder) => update({ defaultFolder })} /></SettingCard><SettingCard><FieldHeading title="Temporary folder" description="Where unfinished downloads are kept. Empty keeps them next to the file." /><PathField label="Temporary folder" optional placeholder="Next to the file" browseFrom={settings.defaultFolder} value={settings.tempFolder ?? ''} onChange={(tempFolder) => update({ tempFolder: tempFolder || null })} /></SettingCard><SettingCard><FieldHeading title="File name collisions" description="Choose how to handle an existing file with the same name." /><Select label="File name collisions" value={settings.collisionBehavior} onChange={(collisionBehavior) => update({ collisionBehavior: collisionBehavior as AppSettings['collisionBehavior'] })} options={[['rename', 'Create a numbered copy'], ['replace', 'Replace existing file']]} /></SettingCard></>;
 }
 
 function BrowserSettings({ settings, update, pairedBrowsers, forgetPairings }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void; pairedBrowsers: number; forgetPairings: () => void }) {
   const [newSite, setNewSite] = useState('');
   const addSite = () => { const site = normalizeSite(newSite); if (site && !settings.excludedSites.includes(site)) update({ excludedSites: [...settings.excludedSites, site] }); setNewSite(''); };
-  return <><SettingsHeading title="Browser Integration" /><SettingCard><SettingToggle title="Intercept browser downloads" description="Detect downloads from supported browsers." checked={settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} /><SettingToggle title="Show media buttons" description="Display download buttons on videos and media." checked={settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} /></SettingCard><SettingCard><FieldHeading title="Excluded media sites" description="These sites are excluded from browser integration." /><div className="excluded-list">{settings.excludedSites.map((site) => <div className="excluded-item" key={site}><span>{site}</span><button aria-label={`Remove ${site}`} onClick={() => update({ excludedSites: settings.excludedSites.filter((item) => item !== site) })}><Icon name="close" size={15} /></button></div>)}<div className="add-site"><input aria-label="Add excluded media site" value={newSite} onChange={(event) => setNewSite(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && addSite()} placeholder="Add a site, such as example.com" /><button className="button" onClick={addSite}>Add</button></div></div><div className="info-callout"><Icon name="info" size={16} /><span>Excluded sites are shared with the extension popup.</span></div></SettingCard><SettingCard><div className="setting-line"><div className="setting-copy"><strong>Paired browsers</strong><span>{pairedBrowsers || 'None'}</span></div><button className="button" disabled={!pairedBrowsers} onClick={forgetPairings}>Forget</button></div></SettingCard></>;
+  return <><SettingsHeading title="Browser Integration" /><SettingCard><SettingToggle title="Intercept browser downloads" description="Detect downloads from supported browsers." checked={settings.interceptDownloads} onChange={(interceptDownloads) => update({ interceptDownloads })} /><SettingToggle title="Show media buttons" description="Display download buttons on videos and media." checked={settings.showMediaButtons} onChange={(showMediaButtons) => update({ showMediaButtons })} /></SettingCard><SettingCard><FieldHeading title="Excluded sites" description="Downloads and media on these sites stay with the browser." /><div className="excluded-list">{settings.excludedSites.map((site) => <div className="excluded-item" key={site}><span>{site}</span><button aria-label={`Remove ${site}`} onClick={() => update({ excludedSites: settings.excludedSites.filter((item) => item !== site) })}><Icon name="close" size={15} /></button></div>)}<div className="add-site"><input aria-label="Add excluded site" value={newSite} onChange={(event) => setNewSite(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && addSite()} placeholder="example.com" /><button className="button" onClick={addSite}>Add</button></div></div></SettingCard><SettingCard><div className="setting-line"><div className="setting-copy"><strong>Paired browsers</strong><span>{pairedBrowsers || 'None'}</span></div><button className="button" disabled={!pairedBrowsers} onClick={forgetPairings}>Forget</button></div></SettingCard></>;
 }
 
 function DebouncedNumberInput({
@@ -822,20 +865,16 @@ function DebouncedNumberInput({
 }
 
 function NetworkSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
-  return <><SettingsHeading title="Network" /><div className="network-grid"><SettingCard><FieldHeading title="Global bandwidth limit (aggregate)" description="Applies to all active downloads combined." /><div className="radio-row" role="radiogroup" aria-label="Global bandwidth limit"><Radio checked={settings.bandwidthLimit === null} onClick={() => update({ bandwidthLimit: null })} label="Unlimited" /><Radio checked={settings.bandwidthLimit !== null} onClick={() => update({ bandwidthLimit: 50 })} label="Limited to:" /><DebouncedNumberInput aria-label="Global bandwidth limit" className="number-input" min={1} max={100000} value={settings.bandwidthLimit ?? 50} onChange={(bandwidthLimit) => update({ bandwidthLimit })} /><Select label="Bandwidth unit" value={settings.bandwidthUnit} onChange={(bandwidthUnit) => update({ bandwidthUnit: bandwidthUnit as AppSettings['bandwidthUnit'] })} options={[['KB/s', 'KB/s'], ['MB/s', 'MB/s'], ['GB/s', 'GB/s']]} /></div><FieldHeading title="Default maximum connections per download" description="Maximum number of connections used for each download." /><DebouncedNumberInput aria-label="Default maximum connections per download" className="number-input large" min={1} max={32} value={settings.maxConnections} onChange={(maxConnections) => update({ maxConnections })} /><SettingToggle title="Per-download override allowed" description="Allow custom limits and connections per download." checked={settings.perDownloadOverrides} onChange={(perDownloadOverrides) => update({ perDownloadOverrides })} /><SettingToggle title="Retry failed downloads automatically" description="Retry downloads that fail due to network issues." checked={settings.retryAutomatically} onChange={(retryAutomatically) => update({ retryAutomatically })} /><FieldHeading title="Max retry attempts" description="Number of times to retry before giving up." /><DebouncedNumberInput className="number-input large" min={0} max={20} aria-label="Max retry attempts" value={settings.maxRetries} onChange={(maxRetries) => update({ maxRetries })} /></SettingCard><NetworkLiveStats /></div></>;
-}
-
-function NetworkLiveStats() {
-  return <SettingCard className="usage-card"><div className="usage-title"><strong>Live transfer status</strong><span>Read-only</span></div><div className="live-status-card"><Icon name="chart" size={28} /><div><strong>Current aggregate speed</strong><span>Live speed is shown in the manager status bar.</span></div></div><div className="info-callout"><Icon name="info" size={16} /><span>Historical usage is not recorded by this build.</span></div></SettingCard>;
+  return <><SettingsHeading title="Network" /><SettingCard className="network-card"><FieldHeading title="Global bandwidth limit (aggregate)" description="Applies to all active downloads combined." /><div className="radio-row" role="radiogroup" aria-label="Global bandwidth limit"><Radio checked={settings.bandwidthLimit === null} onClick={() => update({ bandwidthLimit: null })} label="Unlimited" /><Radio checked={settings.bandwidthLimit !== null} onClick={() => update({ bandwidthLimit: 50 })} label="Limited to:" /><DebouncedNumberInput aria-label="Global bandwidth limit" className="number-input" min={1} max={100000} value={settings.bandwidthLimit ?? 50} onChange={(bandwidthLimit) => update({ bandwidthLimit })} /><Select label="Bandwidth unit" value={settings.bandwidthUnit} onChange={(bandwidthUnit) => update({ bandwidthUnit: bandwidthUnit as AppSettings['bandwidthUnit'] })} options={[['KB/s', 'KB/s'], ['MB/s', 'MB/s'], ['GB/s', 'GB/s']]} /></div><FieldHeading title="Default maximum connections per download" description="Maximum number of connections used for each download." /><DebouncedNumberInput aria-label="Default maximum connections per download" className="number-input large" min={1} max={32} value={settings.maxConnections} onChange={(maxConnections) => update({ maxConnections })} /><SettingToggle title="Per-download override allowed" description="Allow custom limits and connections per download." checked={settings.perDownloadOverrides} onChange={(perDownloadOverrides) => update({ perDownloadOverrides })} /><SettingToggle title="Retry failed downloads automatically" description="Retry downloads that fail due to network issues." checked={settings.retryAutomatically} onChange={(retryAutomatically) => update({ retryAutomatically })} /><FieldHeading title="Max retry attempts" description="Number of times to retry before giving up." /><DebouncedNumberInput className="number-input large" min={0} max={20} aria-label="Max retry attempts" value={settings.maxRetries} onChange={(maxRetries) => update({ maxRetries })} /></SettingCard></>;
 }
 
 function NotificationSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
-  return <><SettingsHeading title="Notifications" /><SettingCard><SettingToggle title="Show notifications for completed downloads" description="Notify when a download finishes successfully." checked={settings.completionNotifications} onChange={(completionNotifications) => update({ completionNotifications })} /><SettingToggle title="Show notifications for failed downloads" description="Notify when a download fails." checked={settings.failureNotifications} onChange={(failureNotifications) => update({ failureNotifications })} /></SettingCard><div className="wide-info"><Icon name="info" size={17} /><div>Notifications use Windows system toasts and respect Focus Assist / Do Not Disturb settings.</div></div></>;
+  return <><SettingsHeading title="Notifications" /><SettingCard><SettingToggle title="Show notifications for completed downloads" description="Notify when a download finishes successfully." checked={settings.completionNotifications} onChange={(completionNotifications) => update({ completionNotifications })} /><SettingToggle title="Show notifications for failed downloads" description="Notify when a download fails." checked={settings.failureNotifications} onChange={(failureNotifications) => update({ failureNotifications })} /></SettingCard></>;
 }
 
 function AppearanceSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
   const accents = ['#0878ed', '#0d9f57', '#9141c9', '#d3138c', '#f28b14', '#e33b31', '#149fb5', '#6c7785'];
-  return <><SettingsHeading title="Appearance" /><SettingCard><FieldHeading title="Theme" /><div className="theme-options" role="radiogroup" aria-label="Theme"><ThemeOption value="system" label="Follow system" icon="monitor" current={settings.theme} onClick={() => update({ theme: 'system' })} /><ThemeOption value="light" label="Light" icon="power" current={settings.theme} onClick={() => update({ theme: 'light' })} /><ThemeOption value="dark" label="Dark" icon="pending" current={settings.theme} onClick={() => update({ theme: 'dark' })} /></div></SettingCard><SettingCard><FieldHeading title="Accent color" /><div className="accent-options" role="radiogroup" aria-label="Accent color">{accents.map((accent) => <button key={accent} role="radio" aria-checked={settings.accent === accent} aria-label={`Use ${accent} accent`} className={`accent-swatch ${settings.accent === accent ? 'selected' : ''}`} style={{ '--swatch': accent } as CSSProperties} onClick={() => update({ accent })}><span /></button>)}</div></SettingCard><SettingCard><FieldHeading title="App density" description="Choose how compact the interface should be." /><Select label="App density" value={settings.density} onChange={(density) => update({ density: density as AppSettings['density'] })} options={[['comfortable', 'Comfortable'], ['compact', 'Compact']]} /></SettingCard></>;
+  return <><SettingsHeading title="Appearance" /><SettingCard><FieldHeading title="Theme" /><div className="theme-options" role="radiogroup" aria-label="Theme"><ThemeOption value="system" label="Follow system" icon="monitor" current={settings.theme} onClick={() => update({ theme: 'system' })} /><ThemeOption value="light" label="Light" icon="light" current={settings.theme} onClick={() => update({ theme: 'light' })} /><ThemeOption value="dark" label="Dark" icon="dark" current={settings.theme} onClick={() => update({ theme: 'dark' })} /></div></SettingCard><SettingCard><FieldHeading title="Accent color" /><div className="accent-options" role="radiogroup" aria-label="Accent color">{accents.map((accent) => <button key={accent} role="radio" aria-checked={settings.accent === accent} aria-label={`Use ${accent} accent`} className={`accent-swatch ${settings.accent === accent ? 'selected' : ''}`} style={{ '--swatch': accent } as CSSProperties} onClick={() => update({ accent })}><span /></button>)}</div></SettingCard><SettingCard><FieldHeading title="App density" description="Choose how compact the interface should be." /><Select label="App density" value={settings.density} onChange={(density) => update({ density: density as AppSettings['density'] })} options={[['comfortable', 'Comfortable'], ['compact', 'Compact']]} /></SettingCard></>;
 }
 
 function ThemeOption({ value, label, icon, current, onClick }: { value: string; label: string; icon: IconName; current: string; onClick: () => void }) {
@@ -846,7 +885,7 @@ function FieldHeading({ title, description }: { title: string; description?: str
   return <div className="field-heading"><strong>{title}</strong>{description && <span>{description}</span>}</div>;
 }
 
-function PathField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function PathField({ label, value, onChange, optional = false, placeholder, browseFrom }: { label: string; value: string; onChange: (value: string) => void; optional?: boolean; placeholder?: string; browseFrom?: string }) {
   const [draft, setDraft] = useState(value);
   const [isFocused, setIsFocused] = useState(false);
   const lastExternalValue = useRef(value);
@@ -857,7 +896,7 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
   }, [value, isFocused]);
   const commit = (candidate: string) => {
     const next = candidate.trim();
-    if (!next) {
+    if (!next && !optional) {
       setDraft(value);
       return;
     }
@@ -865,13 +904,13 @@ function PathField({ label, value, onChange }: { label: string; value: string; o
     if (next !== value) onChange(next);
   };
   const browse = async () => {
-    const dir = await pickFolder(draft);
+    const dir = await pickFolder(draft || browseFrom);
     if (dir) {
       setDraft(dir);
       onChange(dir);
     }
   };
-  return <div className="path-field"><input aria-label={label} value={draft} onFocus={() => setIsFocused(true)} onChange={(event) => setDraft(event.target.value)} onBlur={(event) => { setIsFocused(false); commit(event.currentTarget.value); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { setDraft(value); event.currentTarget.value = value; } }} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
+  return <div className="path-field"><input aria-label={label} value={draft} placeholder={placeholder} onFocus={() => setIsFocused(true)} onChange={(event) => setDraft(event.target.value)} onBlur={(event) => { setIsFocused(false); commit(event.currentTarget.value); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') { setDraft(value); event.currentTarget.value = value; } }} />{isTauriRuntime() && <button className="button" onClick={() => void browse()} aria-label={`Browse for ${label}`}>Browse</button>}</div>;
 }
 
 function Select({ label, value, onChange, options }: { label: string; value: string; onChange: (value: string) => void; options: Array<[string, string]> }) {
@@ -1064,7 +1103,7 @@ export function AddDownloadWindow({ settings, job, captured, onCreate, onCommit,
     setDestination(name ? `${clean}${sep}${name}` : clean);
     setDestTouched(true);
   };
-  return <section ref={dialogRef} className={`add-download-window ${isCapture ? 'captured' : 'manual'}`} role="dialog" aria-label="Add Download" aria-busy={busy} onKeyDown={(event) => { if (event.key === 'Escape' && !busy) void cancel(); }}><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" disabled={busy} onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><div className="add-content-inner"><label className="form-field"><span>URL</span><input aria-label="Source URL" autoFocus={!isCapture} value={source} readOnly={isCapture} title={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}{job?.state === 'failed' && job.error && <div className="form-error" role="alert"><Icon name="error" size={14} />{job.error}</div>}<label className="form-field"><span className="form-field-heading">Filename<em>{sizeText}</em></span><input aria-label="Filename" title={name} value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /></label><label className="form-field"><span>Save to</span><div className="path-field"><input aria-label="Save destination" title={shownDestination} value={shownDestination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} />{isTauriRuntime() && <button className="button" onClick={() => void browseDestination()} aria-label="Browse for folder">Browse</button>}</div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={displayedState} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.state === 'downloading' && job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : '—'} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : job.state === 'connecting' ? 'Checking…' : 'No'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input aria-label="Per-download maximum connections" className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row" role="radiogroup" aria-label="Per-download bandwidth cap"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input aria-label="Per-download bandwidth limit" className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select label="Per-download bandwidth unit" value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div><span className="advanced-note">The per-download limit is applied when the acquisition is accepted.</span></div>}</>}</div></div><div className="add-actions"><button className="button primary" disabled={busy || (!isCapture && !source.trim()) || job?.state === 'failed'} onClick={() => void submit()}><Icon name={isCapture ? 'check' : 'download'} size={16} />{busyAction === 'create' ? 'Starting…' : busyAction === 'commit' ? 'Saving…' : isCapture ? 'Save' : 'Start Download'}</button><button className="button" disabled={busy} onClick={cancel}>{busyAction === 'cancel' ? 'Cancelling…' : 'Cancel'}</button></div></section>;
+  return <section ref={dialogRef} className={`add-download-window ${isCapture ? 'captured' : 'manual'}`} role="dialog" aria-label="Add Download" aria-busy={busy} onKeyDown={(event) => { if (event.key === 'Escape' && !busy) void cancel(); }}><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Add Download</strong><button aria-label="Close" disabled={busy} onClick={cancel}><Icon name="close" size={17} /></button></div><div className="add-content"><div className="add-content-inner"><label className="form-field"><span>URL</span><input aria-label="Source URL" autoFocus={!isCapture} value={source} readOnly={isCapture} title={source} onChange={(event) => { setSource(event.target.value); setFormError(''); }} placeholder="https://example.com/file.iso" /></label>{formError && <div className="form-error" role="alert"><Icon name="error" size={14} />{formError}</div>}{job?.state === 'failed' && job.error && <div className="form-error" role="alert"><Icon name="error" size={14} />{job.error}</div>}<label className="form-field"><span className="form-field-heading">Filename<em>{sizeText}</em></span><input aria-label="Filename" title={name} value={name} onChange={(event) => { setName(event.target.value); setNameTouched(true); }} placeholder="file.iso" /></label><label className="form-field"><span>Save to</span><div className="path-field"><input aria-label="Save destination" title={shownDestination} value={shownDestination} onChange={(event) => { setDestination(event.target.value); setDestTouched(true); }} />{isTauriRuntime() && <button className="button" onClick={() => void browseDestination()} aria-label="Browse for folder">Browse</button>}</div></label>{job && <div className="provisional-panel"><Metric icon="download" label="Downloaded" value={`${formatBytes(job.downloaded)}${job.total ? ` / ${formatBytes(job.total)}` : ''}`} /><Metric icon="pending" label="Status" value={displayedState} tone={stateTone(job.state)} /><Metric icon="network" label="Connections" value={job.state === 'downloading' && job.connections ? `${job.connections} active` : job.state === 'connecting' ? 'Connecting…' : `Up to ${job.maxConnections}`} /><Metric icon="shield" label="Resumable" value={job.resumable ? 'Yes' : job.state === 'connecting' ? 'Checking…' : 'No'} /></div>}{settings.perDownloadOverrides && <><button className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><Icon name={advanced ? 'chevron-down' : 'chevron-right'} size={15} /> Advanced</button>{advanced && <div className="advanced-fields"><div><span>Connections</span><input aria-label="Per-download maximum connections" className="number-input" type="number" min="1" max="32" value={maxConnections} onChange={(event) => setMaxConnections(Math.max(1, Math.min(32, Number(event.target.value) || 1)))} /></div><div><span>Bandwidth cap</span><div className="radio-row" role="radiogroup" aria-label="Per-download bandwidth cap"><Radio checked={!capLimited} onClick={() => setCapLimited(false)} label="Global" /><Radio checked={capLimited} onClick={() => setCapLimited(true)} label="Limited to:" /><input aria-label="Per-download bandwidth limit" className="number-input" type="number" min="1" value={capValue} onChange={(event) => { setCapValue(Number(event.target.value) || 1); setCapLimited(true); }} /><Select label="Per-download bandwidth unit" value={capUnit} onChange={(unit) => setCapUnit(unit as BandwidthUnit)} options={BANDWIDTH_UNITS.map((unit) => [unit, unit] as [string, string])} /></div></div></div>}</>}</div></div><div className="add-actions"><button className="button primary" disabled={busy || (!isCapture && !source.trim()) || job?.state === 'failed'} onClick={() => void submit()}><Icon name={isCapture ? 'check' : 'download'} size={16} />{busyAction === 'create' ? 'Starting…' : busyAction === 'commit' ? 'Saving…' : isCapture ? 'Save' : 'Start Download'}</button><button className="button" disabled={busy} onClick={cancel}>{busyAction === 'cancel' ? 'Cancelling…' : 'Cancel'}</button></div></section>;
 }
 
 /** Approves or declines one browser's pairing request. The browser's popup
@@ -1073,8 +1112,15 @@ function PairWindow({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot:
   const id = new URLSearchParams(window.location.search).get('id') ?? '';
   const [code, setCode] = useState<string | null>(null);
   const [error, setError] = useState('');
-  useEffect(() => { void adapter.pairingCode(id).then(setCode, () => setCode(null)); }, [adapter, id]);
-  const answer = (allow: boolean) => { setError(''); void adapter.answerPairing(id, allow).catch((reason: unknown) => setError(errorMessage(reason, 'Could not record the pairing'))); };
+  // The request expires in the app after two minutes: follow it, so an
+  // expired code is never shown as one that can still be allowed.
+  useEffect(() => {
+    const read = () => void adapter.pairingCode(id).then(setCode, () => setCode(null));
+    read();
+    const timer = window.setInterval(read, 2000);
+    return () => window.clearInterval(timer);
+  }, [adapter, id]);
+  const answer = (allow: boolean) => { setError(''); void adapter.answerPairing(id, allow).catch((reason: unknown) => { setCode(null); setError(errorMessage(reason, 'Could not record the pairing')); }); };
   return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><section className="add-download-window pair-window" role="dialog" aria-label="Pair browser"><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Pair browser</strong><button aria-label="Deny" onClick={() => answer(false)}><Icon name="close" size={17} /></button></div><div className="add-content"><p>Allow this browser to hand downloads to Download Manager?</p><strong className="pair-code">{code ?? 'Expired'}</strong><p className="pair-hint">The extension shows the same code.</p>{error && <div className="form-error" role="alert"><Icon name="error" size={14} />{error}</div>}</div><div className="add-actions"><button className="button" onClick={() => answer(false)}>Deny</button><button className="button primary" disabled={!code} onClick={() => answer(true)}>Allow</button></div></section></div>;
 }
 

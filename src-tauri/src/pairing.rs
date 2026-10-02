@@ -118,15 +118,17 @@ impl Pairings {
     }
 
     /// The user's answer. On Allow, returns the new key for the caller to
-    /// store; it is handed to the extension once, by `status`.
-    pub fn answer(&mut self, request: &str, allow: bool) -> Option<(String, Key)> {
-        let pending = self.pending.as_mut().filter(|pending| pending.request == request && pending.decision.is_none())?;
+    /// store; it is handed to the extension once, by `status`. Err when the
+    /// request expired or a newer one replaced it: nothing was recorded.
+    pub fn answer(&mut self, request: &str, allow: bool) -> Result<Option<(String, Key)>, ()> {
+        self.pending();
+        let pending = self.pending.as_mut().filter(|pending| pending.request == request && pending.decision.is_none()).ok_or(())?;
         pending.decision = Some(allow);
         if !allow {
-            return None;
+            return Ok(None);
         }
         self.keys.insert(pending.key_id.clone(), pending.key);
-        Some((pending.key_id.clone(), pending.key))
+        Ok(Some((pending.key_id.clone(), pending.key)))
     }
 
     pub fn status(&mut self, request: &str) -> Status {

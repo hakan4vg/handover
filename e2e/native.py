@@ -17,6 +17,7 @@ The bridge port (38217) must be free: quit any running Download Manager first.
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import datetime as dt
 import importlib.util
@@ -497,8 +498,13 @@ def main() -> int:
           await invoke('resume_job', { id: 'cap-own' });
           await invoke('resume_job', { id: 'cap-none' });
           const started = performance.now();
+          // What the app reports for the capped job once it has run a while.
+          const reported = [];
           while (performance.now() - started < 40000) {
-            const other = (await invoke('get_snapshot')).jobs.find((job) => job.id === 'cap-none');
+            const jobs = (await invoke('get_snapshot')).jobs;
+            const other = jobs.find((job) => job.id === 'cap-none');
+            const own = jobs.find((job) => job.id === 'cap-own');
+            if (own.state === 'downloading' && performance.now() - started > 3000) reported.push({ speed: own.speed, etaSeconds: own.etaSeconds ?? null, note: own.note ?? null, total: own.total ?? null });
             if (other.state !== 'downloading' && other.state !== 'connecting') break;
             await new Promise((r) => setTimeout(r, 100));
           }
@@ -508,9 +514,22 @@ def main() -> int:
           await new Promise((r) => setTimeout(r, 300));
           const after = { running: await state('cap-own'), completed: await state('range') };
           await invoke('pause_job', { id: 'cap-own' });
-          return after;
+          return { after, reported };
         })()""", timeout=60)
         devtools.invoke("update_settings", {"patch": {"bandwidthLimit": None}})
+        reported = (reattach or {}).get("reported") or []
+        reattach = (reattach or {}).get("after")
+        # Once bytes flow: the status note is gone, and over the later half of
+        # the run the speed is about the cap and the time left a number.
+        flowing = [item for item in reported if item["speed"] > 0]
+        steady = flowing[len(flowing) // 2:]
+        speeds = sorted(item["speed"] for item in steady)
+        median = speeds[len(speeds) // 2] / 1024 ** 2 if speeds else 0
+        run.check("engine/speed-reported", "a download capped at 1 MiB/s reports about that speed, a number of seconds left, and no leftover status note",
+                  len(steady) >= 5 and 0.75 <= median <= 1.25
+                  and all(item["note"] is None for item in flowing)
+                  and all(isinstance(item["etaSeconds"], int) and item["etaSeconds"] > 0 for item in steady if item["total"]),
+                  {"samples": len(reported), "flowing": len(flowing), "median_mib_s": round(median, 3), "speeds_kib": [item["speed"] // 1024 for item in reported], "last": reported[-2:]})
         sent = list(METER)
         rates: dict = {}
         if sent:
@@ -548,6 +567,15 @@ def main() -> int:
         # ---- pairing and the sealed channel --------------------------------
         declined = sealed.pair(allow=False)
         run.check("pairing/declined", "a pairing the user declines yields no key", declined.get("state") == "denied" and "key" not in declined, {k: v for k, v in declined.items() if k != "key"})
+        # Allow on a request a newer one replaced (or that expired) records
+        # nothing, and says so instead of closing as if it had paired.
+        stale, fresh = (base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=").replace("_", "-") for _ in range(2))
+        sealed.post("/v1/pair", {"request": stale})
+        sealed.post("/v1/pair", {"request": fresh})
+        stale_answer = devtools.evaluate(f"window.__TAURI_INTERNALS__.invoke('answer_pairing', {{ id: {json.dumps(stale)}, allow: true }}).then(() => ({{ ok: true }}), (error) => ({{ error: String(error) }}))")
+        stale_status = sealed.post("/v1/pair/status", {"request": stale})[1].get("state")
+        devtools.invoke("answer_pairing", {"id": fresh, "allow": False})
+        run.check("pairing/stale-allow", "allowing a request that was replaced reports that it expired and pairs nothing", "expired" in (stale_answer.get("error") or "") and stale_status == "unknown", {"answer": stale_answer, "staleStatus": stale_status})
         PAIRING.update(sealed.pair(allow=True))
         run.check("pairing/approved", "a pairing the user allows yields a key, once", PAIRING.get("state") == "approved" and len(PAIRING.get("key", "")) == 44 and sealed.post("/v1/pair/status", {"request": PAIRING.get("request")})[1].get("state") == "unknown", {k: v for k, v in PAIRING.items() if k != "key"})
         probe_message = {"type": "cancel-acquisition", "payload": {"captureId": "sealed-probe"}}
@@ -793,6 +821,47 @@ def main() -> int:
             elif not item.get("jobId"):
                 run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
             bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
+
+        # ---- where partial files live ------------------------------------
+        # Next to the file they become, unless the user set a temp folder;
+        # the file grows as ranges land instead of being sized up front
+        # (sizing it makes exFAT write zeros over all of it first).
+        def wait_job(job_id: str, until, seconds: float = 30) -> dict:
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                found = next((j for j in devtools.invoke("get_snapshot")["jobs"] if j["id"] == job_id), {})
+                if until(found):
+                    return found
+                time.sleep(0.2)
+            return next((j for j in devtools.invoke("get_snapshot")["jobs"] if j["id"] == job_id), {})
+
+        folder_a, folder_b = out / "temp-a", out / "temp-b"
+        folder_a.mkdir(exist_ok=True)
+        app_tmp_before = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
+        moving_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-move", "name": "temp-move.bin", "destination": str(folder_a / "temp-move.bin"), "bandwidthLimit": 512 * 1024}})
+        running = wait_job(moving_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > 2 * MIB)
+        part = Path(running.get("tempPath", ""))
+        part_size = part.stat().st_size if part.is_file() else None
+        app_tmp_after = sorted(p.name for p in (runtime / "data" / "tmp").glob("*")) if (runtime / "data" / "tmp").is_dir() else []
+        run.check("temp/next-to-target", "with no temp folder set, the partial file sits next to the file it becomes, not in the app's folder", part.parent == folder_a and part.is_file() and part.name.startswith("temp-move.bin.") and app_tmp_after == app_tmp_before, {"tempPath": str(part), "appTmpNew": sorted(set(app_tmp_after) - set(app_tmp_before))})
+        run.check("engine/no-preallocation", "the partial file grows as ranges land: it is never sized to the whole download up front", part_size is not None and part_size < len(METERED), {"partSize": part_size, "total": len(METERED), "downloaded": running.get("downloaded")})
+        devtools.invoke("commit_provisional", {"id": moving_id, "input": {"name": "temp-move.bin", "destination": str(folder_b / "temp-move.bin"), "bandwidthLimit": None}})
+        moved = wait_job(moving_id, lambda j: Path(j.get("tempPath", "")).parent == folder_b or j.get("state") in ("completed", "failed"))
+        done = wait_job(moving_id, lambda j: j.get("state") in ("completed", "failed"), 60)
+        final = folder_b / "temp-move.bin"
+        left = sorted(p.name for folder in (folder_a, folder_b) for p in folder.glob("*.part*"))
+        run.check("temp/follows-save", "Save to another folder moves the partial file there and the download resumes from it: byte-exact, nothing left behind", Path(moved.get("tempPath", "")).parent == folder_b and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and not left, {"tempPathAfterSave": moved.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "leftovers": left, "events": [e.get("message") for e in done.get("events", [])][:6]})
+
+        explicit = runtime / "explicit-temp"
+        devtools.invoke("update_settings", {"patch": {"tempFolder": str(explicit)}})
+        explicit_id = devtools.invoke("create_provisional", {"input": {"source": f"{base}/metered/temp-explicit", "name": "temp-explicit.bin", "destination": str(folder_a / "temp-explicit.bin"), "bandwidthLimit": 512 * 1024}})
+        running = wait_job(explicit_id, lambda j: j.get("state") == "downloading" and j.get("downloaded", 0) > MIB)
+        devtools.invoke("commit_provisional", {"id": explicit_id, "input": {"name": "temp-explicit.bin", "destination": str(folder_b / "temp-explicit.bin"), "bandwidthLimit": None}})
+        done = wait_job(explicit_id, lambda j: j.get("state") in ("completed", "failed"), 60)
+        final = folder_b / "temp-explicit.bin"
+        devtools.invoke("update_settings", {"patch": {"tempFolder": ""}})
+        cleared = devtools.invoke("get_snapshot")["settings"].get("tempFolder")
+        run.check("temp/explicit-folder", "a temp folder the user set holds the partial file even when Save picks another folder; clearing the setting goes back to next-to-the-file", Path(running.get("tempPath", "")).parent == explicit and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and cleared is None and not list(explicit.glob("*")), {"tempPath": running.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "clearedSetting": cleared, "explicitLeft": [p.name for p in explicit.glob("*")]})
 
         # ---- cookies across a restart -------------------------------------
         reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])

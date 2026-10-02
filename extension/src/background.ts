@@ -274,6 +274,7 @@ async function bridgePost(path: string, body: unknown, timeoutMs = APP_BRIDGE_TI
  *  declined (this browser session) or one tried moments ago is not repeated. */
 function startPairing(asked = false): Promise<void> {
   if (pairingTask) return pairingTask;
+  if (pairingState.state === 'paired') return Promise.resolve();
   if (!asked && (pairingState.state === 'declined' || Date.now() - pairingTriedAt < 10_000)) return Promise.resolve();
   pairingTriedAt = Date.now();
   return awaitPairing(async () => {
@@ -670,7 +671,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
   void (async () => {
     const type = (message as { type?: string })?.type;
     if (type === 'get-policy') {
-      await Promise.all([policyReady, mediaFiltersReady]);
+      await Promise.all([policyReady, mediaFiltersReady, pairingReady]);
       try {
         await refreshResidentPolicy();
       } catch {

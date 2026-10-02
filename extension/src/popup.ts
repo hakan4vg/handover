@@ -31,15 +31,15 @@ function paint(): void {
   const excluded = site !== '' && policy.excludedSites.includes(site);
   const siteState = document.getElementById('site-state');
   if (siteState) {
-    siteState.textContent = !policy.showMediaButtons
-      ? 'Media buttons are off globally'
-      : excluded
-      ? 'Media buttons excluded on this site'
-      : 'Media buttons enabled on this site';
+    siteState.textContent = excluded
+      ? 'Excluded: the browser keeps downloads and media here'
+      : !policy.interceptDownloads && !policy.showMediaButtons
+      ? 'Interception and media buttons are off'
+      : 'Handled by Download Manager';
     siteState.classList.toggle('excluded-copy', excluded);
-    siteState.classList.toggle('enabled-copy', policy.showMediaButtons && !excluded);
+    siteState.classList.toggle('enabled-copy', !excluded && (policy.interceptDownloads || policy.showMediaButtons));
   }
-  document.getElementById('site-toggle')!.textContent = excluded ? 'Enable on this site' : 'Exclude this site';
+  document.getElementById('site-toggle')!.textContent = excluded ? 'Allow site' : 'Exclude site';
   paintMediaFilters();
 }
 
@@ -55,11 +55,13 @@ function paintPairing(pairing: PairingState | undefined): void {
     : pairing.state === 'declined' ? 'Pairing was declined' : 'Not paired with Download Manager';
   document.getElementById('pairing-text')!.textContent = text;
   (document.getElementById('pair') as HTMLButtonElement).hidden = pairing.state === 'waiting';
-  if (pairing.state === 'waiting' && !pairingTimer) {
+  // Follow the pairing until it succeeds: one the worker starts on its own
+  // (the popup's first contact) or one allowed in the app shows up here too.
+  if (pairing.state !== 'paired' && !pairingTimer) {
     pairingTimer = setInterval(() => {
       void chrome.runtime.sendMessage({ type: 'get-pairing' }).then((response: { pairing?: PairingState }) => {
         paintPairing(response?.pairing);
-        if (response?.pairing?.state !== 'waiting') { clearInterval(pairingTimer); pairingTimer = undefined; }
+        if (response?.pairing?.state === 'paired') { clearInterval(pairingTimer); pairingTimer = undefined; }
       }).catch(() => undefined);
     }, 1000);
   }

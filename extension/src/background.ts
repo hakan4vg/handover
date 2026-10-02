@@ -7,6 +7,7 @@ const PAIRING_KEY = 'dm-pairing';
 /** The app takes at most this many cookies per capture. */
 const COOKIE_LIMIT = 150;
 const PAIRING_DECLINED_KEY = 'dm-pairing-declined';
+const PAIRING_PENDING_KEY = 'dm-pairing-pending';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
 
 // Bounded ring of recent media-ish traffic per tab. M0 proof vehicle for the
@@ -273,6 +274,7 @@ async function decisionPolicyReady(): Promise<void> {
 // app once. Until then every download stays with the browser.
 
 type PairingState = { state: 'paired' } | { state: 'unpaired' } | { state: 'waiting'; code: string } | { state: 'declined' };
+type PendingPairing = { request: string; code: string; until: number };
 
 let pairing: Pairing | null = null;
 let pairingState: PairingState = { state: 'unpaired' };
@@ -287,6 +289,12 @@ async function loadPairing(): Promise<void> {
       pairingState = { state: 'paired' };
     } else if ((await chrome.storage.session.get(PAIRING_DECLINED_KEY))[PAIRING_DECLINED_KEY]) {
       pairingState = { state: 'declined' };
+    } else {
+      const pending = (await chrome.storage.session.get(PAIRING_PENDING_KEY))[PAIRING_PENDING_KEY] as PendingPairing | undefined;
+      if (typeof pending?.request === 'string' && typeof pending.code === 'string' && pending.until > Date.now()) {
+        pairingState = { state: 'waiting', code: pending.code };
+        void awaitPairing(async () => pending);
+      }
     }
   } catch {
     pairing = null;
@@ -310,15 +318,31 @@ function startPairing(asked = false): Promise<void> {
   if (pairingTask) return pairingTask;
   if (!asked && (pairingState.state === 'declined' || Date.now() - pairingTriedAt < 10_000)) return Promise.resolve();
   pairingTriedAt = Date.now();
-  pairingTask = (async () => {
+  return awaitPairing(async () => {
     const request = crypto.randomUUID();
+    const begun = await (await bridgePost('/v1/pair', { request })).json() as { ok?: boolean; code?: string };
+    if (!begun.ok || typeof begun.code !== 'string') return undefined;
+    const pending: PendingPairing = { request, code: begun.code, until: Date.now() + 125_000 };
+    await chrome.storage.session.remove(PAIRING_DECLINED_KEY).catch(() => undefined);
+    await chrome.storage.session.set({ [PAIRING_PENDING_KEY]: pending }).catch(() => undefined);
+    return pending;
+  });
+}
+
+/** Wait for the user's answer in the app. The request is kept in session
+ *  storage: Chrome may stop this worker while the user decides (nothing else
+ *  is happening), and the next worker picks the wait up from there. */
+function awaitPairing(begin: () => Promise<PendingPairing | undefined>): Promise<void> {
+  pairingTask = (async () => {
     try {
-      const begun = await (await bridgePost('/v1/pair', { request })).json() as { ok?: boolean; code?: string };
-      if (!begun.ok || typeof begun.code !== 'string') return;
-      pairingState = { state: 'waiting', code: begun.code };
-      await chrome.storage.session.remove(PAIRING_DECLINED_KEY).catch(() => undefined);
-      for (const until = Date.now() + 125_000; Date.now() < until;) {
+      const pending = await begin();
+      if (!pending) return;
+      const { request } = pending;
+      pairingState = { state: 'waiting', code: pending.code };
+      while (Date.now() < pending.until) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
+        // An extension API call: it also tells Chrome this worker is busy.
+        await chrome.storage.session.get(PAIRING_PENDING_KEY);
         const status = await (await bridgePost('/v1/pair/status', { request })).json() as { state?: string; keyId?: string; key?: string };
         if (status.state === 'waiting') continue;
         if (status.state === 'approved' && typeof status.keyId === 'string' && typeof status.key === 'string') {
@@ -336,16 +360,11 @@ function startPairing(asked = false): Promise<void> {
     } catch {
       // The app is not running: pairing starts again on the next contact.
     } finally {
+      await chrome.storage.session.remove(PAIRING_PENDING_KEY).catch(() => undefined);
       if (pairingState.state === 'waiting') pairingState = { state: 'unpaired' };
     }
   })().finally(() => { pairingTask = null; });
   return pairingTask;
-}
-
-async function forgetPairing(): Promise<void> {
-  pairing = null;
-  pairingState = { state: 'unpaired' };
-  await chrome.storage.local.remove(PAIRING_KEY).catch(() => undefined);
 }
 
 /** Send one message to the paired app and return its answer. No answer, an
@@ -362,8 +381,10 @@ async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Pro
     const response = await bridgePost('/v1/message', body, timeoutMs);
     const envelope = await response.json() as { paired?: boolean; error?: string };
     if (response.status === 401 && envelope.paired === false) {
-      // The app no longer knows this key (forgotten there): pair again.
-      await forgetPairing();
+      // The app does not know this key: it was forgotten there, or this is
+      // another program on the port. That answer is unsealed, so it must not
+      // cost the key: pair again, and keep the key until a new one replaces it.
+      pairingState = { state: 'unpaired' };
       void startPairing();
       return { ok: false, unanswered: true, unpaired: true, error: 'Not paired with Download Manager' };
     }

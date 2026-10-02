@@ -1696,8 +1696,11 @@ fn media_mime_kind(mime: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Only `audio/*` is conclusive: it never carries video. A `video/*` type
+/// names a container, which may hold audio alone (audio-only MP4 is commonly
+/// served as video/mp4).
 fn mime_conflicts_player_kind(expected: Option<&str>, mime: Option<&str>) -> bool {
-    matches!((expected, media_mime_kind(mime)), (Some("video"), Some("audio")) | (Some("audio"), Some("video")))
+    expected == Some("video") && media_mime_kind(mime) == Some("audio")
 }
 
 fn partial_response_is_complete(response: &reqwest::Response) -> Result<Option<u64>, String> {
@@ -4128,9 +4131,6 @@ async fn acquire_dual_track(
         .map_err(|error| redact_url_credentials(&error.to_string()))?;
     if !audio_response.status().is_success() {
         return Err(format!("audio source returned {}", audio_response.status()));
-    }
-    if media_mime_kind(header_string(&audio_response, reqwest::header::CONTENT_TYPE).as_deref()) == Some("video") {
-        return Err("The companion source returned video data instead of audio".into());
     }
     let audio_total = partial_response_is_complete(&audio_response)?;
 

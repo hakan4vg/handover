@@ -227,7 +227,8 @@ interface Stream {
   activeAt: number;
 }
 
-function streamsOf(pool: MediaCandidate[]): Stream[] {
+/** `since`: only requests begun from then on count as activity. */
+function streamsOf(pool: MediaCandidate[], since: number): Stream[] {
   const streams: Stream[] = [];
   const manifests = [...pool]
     .filter((item) => item.role === 'manifest' && !isSubtitlePlaylist(item.url))
@@ -256,7 +257,7 @@ function streamsOf(pool: MediaCandidate[]): Stream[] {
     }
     if (!best) continue;
     best.members.push(item);
-    best.activeAt = Math.max(best.activeAt, beganAt(item));
+    if (beganAt(item) >= since) best.activeAt = Math.max(best.activeAt, beganAt(item));
   }
   return streams;
 }
@@ -281,6 +282,11 @@ export type MediaCapturePlanResult = MediaCapturePlan | { unresolved: 'not-playe
  * When nothing has been fetched for any stream yet (the player has not
  * started), a page with a single presentation still resolves; with several,
  * the user is asked to play first rather than handed a guess.
+ *
+ * The player's `srcAt` is when the extension first noticed its source, which
+ * can be long after the page loaded the manifest (a player in a shadow root,
+ * one noticed only on hover). So a manifest is never discarded for its age;
+ * only a stream's activity has to be newer than the source.
  */
 export function planMediaCapture(
   candidates: MediaCandidate[],
@@ -305,18 +311,18 @@ export function planMediaCapture(
   );
   const notBefore = clicked?.srcAt !== undefined ? Math.max(0, clicked.srcAt - 2_000) : 0;
   const unresolved = { unresolved: clicked?.playing ? 'not-found' : 'not-played' } as const;
-  const scoped = candidates.filter((item) =>
+  const ofThisDocument = candidates.filter((item) =>
     item.tabId === tabId &&
     item.frameId === frameId &&
-    (!documentId || !item.documentId || item.documentId === documentId) &&
-    beganAt(item) >= notBefore,
+    (!documentId || !item.documentId || item.documentId === documentId),
   );
-  const pool = scoped.filter((item) => matchesKind(item, expectedKind));
 
-  const streams = streamsOf(pool);
+  const streams = streamsOf(ofThisDocument.filter((item) => matchesKind(item, expectedKind)), notBefore);
   if (streams.length) {
     const active = streams.filter((stream) => stream.activeAt > 0).sort((left, right) => right.activeAt - left.activeAt);
-    const stream = active[0] ?? (streams.length === 1 ? streams[0] : undefined);
+    // Nothing played yet: one presentation loaded for this source resolves.
+    const loaded = streams.filter((stream) => stream.manifests.some((item) => beganAt(item) >= notBefore));
+    const stream = active[0] ?? (loaded.length === 1 ? loaded[0] : undefined);
     if (!stream) return unresolved;
     const source = streamSource(stream);
     const variants = stream.manifests
@@ -328,7 +334,9 @@ export function planMediaCapture(
   }
 
   // No manifest: progressive media. The tab's traffic is this player's only
-  // while it is the one playing.
+  // while it is the one playing, and only from when its source appeared.
+  const scoped = ofThisDocument.filter((item) => beganAt(item) >= notBefore);
+  const pool = scoped.filter((item) => matchesKind(item, expectedKind));
   const playing = players.filter((item) => item.tabId === tabId && now - item.at <= 15_000 && item.playing && item.visible);
   const sole = playing.length === 1 && playing[0].playerKey === playerKey && playing[0].frameId === frameId;
   if (!sole) return unresolved;

@@ -73,6 +73,8 @@ PACED_HLS = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2"] + [line for i in ra
 # Cut-range scenario: the first answer for each range stops half way.
 CUT_RANGES: list[tuple[int, int, int]] = []
 CUT_REQUESTS: list[str] = []
+# Quiet-range scenario: ranges served, Accept-Ranges never sent.
+QUIET_REQUESTS: list[str] = []
 
 
 def pacing_says_wait(key: str, scenario: str) -> bool:
@@ -137,11 +139,14 @@ class Handler(fixture.Handler):
             pass
 
     def _fallback(self, stream_body: bytes, stream_type: str) -> None:
-        # First GET: a range-capable binary. The 1 MiB probe succeeds, every
-        # worker range is rate-limited, so the engine must fall back to one
-        # stream; that stream returns `stream_body`.
+        # First GET: a range-capable binary. The range probe (one byte, or the
+        # first MiB on older builds) succeeds, every worker range is
+        # rate-limited, so the engine must fall back to one stream; that
+        # stream returns `stream_body`.
         size = len(FALLBACK_BYTES)
         rng = self.headers.get("Range")
+        if rng == "bytes=0-0":
+            return self._raw(206, FALLBACK_BYTES[:1], {"Content-Range": f"bytes 0-0/{size}", "Accept-Ranges": "bytes", "Content-Type": "application/octet-stream"})
         if rng == f"bytes=0-{MIB - 1}":
             return self._raw(206, FALLBACK_BYTES[:MIB], {"Content-Range": f"bytes 0-{MIB - 1}/{size}", "Accept-Ranges": "bytes", "Content-Type": "application/octet-stream"})
         if rng:
@@ -263,6 +268,15 @@ class Handler(fixture.Handler):
             if rng.startswith("bytes=") and not rng.startswith("bytes=0-") and pacing_says_wait(rng, "range"):
                 return self._raw(503, b"slow down", {"Retry-After": "1"})
             return self._serve_file("range.bin", seed, size, True)
+        if path == "/quiet/range.bin":
+            rng = self.headers.get("Range", "")
+            QUIET_REQUESTS.append(rng)
+            m = re.match(r"bytes=(\d+)-(\d*)$", rng)
+            if m:
+                start = int(m[1])
+                end = min(int(m[2]) if m[2] else len(RANGE_BYTES) - 1, len(RANGE_BYTES) - 1)
+                return self._raw(206, RANGE_BYTES[start:end + 1], {"Content-Type": "application/octet-stream", "Content-Range": f"bytes {start}-{end}/{len(RANGE_BYTES)}"})
+            return self._raw(200, RANGE_BYTES, {"Content-Type": "application/octet-stream"})
         if path == "/cut/range.bin":
             rng = self.headers.get("Range", "")
             CUT_REQUESTS.append(rng)
@@ -383,6 +397,7 @@ def main() -> int:
         "zero-mpd": ("/zero.mpd", {"media": True, "playerKind": "video"}),
         "paced-range": ("/paced/range.bin", {}),
         "cut-range": ("/cut/range.bin", {}),
+        "quiet-range": ("/quiet/range.bin", {}),
         # Stopped while finalizing: every fragment is on disk, the source has expired.
         "recover-media": ("/gone.mpd", {"media": True, "playerKind": "video", "state": "finalizing", "progress": 100, "segments": {"completed": 6, "total": 6, "identity": "seeded"}}),
         "paced-hls": ("/paced-hls.m3u8", {"media": True, "playerKind": "video"}),
@@ -493,6 +508,11 @@ def main() -> int:
         j = job("cut-range")
         resumed = [(start, end, half) for start, end, half in CUT_RANGES if f"bytes={half}-{end}" in CUT_REQUESTS]
         run.check("engine/range-cut-resumes", "a range whose connection drops half way is asked again only from where it stopped, and the download completes byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and bool(CUT_RANGES) and len(resumed) == len(CUT_RANGES), evidence("cut-range", cutRanges=len(CUT_RANGES), resumedFromCut=len(resumed), requests=CUT_REQUESTS[:12]))
+        j = job("quiet-range")
+        later = [r for r in QUIET_REQUESTS if r.startswith("bytes=") and not r.startswith("bytes=0-")]
+        run.check("engine/range-unadvertised", "a server that serves byte ranges without saying Accept-Ranges still gets a parallel, resumable download, byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and j["mode"] == "whole-object" and bool(later), evidence("quiet-range", requests=QUIET_REQUESTS[:12]))
+        first_again = [r for r in QUIET_REQUESTS if r.startswith("bytes=0-") and r != "bytes=0-0"]
+        run.check("engine/first-response-reused", "a ranged download takes the start of the file from its first response: the only other request from byte 0 is a one-byte probe", j["mode"] == "whole-object" and QUIET_REQUESTS.count("bytes=0-0") == 1 and not first_again, evidence("quiet-range", firstAgain=first_again, requests=QUIET_REQUESTS[:12]))
         j = job("paced-hls")
         run.check("engine/paced-hls", "media segments told Retry-After wait it out: the playlist completes with no retry inside the server's window", j["state"] == "completed" and bool(j["bytes"]) and PACING_EARLY["hls"] == 0, evidence("paced-hls", earlyRetries=PACING_EARLY["hls"]))
 

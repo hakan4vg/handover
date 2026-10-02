@@ -2136,18 +2136,21 @@ fn partial_response_is_complete(response: &reqwest::Response) -> Result<Option<u
     }
 }
 
-fn supports_safe_initial_ranges(response: &reqwest::Response, total: Option<u64>, mime: Option<&str>) -> bool {
-    let Some(total) = total else { return false; };
-    if total <= 1 || response.status() != reqwest::StatusCode::OK || manifest_mime(mime) {
+/// Whether to ask the source for a byte range of this object. Many servers
+/// serve ranges without sending Accept-Ranges, so its absence proves nothing;
+/// only "none" is taken at its word. The length must be known: a response
+/// without one is usually made per request, and asking again would only make
+/// the server do that work twice.
+fn worth_probing_ranges(response: &reqwest::Response, total: Option<u64>, mime: Option<&str>) -> bool {
+    if total.is_none_or(|total| total <= 1) || response.status() != reqwest::StatusCode::OK || manifest_mime(mime) {
         return false;
     }
-    let Some(accept_ranges) = response.headers().get(reqwest::header::ACCEPT_RANGES).and_then(|value| value.to_str().ok()) else {
-        return false;
-    };
-    if !accept_ranges.split(',').any(|value| value.trim().eq_ignore_ascii_case("bytes")) {
-        return false;
-    }
-    true
+    let refused = response
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("none"));
+    !refused
 }
 
 const BODY_SNIFF_LIMIT: usize = 8192;
@@ -3130,14 +3133,17 @@ async fn range_to_file(
     give_up(position, last_error)
 }
 
-async fn acquire_ranges(
+/// A download over parallel byte ranges. `first_body` is the body of the
+/// first response (from byte 0); it supplies the start of the file.
+async fn acquire_ranges<B: AsRef<[u8]>>(
     app: AppHandle,
     id: String,
     source: String,
-    response: reqwest::Response,
-    total: u64,
+    first_body: impl futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    identity: ResourceIdentity,
     generation: u64
 ) -> Result<(), String> {
+    let total = identity.length;
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
@@ -3165,13 +3171,13 @@ async fn acquire_ranges(
                 })
                 .ok_or_else(|| "Acquisition no longer exists".to_string())
         })?;
-    let identity = identity_from_response(&response, total);
     let first_target = total.min(1024 * 1024) as usize;
     let mut first = Vec::with_capacity(first_target);
-    let mut first_stream = response.bytes_stream();
+    let mut first_stream = first_body;
     while first.len() < first_target {
         let Some(chunk) = first_stream.next().await else { break; };
         let chunk = chunk.map_err(|error| error.to_string())?;
+        let chunk = chunk.as_ref();
         let remaining = first_target.saturating_sub(first.len());
         first.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
         if chunk.is_empty() {
@@ -4883,7 +4889,8 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     }
     // Ranged workers re-request the source with GET, which a POST response
     // cannot be rebuilt from: a form capture stays one stream.
-    let safe_ranges = !is_post && supports_safe_initial_ranges(&response, total, response_mime.as_deref());
+    let probe_ranges = !is_post && worth_probing_ranges(&response, total, response_mime.as_deref());
+    let identity = total.map(|total| identity_from_response(&response, total));
     let mut stream = response.bytes_stream();
     // Keep a bounded prefix together while sniffing so a manifest marker
     // split across response chunks is still recognized without losing bytes.
@@ -4970,37 +4977,27 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
     adopt_response_name(&app, &state, &id, page_disposition.as_deref());
     // Headers and first bytes say this is the file: the browser may let go.
     report_viability(&app, &id, Ok(()));
-    if safe_ranges {
-        let probe_end = total
-            .expect("safe range response has a total")
-            .min(1024 * 1024)
-            .saturating_sub(1);
+    if let (true, Some(total), Some(identity)) = (probe_ranges, total, identity.as_ref()) {
+        // One byte asks whether the source serves ranges of this very object.
+        // The first response is not dropped: it still supplies the start of
+        // the file, so nothing is fetched twice.
         let probe = acquisition_request(&client, &app, &id, &manifest_source)
-            .header(reqwest::header::RANGE, format!("bytes=0-{probe_end}"))
+            .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await;
-        let valid_probe = match probe {
-            Ok(probe) if probe.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                content_range(&probe)
-                    .map(|(start, end, advertised)| {
-                        start == 0
-                            && end == probe_end
-                            && advertised == total.expect("safe range response has a total")
-                            && probe.content_length() == Some(probe_end + 1)
-                    })
-                    .unwrap_or(false)
-                    .then_some(probe)
-            }
-            _ => None,
-        };
-        if let Some(probe) = valid_probe {
-            drop(stream);
+        let ranged = matches!(&probe, Ok(probe) if probe.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && content_range(probe) == Some((0, 0, total))
+            && probe.content_length() == Some(1)
+            && valid_range_identity(probe, identity));
+        drop(probe);
+        if ranged {
+            let first = futures_util::stream::iter(prefix_chunks.into_iter().map(Ok::<_, reqwest::Error>)).chain(stream);
             if let Err(error) = acquire_ranges(
                 app.clone(),
                 id.clone(),
                 source.clone(),
-                probe,
-                total.expect("safe range response has a total"),
+                first,
+                identity.clone(),
                 generation,
             )
             .await

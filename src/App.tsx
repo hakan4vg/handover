@@ -289,7 +289,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
                  <div className="toolbar-menu-wrap"><button className="icon-button toolbar-more" aria-label="More options" aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => { setMoreOpen(!moreOpen); setSortOpen(false); }}><Icon name="more" size={19} /></button>{moreOpen && <KeyboardMenu className="toolbar-menu" label="Manager options" onDismiss={() => setMoreOpen(false)}><button role="menuitem" onClick={() => { setFilter('settings' as FilterKey); dismissMenus(); setContextJobId(null); }}><Icon name="settings" size={15} /> Settings</button><button role="menuitem" onClick={() => { setSortBy('created'); setMoreOpen(false); }}><Icon name="refresh" size={15} /> Reset sort</button></KeyboardMenu>}</div>
               </div>
             </div>
-            <div className="workspace-columns">
+            <div className={`workspace-columns${selected && inspectorOpen ? '' : ' no-inspector'}`}>
               <section className="download-list" aria-label="Downloads">
                  <div className="list-header"><span>Downloads</span><div className="list-header-actions"><button className="subtle-button" aria-haspopup="menu" aria-expanded={sortOpen} onClick={() => { setSortOpen(!sortOpen); setMoreOpen(false); }}><Icon name="sort" size={15} /> Sort <Icon name="chevron-down" size={13} /></button>{sortOpen && <SortMenu value={sortBy} onChange={(value) => { setSortBy(value); setSortOpen(false); }} onDismiss={() => setSortOpen(false)} />}</div></div>
                 <div className="rows">
@@ -297,7 +297,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
                 </div>
                 {contextJob && <JobContextMenu job={contextJob} adapter={adapter} onClose={() => setContextJobId(null)} onNotice={showNotice} />}
               </section>
-              {selected && (inspectorOpen ? <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} /> : <button className="inspector-reopen" onClick={() => setInspectorOpen(true)} aria-label="Open inspector"><Icon name="chevron-left" size={17} /><span>Details</span></button>)}
+              {selected && inspectorOpen && <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} />}
             </div>
              <div className="manager-statusbar"><div className="aggregate-status"><span>{active.length} active</span><span>·</span><span>{formatSpeed(active.length > 0 ? snapshot.aggregateSpeed : 0)}</span></div></div>
           </main>
@@ -1112,8 +1112,15 @@ function PairWindow({ adapter, snapshot }: { adapter: DownloadAdapter; snapshot:
   const id = new URLSearchParams(window.location.search).get('id') ?? '';
   const [code, setCode] = useState<string | null>(null);
   const [error, setError] = useState('');
-  useEffect(() => { void adapter.pairingCode(id).then(setCode, () => setCode(null)); }, [adapter, id]);
-  const answer = (allow: boolean) => { setError(''); void adapter.answerPairing(id, allow).catch((reason: unknown) => setError(errorMessage(reason, 'Could not record the pairing'))); };
+  // The request expires in the app after two minutes: follow it, so an
+  // expired code is never shown as one that can still be allowed.
+  useEffect(() => {
+    const read = () => void adapter.pairingCode(id).then(setCode, () => setCode(null));
+    read();
+    const timer = window.setInterval(read, 2000);
+    return () => window.clearInterval(timer);
+  }, [adapter, id]);
+  const answer = (allow: boolean) => { setError(''); void adapter.answerPairing(id, allow).catch((reason: unknown) => { setCode(null); setError(errorMessage(reason, 'Could not record the pairing')); }); };
   return <div className="standalone-surface" data-theme={snapshot.settings.theme} style={{ '--accent': snapshot.settings.accent } as CSSProperties}><section className="add-download-window pair-window" role="dialog" aria-label="Pair browser"><div className="add-titlebar" data-tauri-drag-region="true" onMouseDown={startWindowDrag}><strong>Pair browser</strong><button aria-label="Deny" onClick={() => answer(false)}><Icon name="close" size={17} /></button></div><div className="add-content"><p>Allow this browser to hand downloads to Download Manager?</p><strong className="pair-code">{code ?? 'Expired'}</strong><p className="pair-hint">The extension shows the same code.</p>{error && <div className="form-error" role="alert"><Icon name="error" size={14} />{error}</div>}</div><div className="add-actions"><button className="button" onClick={() => answer(false)}>Deny</button><button className="button primary" disabled={!code} onClick={() => answer(true)}>Allow</button></div></section></div>;
 }
 

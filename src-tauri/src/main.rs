@@ -6110,6 +6110,7 @@ fn open_add_window(app: &AppHandle, id: &str) -> Result<(), String> {
     let window = add_window
         .build()
         .map_err(|error| format!("Could not open Add Download window: {error}"))?;
+    apply_window_icon(&window);
     let close_handle = app.clone();
     let close_id = id.to_string();
     // Destroyed covers every way the window goes away, including the UI's
@@ -7135,13 +7136,14 @@ fn open_pair_window(app: &AppHandle, request: &str) -> Result<(), String> {
         builder = builder.data_directory(app_data_root().join("webview"));
     }
     let window = builder.build().map_err(|error| format!("Could not open the pairing window: {error}"))?;
+    apply_window_icon(&window);
     let handle = app.clone();
     let request = request.to_string();
     window.on_window_event(move |event| {
         // Closing the window unanswered declines the pairing.
         if let WindowEvent::Destroyed = event {
             if let Ok(mut pairings) = handle.state::<CoreState>().pairings.lock() {
-                pairings.answer(&request, false);
+                let _ = pairings.answer(&request, false);
             }
         }
     });
@@ -7156,7 +7158,18 @@ fn pairing_code(state: State<'_, CoreState>, id: String) -> Option<String> {
 
 #[tauri::command]
 fn answer_pairing(app: AppHandle, state: State<'_, CoreState>, id: String, allow: bool) -> Result<(), String> {
-    let approved = state.pairings.lock().map_err(|_| "Pairings unavailable".to_string())?.answer(&id, allow);
+    let approved = state
+        .pairings
+        .lock()
+        .map_err(|_| "Pairings unavailable".to_string())?
+        .answer(&id, allow);
+    // Allowing a request that expired records nothing: say so. Denying it
+    // (or closing its window) has nothing left to decline.
+    let approved = match approved {
+        Ok(approved) => approved,
+        Err(()) if allow => return Err("This request expired. Click Pair in the extension to get a new code.".to_string()),
+        Err(()) => None,
+    };
     if let Some((key_id, key)) = approved {
         let stored = state.database.lock().map_err(|_| "Storage unavailable".to_string()).and_then(|database| {
             database
@@ -7400,7 +7413,8 @@ fn main() {
             {
                 main_window = main_window.data_directory(app_data_root().join("webview"));
             }
-            main_window.build().map_err(|error| error.to_string())?;
+            let main_window = main_window.build().map_err(|error| error.to_string())?;
+            apply_window_icon(&main_window);
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             restrict_file(&root.join("download-manager.db"));
             database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT); CREATE TABLE IF NOT EXISTS pairings (key_id TEXT PRIMARY KEY, secret TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
@@ -7442,9 +7456,9 @@ fn main() {
         .expect("error while running Download Manager");
 }
 
-/// On Windows, windows carry no icon of their own: the taskbar and Alt+Tab
-/// then take the executable's icon, which holds every size. Tauri's default
-/// window icon is the .ico's first (16 px) image, scaled up and blurred.
+/// On Windows, Tauri gives windows no icon of their own: its default window
+/// icon is the .ico's first (16 px) image, scaled up and blurred. Each window
+/// gets the executable's icon instead, through `apply_window_icon`.
 fn app_context() -> tauri::Context<tauri::Wry> {
     #[allow(unused_mut)]
     let mut context = tauri::generate_context!();
@@ -7452,6 +7466,62 @@ fn app_context() -> tauri::Context<tauri::Wry> {
     context.set_default_window_icon(None);
     context
 }
+
+/// Alt+Tab shows a window's own icon and, unlike the taskbar, does not fall
+/// back to the executable's. Give the window the executable's icon at the
+/// sizes its display asks for: the .ico holds every size, so none is scaled.
+#[cfg(windows)]
+fn apply_window_icon(window: &tauri::WebviewWindow) {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetDpiForWindow(hwnd: *mut c_void) -> u32;
+        fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
+        fn LoadImageW(instance: *mut c_void, name: *const u16, kind: u32, width: i32, height: i32, flags: u32) -> *mut c_void;
+        fn SendMessageW(hwnd: *mut c_void, message: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    }
+    const IMAGE_ICON: u32 = 1;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+    const SM_CXICON: i32 = 11;
+    const SM_CXSMICON: i32 = 49;
+    // tauri-build embeds the app icon under IDI_APPLICATION's id.
+    const APP_ICON: usize = 32512;
+    // Icons by pixel size, loaded once: windows come and go, icons stay.
+    static LOADED: OnceLock<Mutex<Vec<(i32, isize)>>> = OnceLock::new();
+
+    let Ok(hwnd) = window.hwnd() else { return };
+    let hwnd = hwnd.0 as *mut c_void;
+    let Ok(mut loaded) = LOADED.get_or_init(|| Mutex::new(Vec::new())).lock() else { return };
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        for (kind, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
+            let size = GetSystemMetricsForDpi(metric, dpi);
+            let icon = match loaded.iter().find(|(loaded_size, _)| *loaded_size == size) {
+                Some((_, icon)) => *icon,
+                None => {
+                    let icon = LoadImageW(GetModuleHandleW(std::ptr::null()), APP_ICON as *const u16, IMAGE_ICON, size, size, 0) as isize;
+                    if icon == 0 {
+                        continue;
+                    }
+                    loaded.push((size, icon));
+                    icon
+                }
+            };
+            SendMessageW(hwnd, WM_SETICON, kind, icon);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_window_icon(_window: &tauri::WebviewWindow) {}
 
 fn configure_portable_webview2() {
     #[cfg(windows)]

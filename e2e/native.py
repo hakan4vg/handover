@@ -17,6 +17,7 @@ The bridge port (38217) must be free: quit any running Download Manager first.
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import datetime as dt
 import importlib.util
@@ -566,6 +567,15 @@ def main() -> int:
         # ---- pairing and the sealed channel --------------------------------
         declined = sealed.pair(allow=False)
         run.check("pairing/declined", "a pairing the user declines yields no key", declined.get("state") == "denied" and "key" not in declined, {k: v for k, v in declined.items() if k != "key"})
+        # Allow on a request a newer one replaced (or that expired) records
+        # nothing, and says so instead of closing as if it had paired.
+        stale, fresh = (base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=").replace("_", "-") for _ in range(2))
+        sealed.post("/v1/pair", {"request": stale})
+        sealed.post("/v1/pair", {"request": fresh})
+        stale_answer = devtools.evaluate(f"window.__TAURI_INTERNALS__.invoke('answer_pairing', {{ id: {json.dumps(stale)}, allow: true }}).then(() => ({{ ok: true }}), (error) => ({{ error: String(error) }}))")
+        stale_status = sealed.post("/v1/pair/status", {"request": stale})[1].get("state")
+        devtools.invoke("answer_pairing", {"id": fresh, "allow": False})
+        run.check("pairing/stale-allow", "allowing a request that was replaced reports that it expired and pairs nothing", "expired" in (stale_answer.get("error") or "") and stale_status == "unknown", {"answer": stale_answer, "staleStatus": stale_status})
         PAIRING.update(sealed.pair(allow=True))
         run.check("pairing/approved", "a pairing the user allows yields a key, once", PAIRING.get("state") == "approved" and len(PAIRING.get("key", "")) == 44 and sealed.post("/v1/pair/status", {"request": PAIRING.get("request")})[1].get("state") == "unknown", {k: v for k, v in PAIRING.items() if k != "key"})
         probe_message = {"type": "cancel-acquisition", "payload": {"captureId": "sealed-probe"}}

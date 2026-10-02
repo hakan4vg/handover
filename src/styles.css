@@ -11,8 +11,8 @@
   --border: #e2e6eb;
   --border-strong: #d3d9e1;
   --accent: #0878ed;
-  --accent-soft: #eaf3ff;
-  --accent-strong: #006bd6;
+  --accent-soft: color-mix(in srgb, var(--accent) 10%, #ffffff);
+  --accent-strong: color-mix(in srgb, var(--accent) 88%, #000000);
   --green: #0c9a4b;
   --green-soft: #e7f7ed;
   --purple: #7a35d4;
@@ -52,8 +52,6 @@ button:disabled { cursor: default; opacity: .56; }
   --border: #e2e6eb;
   --border-strong: #d3d9e1;
   --accent: #0878ed;
-  --accent-soft: #eaf3ff;
-  --accent-strong: #006bd6;
   --green: #0c9a4b;
   --green-soft: #e7f7ed;
   --purple: #7a35d4;
@@ -72,6 +70,13 @@ button:disabled { cursor: default; opacity: .56; }
   overflow: hidden;
 }
 
+/* The accent follows the setting; its soft and strong shades derive from it,
+   so a chosen colour reaches selections and selected text too. */
+.desktop-shell, .standalone-surface {
+  --accent-soft: color-mix(in srgb, var(--accent) 10%, #ffffff);
+  --accent-strong: color-mix(in srgb, var(--accent) 88%, #000000);
+}
+
 .desktop-shell[data-theme="dark"], .standalone-surface[data-theme="dark"] {
   --app-bg: #181a1e;
   --surface: #23262b;
@@ -83,7 +88,8 @@ button:disabled { cursor: default; opacity: .56; }
   --border: #373c44;
   --border-strong: #4b525c;
   --track: #3a3f47;
-  --accent-soft: #183757;
+  --accent-soft: color-mix(in srgb, var(--accent) 24%, var(--surface));
+  --accent-strong: color-mix(in srgb, var(--accent) 75%, #ffffff);
   --green: #43c979;
   --green-soft: #1a3e2a;
   --purple: #b98af0;
@@ -109,7 +115,8 @@ button:disabled { cursor: default; opacity: .56; }
     --border: #373c44;
     --border-strong: #4b525c;
     --track: #3a3f47;
-    --accent-soft: #183757;
+    --accent-soft: color-mix(in srgb, var(--accent) 24%, var(--surface));
+    --accent-strong: color-mix(in srgb, var(--accent) 75%, #ffffff);
     --green: #43c979;
     --green-soft: #1a3e2a;
     --purple: #b98af0;
@@ -157,12 +164,13 @@ button:disabled { cursor: default; opacity: .56; }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; }
 .button, .subtle-button { min-height: 32px; border: 1px solid var(--border-strong); border-radius: 5px; padding: 0 12px; color: var(--text); background: var(--surface); display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 12px; white-space: nowrap; }
 .button:hover, .subtle-button:hover { background: var(--surface-soft); border-color: var(--faint); }
-.button.primary { color: white; border-color: var(--accent); background: var(--accent); box-shadow: 0 1px 2px rgba(0, 93, 190, .2); }
+.button.primary { color: white; border-color: var(--accent); background: var(--accent); box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 20%, transparent); }
 .button.primary:hover { border-color: var(--accent-strong); background: var(--accent-strong); }
 .icon-button { width: 30px; height: 30px; display: inline-grid; place-items: center; border: 0; border-radius: 5px; color: var(--muted); background: transparent; padding: 0; }
 .icon-button:hover { color: var(--text); background: var(--surface-soft); }
 .toolbar-more { margin-left: 2px; }
 .workspace-columns { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 320px; }
+.workspace-columns.no-inspector { grid-template-columns: minmax(0, 1fr); }
 .download-list { min-width: 0; min-height: 0; position: relative; overflow: auto; border-right: 1px solid var(--border); }
 .list-header { height: 37px; padding: 0 18px 0 22px; color: var(--muted); font-size: 11px; display: flex; align-items: center; justify-content: space-between; }
 .subtle-button { border-color: transparent; min-height: 28px; color: var(--muted); padding: 0 6px; background: transparent; font-size: 11px; }
@@ -211,8 +219,6 @@ button:disabled { cursor: default; opacity: .56; }
 .inspector-tabs button.active { color: var(--accent-strong); font-weight: 650; }
 .inspector-tabs button.active::after { content: ""; position: absolute; height: 2px; left: 7px; right: 7px; bottom: -1px; border-radius: 2px 2px 0 0; background: var(--accent); }
 .inspector-close { width: 26px; flex: 0 0 26px; margin-left: auto; align-self: center; }
-.inspector-reopen { width: 38px; border: 0; border-left: 1px solid var(--border); color: var(--muted); background: var(--surface); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; font-size: 11px; cursor: pointer; }
-.inspector-reopen:hover { color: var(--text); background: var(--surface-soft); }
 .inspector-scroll { min-height: 0; flex: 1; overflow: auto; scrollbar-gutter: stable; padding: 16px 14px; }
 .inspector-heading { display: flex; align-items: center; gap: 11px; padding-bottom: 17px; }
 .inspector-heading > div { min-width: 0; }
@@ -297,7 +303,6 @@ button:disabled { cursor: default; opacity: .56; }
 
 @media (max-width: 840px) {
   .workspace-columns { position: relative; grid-template-columns: minmax(0, 1fr); }.toolbar { padding-left: 14px; }.settings-main { grid-template-columns: 190px minmax(0, 1fr); }.settings-content { padding-left: 20px; padding-right: 20px; }
-  .inspector-reopen { display: flex; position: absolute; right: 0; top: 0; bottom: 0; width: 38px; z-index: 5; }
   .inspector { display: flex; position: absolute; right: 0; top: 0; bottom: 0; width: min(320px, 88%); z-index: 8; border-left: 1px solid var(--border); box-shadow: -12px 0 28px rgba(26, 38, 52, .16); }
 }
 

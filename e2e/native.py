@@ -70,6 +70,11 @@ PACING_EARLY: collections.Counter = collections.Counter()
 PACED_HLS = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2"] + [line for i in range(3) for line in ("#EXTINF:2.0,", f"/paced-hls/seg{i}.ts")] + ["#EXT-X-ENDLIST", ""])
 
 
+# Cut-range scenario: the first answer for each range stops half way.
+CUT_RANGES: list[tuple[int, int, int]] = []
+CUT_REQUESTS: list[str] = []
+
+
 def pacing_says_wait(key: str, scenario: str) -> bool:
     now = time.time()
     first = PACING_FIRST.setdefault(key, now)
@@ -258,6 +263,29 @@ class Handler(fixture.Handler):
             if rng.startswith("bytes=") and not rng.startswith("bytes=0-") and pacing_says_wait(rng, "range"):
                 return self._raw(503, b"slow down", {"Retry-After": "1"})
             return self._serve_file("range.bin", seed, size, True)
+        if path == "/cut/range.bin":
+            rng = self.headers.get("Range", "")
+            CUT_REQUESTS.append(rng)
+            m = re.match(r"bytes=(\d+)-(\d+)$", rng)
+            # Only a range's first request is cut (a retry ends at the same byte).
+            if m and int(m[1]) > 0 and not any(end == int(m[2]) for _, end, _ in CUT_RANGES):
+                start, end = int(m[1]), int(m[2])
+                half = start + (end - start + 1) // 2
+                CUT_RANGES.append((start, end, half))
+                self.send_response(206)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(RANGE_BYTES)}")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.end_headers()
+                try:
+                    self.wfile.write(RANGE_BYTES[start:half])
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+                self.close_connection = True
+                return None
+            size, seed, _ = fixture.FILES["range.bin"]
+            return self._serve_file("range.bin", seed, size, True)
         if path == "/paced-hls.m3u8":
             return self._raw(200, PACED_HLS.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
         if path.startswith("/paced-hls/seg"):
@@ -354,6 +382,7 @@ def main() -> int:
         "post-ok": ("/post-ok.bin", {"postBody": "export=requested"}),
         "zero-mpd": ("/zero.mpd", {"media": True, "playerKind": "video"}),
         "paced-range": ("/paced/range.bin", {}),
+        "cut-range": ("/cut/range.bin", {}),
         # Stopped while finalizing: every fragment is on disk, the source has expired.
         "recover-media": ("/gone.mpd", {"media": True, "playerKind": "video", "state": "finalizing", "progress": 100, "segments": {"completed": 6, "total": 6, "identity": "seeded"}}),
         "paced-hls": ("/paced-hls.m3u8", {"media": True, "playerKind": "video"}),
@@ -461,6 +490,9 @@ def main() -> int:
 
         j = job("paced-range")
         run.check("engine/paced-range", "range workers told Retry-After wait it out: the download completes byte-exact with no retry inside the server's window", j["state"] == "completed" and j["_data"] == RANGE_BYTES and PACING_EARLY["range"] == 0, evidence("paced-range", earlyRetries=PACING_EARLY["range"], pacedRanges=sum(1 for k in PACING_FIRST if k.startswith("bytes="))))
+        j = job("cut-range")
+        resumed = [(start, end, half) for start, end, half in CUT_RANGES if f"bytes={half}-{end}" in CUT_REQUESTS]
+        run.check("engine/range-cut-resumes", "a range whose connection drops half way is asked again only from where it stopped, and the download completes byte-exact", j["state"] == "completed" and j["_data"] == RANGE_BYTES and bool(CUT_RANGES) and len(resumed) == len(CUT_RANGES), evidence("cut-range", cutRanges=len(CUT_RANGES), resumedFromCut=len(resumed), requests=CUT_REQUESTS[:12]))
         j = job("paced-hls")
         run.check("engine/paced-hls", "media segments told Retry-After wait it out: the playlist completes with no retry inside the server's window", j["state"] == "completed" and bool(j["bytes"]) and PACING_EARLY["hls"] == 0, evidence("paced-hls", earlyRetries=PACING_EARLY["hls"]))
 

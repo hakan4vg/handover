@@ -1658,14 +1658,122 @@ fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) 
         }
     }
 }
-/// Publishes how many bytes a ranged transfer holds in memory for ranges not
-/// yet written. The counter is read under the snapshot lock, like every
-/// other publish of it, so a range moving from held to written is seen in
-/// one step.
-fn publish_receiving(app: &AppHandle, id: &str, receiving: &AtomicU64) {
+/// Bytes a ranged transfer has received and not yet claimed: ranges still
+/// arriving, and ranges written but not yet flushed (see `Landing`). They
+/// count toward the speed as they arrive. A network read is often a few KiB
+/// and each publish takes the state lock, so publishes are spaced out.
+struct Intake {
+    receiving: AtomicU64,
+    started: std::time::Instant,
+    published_ms: AtomicU64,
+}
+
+const INTAKE_PUBLISH_SPACING_MS: u64 = 100;
+
+impl Intake {
+    fn new() -> Self {
+        Self { receiving: AtomicU64::new(0), started: std::time::Instant::now(), published_ms: AtomicU64::new(0) }
+    }
+
+    fn add(&self, app: &AppHandle, id: &str, bytes: u64) {
+        self.receiving.fetch_add(bytes, Ordering::Relaxed);
+        let now = self.started.elapsed().as_millis() as u64;
+        let last = self.published_ms.load(Ordering::Relaxed);
+        if now >= last + INTAKE_PUBLISH_SPACING_MS && self.published_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            self.publish(app, id);
+        }
+    }
+
+    /// Received bytes that will not be claimed: a range given up part way.
+    fn discard(&self, app: &AppHandle, id: &str, bytes: u64) {
+        if bytes > 0 {
+            self.receiving.fetch_sub(bytes, Ordering::Relaxed);
+            self.publish(app, id);
+        }
+    }
+
+    /// The counter is read under the snapshot lock, like every other publish
+    /// of it, so a range moving from held to claimed is seen in one step.
+    fn publish(&self, app: &AppHandle, id: &str) {
+        let state = app.state::<CoreState>();
+        emit_job(&state, id, |job| job.receiving = self.receiving.load(Ordering::Relaxed));
+        emit_progress(app, &state, id);
+    }
+}
+
+/// Ranges written to the part file but not yet flushed to disk. A range is
+/// claimed (recorded as completed, counted as downloaded) only after a flush
+/// that covers it, because completed ranges are trusted after a crash (F10).
+/// One flush covers every range written before it, so claims are batched:
+/// about one flush a second instead of one per range, which on a hard drive
+/// was a seek and a wait each.
+struct Landing {
+    written: Mutex<(Vec<ByteRange>, std::time::Instant)>,
+    downloaded: AtomicU64,
+}
+
+const LANDING_FLUSH_SPACING: Duration = Duration::from_secs(1);
+
+impl Landing {
+    fn new(downloaded: u64) -> Self {
+        Self { written: Mutex::new((Vec::new(), std::time::Instant::now())), downloaded: AtomicU64::new(downloaded) }
+    }
+
+    /// Record `written` (if any) and, when a flush is due or `now`, hand back
+    /// every range waiting for one.
+    fn due(&self, written: Option<ByteRange>, now: bool) -> Vec<ByteRange> {
+        let Ok(mut pending) = self.written.lock() else { return Vec::new() };
+        pending.0.extend(written);
+        if pending.0.is_empty() || !(now || pending.1.elapsed() >= LANDING_FLUSH_SPACING) {
+            return Vec::new();
+        }
+        pending.1 = std::time::Instant::now();
+        std::mem::take(&mut pending.0)
+    }
+}
+
+/// Flush the part file and claim the ranges written before the flush, when
+/// one is due (or `now`). `update` adds the caller's own fields to the claim.
+#[allow(clippy::too_many_arguments)]
+async fn land(
+    app: &AppHandle,
+    id: &str,
+    generation: u64,
+    temp_path: &str,
+    total: u64,
+    intake: &Intake,
+    landing: &Landing,
+    written: Option<ByteRange>,
+    now: bool,
+    update: impl FnOnce(&mut DownloadJob),
+) -> Result<(), String> {
+    let due = landing.due(written, now);
+    if due.is_empty() {
+        return Ok(());
+    }
+    let len: u64 = due.iter().map(|range| range.end - range.start + 1).sum();
+    let flushed = async {
+        OpenOptions::new().write(true).open(temp_path).await?.sync_data().await
+    }
+    .await;
+    if let Err(error) = flushed {
+        intake.discard(app, id, len);
+        return Err(error.to_string());
+    }
+    if !transfer_is_current(app, id, generation) {
+        return Ok(());
+    }
     let state = app.state::<CoreState>();
-    emit_job(&state, id, |job| job.receiving = receiving.load(Ordering::Relaxed));
+    emit_job(&state, id, |job| {
+        job.receiving = intake.receiving.fetch_sub(len, Ordering::Relaxed) - len;
+        let downloaded = landing.downloaded.fetch_add(len, Ordering::Relaxed) + len;
+        job.downloaded = downloaded;
+        job.progress = downloaded as f64 / total as f64 * 100.0;
+        job.completed_ranges = due.iter().fold(std::mem::take(&mut job.completed_ranges), |ranges, range| merge_range(&ranges, range.clone()));
+        update(job);
+    });
     emit_progress(app, &state, id);
+    Ok(())
 }
 
 /// How many bytes a job had received at one moment.
@@ -2485,24 +2593,34 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize, generation: u64) -> b
     // global rate. A job's own cap is a second bucket shared by that job's
     // workers, refilled at the job's rate. Bytes are taken from both, so each
     // limit holds on its own.
-    let (global, job) = app.state::<CoreState>().snapshot.lock().ok().map(|snapshot| {
+    //
+    // This runs for every network read, so the job's state and both limits
+    // come from one look at the state.
+    let limits = app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
+        let item = snapshot.jobs.iter().find(|item| item.id == id)?;
+        if !state_allows_transfer(Some(item.state.as_str())) {
+            return None;
+        }
         let global = snapshot.settings.bandwidth_limit.map(|value| {
             let multiplier = match snapshot.settings.bandwidth_unit.as_str() { "GB/s" => 1024f64 * 1024f64 * 1024f64, "MB/s" => 1024f64 * 1024f64, _ => 1024f64 };
             value as f64 * multiplier
         });
-        let job = snapshot.jobs.iter().find(|item| item.id == id).and_then(|item| item.bandwidth_limit.map(|value| value as f64));
-        (global.filter(|rate| *rate > 0.0), job.filter(|rate| *rate > 0.0))
-    }).unwrap_or((None, None));
+        let job = item.bandwidth_limit.map(|value| value as f64);
+        Some((global.filter(|rate| *rate > 0.0), job.filter(|rate| *rate > 0.0)))
+    });
+    let Some((global, job)) = limits else { return false };
+    if !transfer_is_current(app, id, generation) {
+        return false;
+    }
     if job.is_none() {
         // The cap was cleared: drop its bucket.
         if let Ok(mut buckets) = app.state::<CoreState>().job_bandwidth.lock() { buckets.remove(id); }
         if global.is_none() {
-            return transfer_can_continue(app, id, generation);
+            return true;
         }
     }
     let mut remaining = bytes as f64;
-    while remaining > 0.0 {
-        if !transfer_can_continue(app, id, generation) { return false; }
+    loop {
         let wait = {
             let state = app.state::<CoreState>();
             let Ok(mut shared) = state.bandwidth.lock() else { return false; };
@@ -2526,11 +2644,14 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize, generation: u64) -> b
                 wait.max((remaining - bucket.tokens).max(0.0) / *rate)
             })
         };
-        if remaining > 0.0 {
-            sleep(Duration::from_secs_f64(wait.clamp(0.001, 0.1))).await;
+        if remaining <= 0.0 {
+            return true;
+        }
+        sleep(Duration::from_secs_f64(wait.clamp(0.001, 0.1))).await;
+        if !transfer_can_continue(app, id, generation) {
+            return false;
         }
     }
-    transfer_can_continue(app, id, generation)
 }
 
 async fn fragment_bytes(
@@ -2878,108 +2999,135 @@ async fn wait_before_retry(app: &AppHandle, id: &str, generation: u64, attempt: 
     }
 }
 
-async fn range_bytes(
+/// How much a range worker gathers before writing. Several workers write to
+/// different parts of one file at once, and on a hard drive small interleaved
+/// writes turn into seeks, so each write is several MiB of one range. A job's
+/// workers share one memory budget: 8 workers write 8 MiB at a time, 32
+/// workers 2 MiB (measured on a hard drive, 1 GiB over 8 connections: 4 MiB
+/// writes took ~8% longer than 8 MiB ones).
+const RANGE_WRITE_BUDGET: usize = 64 * 1024 * 1024;
+
+fn range_write_batch(workers: usize) -> usize {
+    (RANGE_WRITE_BUDGET / workers.max(1)).clamp(2 * 1024 * 1024, 8 * 1024 * 1024)
+}
+
+/// Fetch bytes `start..=end` into the part file at their offset, writing as
+/// they arrive in batches of `batch_size` (a range is no longer held
+/// in memory whole). A dropped connection resumes from the last byte
+/// received. Received bytes count in `intake`; Ok means the whole range is
+/// written, not yet flushed (`land` claims it). On Err nothing of this range
+/// stays counted.
+#[allow(clippy::too_many_arguments)]
+async fn range_to_file(
     client: &reqwest::Client,
     app: &AppHandle,
     id: &str,
     source: &str,
+    temp_path: &str,
     start: u64,
     end: u64,
     retries: u32,
     expected: &ResourceIdentity,
     generation: u64,
-    receiving: &AtomicU64
-) -> Result<Vec<u8>, String> {
+    intake: &Intake,
+    batch_size: usize
+) -> Result<(), String> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("range request failed");
-    let total_len = end.saturating_sub(start).saturating_add(1);
     let mut pacing = None;
+    let mut file = OpenOptions::new().write(true).open(temp_path).await.map_err(|error| error.to_string())?;
+    // The next byte to receive. Everything before it is written, except the
+    // last `batch.len()` bytes, which are gathered for the next write.
+    let mut position = start;
+    let mut batch: Vec<u8> = Vec::with_capacity(batch_size.min((end - start + 1) as usize));
+    let give_up = |position: u64, error: String| {
+        intake.discard(app, id, position - start);
+        Err(error)
+    };
     for attempt in 0..attempts {
         if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
-            return Err("paused".to_string());
+            return give_up(position, "paused".into());
         }
-        match acquisition_request(client, app, id, source)
-            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        let response = match acquisition_request(client, app, id, source)
+            .header(reqwest::header::RANGE, format!("bytes={position}-{end}"))
             .send()
             .await
         {
-            Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
-                let valid_range = content_range(&response)
-                    .map(|(actual_start, actual_end, actual_total)| {
-                        actual_start == start
-                            && actual_end == end
-                            && actual_total == expected.length
-                    })
-                    .unwrap_or(false);
-                if !valid_range {
-                    last_error = "The server returned an invalid byte range".into();
-                    continue;
-                }
-                if !valid_range_identity(&response, expected) {
-                    // A different resource will not turn back into the
-                    // verified one: retrying only spends requests.
-                    return Err("The resource changed while it was being acquired".into());
-                }
-                let mut buf = Vec::new();
-                let mut stream = response.bytes_stream();
-                let mut overflow = false;
-                // Received bytes count toward the speed as they arrive. The
-                // byte counter (progress) moves only once the caller has
-                // durably written the whole range, which keeps progress and
-                // persisted ranges truthful if pause or a retry interrupts
-                // here.
-                let mut counted = 0u64;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            buf.extend_from_slice(&bytes);
-                            if buf.len() as u64 > total_len {
-                                overflow = true;
-                                break;
-                            }
-                            counted += bytes.len() as u64;
-                            receiving.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                            publish_receiving(app, id, receiving);
-                            if !throttle(app, id, bytes.len(), generation).await {
-                                receiving.fetch_sub(counted, Ordering::Relaxed);
-                                return Err("paused".to_string());
-                            }
-                        }
-                        Err(error) => {
-                            last_error = error.to_string();
-                            buf.clear();
-                            break;
-                        }
-                    }
-                }
-                if buf.len() as u64 != total_len {
-                    // This attempt's bytes are discarded.
-                    receiving.fetch_sub(counted, Ordering::Relaxed);
-                    publish_receiving(app, id, receiving);
-                }
-                if overflow {
-                    last_error = "The server returned an overlong byte range".into();
-                    continue;
-                }
-                if buf.len() as u64 == total_len {
-                    return Ok(buf);
-                }
-                if buf.is_empty() {
-                    continue;
-                }
-                last_error = "The server returned an incomplete byte range".into();
-            }
+            Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => response,
             Ok(response) if terminal_source_status(response.status()) => {
-                return Err(terminal_source_error(response.status()));
+                return give_up(position, terminal_source_error(response.status()));
             }
             Ok(response) => {
                 pacing = retry_after(&response);
                 last_error = format!("range request returned {}", response.status());
+                continue;
             }
-            Err(error) => last_error = error.to_string()
+            Err(error) => {
+                last_error = error.to_string();
+                continue;
+            }
+        };
+        if content_range(&response) != Some((position, end, expected.length)) {
+            last_error = "The server returned an invalid byte range".into();
+            continue;
+        }
+        if !valid_range_identity(&response, expected) {
+            // A different resource will not turn back into the verified one:
+            // retrying only spends requests.
+            return give_up(position, "The resource changed while it was being acquired".into());
+        }
+        if let Err(error) = file.seek(SeekFrom::Start(position)).await {
+            return give_up(position, error.to_string());
+        }
+        let mut stream = response.bytes_stream();
+        last_error = "The server returned an incomplete byte range".into();
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    last_error = error.to_string();
+                    break;
+                }
+            };
+            if position + bytes.len() as u64 > end + 1 {
+                // A body longer than the range it claimed: none of what this
+                // range received is trusted.
+                intake.discard(app, id, position - start);
+                position = start;
+                batch.clear();
+                last_error = "The server returned an overlong byte range".into();
+                break;
+            }
+            batch.extend_from_slice(&bytes);
+            position += bytes.len() as u64;
+            intake.add(app, id, bytes.len() as u64);
+            if batch.len() >= batch_size {
+                if let Err(error) = file.write_all(&batch).await {
+                    return give_up(position, error.to_string());
+                }
+                batch.clear();
+            }
+            if !throttle(app, id, bytes.len(), generation).await {
+                return give_up(position, "paused".into());
+            }
+        }
+        // What arrived before the stream ended or broke is good: write it, so
+        // a retry asks only for the rest.
+        if !batch.is_empty() {
+            if let Err(error) = file.write_all(&batch).await {
+                return give_up(position, error.to_string());
+            }
+            batch.clear();
+        }
+        if position > end {
+            // The file's writes complete (and report their errors) here.
+            return match file.flush().await {
+                Ok(()) => Ok(()),
+                Err(error) => give_up(position, error.to_string()),
+            };
         }
     }
-    Err(last_error)
+    give_up(position, last_error)
 }
 
 async fn acquire_ranges(
@@ -3176,10 +3324,8 @@ async fn acquire_ranges(
         );
     });
     emit_snapshot(&app, &state);
-    let downloaded = std::sync::Arc::new(AtomicU64::new(initial_downloaded));
-    // Bytes received for ranges this run has not written yet (see
-    // `DownloadJob::receiving`).
-    let receiving = std::sync::Arc::new(AtomicU64::new(0));
+    let intake = std::sync::Arc::new(Intake::new());
+    let landing = std::sync::Arc::new(Landing::new(initial_downloaded));
     let completed_workers = std::sync::Arc::new(AtomicU64::new(0));
     let total_ranges = ranges.len() as u64;
     // One client per job: connection-pool and TLS-session reuse across every
@@ -3192,81 +3338,36 @@ async fn acquire_ranges(
         let app = app.clone();
         let id = id.clone();
         let identity = identity.clone();
-        let downloaded = downloaded.clone();
-        let receiving = receiving.clone();
+        let intake = intake.clone();
+        let landing = landing.clone();
         let completed_workers = completed_workers.clone();
         async move {
             if !transfer_is_downloading(&app, &id, generation) {
                 return Err("paused".to_string());
             }
-            let bytes = range_bytes(
+            range_to_file(
                 &client,
                 &app,
                 &id,
                 &source,
+                &temp_path,
                 start,
                 end,
                 retry_count,
                 &identity,
                 generation,
-                &receiving
+                &intake,
+                range_write_batch(worker_count)
             )
             .await?;
-            let len = bytes.len() as u64;
-            let written = async {
-                if !transfer_is_downloading(&app, &id, generation) {
-                    return Err("paused".to_string());
-                }
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .open(&temp_path)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !transfer_is_downloading(&app, &id, generation) {
-                    return Err("paused".to_string());
-                }
-                file.seek(SeekFrom::Start(start))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !transfer_is_downloading(&app, &id, generation) {
-                    return Err("paused".to_string());
-                }
-                file.write_all(&bytes)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // Durability barrier: completed ranges are trusted after reboot,
-                // so bytes must be durable before the range is claimed (F10).
-                file.sync_all()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !transfer_is_downloading(&app, &id, generation) {
-                    return Err("paused".to_string());
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = written {
-                // Received, but not written: no longer held.
-                receiving.fetch_sub(len, Ordering::Relaxed);
-                return Err(error);
-            }
             let finished = completed_workers.fetch_add(1, Ordering::Relaxed) + 1;
-            let state = app.state::<CoreState>();
-            emit_job(&state, &id, |job| {
-                // Under the snapshot lock, so the range moves from held to
-                // written in one step: the speed sees no dip or double count.
-                job.receiving = receiving.fetch_sub(len, Ordering::Relaxed) - len;
-                let total_downloaded = downloaded.fetch_add(len, Ordering::Relaxed) + len;
-                job.downloaded = total_downloaded;
-                job.progress = total_downloaded as f64 / total as f64 * 100.0;
-                job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
-                job.connections =
-                    worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32;
-            });
-            emit_progress(&app, &state, &id);
-            // No throttle here: intake was already paced piece-by-piece inside
-            // range_bytes; charging the whole chunk again would halve the rate.
-            Ok::<(), String>(())
+            let connections = worker_count.min(total_ranges.saturating_sub(finished) as usize) as u32;
+            // No throttle here: intake was already paced piece by piece inside
+            // range_to_file; charging the whole chunk again would halve the rate.
+            land(&app, &id, generation, &temp_path, total, &intake, &landing, Some(ByteRange { start, end }), false, |job| {
+                job.connections = connections;
+            })
+            .await
         }
     }))
     .buffer_unordered(worker_count);
@@ -3275,6 +3376,12 @@ async fn acquire_ranges(
         if let Err(error) = result {
             transfer_error = Some(error);
         }
+    }
+    drop(transfers);
+    // Whatever was written since the last flush is claimed now, even when a
+    // worker failed or the job was paused: those ranges are whole.
+    if let Err(error) = land(&app, &id, generation, &temp_path, total, &intake, &landing, None, true, |_| {}).await {
+        transfer_error.get_or_insert(error);
     }
     if let Some(initial_error) = transfer_error {
         if !transfer_is_current(&app, &id, generation) {
@@ -3341,67 +3448,43 @@ async fn acquire_ranges(
             if !transfer_can_continue(&app, &id, generation) {
                 return Ok(());
             }
-            let bytes = match range_bytes(
+            let fetched = range_to_file(
                 &fallback_client,
                 &app,
                 &id,
                 &source,
+                &temp_path,
                 start,
                 end,
                 retry_count.max(1),
                 &identity,
                 generation,
-                &receiving
+                &intake,
+                range_write_batch(1)
             )
-            .await
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    if is_terminal_source_error(&error) {
-                        return Err(error);
-                    }
-                    fallback_error = Some(error);
-                    break;
+            .await;
+            if let Err(error) = fetched {
+                if is_terminal_source_error(&error) {
+                    return Err(error);
                 }
-            };
+                fallback_error = Some(error);
+                break;
+            }
             if !transfer_can_continue(&app, &id, generation) {
                 return Ok(());
             }
-            let mut file = match OpenOptions::new().write(true).open(&temp_path).await {
-                Ok(file) => file,
-                Err(error) => {
-                    fallback_error = Some(error.to_string());
-                    break;
-                }
-            };
-            if !transfer_can_continue(&app, &id, generation) {
-                return Ok(());
-            }
-            if let Err(error) = file.seek(SeekFrom::Start(start)).await {
-                fallback_error = Some(error.to_string());
-                break;
-            }
-            if let Err(error) = file.write_all(&bytes).await {
-                fallback_error = Some(error.to_string());
-                break;
-            }
-            // Same durability barrier as the parallel path (F10).
-            if let Err(error) = file.sync_all().await {
-                fallback_error = Some(error.to_string());
-                break;
-            }
-            let len = bytes.len() as u64;
-            let total_downloaded = downloaded.fetch_add(len, Ordering::Relaxed) + len;
-            emit_job(&state, &id, |job| {
-                job.receiving = receiving.fetch_sub(len, Ordering::Relaxed) - len;
-                job.downloaded = total_downloaded;
-                job.speed = 0;
+            let landed = land(&app, &id, generation, &temp_path, total, &intake, &landing, Some(ByteRange { start, end }), false, |job| {
                 job.note = Some("Retrying with one connection".into());
-                job.progress = total_downloaded as f64 / total as f64 * 100.0;
-                job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
                 job.connections = 1;
-            });
-            emit_progress(&app, &state, &id);
+            })
+            .await;
+            if let Err(error) = landed {
+                fallback_error = Some(error);
+                break;
+            }
+        }
+        if let Err(error) = land(&app, &id, generation, &temp_path, total, &intake, &landing, None, true, |_| {}).await {
+            fallback_error.get_or_insert(error);
         }
         if let Some(_error) = fallback_error {
             emit_job(&state, &id, |job| {
@@ -3512,7 +3595,7 @@ async fn acquire_ranges(
             tokio::fs::rename(&staging, &temp_path)
                 .await
                 .map_err(|error| rejected(error.to_string()))?;
-            downloaded.store(full_downloaded, Ordering::Relaxed);
+            landing.downloaded.store(full_downloaded, Ordering::Relaxed);
             emit_job(&state, &id, |job| {
                 job.downloaded = full_downloaded;
                 job.progress = 100.0;

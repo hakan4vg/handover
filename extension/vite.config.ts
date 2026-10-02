@@ -9,15 +9,16 @@ function copyManifest(): Plugin {
   };
 }
 
-/** page-media.js runs in the page's own JavaScript world, where a classic
+/** page-probe.js runs in the page's own JavaScript world, where a classic
  *  script's top-level const/let/class share one scope with the page's
- *  scripts. Unwrapped, its minified names (p, h, …) made any page script
- *  declaring the same name fail to load. Wrapped, it declares nothing. */
+ *  scripts: unwrapped, its minified names would collide with the page's own
+ *  (an earlier in-page script broke Google's account menu that way). Wrapped,
+ *  it declares nothing. */
 function isolatePageScript(): Plugin {
   return {
     name: 'isolate-page-script',
     generateBundle(_, bundle) {
-      const chunk = bundle['page-media.js'];
+      const chunk = bundle['page-probe.js'];
       if (chunk?.type === 'chunk') chunk.code = `(() => {
 ${chunk.code}
 })();
@@ -36,8 +37,8 @@ export default defineConfig({
     rollupOptions: {
       input: {
         background: resolve(__dirname, 'src/background.ts'),
-        'page-media': resolve(__dirname, 'src/page-media.ts'),
         content: resolve(__dirname, 'src/content.ts'),
+        'page-probe': resolve(__dirname, 'src/page-probe.ts'),
         popup: resolve(__dirname, 'popup.html'),
       },
       output: {

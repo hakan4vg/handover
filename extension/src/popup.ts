@@ -43,6 +43,28 @@ function paint(): void {
   paintMediaFilters();
 }
 
+type PairingState = { state: 'paired' | 'unpaired' | 'declined' } | { state: 'waiting'; code: string };
+let pairingTimer: ReturnType<typeof setInterval> | undefined;
+
+function paintPairing(pairing: PairingState | undefined): void {
+  const box = document.getElementById('pairing');
+  if (!box || !pairing) return;
+  box.hidden = pairing.state === 'paired';
+  const text = pairing.state === 'waiting'
+    ? `Allow the code ${pairing.code} in Download Manager`
+    : pairing.state === 'declined' ? 'Pairing was declined' : 'Not paired with Download Manager';
+  document.getElementById('pairing-text')!.textContent = text;
+  (document.getElementById('pair') as HTMLButtonElement).hidden = pairing.state === 'waiting';
+  if (pairing.state === 'waiting' && !pairingTimer) {
+    pairingTimer = setInterval(() => {
+      void chrome.runtime.sendMessage({ type: 'get-pairing' }).then((response: { pairing?: PairingState }) => {
+        paintPairing(response?.pairing);
+        if (response?.pairing?.state !== 'waiting') { clearInterval(pairingTimer); pairingTimer = undefined; }
+      }).catch(() => undefined);
+    }, 1000);
+  }
+}
+
 function setStatus(message: string): void {
   const element = document.getElementById('status');
   if (!element) return;
@@ -130,15 +152,20 @@ async function init(): Promise<void> {
       ok?: boolean;
       policy?: BrowserPolicy;
       mediaFilters?: MediaFilterSettings;
+      pairing?: PairingState;
       error?: string;
     };
     if (response?.policy) policy = response.policy;
     if (response?.mediaFilters) mediaFilters = normalizeMediaFilterSettings(response.mediaFilters);
+    paintPairing(response?.pairing);
     if (response?.ok === false || !response?.policy) setStatus(response?.error ?? 'Could not load browser integration settings.');
   } catch (reason) {
     policy = { ...DEFAULT_POLICY };
     setStatus(errorText(reason, 'Could not load browser integration settings.'));
   }
+  document.getElementById('pair')!.addEventListener('click', () => {
+    void chrome.runtime.sendMessage({ type: 'pair' }).then((response: { pairing?: PairingState }) => paintPairing(response?.pairing)).catch(() => undefined);
+  });
   document.getElementById('intercept')!.addEventListener('click', () => {
     policy.interceptDownloads = !policy.interceptDownloads;
     void push();

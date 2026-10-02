@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod credentials;
 mod ipc;
 mod lifecycle;
 mod media;
 mod notify;
+mod pairing;
 mod protect;
 mod startup;
 
@@ -150,9 +152,9 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool }
+struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool, paired_browsers: usize }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>> }
+struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings>, credentials: Mutex<std::collections::HashMap<String, credentials::Credentials>> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -277,7 +279,7 @@ struct BandwidthBucket { tokens: f64, updated: std::time::Instant }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool, #[serde(default)] destination: Option<String> }
+struct ProvisionalInput { source: String, name: Option<String>, media: Option<bool>, max_connections: Option<u32>, bandwidth_limit: Option<u64>, #[serde(default)] selected_segments: Vec<String>, #[serde(default)] candidates: Vec<String>, #[serde(default)] player_kind: Option<String>, #[serde(default)] companion_audio: Option<String>, #[serde(default, alias = "pageUrl")] referrer: Option<String>, #[serde(default)] post_body: Option<String>, #[serde(default)] user_agent: Option<String>, #[serde(default)] name_is_hint: bool, #[serde(default)] destination: Option<String>, #[serde(default)] cookies: Vec<credentials::CapturedCookie> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -708,7 +710,7 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
         connected: true,
         aggregate_speed: 0,
         notifications,
-        bridge_available: true,
+        bridge_available: true, paired_browsers: 0,
     }
 }
 
@@ -730,7 +732,45 @@ fn save_snapshot(state: &CoreState) -> Result<(), String> {
     for (id, created, payload) in jobs {
         transaction.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", params![id, created, payload]).map_err(|error| format!("Could not persist job {id}: {error}"))?;
     }
+    // Cookies live exactly as long as an unfinished job that needs them: a
+    // completed, removed or discarded job's are erased here, in memory and on
+    // disk. A committed job's are stored (DPAPI) so it resumes after a
+    // restart; a provisional capture's stay in memory only.
+    if let Ok(mut held) = state.credentials.lock() {
+        held.retain(|id, _| snapshot.jobs.iter().any(|job| job.id == *id && job.state != "completed"));
+        transaction.execute("DELETE FROM credentials", []).map_err(|error| format!("Could not replace credentials: {error}"))?;
+        for (id, credentials) in held.iter_mut() {
+            let committed = snapshot.jobs.iter().any(|job| job.id == *id && job.provisional != Some(true));
+            if !committed || credentials.cookies.is_empty() {
+                continue;
+            }
+            let payload = serde_json::to_string(&credentials.cookies).map_err(|error| format!("Could not serialize credentials: {error}"))?;
+            transaction.execute("INSERT INTO credentials (id, payload) VALUES (?1, ?2)", params![id, protect::protect_field(&payload)]).map_err(|error| format!("Could not persist credentials: {error}"))?;
+        }
+    }
     transaction.commit().map_err(|error| format!("Could not commit snapshot: {error}"))
+}
+
+/// The cookies Chromium would send for this capture become the job's.
+fn set_credentials(state: &CoreState, id: &str, input: &ProvisionalInput) {
+    let navigation = input.media != Some(true);
+    let cookies = credentials::admit(input.cookies.clone(), input.referrer.as_deref(), navigation);
+    if let Ok(mut held) = state.credentials.lock() {
+        held.insert(id.to_string(), credentials::Credentials::new(cookies));
+    }
+}
+
+fn load_credentials(database: &Connection) -> std::collections::HashMap<String, credentials::Credentials> {
+    let mut held = std::collections::HashMap::new();
+    let Ok(mut statement) = database.prepare("SELECT id, payload FROM credentials") else { return held };
+    let Ok(rows) = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) else { return held };
+    for (id, payload) in rows.flatten() {
+        // Protected for another user or machine: the job runs without them
+        // and Reattach brings fresh ones.
+        let Some(cookies) = protect::unprotect_field(&payload).ok().and_then(|plain| serde_json::from_str::<Vec<credentials::CapturedCookie>>(&plain).ok()) else { continue };
+        held.insert(id, credentials::Credentials::new(cookies));
+    }
+    held
 }
 
 fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
@@ -1489,8 +1529,19 @@ fn format_bytes(value: Option<u64>) -> String {
     format!("{value} B")
 }
 
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30)).user_agent("Download Manager/0.1").build().unwrap_or_else(|_| reqwest::Client::new())
+/// The HTTP client for one job's requests. Every job has its own cookie jar:
+/// the browser cookies captured for it, plus whatever its servers set along
+/// the way, picked per request and per redirect hop (credentials.rs).
+fn job_client(app: &AppHandle, id: &str) -> reqwest::Client {
+    let jar = app.state::<CoreState>().credentials.lock().ok().map(|mut jobs| {
+        jobs.entry(id.to_string()).or_insert_with(|| credentials::Credentials::new(Vec::new())).jar.clone()
+    });
+    let builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30)).user_agent("Download Manager/0.1");
+    let builder = match jar {
+        Some(jar) => builder.cookie_provider(jar),
+        None => builder,
+    };
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 // SPEC §5.1 request-context replay under §16 scoping: the capture page is
@@ -1645,8 +1696,11 @@ fn media_mime_kind(mime: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Only `audio/*` is conclusive: it never carries video. A `video/*` type
+/// names a container, which may hold audio alone (audio-only MP4 is commonly
+/// served as video/mp4).
 fn mime_conflicts_player_kind(expected: Option<&str>, mime: Option<&str>) -> bool {
-    matches!((expected, media_mime_kind(mime)), (Some("video"), Some("audio")) | (Some("audio"), Some("video")))
+    expected == Some("video") && media_mime_kind(mime) == Some("audio")
 }
 
 fn partial_response_is_complete(response: &reqwest::Response) -> Result<Option<u64>, String> {
@@ -1770,10 +1824,23 @@ async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String
     if looks_like_webm(&header) {
         return Ok(());
     }
-    media::validate_fmp4_file(Path::new(temp_path)).map_err(|error| {
-        format!("Media finalization failed: {error}; downloaded parts were preserved")
-    })?;
-    Ok(())
+    // The assembled fragments become a regular MP4 that desktop players can
+    // seek; it replaces the assembly only once it is complete. Reading and
+    // writing a file of any size runs on the blocking pool (F13).
+    let assembled = PathBuf::from(temp_path);
+    let regular = PathBuf::from(format!("{temp_path}.regular"));
+    let written = regular.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        media::write_regular_mp4(&[assembled.clone()], &written)
+            .and_then(|()| std::fs::rename(&written, &assembled).map_err(|error| error.to_string()))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&written);
+            })
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result)
+    .map_err(|error| format!("Media finalization failed: {error}; downloaded parts were preserved"))
 }
 
 fn move_needs_fallback(error: &std::io::Error) -> bool {
@@ -2812,7 +2879,7 @@ async fn acquire_ranges(
     let total_ranges = ranges.len() as u64;
     // One client per job: connection-pool and TLS-session reuse across every
     // chunk instead of a fresh handshake per worker (F08).
-    let shared_client = std::sync::Arc::new(http_client());
+    let shared_client = std::sync::Arc::new(job_client(&app, &id));
     let mut transfers = futures_util::stream::iter(ranges.into_iter().map(|(start, end)| {
         let client = shared_client.clone();
         let source = source.clone();
@@ -2956,7 +3023,7 @@ async fn acquire_ranges(
             );
         });
         emit_snapshot(&app, &state);
-        let fallback_client = http_client();
+        let fallback_client = job_client(&app, &id);
         let mut fallback_error = None;
         // Give a rate-limiting server a short quiet period before switching to
         // one connection. The range probe and the failed workers have already
@@ -3045,7 +3112,7 @@ async fn acquire_ranges(
             // verified: it must prove it is still that object and still a
             // file before it may replace them. It streams into a staging file,
             // so a rejected fallback leaves the verified ranges on disk.
-            let stream_client = http_client();
+            let stream_client = job_client(&app, &id);
             let rejected = |reason: String| format!("{initial_error}; one-stream fallback rejected: {reason}");
             let response = match acquisition_request(&stream_client, &app, &id, &source)
                 .send()
@@ -3341,7 +3408,7 @@ async fn acquire_manifest(
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
-    let client = http_client();
+    let client = job_client(&app, &id);
     let mut manifest_source = source;
     let mut manifest_body = body;
     let mut hls_track_sources = None;
@@ -4052,7 +4119,7 @@ async fn acquire_dual_track(
         return Ok(());
     }
     let state = app.state::<CoreState>();
-    let client = http_client();
+    let client = job_client(&app, &id);
     let (temp_path, replace_existing) = state
         .snapshot
         .lock()
@@ -4077,9 +4144,6 @@ async fn acquire_dual_track(
         .map_err(|error| redact_url_credentials(&error.to_string()))?;
     if !audio_response.status().is_success() {
         return Err(format!("audio source returned {}", audio_response.status()));
-    }
-    if media_mime_kind(header_string(&audio_response, reqwest::header::CONTENT_TYPE).as_deref()) == Some("video") {
-        return Err("The companion source returned video data instead of audio".into());
     }
     let audio_total = partial_response_is_complete(&audio_response)?;
 
@@ -4252,7 +4316,7 @@ async fn acquire_dual_track(
 
 async fn acquire_once(app: AppHandle, id: String, source: String, generation: u64) -> bool {
     let state = app.state::<CoreState>();
-    let client = http_client();
+    let client = job_client(&app, &id);
     let selected_segments = state
         .snapshot
         .lock()
@@ -4985,6 +5049,176 @@ async fn classify_candidate(
     CandidateVerdict::NotMedia
 }
 
+/// A URL's identity for matching what a player loaded against what a playlist
+/// lists: origin and path. Query strings carry per-request tokens.
+fn url_key(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    Some(format!("{}://{}{}", parsed.scheme(), parsed.host_str()?.to_ascii_lowercase(), parsed.path()))
+}
+
+/// The page's playlists a played-media resolution reads (a thread of videos
+/// loads several each), how many at once, and how many more playlists a
+/// multivariant playlist may name that the page did not load itself.
+const PLAYED_MANIFESTS: usize = 64;
+const PLAYED_PARALLEL: usize = 8;
+const PLAYED_EXTRA_FETCHES: usize = 16;
+
+async fn fetch_manifest_text(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Option<(String, String)> {
+    let response = acquisition_request(client, app, id, url).send().await.ok()?.error_for_status().ok()?;
+    let effective = response.url().to_string();
+    Some((effective, manifest_text(response).await.ok()?))
+}
+
+/// A capture from a blob/MSE player says what the player itself loaded
+/// (`selected_segments`: the files whose responses the extension matched to
+/// the player's own appends) and which playlists the page loaded (`source`,
+/// then `candidates`). Every one of those playlists is read: the presentation
+/// is the one whose contents list the most of those files, whatever the URLs
+/// look like. An HLS multivariant playlist counts what its variant and audio
+/// playlists list, and those are what the player played. When no playlist
+/// lists them, one whole file the player read from (ranges of one URL) is
+/// itself the source; anything else would be a guess, and is refused.
+async fn resolve_played_source(app: &AppHandle, id: &str, source: &str) -> Result<Option<String>, String> {
+    let state = app.state::<CoreState>();
+    let Some((played, candidates, companion)) = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot.jobs.iter().find(|job| job.id == id).filter(|job| job.media && !job.selected_segments.is_empty()).map(|job| {
+            (job.selected_segments.clone(), job.candidates.clone(), job.companion_audio.clone())
+        })
+    }) else {
+        return Ok(None);
+    };
+    let keys: std::collections::HashSet<String> = played.iter().filter_map(|url| url_key(url)).collect();
+    let companion_key = companion.as_deref().and_then(url_key);
+    let manifests: Vec<String> = std::iter::once(source.to_string())
+        .chain(candidates)
+        .filter(|url| url_key(url).is_some_and(|key| !keys.contains(&key) && Some(&key) != companion_key.as_ref()))
+        .take(PLAYED_MANIFESTS)
+        .collect();
+    let listed = |urls: &[String]| urls.iter().filter(|url| url_key(url).is_some_and(|key| keys.contains(&key))).cloned().collect::<Vec<_>>();
+    // The job's own client: a playlist behind a login is read with the
+    // capture's cookies, as the download will be.
+    let client = job_client(app, id);
+    let fetched: Vec<(String, Option<(String, String)>)> = futures_util::stream::iter(manifests)
+        .map(|manifest| {
+            let client = &client;
+            async move {
+                let body = fetch_manifest_text(client, app, id, &manifest).await;
+                (manifest, body)
+            }
+        })
+        .buffered(PLAYED_PARALLEL)
+        .collect()
+        .await;
+
+    // What each playlist lists of the played files. Media playlists are known
+    // by the URL they were asked under and the one that answered.
+    let mut media_hits: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut media_playlists: Vec<(String, usize, bool)> = Vec::new();
+    let mut multivariant: Vec<(String, String, String)> = Vec::new();
+    // (files listed, manifest, the hints that name what was played in it)
+    let mut best: Option<(usize, String, Vec<String>)> = None;
+    let consider = |hits: usize, manifest: &str, hints: Vec<String>, best: &mut Option<(usize, String, Vec<String>)>| {
+        if hits > best.as_ref().map_or(0, |(count, _, _)| *count) {
+            *best = Some((hits, manifest.to_string(), hints));
+        }
+    };
+    let first_played = played.first().and_then(|url| url_key(url));
+    for (manifest, body) in fetched {
+        let Some((url, body)) = body else { continue };
+        if body.contains("#EXT-X-STREAM-INF") {
+            multivariant.push((manifest, url, body));
+        } else if body.contains("#EXTM3U") {
+            let found = listed(&media::hls_references(&url, &body));
+            for key in [url_key(&manifest), url_key(&url)].into_iter().flatten() {
+                media_hits.insert(key, found.len());
+            }
+            let lists_first = found.iter().any(|file| url_key(file) == first_played);
+            media_playlists.push((manifest, found.len(), lists_first));
+        } else {
+            let files: Vec<String> = media::parse_dash_tracks_for_segments(&url, &body, &played)
+                .map(|tracks| {
+                    tracks
+                        .into_iter()
+                        .flat_map(|track| track.segments.into_iter().map(|segment| segment.url).chain(track.segment_base.map(|base| base.url)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let found = listed(&files);
+            // The representation is chosen by exact URL: hand over the URLs as
+            // the MPD names them.
+            consider(found.len(), &manifest, found, &mut best);
+        }
+    }
+    // A multivariant playlist scores what its variant and audio playlists
+    // list. The page loaded the ones it played; any other is read here.
+    let mut extra = 0usize;
+    for (manifest, url, body) in &multivariant {
+        let mut hits = 0;
+        let mut playlists = Vec::new();
+        for playlist in media::hls_references(url, body) {
+            let key = url_key(&playlist);
+            let found = match key.as_ref().and_then(|key| media_hits.get(key)) {
+                Some(found) => *found,
+                None if extra < PLAYED_EXTRA_FETCHES => {
+                    extra += 1;
+                    let found = match fetch_manifest_text(&client, app, id, &playlist).await {
+                        Some((playlist_url, playlist_body)) => listed(&media::hls_references(&playlist_url, &playlist_body)).len(),
+                        None => 0,
+                    };
+                    if let Some(key) = key {
+                        media_hits.insert(key, found);
+                    }
+                    found
+                }
+                None => 0,
+            };
+            if found > 0 {
+                hits += found;
+                playlists.push(playlist);
+            }
+        }
+        consider(hits, manifest, playlists, &mut best);
+    }
+    // No multivariant playlist names them: a media playlist on its own, the
+    // one with the video's files first.
+    if best.is_none() {
+        if let Some((manifest, hits, _)) = media_playlists.iter().filter(|(_, hits, _)| *hits > 0).max_by_key(|(_, hits, lists_first)| (*lists_first, *hits)) {
+            consider(*hits, manifest, Vec::new(), &mut best);
+        }
+    }
+    let chosen = if let Some((_, manifest, hints)) = best {
+        emit_job(&state, id, |job| {
+            job.source = manifest.clone();
+            job.domain = domain(&manifest);
+            job.candidates.clear();
+            job.companion_audio = None;
+            if !hints.is_empty() {
+                job.selected_segments = hints.clone();
+            }
+            job.events.insert(0, job_event("Found the playlist that lists what the player played", Some("success")));
+        });
+        manifest
+    } else {
+        let mut files: Vec<&String> = played.iter().filter(|url| url_key(url).is_some_and(|key| Some(&key) != companion_key.as_ref())).collect();
+        files.dedup_by_key(|url| url_key(url));
+        let whole: std::collections::HashSet<_> = files.iter().filter_map(|url| url_key(url)).collect();
+        if whole.len() != 1 {
+            return Err("The player's video is not listed in any playlist the page loaded; reload the page and play it again".into());
+        }
+        let file = files[0].clone();
+        emit_job(&state, id, |job| {
+            job.source = file.clone();
+            job.domain = domain(&file);
+            job.candidates.clear();
+            job.selected_segments.clear();
+            job.events.insert(0, job_event("Acquiring the file the player read from", Some("success")));
+        });
+        file
+    };
+    emit_snapshot(app, &state);
+    Ok(Some(chosen))
+}
+
 /// A capture can hand over alternates when the page could not prove which
 /// resource feeds the player (SPEC §6.2): blob/MSE players whose bytes arrive
 /// from a realm nothing can instrument. Deciding is the resident's job, because
@@ -4992,6 +5226,9 @@ async fn classify_candidate(
 /// becomes the job's source, the job's log records the swap, and the alternates
 /// are consumed either way so nothing lingers in the store.
 async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> Result<String, String> {
+    if let Some(played) = resolve_played_source(app, id, &source).await? {
+        return Ok(played);
+    }
     let candidates = app
         .state::<CoreState>()
         .snapshot
@@ -5020,7 +5257,7 @@ async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> Result
     let (referrer, _, user_agent) = job_context(app, id);
     let mut chosen = source.clone();
     if !url_implies_media(&source) || fragment_source {
-        let client = http_client();
+        let client = job_client(app, id);
         let pool = std::iter::once(source.clone()).chain(candidates.iter().cloned());
         for url in pool.take(MAX_SOURCE_PROBES) {
             // A fragment is never a verdict, only a hint that something else
@@ -5137,7 +5374,7 @@ async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
                     state.inner(),
                     &id,
                     error,
-                    "Source was a byte-range fragment, not a file",
+                    "The capture's source could not be decided",
                 );
             }
             return;
@@ -5214,7 +5451,7 @@ fn get_snapshot(state: State<'_, CoreState>) -> AppSnapshot {
             connected: false,
             aggregate_speed: 0,
             notifications: vec![],
-            bridge_available: false,
+            bridge_available: false, paired_browsers: 0,
         })
 }
 
@@ -5502,7 +5739,7 @@ fn main_window_action(app: AppHandle, state: State<'_, CoreState>, action: Strin
 
 #[tauri::command]
 fn start_window_drag(app: AppHandle, label: String) -> Result<(), String> {
-    if label != "main" && !label.starts_with("add-") {
+    if label != "main" && !label.starts_with("pair-") && !label.starts_with("add-") {
         return Err("Unsupported window".into());
     }
     app.get_webview_window(&label)
@@ -5653,6 +5890,7 @@ fn start_provisional(
                     })
                     .unwrap_or(false);
             if accepted {
+                set_credentials(state, &target_id, &input);
                 emit_snapshot(&app, state);
                 if let (Some(sender), Ok(mut pending)) = (viability.take(), state.viability.lock()) {
                     pending.insert(target_id.clone(), sender);
@@ -5668,6 +5906,7 @@ fn start_provisional(
         }
     }
     let id = format!("provisional-{}", Uuid::new_v4());
+    set_credentials(state, &id, &input);
     // A link's download attribute or the URL only suggest a name; the
     // server's own filename outranks both, as it does in Chromium.
     // Manual Add may name the destination up front; it is the user's choice
@@ -6425,7 +6664,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
                     let parsed = reqwest::Url::parse(value).ok()?;
                     matches!(parsed.scheme(), "http" | "https").then(|| value.to_string())
                 })
-                .take(8)
+                // Up to 16 played files per track, video and audio.
+                .take(32)
                 .collect()
         })
         .unwrap_or_default();
@@ -6441,7 +6681,7 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
                 if !matches!(parsed.scheme(), "http" | "https") { continue }
                 let url = parsed.to_string();
                 if url != source && !urls.contains(&url) { urls.push(url); }
-                if urls.len() >= 6 { break; }
+                if urls.len() >= PLAYED_MANIFESTS { break; }
             }
             urls
         })
@@ -6486,7 +6726,13 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
         post_body,
         user_agent,
         name_is_hint: payload.get("nameIsHint").and_then(Value::as_bool).unwrap_or(false),
-        destination: None
+        destination: None,
+        // One malformed entry drops that cookie, not the rest.
+        cookies: payload
+            .get("cookies")
+            .and_then(Value::as_array)
+            .map(|cookies| cookies.iter().take(credentials::MAX_COOKIES).filter_map(|cookie| serde_json::from_value(cookie.clone()).ok()).collect())
+            .unwrap_or_default()
     })
 }
 
@@ -6506,15 +6752,16 @@ fn bridge_host_allowed(host: &Option<String>) -> bool {
     matches!(bare.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
 }
 
-/// Browsers always attach Origin to cross-origin fetches and pages cannot
-/// suppress it, so a present non-extension Origin proves a web caller (F01).
-/// Absent Origin means a non-browser local client (fixtures, harnesses);
-/// those stay allowed behind the loopback bind.
+/// The browser extension's origin. Its ID is fixed by the public key in
+/// extension/manifest.json.
+const EXTENSION_ORIGIN: &str = "chrome-extension://joniainjojgbpnjjclallmfbdgnebgbe";
+
+/// Browsers always attach Origin to cross-origin fetches and neither pages nor
+/// other extensions can forge it, so any Origin but ours is refused (F01).
+/// Absent Origin means a non-browser local client (fixtures, harnesses); those
+/// stay allowed behind the loopback bind.
 fn bridge_origin_allowed(origin: &Option<String>) -> bool {
-    match origin.as_deref() {
-        None => true,
-        Some(origin) => origin.starts_with("chrome-extension://"),
-    }
+    origin.as_deref().is_none_or(|origin| origin == EXTENSION_ORIGIN)
 }
 
 fn bridge_caller_allowed(request: &ipc::Request) -> bool {
@@ -6523,10 +6770,7 @@ fn bridge_caller_allowed(request: &ipc::Request) -> bool {
 
 /// Validated extension origin to reflect in CORS headers, if any (F01).
 fn bridge_allow_origin(request: &ipc::Request) -> Option<String> {
-    match request.origin.as_deref() {
-        Some(origin) if origin.starts_with("chrome-extension://") => Some(origin.to_string()),
-        _ => None,
-    }
+    request.origin.as_deref().filter(|origin| *origin == EXTENSION_ORIGIN).map(str::to_string)
 }
 
 fn bridge_json_content(request: &ipc::Request) -> bool {
@@ -6586,7 +6830,7 @@ fn cancel_capture_job(app: &AppHandle, id: &str) {
 /// source the resident cannot fetch (session cookies, one-use URL, login page)
 /// never costs the user their download (§5.1.1). `captureId` makes creation
 /// idempotent and lets the extension cancel a capture whose answer it lost.
-async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) -> ipc::Response {
+async fn bridge_capture(app: AppHandle, message: Value) -> (u16, Value) {
     let capture_id = capture_id_of(&message);
     if message.get("type").and_then(Value::as_str) == Some("cancel-acquisition") {
         let id = message
@@ -6595,7 +6839,7 @@ async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) 
             .and_then(Value::as_str)
             .map(str::to_string);
         if id.is_none() && capture_id.is_none() {
-            return bridge_reject(request, 400, "invalid cancellation");
+            return (400, json!({ "ok": false, "error": "invalid cancellation" }));
         }
         let mut targets: Vec<String> = id.into_iter().collect();
         if let Some(capture_id) = capture_id {
@@ -6616,10 +6860,10 @@ async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) 
         for target in targets {
             cancel_capture_job(&app, &target);
         }
-        return bridge_respond(request, 200, json!({ "ok": true }));
+        return (200, json!({ "ok": true }));
     }
     let Some(input) = provisional_input_from_message(&message) else {
-        return bridge_reject(request, 400, "invalid acquisition");
+        return (400, json!({ "ok": false, "error": "invalid acquisition" }));
     };
     let require_viable = message
         .get("payload")
@@ -6635,17 +6879,17 @@ async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) 
     let created = {
         let state = app.state::<CoreState>();
         let Ok(mut ledger) = state.captures.lock() else {
-            return bridge_respond(request, 500, json!({ "ok": false, "error": "capture ledger unavailable" }));
+            return (500, json!({ "ok": false, "error": "capture ledger unavailable" }));
         };
         let known = capture_id
             .as_ref()
             .and_then(|capture_id| ledger.iter().find(|(key, _)| key == capture_id).map(|(_, record)| record.clone()));
         match known {
             Some(CaptureRecord::Cancelled) => {
-                return bridge_respond(request, 200, json!({ "ok": false, "error": "capture was cancelled" }));
+                return (200, json!({ "ok": false, "error": "capture was cancelled" }));
             }
             Some(CaptureRecord::Job(id)) => {
-                return bridge_respond(request, 200, json!({ "ok": true, "id": id, "duplicate": true }));
+                return (200, json!({ "ok": true, "id": id, "duplicate": true }));
             }
             None => {}
         }
@@ -6660,7 +6904,7 @@ async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) 
     };
     let id = match created {
         Ok(id) => id,
-        Err(error) => return bridge_respond(request, 500, json!({ "ok": false, "error": error })),
+        Err(error) => return (500, json!({ "ok": false, "error": error })),
     };
     if let Some(receiver) = receiver {
         let reason = match tokio::time::timeout(Duration::from_secs(20), receiver).await {
@@ -6671,7 +6915,7 @@ async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) 
         };
         if let Some(reason) = reason {
             cancel_capture_job(&app, &id);
-            return bridge_respond(request, 200, json!({ "ok": false, "handback": true, "error": redact_url_credentials(&reason) }));
+            return (200, json!({ "ok": false, "handback": true, "error": redact_url_credentials(&reason) }));
         }
         let still_provisional = app
             .state::<CoreState>()
@@ -6681,14 +6925,14 @@ async fn bridge_capture(app: AppHandle, request: &ipc::Request, message: Value) 
             .and_then(|snapshot| snapshot.jobs.iter().find(|job| job.id == id).map(|job| job.provisional == Some(true)))
             .unwrap_or(false);
         if !still_provisional {
-            return bridge_respond(request, 200, json!({ "ok": false, "error": "capture was cancelled" }));
+            return (200, json!({ "ok": false, "error": "capture was cancelled" }));
         }
         if let Err(error) = open_add_window(&app, &id) {
             cancel_capture_job(&app, &id);
-            return bridge_respond(request, 500, json!({ "ok": false, "error": error }));
+            return (500, json!({ "ok": false, "error": error }));
         }
     }
-    bridge_respond(request, 200, json!({ "ok": true, "id": id }))
+    (200, json!({ "ok": true, "id": id }))
 }
 
 async fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response {
@@ -6710,18 +6954,61 @@ async fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response 
     }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/health") => bridge_respond(&request, 200, json!({ "ok": true })),
-        ("GET", "/v1/policy") => {
-            let Ok(snapshot) = app.state::<CoreState>().snapshot.lock().map(|snapshot| browser_policy_value(&snapshot.settings)) else {
-                return bridge_reject(&request, 503, "settings unavailable");
-            };
-            bridge_respond(&request, 200, json!({ "ok": true, "policy": snapshot }))
+        ("POST", "/v1/pair") => bridge_pair(&app, &request, false),
+        ("POST", "/v1/pair/status") => bridge_pair(&app, &request, true),
+        ("POST", "/v1/message") => {
+            let opened = app.state::<CoreState>().pairings.lock().map_err(|_| pairing::OpenError::Rejected("pairings unavailable")).and_then(|mut pairings| pairings.open(&request.body));
+            match opened {
+                Err(pairing::OpenError::NotPaired) => bridge_respond(&request, 401, json!({ "ok": false, "paired": false, "error": "not paired" })),
+                Err(pairing::OpenError::Rejected(why)) => bridge_reject(&request, 400, why),
+                Ok(opened) => {
+                    let (status, value) = bridge_message(app, opened.message).await;
+                    bridge_respond(&request, status, pairing::seal(&opened.key, &opened.nonce, &value))
+                }
+            }
         }
-        ("POST", "/v1/policy") => {
-            let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
-                return bridge_reject(&request, 400, "invalid policy");
-            };
+        _ => bridge_reject(&request, 404, "unknown bridge route"),
+    }
+}
+
+/// Start a pairing (`/v1/pair`) or report on one (`/v1/pair/status`). Both
+/// name the pairing by the extension's own random request id.
+fn bridge_pair(app: &AppHandle, request: &ipc::Request, status: bool) -> ipc::Response {
+    let id = serde_json::from_slice::<Value>(&request.body).ok().and_then(|body| body.get("request").and_then(Value::as_str).map(str::to_string));
+    let Some(id) = id.filter(|id| (16..=128).contains(&id.len()) && id.chars().all(|char| char.is_ascii_alphanumeric() || char == '-')) else {
+        return bridge_reject(request, 400, "invalid pairing request");
+    };
+    let state = app.state::<CoreState>();
+    let Ok(mut pairings) = state.pairings.lock() else {
+        return bridge_reject(request, 503, "pairings unavailable");
+    };
+    if status {
+        let value = match pairings.status(&id) {
+            pairing::Status::Unknown => json!({ "ok": false, "state": "unknown" }),
+            pairing::Status::Waiting => json!({ "ok": true, "state": "waiting" }),
+            pairing::Status::Denied => json!({ "ok": false, "state": "denied" }),
+            pairing::Status::Approved { key_id, key } => json!({ "ok": true, "state": "approved", "keyId": key_id, "key": key }),
+        };
+        return bridge_respond(request, 200, value);
+    }
+    let code = pairings.begin(&id);
+    drop(pairings);
+    if let Err(error) = open_pair_window(app, &id) {
+        return bridge_respond(request, 500, json!({ "ok": false, "error": error }));
+    }
+    bridge_respond(request, 200, json!({ "ok": true, "code": code }))
+}
+
+/// One opened message from the paired extension, dispatched by type.
+async fn bridge_message(app: AppHandle, message: Value) -> (u16, Value) {
+    match message.get("type").and_then(Value::as_str).unwrap_or("") {
+        "get-policy" => match app.state::<CoreState>().snapshot.lock() {
+            Ok(snapshot) => (200, json!({ "ok": true, "policy": browser_policy_value(&snapshot.settings) })),
+            Err(_) => (503, json!({ "ok": false, "error": "settings unavailable" })),
+        },
+        "update-policy" => {
             let Some((intercept, media, excluded)) = browser_policy_from_value(&message) else {
-                return bridge_reject(&request, 400, "invalid policy");
+                return (400, json!({ "ok": false, "error": "invalid policy" }));
             };
             let payload = message.get("payload").unwrap_or(&message);
             let updated_at = payload.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
@@ -6732,35 +7019,124 @@ async fn bridge_request(app: AppHandle, request: ipc::Request) -> ipc::Response 
             if updated_at >= current {
                 let patch = json!({ "interceptDownloads": intercept, "showMediaButtons": media, "excludedSites": excluded, "policyUpdatedAt": updated_at });
                 if let Err(error) = update_settings(app.clone(), state.clone(), patch) {
-                    return bridge_reject(&request, 500, &format!("could not persist policy: {error}"));
+                    return (500, json!({ "ok": false, "error": format!("could not persist policy: {error}") }));
                 }
             }
-            let Ok(policy) = state.snapshot.lock().map(|snapshot| browser_policy_value(&snapshot.settings)) else {
-                return bridge_reject(&request, 503, "settings unavailable");
-            };
-            bridge_respond(&request, 200, json!({ "ok": true, "policy": policy }))
-        }
-        ("POST", "/v1/capture") => {
-            let Ok(message) = serde_json::from_slice::<Value>(&request.body) else {
-                return bridge_reject(&request, 400, "invalid acquisition");
-            };
-            bridge_capture(app, &request, message).await
-        }
-        ("POST", "/v1/manager") => {
-            let Some(window) = app.get_webview_window("main") else {
-                return bridge_respond(
-                    &request,
-                    500,
-                    json!({ "ok": false, "error": "manager window unavailable" })
-                );
-            };
-            if let Err(error) = window.show().and_then(|_| window.set_focus()) {
-                return bridge_respond(&request, 500, json!({ "ok": false, "error": error.to_string() }));
+            let policy = state.snapshot.lock().map(|snapshot| browser_policy_value(&snapshot.settings));
+            match policy {
+                Ok(policy) => (200, json!({ "ok": true, "policy": policy })),
+                Err(_) => (503, json!({ "ok": false, "error": "settings unavailable" })),
             }
-            bridge_respond(&request, 200, json!({ "ok": true }))
         }
-        _ => bridge_reject(&request, 404, "unknown bridge route"),
+        "open-manager" => {
+            let Some(window) = app.get_webview_window("main") else {
+                return (500, json!({ "ok": false, "error": "manager window unavailable" }));
+            };
+            match window.show().and_then(|_| window.set_focus()) {
+                Ok(()) => (200, json!({ "ok": true })),
+                Err(error) => (500, json!({ "ok": false, "error": error.to_string() })),
+            }
+        }
+        _ => bridge_capture(app, message).await,
     }
+}
+
+fn load_pairings(database: &Connection) -> std::collections::HashMap<String, pairing::Key> {
+    let mut keys = std::collections::HashMap::new();
+    let Ok(mut statement) = database.prepare("SELECT key_id, secret FROM pairings") else { return keys };
+    let Ok(rows) = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) else { return keys };
+    for (key_id, secret) in rows.flatten() {
+        // A key protected for another user or machine is unusable: that
+        // browser pairs again.
+        if let Some(key) = protect::unprotect_field(&secret).ok().as_deref().and_then(pairing::decode_key) {
+            keys.insert(key_id, key);
+        }
+    }
+    keys
+}
+
+fn open_pair_window(app: &AppHandle, request: &str) -> Result<(), String> {
+    // A newer request replaces an unanswered one, window included.
+    for (label, previous) in app.webview_windows() {
+        if label.starts_with("pair-") {
+            let _ = previous.destroy();
+        }
+    }
+    let mut builder = WebviewWindowBuilder::new(app, format!("pair-{request}"), WebviewUrl::App(format!("index.html?window=pair&id={request}").into()))
+        .title("Pair browser")
+        .inner_size(380.0, 230.0)
+        .resizable(false)
+        .decorations(false)
+        .shadow(true)
+        .visible(false)
+        .on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let _ = window.show().and_then(|_| window.set_focus());
+            }
+        })
+        .center();
+    #[cfg(windows)]
+    {
+        builder = builder.data_directory(app_data_root().join("webview"));
+    }
+    let window = builder.build().map_err(|error| format!("Could not open the pairing window: {error}"))?;
+    let handle = app.clone();
+    let request = request.to_string();
+    window.on_window_event(move |event| {
+        // Closing the window unanswered declines the pairing.
+        if let WindowEvent::Destroyed = event {
+            if let Ok(mut pairings) = handle.state::<CoreState>().pairings.lock() {
+                pairings.answer(&request, false);
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn pairing_code(state: State<'_, CoreState>, id: String) -> Option<String> {
+    let mut pairings = state.pairings.lock().ok()?;
+    pairings.pending().filter(|pending| pending.request == id).map(|pending| pending.code.clone())
+}
+
+#[tauri::command]
+fn answer_pairing(app: AppHandle, state: State<'_, CoreState>, id: String, allow: bool) -> Result<(), String> {
+    let approved = state.pairings.lock().map_err(|_| "Pairings unavailable".to_string())?.answer(&id, allow);
+    if let Some((key_id, key)) = approved {
+        let stored = state.database.lock().map_err(|_| "Storage unavailable".to_string()).and_then(|database| {
+            database
+                .execute("INSERT OR REPLACE INTO pairings (key_id, secret, created_at) VALUES (?1, ?2, datetime('now'))", params![key_id, protect::protect_field(&pairing::encode_key(&key))])
+                .map_err(|error| format!("Could not record the pairing: {error}"))
+        });
+        if let Err(error) = stored {
+            // Unrecorded, the pairing would vanish on restart: undo it.
+            if let Ok(mut pairings) = state.pairings.lock() {
+                pairings.forget(&key_id);
+            }
+            return Err(error);
+        }
+    }
+    let count = state.pairings.lock().map(|pairings| pairings.count()).unwrap_or(0);
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        snapshot.paired_browsers = count;
+    }
+    emit_snapshot_event(&app, &state)?;
+    if let Some(window) = app.get_webview_window(&format!("pair-{id}")) {
+        let _ = window.destroy();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn forget_pairings(app: AppHandle, state: State<'_, CoreState>) -> Result<(), String> {
+    state.database.lock().map_err(|_| "Storage unavailable".to_string())?.execute("DELETE FROM pairings", []).map_err(|error| format!("Could not forget the pairings: {error}"))?;
+    if let Ok(mut pairings) = state.pairings.lock() {
+        pairings.forget_all();
+    }
+    if let Ok(mut snapshot) = state.snapshot.lock() {
+        snapshot.paired_browsers = 0;
+    }
+    emit_snapshot_event(&app, &state)
 }
 
 fn start_bridge(app: &AppHandle) {
@@ -6978,16 +7354,19 @@ fn main() {
             main_window.build().map_err(|error| error.to_string())?;
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             restrict_file(&root.join("download-manager.db"));
-            database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT);").map_err(|error| error.to_string())?;
+            database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT); CREATE TABLE IF NOT EXISTS pairings (key_id TEXT PRIMARY KEY, secret TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
+            let paired_keys = load_pairings(&database);
+            let stored_credentials = load_credentials(&database);
             let stored_settings: Result<String, _> = database.query_row("SELECT payload FROM settings WHERE id = 1", [], |row| row.get::<_, String>(0));
             let settings = stored_settings.as_deref().map(settings_from_stored).unwrap_or_else(|_| default_settings());
             let show_manager_at_startup = settings.show_manager_at_sign_in;
             if let Err(error) = startup::sync(settings.start_at_sign_in) { eprintln!("Startup registration unavailable: {error}"); }
-            let initial_snapshot = snapshot_from_database(&database, settings);
+            let mut initial_snapshot = snapshot_from_database(&database, settings);
+            initial_snapshot.paired_browsers = paired_keys.len();
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && TRANSFER_STATES.contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()) });
+            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());
@@ -7009,7 +7388,7 @@ fn main() {
             for (id, source) in recovered { let _ = spawn_transfer(app.handle(), app.state::<CoreState>().inner(), id, source); }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, main_window_action, start_window_drag])
+        .invoke_handler(tauri::generate_handler![pairing_code, answer_pairing, forget_pairings, get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, main_window_action, start_window_drag])
         .run(tauri::generate_context!())
         .expect("error while running Download Manager");
 }

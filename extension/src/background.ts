@@ -1,114 +1,78 @@
+import { open as openSealed, seal, type Pairing } from './sealed';
 import { APP_BRIDGE_ORIGIN, APP_BRIDGE_TIMEOUT_MS, APP_CAPTURE_TIMEOUT_MS, APP_MEDIA_CAPTURE_TIMEOUT_MS, DEFAULT_MEDIA_FILTERS, DEFAULT_POLICY, isHttp, mediaFileTypeFor, normalizeMediaFilterSettings, siteOf, type BrowserPolicy, type MediaFilterSettings } from './shared';
-import { isLikelyRepresentation, isMediaCandidate, mediaKindFor, normalizeChunkUrl, planMediaCapture, roleFor, type MediaCandidate, type MediaEvidence, type MediaKind, type MediaPlayerEvidence } from './media-candidates';
+import { cleanPlayerTracks, isManifest, normalizeChunkUrl, playedTracks, responseLengths, type ObservedResponse } from './player-evidence';
 
 const POLICY_KEY = 'dm-policy';
+const PAIRING_KEY = 'dm-pairing';
+/** The app takes at most this many cookies per capture. */
+const COOKIE_LIMIT = 150;
+const PAIRING_DECLINED_KEY = 'dm-pairing-declined';
+const PAIRING_PENDING_KEY = 'dm-pairing-pending';
 const MEDIA_FILTERS_KEY = 'dm-media-filters';
 
-// Bounded ring of recent media-ish traffic per tab. M0 proof vehicle for the
-// generic current-media mechanism (SPEC §6): content scripts report the
-// element the user interacts with, this buffer supplies the real network
-// source behind blob:/MSE players. URLs only, no bodies, no cookies.
-const recentMedia: MediaCandidate[] = [];
-const recentPlayers: MediaPlayerEvidence[] = [];
-const MEDIA_BUFFER_MAX = 60;
-const MEDIA_BUFFER_MS = 90_000;
-// Manifests are the only durable handle for chunked providers — their fragment
-// signatures expire within seconds (measured live) — so they are retained on a
-// much longer window instead of being flooded out by the segments that follow
-// them. This is role-based retention, not site knowledge.
-const MANIFEST_BUFFER_MAX = 16;
-const MANIFEST_BUFFER_MS = 10 * 60_000;
-const PLAYER_BUFFER_MAX = 40;
-const PLAYER_BUFFER_MS = 15_000;
+// The tab's recent responses, by tab: what a player's appends are matched
+// against (player-evidence.ts). URLs and lengths only; no bodies, no cookies.
+const responsesByTab = new Map<number, ObservedResponse[]>();
+const RESPONSES_PER_TAB = 1500;
+const RESPONSE_TTL_MS = 10 * 60_000;
+// The playlists each tab loaded, most recent last. A player keeps playing
+// long after its playlist was fetched, and Chrome may restart this worker in
+// between, so they are kept longer and in session storage.
+const MANIFESTS_KEY = 'dm-manifests';
+const MANIFESTS_PER_TAB = 64;
+const MANIFEST_TTL_MS = 60 * 60_000;
+type SeenManifest = { url: string; at: number };
+const manifestsByTab = new Map<number, SeenManifest[]>();
 
-// Last-resolved acquisition source per player scope. The traffic ring above
-// is bounded and shared, so long playback evicts the manifest that a later
-// capture needs (F07). This record keeps the playback's current source for
-// its lifetime and is only a fallback: live traffic that resolves wins, so a
-// quality change in the site player still follows the new representation
-// (SPEC §6.1). Session storage carries the records across service-worker
-// restarts; the ring cannot.
-const RESOLVED_MEDIA_KEY = 'dm-resolved-media';
-const RESOLVED_MEDIA_MAX = 24;
-const RESOLVED_MEDIA_TTL_MS = 15 * 60_000;
-interface ResolvedMedia { scope: string; source: string; selectedSegments: string[]; companionAudio?: string; at: number }
-const resolvedMedia: ResolvedMedia[] = [];
-
-function mediaScope(tabId: number, frameId: number, documentId?: string, playerKey?: string, sourceIdentity?: string): string {
-  const base = `${tabId}/${frameId}/${documentId ?? ''}/${playerKey ?? ''}`;
-  return sourceIdentity === undefined ? base : `${base}/${sourceIdentity}`;
+function rememberResponse(tabId: number, response: ObservedResponse): void {
+  const now = Date.now();
+  const responses = (responsesByTab.get(tabId) ?? []).filter((item) => now - item.at <= RESPONSE_TTL_MS);
+  responses.push(response);
+  if (responses.length > RESPONSES_PER_TAB) responses.splice(0, responses.length - RESPONSES_PER_TAB);
+  responsesByTab.set(tabId, responses);
+  if (!response.manifest) return;
+  const manifests = (manifestsByTab.get(tabId) ?? []).filter((item) => now - item.at <= MANIFEST_TTL_MS);
+  const known = manifests.findIndex((item) => item.url === response.url);
+  if (known >= 0) manifests.splice(known, 1);
+  manifests.push({ url: response.url, at: response.at });
+  if (manifests.length > MANIFESTS_PER_TAB) manifests.shift();
+  manifestsByTab.set(tabId, manifests);
+  if (known < 0) persistManifests();
 }
 
-function pruneResolvedMedia(now = Date.now()): void {
-  for (let index = resolvedMedia.length - 1; index >= 0; index -= 1) {
-    if (now - resolvedMedia[index].at > RESOLVED_MEDIA_TTL_MS) resolvedMedia.splice(index, 1);
-  }
-  while (resolvedMedia.length > RESOLVED_MEDIA_MAX) resolvedMedia.shift();
+/** The playlists a tab loaded, most recent first. */
+function manifestsOf(tabId: number): string[] {
+  const now = Date.now();
+  return (manifestsByTab.get(tabId) ?? []).filter((item) => now - item.at <= MANIFEST_TTL_MS).map((item) => item.url).reverse();
 }
 
-function persistResolvedMedia(): void {
+function persistManifests(): void {
   try {
-    void chrome.storage.session?.set({ [RESOLVED_MEDIA_KEY]: resolvedMedia });
+    void chrome.storage.session?.set({ [MANIFESTS_KEY]: [...manifestsByTab.entries()] }).catch(() => undefined);
   } catch {
-    // Session persistence is best-effort; the in-memory record still serves.
+    // Best effort: the in-memory record still serves this worker.
   }
 }
 
-async function hydrateResolvedMedia(): Promise<void> {
+async function hydrateManifests(): Promise<void> {
   try {
-    const stored = await chrome.storage.session?.get(RESOLVED_MEDIA_KEY);
-    const records = stored?.[RESOLVED_MEDIA_KEY];
-    if (!Array.isArray(records)) return;
-    const now = Date.now();
-    for (const record of records) {
-      if (
-        record && typeof record.scope === 'string' && typeof record.source === 'string' &&
-        Array.isArray(record.selectedSegments) && typeof record.at === 'number' &&
-        now - record.at <= RESOLVED_MEDIA_TTL_MS && isHttp(record.source)
-      ) {
-        const companionAudio = typeof record.companionAudio === 'string' && isHttp(record.companionAudio) ? record.companionAudio : undefined;
-        resolvedMedia.push({ scope: record.scope, source: record.source, selectedSegments: record.selectedSegments.filter((item: unknown): item is string => typeof item === 'string' && isHttp(item)).slice(0, 8), ...(companionAudio ? { companionAudio } : {}), at: record.at });
-      }
+    const stored = (await chrome.storage.session?.get(MANIFESTS_KEY))?.[MANIFESTS_KEY];
+    if (!Array.isArray(stored)) return;
+    for (const entry of stored) {
+      if (!Array.isArray(entry) || typeof entry[0] !== 'number' || !Array.isArray(entry[1])) continue;
+      const manifests = (entry[1] as unknown[]).filter((item): item is SeenManifest =>
+        !!item && typeof (item as SeenManifest).url === 'string' && isHttp((item as SeenManifest).url) && typeof (item as SeenManifest).at === 'number');
+      if (manifests.length && !manifestsByTab.has(entry[0])) manifestsByTab.set(entry[0], manifests.slice(-MANIFESTS_PER_TAB));
     }
-    pruneResolvedMedia(now);
   } catch {
     // Start empty when session storage is unavailable.
   }
 }
 
-function rememberResolvedMedia(scope: string, source: string, selectedSegments: string[], companionAudio?: string): void {
-  pruneResolvedMedia();
-  const existing = resolvedMedia.find((item) => item.scope === scope);
-  if (existing) {
-    existing.source = source;
-    existing.selectedSegments = selectedSegments.slice(0, 8);
-    existing.companionAudio = companionAudio;
-    existing.at = Date.now();
-  } else {
-    resolvedMedia.push({ scope, source, selectedSegments: selectedSegments.slice(0, 8), ...(companionAudio ? { companionAudio } : {}), at: Date.now() });
-  }
-  pruneResolvedMedia();
-  persistResolvedMedia();
-}
-
-function takeResolvedMedia(scope: string): ResolvedMedia | undefined {
-  pruneResolvedMedia();
-  return resolvedMedia.find((item) => item.scope === scope);
-}
-
-function invalidateOtherResolvedMedia(tabId: number, frameId: number, documentId: string | undefined, playerKey: string | undefined, sourceIdentity: string | undefined): void {
-  if (!playerKey || !sourceIdentity) return;
-  const prefix = `${mediaScope(tabId, frameId, documentId, playerKey)}/`;
-  const current = mediaScope(tabId, frameId, documentId, playerKey, sourceIdentity);
-  let changed = false;
-  for (let index = resolvedMedia.length - 1; index >= 0; index -= 1) {
-    if (resolvedMedia[index].scope.startsWith(prefix) && resolvedMedia[index].scope !== current) {
-      resolvedMedia.splice(index, 1);
-      changed = true;
-    }
-  }
-  if (changed) persistResolvedMedia();
-}
+chrome.tabs?.onRemoved?.addListener((tabId) => {
+  responsesByTab.delete(tabId);
+  if (manifestsByTab.delete(tabId)) persistManifests();
+});
 
 let policy: BrowserPolicy = { ...DEFAULT_POLICY };
 let policyLoadError = '';
@@ -263,26 +227,151 @@ async function decisionPolicyReady(): Promise<void> {
   }
 }
 
-async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<unknown> {
-  const type = (message as { type?: string })?.type;
-  const route = type === 'get-policy' ? '/v1/policy' : type === 'open-manager' ? '/v1/manager' : type === 'update-policy' ? '/v1/policy' : '/v1/capture';
+// ---- pairing --------------------------------------------------------------
+// Nothing reaches the app until the user has approved this browser in the
+// app once. Until then every download stays with the browser.
+
+type PairingState = { state: 'paired' } | { state: 'unpaired' } | { state: 'waiting'; code: string } | { state: 'declined' };
+type PendingPairing = { request: string; code: string; until: number };
+
+let pairing: Pairing | null = null;
+let pairingState: PairingState = { state: 'unpaired' };
+let pairingTask: Promise<void> | null = null;
+let pairingTriedAt = 0;
+
+async function loadPairing(): Promise<void> {
+  try {
+    const stored = (await chrome.storage.local.get(PAIRING_KEY))[PAIRING_KEY] as Partial<Pairing> | undefined;
+    if (typeof stored?.keyId === 'string' && typeof stored.key === 'string') {
+      pairing = { keyId: stored.keyId, key: stored.key };
+      pairingState = { state: 'paired' };
+    } else if ((await chrome.storage.session.get(PAIRING_DECLINED_KEY))[PAIRING_DECLINED_KEY]) {
+      pairingState = { state: 'declined' };
+    } else {
+      const pending = (await chrome.storage.session.get(PAIRING_PENDING_KEY))[PAIRING_PENDING_KEY] as PendingPairing | undefined;
+      if (typeof pending?.request === 'string' && typeof pending.code === 'string' && pending.until > Date.now()) {
+        pairingState = { state: 'waiting', code: pending.code };
+        void awaitPairing(async () => pending);
+      }
+    }
+  } catch {
+    pairing = null;
+  }
+}
+
+async function bridgePost(path: string, body: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${APP_BRIDGE_ORIGIN}${route}`, {
-      method: type === 'get-policy' ? 'GET' : 'POST',
-      headers: type === 'get-policy' ? undefined : { 'Content-Type': 'application/json' },
-      body: type === 'get-policy' ? undefined : JSON.stringify(message),
-      signal: controller.signal,
-    });
-    const payload = await response.json() as unknown;
-    if (!response.ok && typeof payload === 'object' && payload !== null && 'error' in payload) return payload;
-    return payload;
-  } catch {
-    return { ok: false, unanswered: true, error: 'Download Manager is not running' };
+    return await fetch(`${APP_BRIDGE_ORIGIN}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: typeof body === 'string' ? body : JSON.stringify(body), signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Ask the app to pair. The app opens a window with a code that the popup
+ *  shows too; the user allows it there. Without `asked`, a pairing the user
+ *  declined (this browser session) or one tried moments ago is not repeated. */
+function startPairing(asked = false): Promise<void> {
+  if (pairingTask) return pairingTask;
+  if (!asked && (pairingState.state === 'declined' || Date.now() - pairingTriedAt < 10_000)) return Promise.resolve();
+  pairingTriedAt = Date.now();
+  return awaitPairing(async () => {
+    const request = crypto.randomUUID();
+    const begun = await (await bridgePost('/v1/pair', { request })).json() as { ok?: boolean; code?: string };
+    if (!begun.ok || typeof begun.code !== 'string') return undefined;
+    const pending: PendingPairing = { request, code: begun.code, until: Date.now() + 125_000 };
+    await chrome.storage.session.remove(PAIRING_DECLINED_KEY).catch(() => undefined);
+    await chrome.storage.session.set({ [PAIRING_PENDING_KEY]: pending }).catch(() => undefined);
+    return pending;
+  });
+}
+
+/** Wait for the user's answer in the app. The request is kept in session
+ *  storage: Chrome may stop this worker while the user decides (nothing else
+ *  is happening), and the next worker picks the wait up from there. */
+function awaitPairing(begin: () => Promise<PendingPairing | undefined>): Promise<void> {
+  pairingTask = (async () => {
+    try {
+      const pending = await begin();
+      if (!pending) return;
+      const { request } = pending;
+      pairingState = { state: 'waiting', code: pending.code };
+      while (Date.now() < pending.until) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // An extension API call: it also tells Chrome this worker is busy.
+        await chrome.storage.session.get(PAIRING_PENDING_KEY);
+        const status = await (await bridgePost('/v1/pair/status', { request })).json() as { state?: string; keyId?: string; key?: string };
+        if (status.state === 'waiting') continue;
+        if (status.state === 'approved' && typeof status.keyId === 'string' && typeof status.key === 'string') {
+          pairing = { keyId: status.keyId, key: status.key };
+          await chrome.storage.local.set({ [PAIRING_KEY]: pairing });
+          pairingState = { state: 'paired' };
+          residentPolicySyncedAt = 0;
+          void refreshResidentPolicy().catch(() => undefined);
+        } else if (status.state === 'denied') {
+          pairingState = { state: 'declined' };
+          await chrome.storage.session.set({ [PAIRING_DECLINED_KEY]: true }).catch(() => undefined);
+        }
+        return;
+      }
+    } catch {
+      // The app is not running: pairing starts again on the next contact.
+    } finally {
+      await chrome.storage.session.remove(PAIRING_PENDING_KEY).catch(() => undefined);
+      if (pairingState.state === 'waiting') pairingState = { state: 'unpaired' };
+    }
+  })().finally(() => { pairingTask = null; });
+  return pairingTask;
+}
+
+/** Send one message to the paired app and return its answer. No answer, an
+ *  answer that does not open under the pairing key, or no pairing at all are
+ *  all "unanswered": the caller leaves the download with the browser. */
+async function sendApp(message: unknown, timeoutMs = APP_BRIDGE_TIMEOUT_MS): Promise<unknown> {
+  const current = pairing;
+  if (!current) {
+    void startPairing();
+    return { ok: false, unanswered: true, unpaired: true, error: 'Not paired with Download Manager' };
+  }
+  try {
+    const { body, nonce } = await seal(current, message);
+    const response = await bridgePost('/v1/message', body, timeoutMs);
+    const envelope = await response.json() as { paired?: boolean; error?: string };
+    if (response.status === 401 && envelope.paired === false) {
+      // The app does not know this key: it was forgotten there, or this is
+      // another program on the port. That answer is unsealed, so it must not
+      // cost the key: pair again, and keep the key until a new one replaces it.
+      pairingState = { state: 'unpaired' };
+      void startPairing();
+      return { ok: false, unanswered: true, unpaired: true, error: 'Not paired with Download Manager' };
+    }
+    return await openSealed(current, nonce, envelope);
+  } catch {
+    return { ok: false, unanswered: true, error: 'Download Manager did not answer' };
+  }
+}
+
+/** The cookies Chromium holds for these URLs (and, for a page's own
+ *  partition, its partitioned ones): never the whole jar. The app narrows them
+ *  to what Chromium would send for each request (SameSite, path, Secure) and
+ *  keeps them only for this download. */
+async function cookiesFor(urls: string[], pageUrl?: string): Promise<Array<Record<string, unknown>>> {
+  let partitionKey: { topLevelSite: string } | undefined;
+  try {
+    if (pageUrl && isHttp(pageUrl)) partitionKey = { topLevelSite: new URL(pageUrl).origin };
+  } catch {
+    partitionKey = undefined;
+  }
+  const found = new Map<string, chrome.cookies.Cookie>();
+  for (const url of new Set(urls.filter(isHttp))) {
+    const lists = await Promise.all([
+      chrome.cookies.getAll({ url }).catch(() => []),
+      partitionKey ? chrome.cookies.getAll({ url, partitionKey }).catch(() => []) : Promise.resolve([]),
+    ]);
+    for (const cookie of lists.flat()) found.set(`${cookie.name}\t${cookie.domain}\t${cookie.path}\t${JSON.stringify(cookie.partitionKey ?? null)}`, cookie);
+  }
+  return [...found.values()].slice(0, COOKIE_LIMIT).map(({ name, value, domain, hostOnly, path, secure, httpOnly, sameSite, expirationDate }) => ({ name, value, domain, hostOnly, path, secure, httpOnly, sameSite, expirationDate }));
 }
 
 type HandOverReply = { ok?: boolean; id?: string; error?: string; handback?: boolean; unanswered?: boolean };
@@ -293,26 +382,11 @@ type HandOverReply = { ok?: boolean; id?: string; error?: string; handback?: boo
  *  only owner. The resident honours a cancel that overtakes its create. */
 async function handOver(type: 'capture-acquisition' | 'media-capture', payload: Record<string, unknown>, timeoutMs: number): Promise<HandOverReply> {
   const captureId = crypto.randomUUID();
-  const reply = ((await sendApp({ type, payload: { ...payload, captureId } }, timeoutMs)) ?? {}) as HandOverReply;
+  const urls = [payload.source, payload.companionAudio, ...(Array.isArray(payload.candidates) ? payload.candidates : []), ...(Array.isArray(payload.selectedSegments) ? payload.selectedSegments : [])].filter((url): url is string => typeof url === 'string');
+  const cookies = await cookiesFor(urls, typeof payload.pageUrl === 'string' ? payload.pageUrl : undefined);
+  const reply = ((await sendApp({ type, payload: { ...payload, captureId, ...(cookies.length ? { cookies } : {}) } }, timeoutMs)) ?? {}) as HandOverReply;
   if (reply.unanswered) void sendApp({ type: 'cancel-acquisition', payload: { captureId } });
   return reply;
-}
-
-function pruneMedia(now = Date.now()): void {
-  const manifests: MediaCandidate[] = [];
-  const others: MediaCandidate[] = [];
-  for (const item of recentMedia) (item.role === 'manifest' ? manifests : others).push(item);
-  while (manifests.length && now - manifests[0].at > MANIFEST_BUFFER_MS) manifests.shift();
-  while (manifests.length > MANIFEST_BUFFER_MAX) manifests.shift();
-  while (others.length && now - others[0].at > MEDIA_BUFFER_MS) others.shift();
-  while (others.length > MEDIA_BUFFER_MAX) others.shift();
-  recentMedia.length = 0;
-  recentMedia.push(...[...manifests, ...others].sort((left, right) => left.at - right.at));
-}
-
-function prunePlayers(now = Date.now()): void {
-  while (recentPlayers.length && now - recentPlayers[0].at > PLAYER_BUFFER_MS) recentPlayers.shift();
-  while (recentPlayers.length > PLAYER_BUFFER_MAX) recentPlayers.shift();
 }
 
 function cleanUserAgent(value: unknown): string | undefined {
@@ -323,7 +397,6 @@ function cleanUserAgent(value: unknown): string | undefined {
 }
 
 const MEDIA_EVIDENCE_URL_MAX = 4096;
-const MEDIA_EVIDENCE_ID_MAX = 256;
 
 function cleanMediaUrl(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length === 0 || value.length > MEDIA_EVIDENCE_URL_MAX) return undefined;
@@ -337,101 +410,6 @@ function cleanMediaUrl(value: unknown): string | undefined {
   }
 }
 
-function cleanMediaEvidence(value: unknown, expectedKind?: Exclude<MediaKind, 'unknown'>, pageUrl?: string): MediaEvidence | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const item = value as Partial<MediaEvidence>;
-  if (typeof item.currentSrc !== 'string' || item.currentSrc.length === 0 || item.currentSrc.length > MEDIA_EVIDENCE_URL_MAX) return undefined;
-  if (typeof item.sourceIdentity !== 'string' || item.sourceIdentity.length === 0 || item.sourceIdentity.length > MEDIA_EVIDENCE_ID_MAX) return undefined;
-  let currentSrc: string | undefined;
-  if (item.currentSrc.startsWith('blob:')) {
-    try {
-      const parsed = new URL(item.currentSrc);
-      const pageOrigin = pageUrl ? new URL(pageUrl).origin : '';
-      if (parsed.protocol !== 'blob:' || (pageOrigin && pageOrigin !== 'null' && parsed.origin !== pageOrigin)) return undefined;
-      currentSrc = parsed.href;
-    } catch {
-      return undefined;
-    }
-  } else {
-    currentSrc = cleanMediaUrl(item.currentSrc);
-  }
-  const source = item.source === undefined ? undefined : cleanMediaUrl(item.source);
-  const playerKind = item.playerKind === 'audio' || item.playerKind === 'video' ? item.playerKind : undefined;
-  const companionAudio = item.companionAudio === undefined ? undefined : cleanMediaUrl(item.companionAudio);
-  if (!currentSrc || (expectedKind && playerKind && expectedKind !== playerKind) || (source !== undefined && !item.currentSrc.startsWith('blob:') && source !== currentSrc) || (item.source !== undefined && !source) || (item.companionAudio !== undefined && !companionAudio) || (companionAudio !== undefined && (expectedKind ?? playerKind) !== 'video')) return undefined;
-  // Hints are advisory. A URL that is neither a manifest nor a representation
-  // is dropped; it must never invalidate the source the page did name — during
-  // steady-state playback the hint list is mostly segments, and one segment
-  // entry used to discard otherwise exact evidence.
-  const selectedSegments = (Array.isArray(item.selectedSegments) ? item.selectedSegments : [])
-      .map((candidate) => cleanMediaUrl(candidate))
-      .filter((candidate): candidate is string => !!candidate)
-      .filter((candidate) => {
-        const role = roleFor(candidate);
-        return role === 'manifest' || (role === 'unknown' && isLikelyRepresentation(candidate));
-      })
-      .slice(0, 8);
-  return { currentSrc, sourceIdentity: item.sourceIdentity, ...(source ? { source } : {}), ...(playerKind ? { playerKind } : {}), ...(companionAudio ? { companionAudio } : {}), selectedSegments };
-}
-
-function observedKind(url: string, tabId: number, frameId: number, documentId?: string): MediaKind {
-  const candidate = [...recentMedia]
-    .filter((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId)
-    .sort((left, right) => right.at - left.at)[0];
-  return candidate ? (candidate.kind && candidate.kind !== 'unknown' ? candidate.kind : mediaKindFor(url, candidate.contentType)) : mediaKindFor(url);
-}
-
-function rememberEvidence(evidence: MediaEvidence, tabId: number, frameId: number, documentId: string | undefined, playerKey: string | undefined, expectedKind?: Exclude<MediaKind, 'unknown'>): void {
-  const sourceKind = evidence.playerKind ?? expectedKind ?? (evidence.source ? mediaKindFor(evidence.source) : 'unknown');
-  if (evidence.source) rememberMedia(evidence.source, tabId, frameId, roleFor(evidence.source), documentId, playerKey, sourceKind);
-  if (evidence.companionAudio) rememberMedia(evidence.companionAudio, tabId, frameId, roleFor(evidence.companionAudio), documentId, playerKey, 'audio');
-  for (const hint of evidence.selectedSegments) rememberMedia(hint, tabId, frameId, roleFor(hint), documentId, playerKey, mediaKindFor(hint));
-}
-
-function selectionFromEvidence(evidence: MediaEvidence | undefined, expectedKind?: Exclude<MediaKind, 'unknown'>): { source: string; selectedSegments: string[]; companionAudio?: string } | undefined {
-  if (!evidence?.source || !isHttp(evidence.source)) return undefined;
-  const sourceKind = mediaKindFor(evidence.source);
-  if (expectedKind && sourceKind !== 'unknown' && sourceKind !== expectedKind) return undefined;
-  const selection: { source: string; selectedSegments: string[]; companionAudio?: string } = {
-    source: roleFor(evidence.source) === 'unknown' ? normalizeChunkUrl(evidence.source) : evidence.source,
-    selectedSegments: evidence.selectedSegments.slice(0, 8),
-  };
-  if (expectedKind === 'video' && evidence.companionAudio && roleFor(evidence.source) === 'unknown') selection.companionAudio = normalizeChunkUrl(evidence.companionAudio);
-  return selection;
-}
-
-function rememberPlayer(payload: Record<string, unknown>, tabId: number, frameId: number, documentId?: string): void {
-  const playerKey = typeof payload.playerKey === 'string' ? payload.playerKey.trim() : '';
-  if (!playerKey) return;
-  const now = Date.now();
-  prunePlayers(now);
-  const currentSrc = typeof payload.currentSrc === 'string' && payload.currentSrc ? payload.currentSrc.slice(0, 500) : undefined;
-  const mediaIdentity = typeof payload.mediaIdentity === 'string' && payload.mediaIdentity ? payload.mediaIdentity.slice(0, 300) : undefined;
-  const evidence: MediaPlayerEvidence = {
-    playerKey,
-    tabId,
-    frameId,
-    at: now,
-    documentId,
-    active: payload.active === true,
-    hovered: payload.hovered === true,
-    playing: payload.playing === true,
-    visible: payload.visible === true,
-    ...(currentSrc ? { currentSrc } : {}),
-    ...(mediaIdentity ? { mediaIdentity } : {}),
-  };
-  const existing = recentPlayers.find((item) => item.playerKey === playerKey && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
-  if (existing) {
-    // srcAt marks when the current source first appeared: attribution only
-    // credits traffic newer than it (an SPA navigation replaces currentSrc).
-    const sameSrc = currentSrc !== undefined && existing.currentSrc === currentSrc;
-    Object.assign(existing, evidence);
-    existing.srcAt = sameSrc ? existing.srcAt ?? now : now;
-  } else {
-    recentPlayers.push({ ...evidence, srcAt: now });
-  }
-}
-
 function cleanFilename(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const leaf = value.trim().split('/').pop()?.split('\\').pop()?.trim();
@@ -441,6 +419,7 @@ function cleanFilename(value: unknown): string | undefined {
 function ordinaryCaptureError(source: string, pageUrl: string): string | undefined {
   const pageSite = siteOf(pageUrl);
   if (!policy.interceptDownloads) return 'ordinary interception disabled';
+  if (!pairing) { void startPairing(); return 'not paired'; }
   if (pageSite && policy.excludedSites.includes(pageSite)) return 'site excluded';
   if (!isHttp(source)) return 'invalid source';
   return undefined;
@@ -465,6 +444,7 @@ async function excludedWithoutReferrer(source: string): Promise<boolean> {
 
 function mediaCapturePolicyError(pageUrl: string): string | undefined {
   if (!policy.showMediaButtons) return 'media buttons disabled';
+  if (!pairing) { void startPairing(); return 'not paired'; }
   const pageSite = siteOf(pageUrl);
   if (pageSite && policy.excludedSites.includes(pageSite)) return 'site excluded';
   return undefined;
@@ -512,70 +492,24 @@ function responseHeader(details: chrome.webRequest.OnHeadersReceivedDetails, nam
   return details.responseHeaders?.find((header) => header.name.toLowerCase() === name)?.value?.trim() ?? '';
 }
 
-function wholeMediaResponse(details: chrome.webRequest.OnHeadersReceivedDetails, role: ReturnType<typeof roleFor>, kind: MediaKind, contentType: string): boolean {
-  if (role !== 'unknown') return false;
-  if (/^(?:text\/|application\/(?:json|javascript|xml|x-javascript))/i.test(contentType)) return false;
-  if (kind !== 'unknown' || /^(?:audio|video|image)\//i.test(contentType)) return true;
-  return !!mediaFileTypeFor(details.url, contentType) && /\.(?:aac|flac|gif|m4a|m4v|mov|mp3|mp4|oga|ogg|ogv|opus|wav|webm|webp)(?:[?#]|$)/i.test(details.url);
-}
-
-function totalBytesForResponse(details: chrome.webRequest.OnHeadersReceivedDetails, role: ReturnType<typeof roleFor>, kind: MediaKind, contentType: string): number | undefined {
-  if (!wholeMediaResponse(details, role, kind, contentType)) return undefined;
-  const contentRange = responseHeader(details, 'content-range');
-  const rangeTotal = contentRange.match(/^bytes\s+\d+-\d+\/(\d+)$/i)?.[1];
-  if (rangeTotal) {
-    const total = Number(rangeTotal);
-    if (Number.isSafeInteger(total) && total > 0) return total;
-  }
-  if (details.statusCode !== undefined && details.statusCode !== 200) return undefined;
-  const contentLength = Number(responseHeader(details, 'content-length'));
-  return Number.isSafeInteger(contentLength) && contentLength > 0 ? contentLength : undefined;
-}
-
-function rememberMedia(url: string, tabId: number, frameId: number, role = roleFor(url), documentId?: string, playerKey?: string, kind: MediaKind = mediaKindFor(url), contentType = '', totalBytes?: number, startedAt?: number): void {
-  if (!isHttp(url)) return;
-  pruneMedia();
-  const existing = recentMedia.find((item) => item.url === url && item.tabId === tabId && item.frameId === frameId && item.documentId === documentId);
-  if (existing) {
-    if (role === 'manifest' || existing.role === 'unknown') existing.role = role;
-    if (playerKey && !existing.playerKey) existing.playerKey = playerKey;
-    if (kind !== 'unknown' || !existing.kind) existing.kind = kind;
-    if (contentType && !existing.contentType) existing.contentType = contentType;
-    if (totalBytes !== undefined) existing.totalBytes = totalBytes;
-    // A later request for the same URL is newer evidence; an older request
-    // answering late is not.
-    if (startedAt !== undefined) existing.startedAt = Math.max(existing.startedAt ?? 0, startedAt);
-    existing.at = Date.now();
-    return;
-  }
-  recentMedia.push({ url, tabId, frameId, at: Date.now(), ...(startedAt === undefined ? {} : { startedAt }), role, kind, contentType: contentType || undefined, ...(totalBytes === undefined ? {} : { totalBytes }), documentId, playerKey });
-}
-
-function mediaCandidateForSource(source: string, tabId?: number, frameId = 0, documentId?: string): MediaCandidate | undefined {
-  const normalized = normalizeChunkUrl(source);
-  return [...recentMedia]
-    .filter((item) =>
-      item.url === source || normalizeChunkUrl(item.url) === normalized,
-    )
-    .filter((item) => tabId === undefined || (item.tabId === tabId && (item.frameId === frameId || item.frameId === 0) && (!documentId || item.documentId === documentId)))
-    .sort((left, right) => right.at - left.at)[0];
+/** The latest response seen for `url` (in `tabId`, when given). */
+function seenResponse(url: string, tabId?: number): ObservedResponse | undefined {
+  const normalized = normalizeChunkUrl(url);
+  const pool = tabId === undefined ? [...responsesByTab.values()].flat() : responsesByTab.get(tabId) ?? [];
+  return pool.filter((item) => item.url === normalized).sort((left, right) => right.at - left.at)[0];
 }
 
 type MediaFilterDecision = { allowed: boolean; type?: string; totalBytes?: number; reason?: 'excluded-type' | 'below-minimum' };
 
-function mediaFilterDecision(source: string, tabId?: number, frameId = 0, documentId?: string, contentType = '', companionAudio?: string): MediaFilterDecision {
-  const candidate = mediaCandidateForSource(source, tabId, frameId, documentId);
-  const observedContentType = candidate?.contentType || contentType;
-  const role = candidate?.role ?? roleFor(source, observedContentType);
+function mediaFilterDecision(source: string, tabId?: number, contentType = '', companionAudio?: string): MediaFilterDecision {
+  const seen = seenResponse(source, tabId);
+  const observedContentType = seen?.contentType || contentType;
+  if (isManifest(source, observedContentType)) return { allowed: true };
   const type = mediaFileTypeFor(source, observedContentType);
-  if (type && mediaFilters.excludedFileTypes.includes(type)) return { allowed: false, type, reason: 'excluded-type', ...(candidate?.totalBytes === undefined ? {} : { totalBytes: candidate.totalBytes }) };
-  if (role === 'manifest') return { allowed: true };
-  if (role === 'segment') return { allowed: true, ...(type ? { type } : {}) };
-  const totalBytes = candidate?.totalBytes;
+  const totalBytes = seen?.total;
+  if (type && mediaFilters.excludedFileTypes.includes(type)) return { allowed: false, type, reason: 'excluded-type', ...(totalBytes === undefined ? {} : { totalBytes }) };
   if (mediaFilters.minimumSizeBytes > 0 && totalBytes !== undefined) {
-    const companionTotal = companionAudio === undefined
-      ? undefined
-      : mediaCandidateForSource(companionAudio, tabId, frameId, documentId)?.totalBytes;
+    const companionTotal = companionAudio === undefined ? undefined : seenResponse(companionAudio, tabId)?.total;
     const aggregate = companionTotal === undefined ? undefined : totalBytes + companionTotal;
     if ((aggregate === undefined && companionAudio === undefined && totalBytes < mediaFilters.minimumSizeBytes) || (aggregate !== undefined && aggregate < mediaFilters.minimumSizeBytes)) {
       return { allowed: false, ...(type ? { type } : {}), totalBytes, reason: 'below-minimum' };
@@ -584,53 +518,22 @@ function mediaFilterDecision(source: string, tabId?: number, frameId = 0, docume
   return { allowed: true, ...(type ? { type } : {}), ...(totalBytes === undefined ? {} : { totalBytes }) };
 }
 
-// Request start times, keyed by request id. Responses are observed when they
-// arrive, which for a slow request can be long after the player switched to a
-// new source; attribution needs when the request began (SPEC §6.2.1).
-const REQUEST_START_MAX = 2_000;
-const requestStartedAt = new Map<string, number>();
-
-chrome.webRequest.onBeforeRequest.addListener(
-  (details): undefined => {
-    if (details.tabId < 0 || (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'other')) return undefined;
-    requestStartedAt.set(details.requestId, details.timeStamp);
-    while (requestStartedAt.size > REQUEST_START_MAX) {
-      const oldest = requestStartedAt.keys().next().value;
-      if (oldest === undefined) break;
-      requestStartedAt.delete(oldest);
-    }
-    return undefined;
-  },
-  { urls: ['<all_urls>'] },
-);
-for (const settled of [chrome.webRequest.onCompleted, chrome.webRequest.onErrorOccurred]) {
-  settled.addListener((details: { requestId: string }) => { requestStartedAt.delete(details.requestId); }, { urls: ['<all_urls>'] });
-}
-
-// Observe (never block) response traffic that feeds media elements.
-chrome.webRequest.onResponseStarted.addListener(
-  (details) => {
-    if (details.tabId < 0) return;
-    const type = details.type;
-    if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return;
-    const role = roleFor(details.url);
-    const kind = mediaKindFor(details.url);
-    if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind })) return;
-    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind, '', undefined, requestStartedAt.get(details.requestId));
-  },
-  { urls: ['<all_urls>'] },
-);
-
+// Observe (never block) the tab's responses: their URL, lengths and type.
+// Page documents, scripts, styles and JSON are not media and are skipped.
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return undefined;
-    const type = details.type;
-    if (type !== 'media' && type !== 'xmlhttprequest' && type !== 'other') return undefined;
+    if (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'other') return undefined;
     const contentType = responseHeader(details, 'content-type');
-    const role = roleFor(details.url, contentType);
-    const kind = mediaKindFor(details.url, contentType);
-    if (type !== 'media' && !isMediaCandidate({ url: details.url, role, kind }, contentType)) return undefined;
-    rememberMedia(details.url, details.tabId, details.frameId, role, details.documentId, undefined, kind, contentType, totalBytesForResponse(details, role, kind, contentType), requestStartedAt.get(details.requestId));
+    const manifest = isManifest(details.url, contentType);
+    if (!manifest && /^(?:text\/|application\/(?:json|javascript|x-javascript|xml)\b)/i.test(contentType)) return undefined;
+    rememberResponse(details.tabId, {
+      url: normalizeChunkUrl(details.url),
+      at: details.timeStamp,
+      manifest,
+      ...(contentType ? { contentType } : {}),
+      ...responseLengths(details.statusCode, responseHeader(details, 'content-range'), responseHeader(details, 'content-length'), responseHeader(details, 'content-encoding').toLowerCase()),
+    });
     return undefined;
   },
   { urls: ['<all_urls>'] },
@@ -775,7 +678,15 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       }
       const includeMediaFilters = (message as { includeMediaFilters?: boolean })?.includeMediaFilters === true;
       const extra = includeMediaFilters ? { mediaFilters } : {};
-      reply(policyLoadError ? { ok: false, error: policyLoadError, policy, ...extra } : { ok: true, policy, ...extra });
+      reply(policyLoadError ? { ok: false, error: policyLoadError, policy, pairing: pairingState, ...extra } : { ok: true, policy, pairing: pairingState, ...extra });
+    } else if (type === 'pair') {
+      await pairingReady;
+      void startPairing(true);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      reply({ ok: true, pairing: pairingState });
+    } else if (type === 'get-pairing') {
+      await pairingReady;
+      reply({ ok: true, pairing: pairingState });
     } else if (type === 'get-media-filters') {
       await mediaFiltersReady;
       reply({ ok: true, mediaFilters });
@@ -802,9 +713,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         reply({ ok: true, allowed: true });
         return;
       }
-      const tabId = sender.tab?.id;
       const companionAudio = typeof payload.companionAudio === 'string' ? cleanMediaUrl(payload.companionAudio) : undefined;
-      const result = mediaFilterDecision(source, tabId, sender.frameId ?? 0, sender.documentId, typeof payload.contentType === 'string' ? payload.contentType : '', companionAudio);
+      const result = mediaFilterDecision(source, sender.tab?.id, typeof payload.contentType === 'string' ? payload.contentType : '', companionAudio);
       reply({ ok: true, ...result });
     } else if (type === 'update-policy') {
       const patch = (message as { patch?: Partial<BrowserPolicy> }).patch ?? {};
@@ -839,10 +749,6 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       const source = typeof payload.source === 'string' ? payload.source.trim() : '';
       if (isHttp(source)) rememberBrowserOwnedDownload(source, cleanFilename(payload.name));
       reply({ ok: isHttp(source) });
-    } else if (type === 'media-player-state') {
-      const tabId = sender.tab?.id;
-      if (tabId !== undefined) rememberPlayer((message as { payload?: Record<string, unknown> }).payload ?? {}, tabId, sender.frameId ?? 0, sender.documentId);
-      reply({ ok: true });
     } else if (type === 'media-capture') {
       await Promise.all([policyReady, mediaFiltersReady]);
       const payload = (message as { payload?: Record<string, unknown> }).payload ?? {};
@@ -852,66 +758,42 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         reply({ ok: false, error: policyError });
         return;
       }
-      const documentId = sender.documentId;
+      const tabId = sender.tab?.id;
       const expectedKind = payload.playerKind === 'audio' || payload.playerKind === 'video' ? payload.playerKind : undefined;
-      const playerKey = typeof payload.playerKey === 'string' && payload.playerKey.length <= 128 ? payload.playerKey : undefined;
-      const evidence = cleanMediaEvidence(payload.pageEvidence, expectedKind, pageUrl);
-      const sourceIdentity = evidence?.sourceIdentity ?? (typeof payload.mediaIdentity === 'string' && payload.mediaIdentity.length <= MEDIA_EVIDENCE_ID_MAX ? payload.mediaIdentity : undefined);
-      const scope = sender.tab?.id === undefined ? undefined : mediaScope(sender.tab.id, sender.frameId ?? 0, documentId, playerKey, sourceIdentity);
-      if (sender.tab?.id !== undefined) invalidateOtherResolvedMedia(sender.tab.id, sender.frameId ?? 0, documentId, playerKey, sourceIdentity);
+      // A player with an http(s) source names its file.
       let source = typeof payload.source === 'string' ? cleanMediaUrl(payload.source) ?? '' : '';
+      if (isHttp(source) && !isManifest(source)) source = normalizeChunkUrl(source);
       let selectedSegments: string[] = [];
-      let companionAudio: string | undefined;
-      if (sender.tab?.id !== undefined && evidence) {
-        rememberEvidence(evidence, sender.tab.id, sender.frameId ?? 0, documentId, playerKey, expectedKind);
-        const exact = selectionFromEvidence(evidence, expectedKind);
-        if (exact) {
-          source = exact.source;
-          selectedSegments = exact.selectedSegments;
-          companionAudio = exact.companionAudio;
-        }
-      }
-      const directKind = isHttp(source) && sender.tab?.id !== undefined
-        ? observedKind(source, sender.tab.id, sender.frameId ?? 0, documentId)
-        : mediaKindFor(source);
-      if (expectedKind && directKind !== 'unknown' && directKind !== expectedKind && roleFor(source) !== 'manifest') source = '';
-      if (isHttp(source) && roleFor(source) === 'unknown') source = normalizeChunkUrl(source);
       let candidates: string[] = [];
-      if (!isHttp(source) && sender.tab?.id !== undefined) {
-        // Exact page evidence did not name a source. Ask the tab's observed
-        // traffic instead: while exactly one player is playing, that traffic is
-        // its media, whatever realm fetched it.
-        const plan = planMediaCapture(
-          recentMedia,
-          recentPlayers,
-          sender.tab.id,
-          sender.frameId ?? 0,
-          playerKey,
-          documentId,
-          Date.now(),
-          expectedKind,
-        );
-        source = plan?.source ?? '';
-        selectedSegments = plan?.selectedSegments ?? [];
-        companionAudio = plan?.companionAudio;
-        candidates = plan?.alternatives ?? [];
-      }
-      if (!isHttp(source) && scope !== undefined) {
-        const remembered = takeResolvedMedia(scope);
-        if (remembered !== undefined) {
-          source = remembered.source;
-          selectedSegments = [...remembered.selectedSegments];
-          companionAudio = remembered.companionAudio;
+      let companionAudio: string | undefined;
+      if (!isHttp(source)) {
+        // A blob/MSE player: what it played, from its own appends. The app
+        // picks, among the page's playlists, the one that lists these files;
+        // with none, a single played file is itself the source.
+        if (!Array.isArray(payload.player)) {
+          reply({ ok: false, reason: 'not-visible', error: "This player is not visible to the extension: reload the page. If it still fails, the video is played by another extension's player" });
+          return;
+        }
+        const tracks = cleanPlayerTracks(payload.player);
+        if (!tracks.some((track) => track.appends.length > 0)) {
+          reply({ ok: false, reason: 'not-played', error: 'Start playback first: the player has not loaded anything yet' });
+          return;
+        }
+        const played = tabId === undefined ? [] : playedTracks(tracks, responsesByTab.get(tabId) ?? []);
+        const video = played.find((track) => track.kind === 'video')?.files ?? [];
+        const audio = played.find((track) => track.kind === 'audio')?.files ?? [];
+        const single = (files: string[]) => (files.length > 0 && new Set(files).size === 1 ? files[0] : undefined);
+        const manifests = tabId === undefined ? [] : manifestsOf(tabId);
+        selectedSegments = [...video, ...audio];
+        companionAudio = video.length > 0 ? single(audio) : undefined;
+        source = manifests[0] ?? single(video) ?? single(audio) ?? '';
+        candidates = manifests.slice(1);
+        if (selectedSegments.length === 0 || !isHttp(source)) {
+          reply({ ok: false, error: "The player's downloads were not seen; reload the page and play it again" });
+          return;
         }
       }
-      if (isHttp(source) && scope !== undefined) {
-        rememberResolvedMedia(scope, source, selectedSegments, companionAudio);
-      }
-      if (!isHttp(source)) {
-        reply({ ok: false, error: 'no downloadable media found for this player' });
-        return;
-      }
-      const filterResult = mediaFilterDecision(source, sender.tab?.id, sender.frameId ?? 0, documentId, '', companionAudio);
+      const filterResult = mediaFilterDecision(source, tabId, '', companionAudio);
       if (!filterResult.allowed) {
         reply({ ok: false, error: filterResult.reason === 'excluded-type' ? `media type ${filterResult.type ?? 'unknown'} is excluded` : 'media is below the minimum size' });
         return;
@@ -926,7 +808,6 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         userAgent,
         media: true,
         playerKind: expectedKind,
-        ...(playerKey ? { playerKey } : {}),
         ...(cleanFilename(payload.name) ? { name: cleanFilename(payload.name) } : {}),
         ...(companionAudio ? { companionAudio } : {}),
       };
@@ -942,7 +823,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
 
 policyReady = loadPolicy();
 mediaFiltersReady = loadMediaFilters();
-void policyReady
+const pairingReady = loadPairing();
+void Promise.all([policyReady, pairingReady])
   .then(() => refreshResidentPolicy())
   .catch(() => undefined);
-void hydrateResolvedMedia();
+void hydrateManifests();

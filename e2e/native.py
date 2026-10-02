@@ -21,6 +21,8 @@ import collections
 import datetime as dt
 import importlib.util
 import json
+import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -34,6 +36,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import devtools
+import sealed
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "e2e" / "results"
@@ -55,6 +58,9 @@ counts: collections.Counter = collections.Counter()
 # server sends them, per job.
 METERED = bytes(range(256)) * (32 * MIB // 256)
 METER: list[tuple[float, str, int]] = []
+# Cookie scenarios: every request under /ck/ is logged with its Cookie header.
+SESSION = "ck-" + os.urandom(8).hex()
+COOKIE_LOG: list[tuple[float, str, str, str]] = []
 
 # Server pacing (F22): the first request for each range or segment is told
 # to come back in a second; a retry inside that second is counted as early.
@@ -81,6 +87,31 @@ DASH_BOUNDARY = {
     "/dynamic-spaced.mpd": f'<MPD type = "dynamic" mediaPresentationDuration="PT4S"><Period>{_VIDEO_SET}</Period></MPD>',
     "/two-periods.mpd": f'<MPD type="static" mediaPresentationDuration="PT8S"><Period id="main">{_VIDEO_SET}</Period><Period id="ad">{_VIDEO_SET}</Period></MPD>',
     "/drm.mpd": '<MPD type="static" mediaPresentationDuration="PT4S"><Period>' + _VIDEO_SET.replace('<Representation', '<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc"/><Representation') + '</Period></MPD>',
+}
+
+
+# Player-evidence presentations: HLS whose playlist URLs look nothing like
+# their segments' (as on X: /pl/ playlists, /vid/ segments), so only what a
+# playlist lists can tie it to what a player played. Segment ids map to the
+# fixture's video (v) and audio (a) tracks.
+PE_SEGMENTS = {"7f3a": "v", "91c2": "a", "2d0e": "v"}
+
+
+def pe_media_playlist(segment_id: str) -> bytes:
+    track = PE_SEGMENTS[segment_id]
+    count = fixture.DASH_V_SEGS if track == "v" else fixture.DASH_A_SEGS
+    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:4", "#EXT-X-PLAYLIST-TYPE:VOD", f'#EXT-X-MAP:URI="/pe/seg/{segment_id}/init.mp4"']
+    for index in range(count):
+        lines += ["#EXTINF:2.0,", f"/pe/seg/{segment_id}/{index}.m4s"]
+    return ("\n".join(lines + ["#EXT-X-ENDLIST"]) + "\n").encode()
+
+
+PE_PLAYLISTS = {
+    "/pe/a/master.m3u8": b'#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=300000,AUDIO="aud"\nvideo.m3u8\n',
+    "/pe/a/video.m3u8": pe_media_playlist("7f3a"),
+    "/pe/a/audio.m3u8": pe_media_playlist("91c2"),
+    "/pe/b/master.m3u8": b"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=300000\nvideo.m3u8\n",
+    "/pe/b/video.m3u8": pe_media_playlist("2d0e"),
 }
 
 
@@ -135,16 +166,66 @@ class Handler(fixture.Handler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
+    def _cookie_route(self, path: str):
+        """Routes that need the browser's session cookie, like a logged-in site."""
+        header = self.headers.get("Cookie", "")
+        COOKIE_LOG.append((time.time(), path, self.headers.get("Host", ""), header))
+        jar = dict(part.strip().split("=", 1) for part in header.split(";") if "=" in part)
+        if path == "/ck/hop.bin":
+            # A redirect to another host (localhost is not 127.0.0.1).
+            return self._raw(302, b"", {"Location": f"http://localhost:{self.server.server_port}/ck/landing.bin"})
+        if path == "/ck/landing.bin":
+            return self._raw(200, NAMED_BYTES, {"Content-Type": "application/octet-stream"})
+        if jar.get("session") != SESSION:
+            return self._raw(403, b"login required")
+        if path == "/ck/gated.bin":
+            size, seed, _ = fixture.FILES["range.bin"]
+            return self._serve_file("range.bin", seed, size, True)
+        if path == "/ck/confirm.bin":
+            # A confirmation step: the server sets a cookie and redirects back.
+            if jar.get("confirm") != "yes":
+                return self._raw(302, b"", {"Location": "/ck/confirm.bin?step=2", "Set-Cookie": "confirm=yes; Path=/ck"})
+            return self._raw(200, EXPORT_BYTES, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=confirm.csv"})
+        if path == "/ck/slow.bin":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(FALLBACK_BYTES)))
+            self.end_headers()
+            try:
+                for at in range(0, len(FALLBACK_BYTES), 64 * 1024):
+                    self.wfile.write(FALLBACK_BYTES[at:at + 64 * 1024])
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return None
+        if path.startswith("/ck/hls/"):
+            self.path = "/hls/" + self.path[len("/ck/hls/"):]
+            return fixture.Handler.do_GET(self)
+        return self._raw(404, b"missing")
+
     def do_GET(self):  # noqa: N802
         self._count("GET")
         path = self.path.split("?")[0]
+        if path.startswith("/ck/"):
+            return self._cookie_route(path)
         if path.startswith("/metered/"):
             return self._metered(path[len("/metered/"):])
+        if path in PE_PLAYLISTS:
+            return self._raw(200, PE_PLAYLISTS[path], {"Content-Type": "application/vnd.apple.mpegurl"})
+        pe = re.match(r"^/pe/seg/([0-9a-f]{4})/(init\.mp4|\d+\.m4s)$", path)
+        if pe and pe.group(1) in PE_SEGMENTS:
+            track = PE_SEGMENTS[pe.group(1)]
+            data = fixture.media_file(f"{track}-init.mp4" if pe.group(2) == "init.mp4" else f"{track}-{pe.group(2)}")
+            if data is not None:
+                return self._raw(200, data, {"Content-Type": "video/mp4"})
         # The fixture's fragmented MP4 tracks served whole, as progressive files.
         if path == "/progressive/video.mp4":
             return self._raw(200, b"".join(fixture.media_file(f) for f in ("v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s")), {"Content-Type": "video/mp4"})
         if path == "/progressive/audio.mp4":
             return self._raw(200, fixture.media_file("a-init.mp4") + fixture.media_file("a-0.m4s"), {"Content-Type": "audio/mp4"})
+        if path == "/progressive/audio-labelled-video.mp4":
+            # Audio-only MP4 served as video/mp4, as v.redd.it serves its audio.
+            return self._raw(200, fixture.media_file("a-init.mp4") + fixture.media_file("a-0.m4s"), {"Content-Type": "video/mp4"})
         if path == "/fallback-html.bin":
             return self._fallback(LOGIN_PAGE, "text/html")
         if path == "/fallback-good.bin":
@@ -224,13 +305,13 @@ class Run:
         print(f"{'PASS' if ok else 'FAIL'}  {scenario}  - {guards}")
 
 
+EXTENSION_ORIGIN = "chrome-extension://joniainjojgbpnjjclallmfbdgnebgbe"
+PAIRING: dict = {}
+
+
 def bridge(message: dict, timeout: float = 30) -> dict:
-    request = urllib.request.Request(f"{BRIDGE}/v1/capture", data=json.dumps(message).encode(), headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read() or b"{}")
-    except urllib.error.HTTPError as error:
-        return json.loads(error.read() or b"{}")
+    """One message to the resident over the paired, sealed channel."""
+    return sealed.message(PAIRING, message, timeout)
 
 
 def main() -> int:
@@ -280,6 +361,8 @@ def main() -> int:
         "mpd-drm": ("/drm.mpd", {"media": True, "playerKind": "video"}),
         "hls-vod": ("/hls/vod.m3u8", {"media": True, "playerKind": "video"}),
         "dual": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/audio.mp4"}),
+        "dual-labelled": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/audio-labelled-video.mp4"}),
+        "dual-two-videos": ("/progressive/video.mp4", {"media": True, "playerKind": "video", "companionAudio": "/progressive/video.mp4?as-companion"}),
         "hls-hole": ("/hls-hole.m3u8", {"media": True, "playerKind": "video"}),
         "hls-two-maps": ("/hls-two-maps.m3u8", {"media": True, "playerKind": "video"}),
     }
@@ -330,6 +413,16 @@ def main() -> int:
             dest = Path(j.get("destination", out / f"{name}.bin"))
             data = dest.read_bytes() if dest.is_file() else None
             return {"state": j.get("state"), "mode": j.get("mode"), "error": j.get("error"), "bytes": None if data is None else len(data), "prefix": None if data is None else data[:48].decode("latin-1"), "zone": zone_identifier(dest) if data is not None else None, "_data": data}
+
+        def top_boxes(data: bytes | None) -> list[str]:
+            kinds, position = [], 0
+            while data and position + 8 <= len(data):
+                length = int.from_bytes(data[position:position + 4], "big")
+                if length == 1:
+                    length = int.from_bytes(data[position + 8:position + 16], "big")
+                kinds.append(data[position + 4:position + 8].decode("latin-1"))
+                position += max(length, 8)
+            return kinds
 
         def evidence(name: str, **extra) -> dict:
             return {k: v for k, v in {**job(name), **extra}.items() if k != "_data"}
@@ -385,7 +478,12 @@ def main() -> int:
           const label = [...document.querySelectorAll('.inspector *')].find((e) => e.children.length === 0 && e.textContent === 'Transfer mode');
           return label?.parentElement?.textContent ?? null;
         })()""")
-        run.check("engine/dual-track", "separate video and audio streams complete into one file, are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown))
+        run.check("engine/dual-track", "separate video and audio streams complete into one regular MP4 (indexed, no fragments), are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and top_boxes(j["_data"]) == ["ftyp", "moov", "mdat"] and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown, boxes=top_boxes(j["_data"])))
+
+        j = job("dual-labelled")
+        run.check("engine/dual-track-audio-labelled-video", "an audio track served as video/mp4 is still the audio: the two tracks complete into one file", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp", evidence("dual-labelled"))
+        j = job("dual-two-videos")
+        run.check("engine/dual-track-two-videos", "a companion that holds video, not audio, fails the job with that reason instead of muxing two pictures", j["state"] == "failed" and "holds video, not audio" in (j["error"] or ""), evidence("dual-two-videos"))
 
         # ---- bandwidth: a job's own cap under a global limit -----------------
         # Both jobs run together. Rates are measured from the bytes the server
@@ -439,6 +537,39 @@ def main() -> int:
         def job_ids_for(capture_id: str) -> list[str]:
             return [j["id"] for j in jobs().values() if j.get("name") == f"{capture_id}.bin" and j.get("provisional")]
 
+        # Only the browser extension with the pinned ID (and local non-browser
+        # clients, which send no Origin) may use the bridge.
+        probe = {"request": "origin-probe-0000000000"}
+        other = sealed.post("/v1/pair/status", probe, {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"})[0]
+        page = sealed.post("/v1/pair/status", probe, {"Origin": "https://example.com"})[0]
+        ours = sealed.post("/v1/pair/status", probe, {"Origin": EXTENSION_ORIGIN})[0]
+        run.check("bridge/extension-origin-pinned", "another extension and a web page are refused; the extension with the pinned ID is accepted", other == 403 and page == 403 and ours == 200, {"otherExtension": other, "webPage": page, "ours": ours})
+
+        # ---- pairing and the sealed channel --------------------------------
+        declined = sealed.pair(allow=False)
+        run.check("pairing/declined", "a pairing the user declines yields no key", declined.get("state") == "denied" and "key" not in declined, {k: v for k, v in declined.items() if k != "key"})
+        PAIRING.update(sealed.pair(allow=True))
+        run.check("pairing/approved", "a pairing the user allows yields a key, once", PAIRING.get("state") == "approved" and len(PAIRING.get("key", "")) == 44 and sealed.post("/v1/pair/status", {"request": PAIRING.get("request")})[1].get("state") == "unknown", {k: v for k, v in PAIRING.items() if k != "key"})
+        probe_message = {"type": "cancel-acquisition", "payload": {"captureId": "sealed-probe"}}
+        plain_status, plain = sealed.post("/v1/message", probe_message)
+        legacy_status, _ = sealed.post("/v1/capture", probe_message)
+        run.check("sealed/plain-refused", "an unsealed message is refused, and the old unsealed routes are gone", plain_status == 400 and legacy_status == 404, {"plain": [plain_status, plain], "legacyRoute": legacy_status})
+        stranger = {"keyId": "0000000000000000", "key": PAIRING["key"]}
+        status, answer = sealed.post("/v1/message", sealed.seal(stranger, probe_message)[0])
+        run.check("sealed/unknown-key", "a message under a key the app never paired is told to pair", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
+        body, nonce = sealed.seal(PAIRING, probe_message)
+        first, envelope = sealed.post("/v1/message", body)
+        again, _ = sealed.post("/v1/message", body)
+        stale, _ = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message, sent_at=time.time() - 300)[0])
+        run.check("sealed/replay-and-stale", "a replayed or five-minute-old message is refused", first == 200 and again == 400 and stale == 400, {"first": first, "replayed": again, "stale": stale})
+        opened = sealed.open_answer(PAIRING, nonce, envelope)
+        try:
+            sealed.open_answer(PAIRING, sealed.seal(PAIRING, probe_message)[1], envelope)
+            rebound = True
+        except Exception:
+            rebound = False
+        run.check("sealed/answer-bound", "the answer opens only for the request it answers", opened.get("ok") is True and not rebound, {"opened": opened, "opensForAnotherRequest": rebound})
+
         reply = capture("/file/range.bin", "cap-viable")
         run.check("bridge/viable", "a fetchable capture is accepted with a job id", reply.get("ok") is True and isinstance(reply.get("id"), str), {"reply": reply})
         run.check("bridge/lookup-is-live", "the harness can see a live provisional job by name (guards the negative checks below)", job_ids_for("cap-viable") == [reply.get("id")], {"found": job_ids_for("cap-viable")})
@@ -478,6 +609,72 @@ def main() -> int:
         run.check("bridge/name-length-capped", "an overlong name is shortened to a Windows-safe length and keeps its extension", bool(got) and len(got) <= 180 and got.endswith(".bin"), {"name": got, "length": len(got or "")})
         got = named("/named/plain.bin", "cap-name-explicit", "chosen-by-browser.bin", False)
         run.check("bridge/name-explicit-kept", "a name the browser already decided is not replaced", got == "chosen-by-browser.bin", {"name": got})
+
+        # ---- browser cookies (SPEC §16) ------------------------------------
+        now = time.time()
+
+        def cookie(name: str, value: str, **extra) -> dict:
+            return {"name": name, "value": value, "domain": "127.0.0.1", "hostOnly": True, "path": "/", "secure": False, "httpOnly": True, "sameSite": "lax", **extra}
+
+        session = cookie("session", SESSION)
+        # Loopback counts as a secure context (Chromium's rule, and the jar's),
+        # so a Secure cookie is sent here; on a plain-http public host it is not.
+        never = [
+            cookie("otherpath", "p-" + SESSION, path="/elsewhere"),
+            cookie("expired", "e-" + SESSION, expirationDate=now - 60),
+        ]
+        cross_page = f"http://localhost:{server.server_port}/page"
+
+        def take(kind: str, path: str, name: str, cookies: list, page: str | None = None, extra: dict | None = None) -> dict:
+            payload = {"source": base + path, "name": name, "pageUrl": page or base + "/page", "captureId": "cap-" + name, "requireViable": True, "cookies": cookies, **(extra or {})}
+            return bridge({"type": kind, "payload": payload}, timeout=60)
+
+        def commit_and_wait(job_id: str, name: str) -> dict:
+            devtools.invoke("commit_provisional", {"id": job_id, "input": {"name": name, "destination": str(out / name)}})
+            for _ in range(120):
+                time.sleep(0.25)
+                found = jobs().get(job_id, {})
+                if found.get("state") in ("completed", "failed"):
+                    return found
+            return jobs().get(job_id, {})
+
+        def cookies_sent(prefix: str, since: float = 0) -> list[str]:
+            return [header for at, path, _, header in COOKIE_LOG if path.startswith(prefix) and at >= since]
+
+        def leaked(headers: list[str]) -> list[str]:
+            return [name for name in ("otherpath", "expired", "strict", "laxonly") if any(f"{name}=" in header for header in headers)]
+
+        reply = take("capture-acquisition", "/ck/gated.bin", "ck-gated.bin", [session, cookie("secureonly", "s-" + SESSION, secure=True), *never, cookie("strict", "t-" + SESSION, sameSite="strict")], page=cross_page)
+        done = commit_and_wait(reply.get("id", ""), "ck-gated.bin") if reply.get("ok") else {}
+        sent = cookies_sent("/ck/gated.bin")
+        data = (out / "ck-gated.bin").read_bytes() if (out / "ck-gated.bin").is_file() else b""
+        run.check("cookies/logged-in-download", "a download that needs the browser's session completes byte-exact, every request (each range worker) carrying the session cookie", reply.get("ok") is True and done.get("state") == "completed" and data == RANGE_BYTES and sent and all(f"session={SESSION}" in header for header in sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "withSession": sum(f"session={SESSION}" in header for header in sent)})
+        run.check("cookies/scoped-like-chromium", "cookies Chromium would not send here stay behind (another path, expired, Strict from another site's page), while a Secure one goes to loopback as Chromium sends it", not leaked(sent) and all("secureonly=" in header for header in sent), {"leaked": leaked(sent), "secureOnLoopback": all("secureonly=" in header for header in sent)})
+
+        reply = take("capture-acquisition", "/ck/hop.bin", "ck-hop.bin", [session])
+        done = commit_and_wait(reply.get("id", ""), "ck-hop.bin") if reply.get("ok") else {}
+        landing = [(host, header) for _, path, host, header in COOKIE_LOG if path == "/ck/landing.bin"]
+        run.check("cookies/redirect-to-another-host", "a redirect to another host carries none of the original host's cookies", done.get("state") == "completed" and landing and all(SESSION not in header for _, header in landing), {"reply": reply, "state": done.get("state"), "landing": landing})
+
+        reply = take("capture-acquisition", "/ck/confirm.bin", "ck-confirm.csv", [session])
+        done = commit_and_wait(reply.get("id", ""), "ck-confirm.csv") if reply.get("ok") else {}
+        confirmed = [header for header in cookies_sent("/ck/confirm.bin") if "confirm=yes" in header]
+        run.check("cookies/set-by-server", "a cookie the server sets along the way (a confirmation step) is kept for that download", done.get("state") == "completed" and bool(confirmed), {"reply": reply, "state": done.get("state"), "requestsWithConfirm": len(confirmed)})
+
+        reply = take("media-capture", "/ck/hls/vod.m3u8", "ck-media.ts", [cookie("session", SESSION, sameSite="no_restriction"), cookie("laxonly", "l-" + SESSION)], page=cross_page, extra={"playerKind": "video"})
+        done = commit_and_wait(reply.get("id", ""), "ck-media.ts") if reply.get("ok") else {}
+        sent = cookies_sent("/ck/hls/")
+        run.check("cookies/media-from-another-site", "a gated HLS stream played on another site completes with its SameSite=None session on every request, and without its Lax cookie", done.get("state") == "completed" and len(sent) > 2 and all(f"session={SESSION}" in header for header in sent) and not leaked(sent), {"reply": reply, "state": done.get("state"), "requests": len(sent), "leaked": leaked(sent)})
+
+        exposed = {
+            "uiSnapshot": SESSION in json.dumps(devtools.invoke("get_snapshot")),
+            "database": any(SESSION.encode() in path.read_bytes() for path in (runtime / "data").glob("download-manager.db*")),
+            "appLog": SESSION in log_path.read_text(encoding="utf-8", errors="replace"),
+        }
+        run.check("cookies/never-exposed", "cookie values reach neither the UI, nor the database in readable form, nor the log", not any(exposed.values()), exposed)
+        with sqlite3.connect(db) as connection:
+            rows = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+        run.check("cookies/erased-when-done", "once those downloads complete, their cookies are gone from storage", rows == 0, {"credentialRows": rows})
 
         # ---- Save durability: the real Add window, driven by UI Automation ----
         uia_timeouts: list[tuple[str, ...]] = []
@@ -561,7 +758,7 @@ def main() -> int:
             bridge({"type": "cancel-acquisition", "payload": {"id": i}})
 
         # ---- extension worker scenarios (real background.ts, real bridge) ------
-        worker = subprocess.run(["node", str(ROOT / "e2e" / "extension.mjs"), base], capture_output=True, text=True, encoding="utf-8", timeout=240)
+        worker = subprocess.run(["node", str(ROOT / "e2e" / "extension.mjs"), base], capture_output=True, text=True, encoding="utf-8", timeout=240, env={**os.environ, "DM_PAIRING": json.dumps({"keyId": PAIRING["keyId"], "key": PAIRING["key"]})})
         try:
             report = json.loads(worker.stdout.strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError):
@@ -571,6 +768,24 @@ def main() -> int:
             run.check(f"extension/{item['scenario']}", item["guards"], item["pass"], item["evidence"])
         time.sleep(1.5)
         stored = jobs()
+        # A capture whose source the app decides: wait until its job has
+        # downloaded (or failed), then check what it settled on.
+        for item in report["handedOver"]:
+            expect = item.get("expect")
+            if not expect:
+                continue
+            job_id, settled = item.get("jobId"), {}
+            for _ in range(120):
+                # The app's own view: sources are stored encrypted.
+                snapshot = devtools.invoke("get_snapshot") or {}
+                settled = next((j for j in snapshot.get("jobs", []) if j.get("id") == job_id), {})
+                if settled.get("state") in ("ready", "completed", "failed"):
+                    break
+                time.sleep(0.25)
+            fetched = sorted({path for (path, _, _) in counts if any(path.startswith(prefix) for prefix in expect.get("notRequested", []))})
+            ok = settled.get("state") in expect["states"] and (settled.get("source") or "").endswith(expect.get("source", "")) and expect.get("error", "") in (settled.get("error") or "") and not fetched
+            run.check(f"extension/{item['scenario']} app", expect["guards"], ok, {"state": settled.get("state"), "source": settled.get("source"), "error": settled.get("error"), "events": [event.get("message") for event in settled.get("events", [])][:4], "requestedButShouldNotBe": fetched})
+        stored = jobs()
         for item in report["handedOver"]:
             owners = [j["id"] for j in stored.values() if j.get("name") == item.get("name") and j.get("provisional")]
             if item.get("expectJob"):
@@ -578,6 +793,44 @@ def main() -> int:
             elif not item.get("jobId"):
                 run.check(f"extension/{item['scenario']} no resident owner", "a handed-back or unanswered capture leaves no resident job", not owners, {"name": item.get("name"), "owners": owners})
             bridge({"type": "cancel-acquisition", "payload": {"captureId": item.get("captureId")}})
+
+        # ---- cookies across a restart -------------------------------------
+        reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])
+        slow_id = reply.get("id", "")
+        devtools.invoke("commit_provisional", {"id": slow_id, "input": {"name": "ck-slow.bin", "destination": str(out / "ck-slow.bin")}})
+        devtools.invoke("pause_job", {"id": slow_id})
+        time.sleep(1)
+        with sqlite3.connect(db) as connection:
+            row = connection.execute("SELECT payload FROM credentials WHERE id = ?", (slow_id,)).fetchone()
+        stored = row[0] if row else ""
+        paused_state = jobs().get(slow_id, {}).get("state")
+        app.terminate()
+        app.wait(timeout=15)
+        log.close()
+        log = open(log_path, "a", encoding="utf-8")
+        app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        restarted = time.time()
+        for _ in range(60):
+            try:
+                devtools.invoke("resume_job", {"id": slow_id}, timeout=10)
+                break
+            except Exception:
+                time.sleep(0.5)
+        done = {}
+        for _ in range(120):
+            time.sleep(0.25)
+            done = jobs().get(slow_id, {})
+            if done.get("state") in ("completed", "failed"):
+                break
+        after = cookies_sent("/ck/slow.bin", since=restarted)
+        with sqlite3.connect(db) as connection:
+            remaining = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
+        run.check("cookies/survive-restart", "a committed download's cookies are kept protected (DPAPI) on disk, carry it through an app restart, and are erased when it completes", paused_state == "paused" and stored.startswith("dpapi1:") and SESSION not in stored and done.get("state") == "completed" and bool(after) and all(f"session={SESSION}" in header for header in after) and remaining == 0, {"pausedState": paused_state, "storedProtected": stored.startswith("dpapi1:"), "storedReadable": SESSION in stored, "state": done.get("state"), "requestsAfterRestart": len(after), "credentialRowsAfter": remaining})
+
+        # Forgetting pairings in Settings: the old key stops working.
+        devtools.invoke("forget_pairings")
+        status, answer = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message)[0])
+        run.check("pairing/forget", "after Forget in Settings the browser's key is refused and it must pair again", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
     finally:
         app.terminate()
         try:

@@ -174,13 +174,19 @@ jobs:
           - Three transfer modes chosen automatically from observed source behaviour:
             whole-object multi-connection, ordered-segment multi-connection, and
             single-stream fallback
-          - Pause, resume, and restart recovery with preserved partial state
-          - Portable layout with all state under `data` beside the executable
+          - Pause, resume and restart recovery for multi-connection and segmented
+            downloads; a single-stream fallback download starts over
+          - One-time pairing between the extension and the app; a download that needs
+            the browser's login carries its cookies for that download only
+          - Partial files sit next to the download (or in a temporary folder set in
+            Settings); the app's own state stays under `data` beside the executable
 
           ### Notes
 
           - Windows 10/11 x64. Chrome is the reference browser; other Chromium browsers
             should work.
+          - The executable is not code-signed yet, so Microsoft Defender may flag it as a
+            false positive (a known issue for new unsigned Tauri apps).
           - Early development release. Not production-ready.
           '@
           $notes | Out-File -Encoding utf8 "$env:RUNNER_TEMP\notes.md"

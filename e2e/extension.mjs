@@ -316,9 +316,11 @@ const captures = (w) => w.outbound.filter((m) => m.type === 'capture-acquisition
     target.dispatchEvent(new CustomEvent('dm-player-evidence-request'));
     return JSON.parse(answer ?? 'null');
   };
+  const unseen = new HTMLMediaElement();
+  unseen.src = unseen.currentSrc = 'blob:https://page.example/made-elsewhere';
   const answered = ask(element);
   const sizes = answered?.map((track) => [track.mime.split(';')[0], track.appends.map(([bytes]) => bytes)]);
-  check('probe/what-the-player-is-fed', "the page probe reports each of the clicked element's tracks and the sizes it was given, and only that element's", JSON.stringify(sizes) === JSON.stringify([['video/mp4', [1234, 56789]], ['audio/mp4', [4321]]]) && JSON.stringify(ask(other)) === '[]' && JSON.stringify(video.received) === '[1234,56789]', { sizes, otherElement: ask(other), stillAppended: video.received });
+  check('probe/what-the-player-is-fed', "the page probe reports each of the clicked element's tracks and the sizes it was given, and only that element's", JSON.stringify(sizes) === JSON.stringify([['video/mp4', [1234, 56789]], ['audio/mp4', [4321]]]) && JSON.stringify(ask(other)) === '[]' && ask(unseen) === null && JSON.stringify(video.received) === '[1234,56789]', { sizes, otherElement: ask(other), unseenPlayer: ask(unseen), stillAppended: video.received });
   check('probe/wrappers-keep-names', 'the wrapped functions keep their names', SourceBuffer.prototype.appendBuffer.name === 'appendBuffer' && MediaSource.prototype.addSourceBuffer.name === 'addSourceBuffer' && URLish.createObjectURL.name === 'createObjectURL', { names: [SourceBuffer.prototype.appendBuffer.name, MediaSource.prototype.addSourceBuffer.name, URLish.createObjectURL.name] });
 
   // A classic script in the page's world shares its top-level names with the
@@ -366,6 +368,23 @@ const mediaCaptures = (w) => w.outbound.filter((m) => m.type === 'media-capture'
   handedOver.push(...sent.map((p) => ({ scenario: 'player/played-files', name: p.name, source: p.source, captureId: p.captureId, jobId: reply.id, expect: { states: ['ready', 'completed'], source: '/pe/a/master.m3u8', notRequested: ['/pe/seg/2d0e/'], guards: "the app takes the playlist that lists what the player played (the film's), not the one loaded last (the preview's), and downloads it" } })));
 }
 {
+  // A thread of videos: the clicked one's playlists were loaded first, and
+  // twenty other videos' playlists after them.
+  const w = world(); await settle();
+  const at = Date.now() - 6_000;
+  for (const url of ['/pe/a/master.m3u8', '/pe/a/video.m3u8', '/pe/a/audio.m3u8']) playlist(w, 26, base + url, at);
+  [...PE_A.video, ...PE_A.audio].forEach((url, index) => received(w, 26, url, { at: at + 100 + index * 10, bytes: sizes.get(url) }));
+  for (let other = 0; other < 20; other += 1) {
+    playlist(w, 26, `${base}/pe/b/master.m3u8?video=${other}`, at + 1000 + other * 100);
+    playlist(w, 26, `${base}/pe/b/video.m3u8?video=${other}`, at + 1050 + other * 100);
+  }
+  const reply = await captureMedia(w, 26, [{ mime: 'video/mp4; codecs="avc1.64001e"', appends: appendsOf(PE_A.video, at + 100) }, { mime: 'audio/mp4; codecs="mp4a.40.2"', appends: appendsOf(PE_A.audio, at + 140) }], 'pe-thread.mp4');
+  const sent = mediaCaptures(w);
+  const offered = [sent[0]?.source, ...(sent[0]?.candidates ?? [])];
+  check('player/thread-of-videos', "with forty newer playlists in the tab, the clicked video's own playlist is still handed over", reply.ok === true && offered.includes(`${base}/pe/a/master.m3u8`), { reply: { ok: reply.ok, error: reply.error }, playlists: offered.length });
+  handedOver.push(...sent.map((p) => ({ scenario: 'player/thread-of-videos', name: p.name, source: p.source, captureId: p.captureId, jobId: reply.id, expect: { states: ['ready', 'completed'], source: '/pe/a/master.m3u8', notRequested: ['/pe/seg/2d0e/'], guards: "in a thread of videos the app takes the clicked video's playlist, video and audio, however many others the page loaded after it" } })));
+}
+{
   // The same, with a player that converts what it downloads: its appends
   // have other lengths, each made right after a download arrived.
   const w = world(); await settle();
@@ -397,6 +416,13 @@ const mediaCaptures = (w) => w.outbound.filter((m) => m.type === 'media-capture'
   PE_A.video.forEach((url, index) => received(w, 24, url, { at: at + index * 10, bytes: sizes.get(url) }));
   const reply = await captureMedia(w, 24, [{ mime: 'video/mp4', appends: appendsOf(PE_A.video, at) }], 'pe-unlisted.mp4');
   check('player/segments-without-playlist', 'segments whose playlist was never seen are not handed over as if one of them were the video', reply.ok === false && mediaCaptures(w).length === 0, { reply });
+}
+{
+  // A player whose MediaSource the probe never saw (another extension's
+  // player, as RES plays v.redd.it): said so, not "play first".
+  const w = world(); await settle();
+  const reply = await captureMedia(w, 27, null, 'pe-not-visible.mp4');
+  check('player/not-visible', 'a player the page probe cannot see is reported as not visible, not as unplayed', reply.ok === false && reply.reason === 'not-visible' && mediaCaptures(w).length === 0, { reply });
 }
 {
   const w = world(); await settle();

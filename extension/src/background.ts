@@ -19,7 +19,7 @@ const RESPONSE_TTL_MS = 10 * 60_000;
 // long after its playlist was fetched, and Chrome may restart this worker in
 // between, so they are kept longer and in session storage.
 const MANIFESTS_KEY = 'dm-manifests';
-const MANIFESTS_PER_TAB = 16;
+const MANIFESTS_PER_TAB = 64;
 const MANIFEST_TTL_MS = 60 * 60_000;
 type SeenManifest = { url: string; at: number };
 const manifestsByTab = new Map<number, SeenManifest[]>();
@@ -770,6 +770,10 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
         // A blob/MSE player: what it played, from its own appends. The app
         // picks, among the page's playlists, the one that lists these files;
         // with none, a single played file is itself the source.
+        if (!Array.isArray(payload.player)) {
+          reply({ ok: false, reason: 'not-visible', error: "This player is not visible to the extension: reload the page. If it still fails, the video is played by another extension's player" });
+          return;
+        }
         const tracks = cleanPlayerTracks(payload.player);
         if (!tracks.some((track) => track.appends.length > 0)) {
           reply({ ok: false, reason: 'not-played', error: 'Start playback first: the player has not loaded anything yet' });

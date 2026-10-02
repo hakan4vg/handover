@@ -205,6 +205,34 @@ def probe(path: Path) -> dict:
     }
 
 
+def top_boxes(path: Path) -> list[str]:
+    """The kinds of a file's top-level MP4 boxes, in order."""
+    kinds, position, size = [], 0, path.stat().st_size
+    with open(path, "rb") as handle:
+        while position + 8 <= size:
+            handle.seek(position)
+            head = handle.read(16)
+            length, kind = struct.unpack(">I4s", head[:8])
+            if length == 1:
+                length = struct.unpack(">Q", head[8:16])[0]
+            elif length == 0:
+                length = size - position
+            kinds.append(kind.decode("latin-1"))
+            position += max(length, 8)
+    return kinds
+
+
+def packets(source: str) -> list[list[tuple[str, str]]]:
+    """Each stream's packets as (size, MD5), streams in a stable order."""
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", source, "-map", "0", "-c", "copy", "-f", "framemd5", "-"], capture_output=True, text=True).stdout
+    streams: dict[str, list[tuple[str, str]]] = {}
+    for line in out.splitlines():
+        if line and not line.startswith("#"):
+            fields = [field.strip() for field in line.split(",")]
+            streams.setdefault(fields[0], []).append((fields[4], fields[5]))
+    return sorted(streams.values())
+
+
 def main() -> int:
     global BIG
     parser = argparse.ArgumentParser()
@@ -238,6 +266,14 @@ def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
+    # The fMP4 presentation's tracks as plain files (initialization, then
+    # segments): the samples the output must hold, as ffmpeg reads them.
+    reference_packets = []
+    for track, count in (("v", fixture.DASH_V_SEGS), ("a", fixture.DASH_A_SEGS)):
+        whole = runtime / f"reference-{track}.mp4"
+        whole.write_bytes(fixture.media_file(f"{track}-init.mp4") + b"".join(fixture.media_file(f"{track}-{i}.m4s") for i in range(count)))
+        reference_packets += packets(str(whole))
+    reference_packets.sort()
 
     jobs_to_run = {
         # name: (manifest path, requested file name, what it exercises)
@@ -333,6 +369,8 @@ def main() -> int:
             evidence.update(bytes=dest.stat().st_size, sha256=sha256(dest))
             if name != "large":
                 evidence.update(probe(dest))
+            if dest.suffix == ".mp4":
+                evidence.update(boxes=sorted(set(top_boxes(dest))))
         outputs[name] = evidence
         scenario = f"{'segments' if name == 'aes' else 'mux'}/{name}"
         if name == "large":
@@ -347,6 +385,12 @@ def main() -> int:
             kinds = {stream.split(":")[0] for stream in evidence.get("streams", [])}
             ok = evidence["state"] == "completed" and kinds == expected and evidence.get("decodeExit") == 0 and not evidence.get("decodeErrors")
             run.check(scenario, f"{reaches}: completes, carries one video and one audio stream, and decodes without errors", ok, evidence)
+        if name == "fmp4":
+            regular = evidence.get("boxes") == ["ftyp", "mdat", "moov"]
+            identical = dest.is_file() and packets(str(dest)) == reference_packets
+            run.check("mux/regular-mp4", "fragmented MP4 tracks are written as a regular MP4 (one indexed moov, one mdat, no fragments) holding the source's samples byte for byte", regular and identical, {"boxes": evidence.get("boxes"), "samplesIdentical": identical, "referenceStreams": [len(stream) for stream in reference_packets]})
+        if name == "large":
+            run.check("mux/large-regular-mp4", "a large download is written as a regular MP4 too", evidence.get("boxes") == ["ftyp", "mdat", "moov"], {"boxes": evidence.get("boxes")})
         if compare:
             same = compare.get(scenario) == evidence.get("sha256") and evidence.get("sha256") is not None
             run.check(f"equivalence/{name}", "the output is byte-identical to the compared run", same, {"now": evidence.get("sha256"), "compared": compare.get(scenario)})

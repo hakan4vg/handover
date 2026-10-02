@@ -331,6 +331,16 @@ def main() -> int:
             data = dest.read_bytes() if dest.is_file() else None
             return {"state": j.get("state"), "mode": j.get("mode"), "error": j.get("error"), "bytes": None if data is None else len(data), "prefix": None if data is None else data[:48].decode("latin-1"), "zone": zone_identifier(dest) if data is not None else None, "_data": data}
 
+        def top_boxes(data: bytes | None) -> list[str]:
+            kinds, position = [], 0
+            while data and position + 8 <= len(data):
+                length = int.from_bytes(data[position:position + 4], "big")
+                if length == 1:
+                    length = int.from_bytes(data[position + 8:position + 16], "big")
+                kinds.append(data[position + 4:position + 8].decode("latin-1"))
+                position += max(length, 8)
+            return kinds
+
         def evidence(name: str, **extra) -> dict:
             return {k: v for k, v in {**job(name), **extra}.items() if k != "_data"}
 
@@ -385,7 +395,7 @@ def main() -> int:
           const label = [...document.querySelectorAll('.inspector *')].find((e) => e.children.length === 0 && e.textContent === 'Transfer mode');
           return label?.parentElement?.textContent ?? null;
         })()""")
-        run.check("engine/dual-track", "separate video and audio streams complete into one file, are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and (j["_data"] or b"")[4:8] == b"ftyp" and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown))
+        run.check("engine/dual-track", "separate video and audio streams complete into one regular MP4 (indexed, no fragments), are not claimed resumable, and the inspector names the mode", j["state"] == "completed" and top_boxes(j["_data"]) == ["ftyp", "moov", "mdat"] and stored.get("mode") == "dual-track" and stored.get("resumable") is False and "Separate video and audio" in (shown or ""), evidence("dual", resumable=stored.get("resumable"), inspector=shown, boxes=top_boxes(j["_data"])))
 
         # ---- bandwidth: a job's own cap under a global limit -----------------
         # Both jobs run together. Rates are measured from the bytes the server

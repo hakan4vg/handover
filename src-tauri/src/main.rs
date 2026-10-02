@@ -1770,10 +1770,23 @@ async fn finalize_media(temp_path: &str, destination: &str) -> Result<(), String
     if looks_like_webm(&header) {
         return Ok(());
     }
-    media::validate_fmp4_file(Path::new(temp_path)).map_err(|error| {
-        format!("Media finalization failed: {error}; downloaded parts were preserved")
-    })?;
-    Ok(())
+    // The assembled fragments become a regular MP4 that desktop players can
+    // seek; it replaces the assembly only once it is complete. Reading and
+    // writing a file of any size runs on the blocking pool (F13).
+    let assembled = PathBuf::from(temp_path);
+    let regular = PathBuf::from(format!("{temp_path}.regular"));
+    let written = regular.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        media::write_regular_mp4(&[assembled.clone()], &written)
+            .and_then(|()| std::fs::rename(&written, &assembled).map_err(|error| error.to_string()))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&written);
+            })
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result)
+    .map_err(|error| format!("Media finalization failed: {error}; downloaded parts were preserved"))
 }
 
 fn move_needs_fallback(error: &std::io::Error) -> bool {

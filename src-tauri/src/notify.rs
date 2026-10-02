@@ -151,13 +151,7 @@ fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, desti
             let _ = crate::open_path(destination.to_string());
         }
         "folder" => {
-            let folder = std::path::Path::new(destination)
-                .parent()
-                .map(|parent| parent.to_string_lossy().into_owned())
-                .filter(|parent| !parent.is_empty());
-            if let Some(folder) = folder {
-                let _ = crate::open_path(folder);
-            }
+            let _ = crate::reveal_path(destination.to_string());
         }
         "details" => {
             if let Some(window) = app.get_webview_window("main") {

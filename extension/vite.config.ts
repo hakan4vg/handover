@@ -1,11 +1,14 @@
 import { defineConfig, type Plugin } from 'vite';
-import { copyFileSync } from 'node:fs';
+import { copyFileSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 function copyManifest(): Plugin {
   return {
     name: 'copy-manifest',
-    closeBundle: () => copyFileSync(resolve(__dirname, 'manifest.json'), resolve(__dirname, 'dist/manifest.json')),
+    closeBundle: () => {
+      copyFileSync(resolve(__dirname, 'manifest.json'), resolve(__dirname, 'dist/manifest.json'));
+      cpSync(resolve(__dirname, 'icons'), resolve(__dirname, 'dist/icons'), { recursive: true });
+    },
   };
 }
 

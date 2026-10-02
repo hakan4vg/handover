@@ -120,22 +120,22 @@ function initialJobs(): DownloadJob[] {
   });
   return [
     make({
-      id: 'job-1', name: 'ubuntu-24.04-desktop-amd64.iso', source: 'https://releases.ubuntu.com/24.04/ubuntu-24.04-desktop-amd64.iso', domain: 'releases.ubuntu.com', state: 'downloading', progress: 49.8, downloaded: 2.34 * 1024 ** 3, total: 4.70 * 1024 ** 3, speed: 42.3 * 1024 ** 2, eta: '36s left', connections: 4, maxConnections: 16, mode: 'whole-object', media: false, destination: `${base}\\ubuntu-24.04-desktop-amd64.iso`, tempPath: `${temp}\\job-1.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', events: [event('Range support verified'), event('4 workers downloading', 'success')],
+      id: 'job-1', name: 'ubuntu-24.04-desktop-amd64.iso', source: 'https://releases.ubuntu.com/24.04/ubuntu-24.04-desktop-amd64.iso', domain: 'releases.ubuntu.com', state: 'downloading', progress: 49.8, downloaded: 2.34 * 1024 ** 3, total: 4.70 * 1024 ** 3, speed: 42.3 * 1024 ** 2, etaSeconds: 36, connections: 4, maxConnections: 16, mode: 'whole-object', media: false, destination: `${base}\\ubuntu-24.04-desktop-amd64.iso`, tempPath: `${temp}\\job-1.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', events: [event('Range support verified'), event('4 workers downloading', 'success')],
     }),
     make({
-      id: 'job-2', name: 'Big Buck Bunny (1080p).mkv', source: 'https://media.example.org/vod/big-buck-bunny/1080p/manifest.mpd', domain: 'media.example.org', state: 'finalizing', progress: 95, downloaded: 1.18 * 1024 ** 3, total: 1.28 * 1024 ** 3, speed: 0, eta: 'Finalizing', connections: 4, maxConnections: 16, mode: 'segments', media: true, destination: `${base}\\Big Buck Bunny (1080p).mkv`, tempPath: `${temp}\\job-2\\`, resumable: true, mime: 'video/x-matroska', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', segments: { completed: 118, total: 124 }, events: [event('Manifest parsed: 124 fragments'), event('Media parts acquired', 'success'), event('Merging container (95%)', 'warning')],
+      id: 'job-2', name: 'Big Buck Bunny (1080p).mkv', source: 'https://media.example.org/vod/big-buck-bunny/1080p/manifest.mpd', domain: 'media.example.org', state: 'finalizing', progress: 95, downloaded: 1.18 * 1024 ** 3, total: 1.28 * 1024 ** 3, speed: 0, note: 'Finalizing', connections: 4, maxConnections: 16, mode: 'segments', media: true, destination: `${base}\\Big Buck Bunny (1080p).mkv`, tempPath: `${temp}\\job-2\\`, resumable: true, mime: 'video/x-matroska', created: 'Today, 9:41 AM', started: 'Today, 9:41 AM', segments: { completed: 118, total: 124 }, events: [event('Manifest parsed: 124 fragments'), event('Media parts acquired', 'success'), event('Merging container (95%)', 'warning')],
     }),
     make({
-      id: 'job-3', name: 'project-assets.zip', source: 'https://cdn.example.com/releases/project-assets.zip', domain: 'cdn.example.com', state: 'paused', progress: 0, downloaded: 0, total: 512 * 1024 ** 2, speed: 0, eta: 'Paused', connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\project-assets.zip`, tempPath: `${temp}\\job-3.part`, resumable: true, mime: 'application/zip', created: 'Today, 9:38 AM', events: [event('Paused before start', 'warning')],
+      id: 'job-3', name: 'project-assets.zip', source: 'https://cdn.example.com/releases/project-assets.zip', domain: 'cdn.example.com', state: 'paused', progress: 0, downloaded: 0, total: 512 * 1024 ** 2, speed: 0, note: 'Paused', connections: 0, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\project-assets.zip`, tempPath: `${temp}\\job-3.part`, resumable: true, mime: 'application/zip', created: 'Today, 9:38 AM', events: [event('Paused before start', 'warning')],
     }),
     make({
-      id: 'job-4', name: 'Nature Documentary (4K).mkv', source: 'https://media.example.org/nature/4k/documentary.mkv', domain: 'media.example.org', state: 'completed', progress: 100, downloaded: 2.85 * 1024 ** 3, total: 2.85 * 1024 ** 3, speed: 0, eta: undefined, connections: 0, maxConnections: 8, mode: 'segments', media: true, destination: `${base}\\Nature Documentary (4K).mkv`, tempPath: `${temp}\\job-4\\`, resumable: true, mime: 'video/x-matroska', created: 'Yesterday, 3:12 PM', started: 'Yesterday, 3:12 PM', completed: 'Yesterday, 3:27 PM', segments: { completed: 284, total: 284 }, events: [event('Download completed', 'success')],
+      id: 'job-4', name: 'Nature Documentary (4K).mkv', source: 'https://media.example.org/nature/4k/documentary.mkv', domain: 'media.example.org', state: 'completed', progress: 100, downloaded: 2.85 * 1024 ** 3, total: 2.85 * 1024 ** 3, speed: 0, note: undefined, etaSeconds: undefined, connections: 0, maxConnections: 8, mode: 'segments', media: true, destination: `${base}\\Nature Documentary (4K).mkv`, tempPath: `${temp}\\job-4\\`, resumable: true, mime: 'video/x-matroska', created: 'Yesterday, 3:12 PM', started: 'Yesterday, 3:12 PM', completed: 'Yesterday, 3:27 PM', segments: { completed: 284, total: 284 }, events: [event('Download completed', 'success')],
     }),
     make({
-      id: 'job-5', name: 'Fedora-Workstation-Live-x86_64.iso', source: 'https://download.fedoraproject.org/pub/fedora/linux/releases/41/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64.iso', domain: 'download.fedoraproject.org', state: 'downloading', progress: 54.2, downloaded: 1.09 * 1024 ** 3, total: 2.01 * 1024 ** 3, speed: 18.7 * 1024 ** 2, eta: '51s left', connections: 3, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\Fedora-Workstation-Live-x86_64.iso`, tempPath: `${temp}\\job-5.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:26 AM', started: 'Today, 9:26 AM', events: [event('Range support verified'), event('3 workers downloading', 'success')],
+      id: 'job-5', name: 'Fedora-Workstation-Live-x86_64.iso', source: 'https://download.fedoraproject.org/pub/fedora/linux/releases/41/Workstation/x86_64/iso/Fedora-Workstation-Live-x86_64.iso', domain: 'download.fedoraproject.org', state: 'downloading', progress: 54.2, downloaded: 1.09 * 1024 ** 3, total: 2.01 * 1024 ** 3, speed: 18.7 * 1024 ** 2, etaSeconds: 51, connections: 3, maxConnections: 8, mode: 'whole-object', media: false, destination: `${base}\\Fedora-Workstation-Live-x86_64.iso`, tempPath: `${temp}\\job-5.part`, resumable: true, mime: 'application/x-iso9660-image', created: 'Today, 9:26 AM', started: 'Today, 9:26 AM', events: [event('Range support verified'), event('3 workers downloading', 'success')],
     }),
     make({
-      id: 'job-6', name: 'old-archive.tar.xz', source: 'https://archive.example.net/old-archive.tar.xz', domain: 'archive.example.net', state: 'failed', progress: 0, downloaded: 0, total: 128 * 1024 ** 2, speed: 0, eta: undefined, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\old-archive.tar.xz`, tempPath: `${temp}\\job-6.part`, resumable: true, error: 'Network error: Connection reset by peer', created: 'Today, 8:58 AM', events: [event('Connection reset by peer', 'error')],
+      id: 'job-6', name: 'old-archive.tar.xz', source: 'https://archive.example.net/old-archive.tar.xz', domain: 'archive.example.net', state: 'failed', progress: 0, downloaded: 0, total: 128 * 1024 ** 2, speed: 0, note: undefined, etaSeconds: undefined, connections: 0, maxConnections: 8, mode: 'single-stream', media: false, destination: `${base}\\old-archive.tar.xz`, tempPath: `${temp}\\job-6.part`, resumable: true, error: 'Network error: Connection reset by peer', created: 'Today, 8:58 AM', events: [event('Connection reset by peer', 'error')],
     }),
     make({ id: 'job-7', name: 'Lecture 12 — Distributed Systems.mp4', source: 'https://video.university.example/lecture/12.mp4', domain: 'video.university.example', state: 'completed', progress: 100, downloaded: 846 * 1024 ** 2, total: 846 * 1024 ** 2, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\Lecture 12 — Distributed Systems.mp4`, tempPath: `${temp}\\job-7.part`, resumable: true, completed: 'Today, 8:34 AM', created: 'Today, 8:12 AM', events: [event('Download completed', 'success')] }),
     make({ id: 'job-8', name: 'conference-keynote.webm', source: 'https://events.example.org/2026/keynote.webm', domain: 'events.example.org', state: 'completed', progress: 100, downloaded: 1.3 * 1024 ** 3, total: 1.3 * 1024 ** 3, speed: 0, connections: 0, maxConnections: 8, mode: 'whole-object', media: true, destination: `${base}\\conference-keynote.webm`, tempPath: `${temp}\\job-8.part`, resumable: true, completed: 'Today, 7:15 AM', created: 'Today, 6:51 AM', events: [event('Download completed', 'success')] }),
@@ -202,15 +202,14 @@ class MockAdapter implements DownloadAdapter {
       const progress = (downloaded / job.total) * 100;
       changed = true;
       if (progress >= 100) {
-        const completed = { ...job, state: 'completed' as const, progress: 100, downloaded: job.total, speed: 0, connections: 0, eta: undefined, completed: 'Just now', events: [event('Download completed', 'success'), ...job.events] };
+        const completed = { ...job, state: 'completed' as const, progress: 100, downloaded: job.total, speed: 0, connections: 0, note: undefined, etaSeconds: undefined, completed: 'Just now', events: [event('Download completed', 'success'), ...job.events] };
         if (this.snapshot.settings.completionNotifications && !this.snapshot.notifications.some((item) => item.jobId === job.id)) {
           this.snapshot.notifications = [{ id: `notice-${job.id}`, type: 'completed', title: 'Download completed', detail: `${job.name} · ${formatBytes(job.total)}`, time: timeLabel(), jobId: job.id }, ...this.snapshot.notifications];
         }
         return completed;
       }
       const remaining = job.total - downloaded;
-      const seconds = job.speed ? Math.ceil(remaining / job.speed) : 0;
-      return { ...job, downloaded, progress, eta: `${Math.max(1, seconds)}s left` };
+      return { ...job, downloaded, progress, etaSeconds: job.speed ? Math.ceil(remaining / job.speed) : undefined };
     });
     if (changed) this.emit();
   }
@@ -225,12 +224,12 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async resumeJob(id: string) {
-    this.update(id, (job) => job.state === 'paused' || job.state === 'pending' ? { ...job, state: 'downloading', speed: job.speed || 12.4 * 1024 ** 2, connections: Math.min(job.maxConnections, 4), started: job.started ?? 'Just now', eta: job.total ? `${Math.max(1, Math.ceil((job.total - job.downloaded) / (job.speed || 1)))}s left` : 'Connecting…', events: [event('Resumed', 'success'), ...job.events] } : job);
+    this.update(id, (job) => job.state === 'paused' || job.state === 'pending' ? { ...job, state: 'downloading', speed: job.speed || 12.4 * 1024 ** 2, connections: Math.min(job.maxConnections, 4), started: job.started ?? 'Just now', etaSeconds: job.total ? Math.max(1, Math.ceil((job.total - job.downloaded) / (job.speed || 12.4 * 1024 ** 2))) : undefined, events: [event('Resumed', 'success'), ...job.events] } : job);
   }
 
   async retryJob(id: string) {
-    this.update(id, (job) => ({ ...job, state: 'connecting', speed: 0, connections: 0, error: undefined, eta: 'Connecting…', events: [event('Retrying connection'), ...job.events] }));
-    window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'downloading', speed: 9.8 * 1024 ** 2, connections: Math.min(job.maxConnections, 3), eta: job.total ? '1m left' : 'Receiving metadata', events: [event('Connection established', 'success'), ...job.events] })), 900);
+    this.update(id, (job) => ({ ...job, state: 'connecting', speed: 0, connections: 0, error: undefined, note: 'Connecting…', events: [event('Retrying connection'), ...job.events] }));
+    window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'downloading', speed: 9.8 * 1024 ** 2, connections: Math.min(job.maxConnections, 3), note: undefined, etaSeconds: job.total ? 60 : undefined, events: [event('Connection established', 'success'), ...job.events] })), 900);
   }
 
   async cancelJob(id: string) {
@@ -249,7 +248,7 @@ class MockAdapter implements DownloadAdapter {
   }
 
   async resumeAll() {
-    this.snapshot.jobs = this.snapshot.jobs.map((job) => ['paused', 'pending'].includes(job.state) ? { ...job, state: 'downloading' as const, speed: 11.2 * 1024 ** 2, connections: Math.min(job.maxConnections, 3), eta: job.total ? '1m left' : 'Connecting…', events: [event('Resumed with Resume All', 'success'), ...job.events] } : job);
+    this.snapshot.jobs = this.snapshot.jobs.map((job) => ['paused', 'pending'].includes(job.state) ? { ...job, state: 'downloading' as const, speed: 11.2 * 1024 ** 2, connections: Math.min(job.maxConnections, 3), note: undefined, etaSeconds: job.total ? 60 : undefined, events: [event('Resumed with Resume All', 'success'), ...job.events] } : job);
     this.emit();
   }
 
@@ -268,7 +267,7 @@ class MockAdapter implements DownloadAdapter {
       downloaded: 0,
       total: undefined,
       speed: 0,
-      eta: 'Connecting…',
+      note: 'Connecting…',
       connections: 0,
        maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? this.snapshot.settings.maxConnections)),
       bandwidthLimit: sanitizeCapBps(input.bandwidthLimit) ?? null,
@@ -284,13 +283,13 @@ class MockAdapter implements DownloadAdapter {
     this.snapshot.jobs = [job, ...this.snapshot.jobs];
     this.emit();
     window.setTimeout(() => {
-      this.update(id, (current) => ({ ...current, state: 'downloading', started: current.started ?? 'Just now', total: media ? 768 * 1024 ** 2 : 1.25 * 1024 ** 3, downloaded: 6.5 * 1024 ** 2, progress: media ? 0.85 : 0.5, speed: media ? 7.2 * 1024 ** 2 : 14.8 * 1024 ** 2, connections: media ? 2 : 1, mode: media ? 'segments' : 'whole-object', resumable: true, eta: media ? '1m 47s left' : '1m 24s left', mediaDetails: media ? '1080p · source selected from playback' : undefined, events: [event('Source metadata received', 'success'), ...current.events] }));
+      this.update(id, (current) => ({ ...current, state: 'downloading', started: current.started ?? 'Just now', total: media ? 768 * 1024 ** 2 : 1.25 * 1024 ** 3, downloaded: 6.5 * 1024 ** 2, progress: media ? 0.85 : 0.5, speed: media ? 7.2 * 1024 ** 2 : 14.8 * 1024 ** 2, connections: media ? 2 : 1, mode: media ? 'segments' : 'whole-object', resumable: true, etaSeconds: media ? 107 : 84, mediaDetails: media ? '1080p · source selected from playback' : undefined, events: [event('Source metadata received', 'success'), ...current.events] }));
     }, 700);
     // The acquisition finishes on its own; saving it is a separate decision, so
     // the mock reaches the same "ready" gate the native core reports.
     window.setTimeout(() => {
       this.update(id, (current) => current.provisional === true && current.state === 'downloading'
-        ? { ...current, state: 'ready', progress: 100, downloaded: current.total ?? current.downloaded, speed: 0, connections: 0, eta: undefined, events: [event('Download ready; waiting for destination', 'warning'), ...current.events] }
+        ? { ...current, state: 'ready', progress: 100, downloaded: current.total ?? current.downloaded, speed: 0, connections: 0, note: undefined, etaSeconds: undefined, events: [event('Download ready; waiting for destination', 'warning'), ...current.events] }
         : current);
     }, 2400);
     return id;
@@ -303,7 +302,7 @@ class MockAdapter implements DownloadAdapter {
       return { ...job, name: input.name.trim() || job.name, destination: input.destination.trim() || job.destination, maxConnections: Math.max(1, Math.min(32, input.maxConnections ?? job.maxConnections)), bandwidthLimit: input.bandwidthLimit === undefined ? job.bandwidthLimit : sanitizeCapBps(input.bandwidthLimit) ?? null, provisional: false, resumable: true, state: finishing ? 'finalizing' : job.state === 'connecting' ? 'downloading' : job.state, speed: finishing ? 0 : job.speed || 9.4 * 1024 ** 2, connections: finishing ? 0 : job.connections || 1, events: [event('Accepted as managed download', 'success'), ...job.events] };
     });
     if (finishing) {
-      window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'completed', progress: 100, speed: 0, connections: 0, eta: undefined, completed: 'Just now', events: [event('Download completed', 'success'), ...job.events] })), 900);
+      window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'completed', progress: 100, speed: 0, connections: 0, note: undefined, etaSeconds: undefined, completed: 'Just now', events: [event('Download completed', 'success'), ...job.events] })), 900);
     }
   }
 
@@ -320,8 +319,8 @@ class MockAdapter implements DownloadAdapter {
   async forgetPairings() { this.snapshot = { ...this.snapshot, pairedBrowsers: 0 }; this.emit(); }
 
   async reattachJob(id: string) {
-    this.update(id, (job) => ({ ...job, state: 'connecting', error: undefined, eta: 'Reattaching…', events: [event('Waiting for a renewed browser source'), ...job.events] }));
-    window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'downloading', speed: 10.1 * 1024 ** 2, connections: Math.min(3, job.maxConnections), eta: '2m left', events: [event('Source reattached', 'success'), ...job.events] })), 1100);
+    this.update(id, (job) => ({ ...job, state: 'connecting', error: undefined, note: 'Reattaching…', events: [event('Waiting for a renewed browser source'), ...job.events] }));
+    window.setTimeout(() => this.update(id, (job) => ({ ...job, state: 'downloading', speed: 10.1 * 1024 ** 2, connections: Math.min(3, job.maxConnections), etaSeconds: 120, events: [event('Source reattached', 'success'), ...job.events] })), 1100);
   }
 }
 
@@ -371,7 +370,8 @@ class NativeAdapter implements DownloadAdapter {
 }
 
 export function createAdapter(): DownloadAdapter {
-  if (import.meta.env.VITE_DATA_MODE === 'mock') return new MockAdapter();
+  // `npm run dev` runs Vite in mock mode for visual work without the core.
+  if (import.meta.env.MODE === 'mock') return new MockAdapter();
   return new NativeAdapter();
 }
 
@@ -381,6 +381,14 @@ export function formatBytes(bytes?: number | null) {
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(bytes >= 100 * 1024 ** 2 ? 0 : 1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${Math.round(bytes)} B`;
+}
+
+/** 42s, 3m 05s, 1h 12m. */
+export function formatDuration(seconds: number) {
+  const total = Math.max(1, Math.round(seconds));
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, '0')}s`;
+  return `${Math.floor(total / 3600)}h ${String(Math.floor((total % 3600) / 60)).padStart(2, '0')}m`;
 }
 
 export function formatSpeed(bytes?: number) {

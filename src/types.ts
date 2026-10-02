@@ -41,7 +41,10 @@ export interface DownloadJob {
   downloaded: number;
   total?: number;
   speed: number;
-  eta?: string;
+  /** What the transfer is doing when that is not plain downloading. */
+  note?: string;
+  /** Seconds left at the current speed. */
+  etaSeconds?: number;
   connections: number;
   maxConnections: number;
   /** Per-job bandwidth cap in bytes/sec. Absent/null = follow the global setting. */

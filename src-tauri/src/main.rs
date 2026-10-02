@@ -46,7 +46,16 @@ struct DownloadJob {
     downloaded: u64,
     total: Option<u64>,
     speed: u64,
-    eta: Option<String>,
+    /// What the transfer is doing when that is not plain downloading
+    /// ("Paused", "Retrying as one stream"); the UI shows it instead of the
+    /// time left.
+    #[serde(default)]
+    note: Option<String>,
+    /// Seconds left at the current speed (see `sample_speed`).
+    #[serde(default)]
+    eta_seconds: Option<u64>,
+    #[serde(skip)]
+    speed_samples: std::collections::VecDeque<SpeedSample>,
     connections: u32,
     max_connections: u32,
     /// Per-job bandwidth cap in bytes/sec (SPEC §8.6: constrains the job
@@ -154,7 +163,15 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool, paired_browsers: usize }
 
-struct CoreState { snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings>, credentials: Mutex<std::collections::HashMap<String, credentials::Credentials>> }
+/// Tray menu items that follow the downloads, and what they last showed.
+struct TrayItems {
+    status: tauri::menu::MenuItem<tauri::Wry>,
+    pause_all: tauri::menu::MenuItem<tauri::Wry>,
+    resume_all: tauri::menu::MenuItem<tauri::Wry>,
+    shown: Option<(String, bool, bool)>,
+}
+
+struct CoreState { tray_items: Mutex<Option<TrayItems>>, snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings>, credentials: Mutex<std::collections::HashMap<String, credentials::Credentials>> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -813,24 +830,35 @@ fn emit_snapshot(app: &AppHandle, state: &CoreState) {
 }
 
 // SPEC §12: the tray shows the live active-download count and aggregate
-// speed. The tooltip is the flicker-free surface for it; menu labels stay
-// static so the menu never rebuilds under the user's cursor.
+// speed, in its tooltip and as the first line of its menu. Items are updated
+// in place, never rebuilt, so an open menu does not jump.
 fn tray_status_text(active: usize, aggregate_speed: u64) -> String {
     if active == 0 {
-        return "Download Manager — idle".into();
+        return "No active downloads".into();
     }
     let noun = if active == 1 { "download" } else { "downloads" };
-    format!("Download Manager — {active} active {noun} · {}/s", format_bytes(Some(aggregate_speed)))
+    format!("{active} active {noun} · {}/s", format_bytes(Some(aggregate_speed)))
 }
 
 fn refresh_tray(app: &AppHandle, state: &CoreState) {
-    let status = state.snapshot.lock().ok().map(|snapshot| {
+    let Some(next) = state.snapshot.lock().ok().map(|snapshot| {
         let active = snapshot.jobs.iter().filter(|job| TRANSFER_STATES.contains(&job.state.as_str())).count();
-        tray_status_text(active, snapshot.aggregate_speed)
-    });
-    if let Some(text) = status {
-        if let Some(tray) = app.tray_by_id("main-tray") { let _ = tray.set_tooltip(Some(text)); }
+        let can_pause = snapshot.jobs.iter().any(|job| matches!(job.state.as_str(), "connecting" | "downloading"));
+        let can_resume = snapshot.jobs.iter().any(|job| matches!(job.state.as_str(), "paused" | "pending"));
+        (tray_status_text(active, snapshot.aggregate_speed), can_pause, can_resume)
+    }) else { return };
+    let Ok(mut items) = state.tray_items.lock() else { return };
+    let Some(items) = items.as_mut() else { return };
+    if items.shown.as_ref() == Some(&next) {
+        return;
     }
+    if items.shown.as_ref().map(|shown| &shown.0) != Some(&next.0) {
+        let _ = items.status.set_text(&next.0);
+        if let Some(tray) = app.tray_by_id("main-tray") { let _ = tray.set_tooltip(Some(format!("Download Manager — {}", next.0))); }
+    }
+    let _ = items.pause_all.set_enabled(next.1);
+    let _ = items.resume_all.set_enabled(next.2);
+    items.shown = Some(next);
 }
 
 fn job_event(message: &str, tone: Option<&str>) -> JobEvent { JobEvent { at: now_label(), message: redact_url_credentials(message), tone: tone.map(str::to_string) } }
@@ -880,7 +908,7 @@ fn complete_job(job: &mut DownloadJob) {
     mark_downloaded_file(&job.destination, &job.source, job.referrer.as_deref());
     job.speed = 0;
     job.connections = 0;
-    job.eta = None;
+    job.note = None;
     job.state = "completed".into();
     job.progress = 100.0;
     job.completed = Some(now_label());
@@ -905,7 +933,7 @@ fn mark_ready_for_confirmation(job: &mut DownloadJob, event: &str) {
     job.progress = 100.0;
     job.speed = 0;
     job.connections = 0;
-    job.eta = None;
+    job.note = None;
     job.events.insert(0, job_event(event, Some("warning")));
 }
 
@@ -1414,14 +1442,67 @@ fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) 
     if let Ok(mut snapshot) = state.snapshot.lock() {
         if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) {
             update(job);
-            if job.state != "downloading" {
-                job.speed = 0;
-            }
+            sample_speed(job, std::time::Instant::now());
             job.events.truncate(50);
             snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == "downloading").map(|item| item.speed).sum();
         }
     }
 }
+/// Where a job's byte count stood at one moment.
+#[derive(Clone, Copy)]
+struct SpeedSample { at: std::time::Instant, downloaded: u64 }
+
+/// Speed is the bytes written over about the last few seconds: long enough to
+/// even out a throttled or bursty transfer (reads arrive as whatever the
+/// socket buffered), short enough to follow a real change. Samples closer
+/// together than the spacing add nothing.
+const SPEED_WINDOW: Duration = Duration::from_secs(3);
+const SPEED_SAMPLE_SPACING: Duration = Duration::from_millis(200);
+const SPEED_MIN_SPAN: Duration = Duration::from_millis(500);
+
+/// The one place speed and time left are computed: from the change in bytes
+/// written over a moving window, whatever the transfer mode.
+fn sample_speed(job: &mut DownloadJob, now: std::time::Instant) {
+    if job.state != "downloading" {
+        job.speed = 0;
+        job.eta_seconds = None;
+        job.speed_samples.clear();
+        return;
+    }
+    let samples = &mut job.speed_samples;
+    if let Some(last) = samples.back() {
+        // Bytes are flowing again: "Connecting…", "Resuming" or a retry
+        // notice is over.
+        if job.downloaded > last.downloaded {
+            job.note = None;
+        }
+    }
+    if samples.back().is_none_or(|last| now.saturating_duration_since(last.at) >= SPEED_SAMPLE_SPACING) {
+        samples.push_back(SpeedSample { at: now, downloaded: job.downloaded });
+    }
+    // Keep one sample at or beyond the window's start so the span covers it.
+    while samples.len() > 2 && samples.get(1).is_some_and(|next| now.saturating_duration_since(next.at) >= SPEED_WINDOW) {
+        samples.pop_front();
+    }
+    if let (Some(first), Some(last)) = (samples.front(), samples.back()) {
+        let span = last.at.saturating_duration_since(first.at);
+        if span >= SPEED_MIN_SPAN {
+            job.speed = (last.downloaded.saturating_sub(first.downloaded) as f64 / span.as_secs_f64()).round() as u64;
+        }
+    }
+    // A segmented job without a known size is estimated from the segments
+    // done so far.
+    let total = job.total.or_else(|| {
+        job.segments.as_ref().filter(|segments| segments.completed > 0).map(|segments| {
+            job.downloaded / u64::from(segments.completed) * u64::from(segments.total)
+        })
+    });
+    job.eta_seconds = match total {
+        Some(total) if job.speed > 0 && total > job.downloaded => Some((total - job.downloaded).div_ceil(job.speed)),
+        _ => None,
+    };
+}
+
 fn missing_ranges(total: u64, completed: &[ByteRange], target_workers: u32) -> Vec<(u64, u64)> {
     if total == 0 { return Vec::new(); }
     let chunk = (total / u64::from(target_workers.clamp(1, 32).saturating_mul(4))).max(1024 * 1024).min(16 * 1024 * 1024);
@@ -1797,7 +1878,7 @@ fn mark_acquisition_failed(app: &AppHandle, state: &CoreState, id: &str, error: 
         job.error = Some(redact_url_credentials(&error));
         job.connections = 0;
         job.speed = 0;
-        job.eta = None;
+        job.note = None;
         job.events.insert(0, job_event(event, Some("error")));
     });
     emit_snapshot(app, state);
@@ -2480,8 +2561,6 @@ async fn acquire_media_segment(
     generation: u64,
     completed: &AtomicU64,
     downloaded: &AtomicU64,
-    started: std::time::Instant,
-    existing_bytes: u64,
     total_segments: u32,
     existing_count: u64,
     connection_cap: usize,
@@ -2510,23 +2589,12 @@ async fn acquire_media_segment(
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
     let size = downloaded.fetch_add(written, Ordering::Relaxed) + written;
-    let elapsed = started.elapsed().as_secs_f64().max(0.1);
-    let speed = ((size.saturating_sub(existing_bytes)) as f64 / elapsed) as u64;
-    let remaining = (total_segments as u64).saturating_sub(done);
-    let eta = if speed > 0 && remaining > 0 {
-        let average_fragment = size / done.max(1);
-        Some(format!("{}s left", (average_fragment.saturating_mul(remaining) / speed).max(1)))
-    } else {
-        None
-    };
     let state = app.state::<CoreState>();
     let finished_missing = done.saturating_sub(existing_count);
     if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
     emit_job(&state, id, |job| {
         job.downloaded = size;
         job.progress = done as f64 / total_segments as f64 * 100.0;
-        job.speed = speed;
-        job.eta = eta.clone();
         job.segments = Some(SegmentState { completed: done as u32, total: total_segments, identity: job.segments.as_ref().and_then(|segments| segments.identity.clone()) });
         job.connections = connection_cap.min((total_segments as u64).saturating_sub(finished_missing) as usize) as u32;
     });
@@ -2874,7 +2942,6 @@ async fn acquire_ranges(
     });
     emit_snapshot(&app, &state);
     let downloaded = std::sync::Arc::new(AtomicU64::new(initial_downloaded));
-    let started = std::time::Instant::now();
     let completed_workers = std::sync::Arc::new(AtomicU64::new(0));
     let total_ranges = ranges.len() as u64;
     // One client per job: connection-pool and TLS-session reuse across every
@@ -2935,21 +3002,10 @@ async fn acquire_ranges(
             }
             let total_downloaded =
                 downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
-            let speed = ((total_downloaded.saturating_sub(initial_downloaded)) as f64
-                / started.elapsed().as_secs_f64().max(0.1)) as u64;
             let finished = completed_workers.fetch_add(1, Ordering::Relaxed) + 1;
             let state = app.state::<CoreState>();
             emit_job(&state, &id, |job| {
                 job.downloaded = total_downloaded;
-                job.speed = speed;
-                job.eta = if speed > 0 {
-                    Some(format!(
-                        "{}s left",
-                        total.saturating_sub(total_downloaded) / speed
-                    ))
-                } else {
-                    None
-                };
                 job.progress = total_downloaded as f64 / total as f64 * 100.0;
                 job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
                 job.connections =
@@ -2976,7 +3032,7 @@ async fn acquire_ranges(
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
-                job.eta = Some("Paused".into());
+                job.note = Some("Paused".into());
                 job.events.insert(
                     0,
                     job_event(
@@ -3013,7 +3069,7 @@ async fn acquire_ranges(
         emit_job(&state, &id, |job| {
             job.connections = if fallback_ranges.is_empty() { 0 } else { 1 };
             job.speed = 0;
-            job.eta = Some("Retrying with one connection".into());
+            job.note = Some("Retrying with one connection".into());
             job.events.insert(
                 0,
                 job_event(
@@ -3086,7 +3142,7 @@ async fn acquire_ranges(
             emit_job(&state, &id, |job| {
                 job.downloaded = total_downloaded;
                 job.speed = 0;
-                job.eta = Some("Retrying with one connection".into());
+                job.note = Some("Retrying with one connection".into());
                 job.progress = total_downloaded as f64 / total as f64 * 100.0;
                 job.completed_ranges = merge_range(&job.completed_ranges, ByteRange { start, end });
                 job.connections = 1;
@@ -3097,7 +3153,7 @@ async fn acquire_ranges(
             emit_job(&state, &id, |job| {
                 job.connections = 1;
                 job.speed = 0;
-                job.eta = Some("Retrying as one stream".into());
+                job.note = Some("Retrying as one stream".into());
                 job.events.insert(
                     0,
                     job_event(
@@ -3174,7 +3230,7 @@ async fn acquire_ranges(
                         job.downloaded = full_downloaded;
                         job.progress = progress;
                         job.speed = 0;
-                        job.eta = Some("Retrying as one stream".into());
+                        job.note = Some("Retrying as one stream".into());
                         job.connections = 1;
                     });
                     // Same progress bookkeeping as every other streaming path: a
@@ -3210,7 +3266,7 @@ async fn acquire_ranges(
                 job.mode = "single-stream".into();
                 job.completed_ranges = Vec::new();
                 job.mime = fallback_mime.clone();
-                job.eta = Some("Finalizing".into());
+                job.note = Some("Finalizing".into());
             });
             emit_snapshot(&app, &state);
         }
@@ -3223,7 +3279,7 @@ async fn acquire_ranges(
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
-                job.eta = Some("Paused".into());
+                job.note = Some("Paused".into());
             });
             emit_snapshot(&app, &state);
         }
@@ -3649,7 +3705,7 @@ async fn acquire_manifest(
         job.downloaded = existing_bytes;
         job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0;
         job.speed = 0;
-        job.eta = None;
+        job.note = None;
         job.connections = concurrency.min(missing_count) as u32;
         job.segments = Some(SegmentState {
             completed: existing_segments.len() as u32,
@@ -3672,7 +3728,6 @@ async fn acquire_manifest(
         );
     });
     emit_snapshot(&app, &state);
-    let started = std::time::Instant::now();
     let completed = std::sync::Arc::new(AtomicU64::new(existing_segments.len() as u64));
     let downloaded = std::sync::Arc::new(AtomicU64::new(existing_bytes));
     let existing_segments = std::sync::Arc::new(existing_segments);
@@ -3709,8 +3764,6 @@ async fn acquire_manifest(
                     generation,
                     &completed,
                     &downloaded,
-                    started,
-                    existing_bytes,
                     total_segments,
                     existing_count,
                     concurrency
@@ -3732,7 +3785,7 @@ async fn acquire_manifest(
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
-                job.eta = Some("Paused".into());
+                job.note = Some("Paused".into());
                 job.events.insert(
                     0,
                     job_event("Paused with completed fragments preserved", Some("warning"))
@@ -3759,7 +3812,7 @@ async fn acquire_manifest(
         emit_job(&state, &id, |job| {
             job.connections = 1;
             job.speed = 0;
-            job.eta = Some("Retrying sequentially".into());
+            job.note = Some("Retrying sequentially".into());
             job.events.insert(
                 0,
                 job_event(
@@ -3794,8 +3847,6 @@ async fn acquire_manifest(
                 generation,
                 &completed,
                 &downloaded,
-                started,
-                existing_bytes,
                 total_segments,
                 existing_count,
                 1
@@ -3848,7 +3899,7 @@ async fn finish_segmented(
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
-                job.eta = Some("Paused".into());
+                job.note = Some("Paused".into());
             });
             emit_snapshot(&app, &state);
         }
@@ -4025,7 +4076,6 @@ async fn download_track_to_file(
     generation: u64,
     downloaded_atomic: &std::sync::Arc<AtomicU64>,
     combined_total: Option<u64>,
-    started: std::time::Instant,
     response: reqwest::Response,
     expected_kind: Option<&str>,
 ) -> Result<(), String> {
@@ -4085,15 +4135,10 @@ async fn download_track_to_file(
         track_downloaded = track_downloaded.saturating_add(bytes.len() as u64);
         downloaded_atomic.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let so_far = downloaded_atomic.load(Ordering::Relaxed);
-        let speed = (so_far as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
         emit_job(&state, id, |job| {
             job.downloaded = so_far;
-            job.speed = speed;
             if let Some(total) = combined_total {
                 job.progress = (so_far as f64 / total as f64 * 100.0).min(100.0);
-                if speed > 0 {
-                    job.eta = Some(format!("{}s left", (total.saturating_sub(so_far) / speed).max(1)));
-                }
             }
         });
         emit_progress(app, &state, id);
@@ -4171,7 +4216,6 @@ async fn acquire_dual_track(
     });
     emit_snapshot(&app, &state);
 
-    let started = std::time::Instant::now();
     let downloaded = std::sync::Arc::new(AtomicU64::new(0));
 
     let track0_path = format!("{temp_path}.track-00");
@@ -4184,7 +4228,6 @@ async fn acquire_dual_track(
         generation,
         &downloaded,
         combined_total,
-        started,
         video_response,
         Some("video"),
     );
@@ -4196,7 +4239,6 @@ async fn acquire_dual_track(
         generation,
         &downloaded,
         combined_total,
-        started,
         audio_response,
         Some("audio"),
     );
@@ -4212,7 +4254,7 @@ async fn acquire_dual_track(
         job.total = Some(job.downloaded);
         job.connections = 0;
         job.speed = 0;
-        job.eta = Some("Assembling media".into());
+        job.note = Some("Assembling media".into());
         job.events.insert(
             0,
             job_event("Muxing video and audio tracks", Some("warning")),
@@ -4454,7 +4496,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                     emit_job(&state, &id, |job| {
                         job.connections = 0;
                         job.speed = 0;
-                        job.eta = Some("Paused".into());
+                        job.note = Some("Paused".into());
                     });
                     emit_snapshot(&app, &state);
                 } else if job_state(&app, &id).as_deref() != Some("failed") {
@@ -4484,7 +4526,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                     emit_job(&state, &id, |job| {
                         job.connections = 0;
                         job.speed = 0;
-                        job.eta = Some("Paused".into());
+                        job.note = Some("Paused".into());
                     });
                     emit_snapshot(&app, &state);
                 } else if job_state(&app, &id).as_deref() != Some("failed") {
@@ -4623,7 +4665,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                         emit_job(&state, &id, |job| {
                             job.connections = 0;
                             job.speed = 0;
-                            job.eta = Some("Paused".into());
+                            job.note = Some("Paused".into());
                         });
                         emit_snapshot(&app, &state);
                     } else if job_state(&app, &id).as_deref() != Some("failed") {
@@ -4700,7 +4742,6 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         );
     });
     emit_snapshot(&app, &state);
-    let started = std::time::Instant::now();
     let mut downloaded = 0u64;
     let mut stream = futures_util::stream::iter(
         prefix_chunks
@@ -4738,23 +4779,11 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                     return false;
                 }
                 downloaded += bytes.len() as u64;
-                let speed = (downloaded as f64 / started.elapsed().as_secs_f64().max(0.1)) as u64;
                 emit_job(&state, &id, |job| {
                     job.downloaded = downloaded;
-                    job.speed = speed;
                     job.progress = total
                         .map(|value| downloaded as f64 / value as f64 * 100.0)
                         .unwrap_or(0.0);
-                    job.eta = total.and_then(|value| {
-                        if speed > 0 {
-                            Some(format!(
-                                "{}s left",
-                                (value.saturating_sub(downloaded) / speed).max(1)
-                            ))
-                        } else {
-                            None
-                        }
-                    });
                 });
                 emit_progress(&app, &state, &id);
                 if !throttle(&app, &id, bytes.len(), generation).await {
@@ -5508,6 +5537,30 @@ fn open_path(path: String) -> Result<(), String> {
     }
 }
 
+/// Shows a file in its folder with the file selected; when the file is not
+/// there (yet), opens the folder it goes to.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let file = Path::new(path.trim());
+    #[cfg(windows)]
+    if file.is_file() {
+        use std::os::windows::process::CommandExt;
+        return std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{}\"", file.display()))
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Could not open Explorer: {error}"));
+    }
+    let folder = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "The download has no folder".to_string())?;
+    if !folder.is_dir() {
+        return Err("The folder does not exist yet".into());
+    }
+    open_path(folder.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 fn pause_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     let _lifecycle = state.lifecycle.lock().ok();
@@ -5542,7 +5595,7 @@ fn pause_in_place(job: &mut DownloadJob, event: &str) -> bool {
     job.state = "paused".into();
     job.speed = 0;
     job.connections = 0;
-    job.eta = Some("Paused".into());
+    job.note = Some("Paused".into());
     job.events.insert(0, job_event(event, Some("warning")));
     true
 }
@@ -5601,7 +5654,7 @@ fn plan_resume_all(
         }
         job.state = "downloading".into();
         job.connections = 1;
-        job.eta = Some("Resuming".into());
+        job.note = Some("Resuming".into());
         job.events.insert(0, job_event(event, Some("success")));
         sources.push((job.id.clone(), job.source.clone()));
     }
@@ -5629,7 +5682,7 @@ fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
         if ["paused", "pending"].contains(&job.state.as_str()) {
             job.state = "downloading".into();
             job.connections = 1;
-            job.eta = Some("Resuming".into());
+            job.note = Some("Resuming".into());
             job.events.insert(0, job_event("Resumed", Some("success")));
         }
     });
@@ -5970,7 +6023,9 @@ fn start_provisional(
         downloaded: 0,
         total: None,
         speed: 0,
-        eta: Some("Connecting…".into()),
+        note: Some("Connecting…".into()),
+        eta_seconds: None,
+        speed_samples: std::collections::VecDeque::new(),
         connections: 0,
         max_connections,
         bandwidth_limit,
@@ -6250,7 +6305,7 @@ async fn commit_provisional(
         if decision == CommitDecision::Reject {
             return Err("Acquisition is no longer available for commit".into());
         }
-        let before = (job.name.clone(), job.destination.clone(), job.max_connections, job.bandwidth_limit, job.state.clone(), job.eta.clone());
+        let before = (job.name.clone(), job.destination.clone(), job.max_connections, job.bandwidth_limit, job.state.clone(), job.note.clone());
         let name = if input.name.trim().is_empty() {
             job.name.clone()
         } else {
@@ -6294,7 +6349,7 @@ async fn commit_provisional(
         // into place is exactly the work that is left.
         if job.state == "ready" {
             job.state = "finalizing".into();
-            job.eta = None;
+            job.note = None;
         }
         // Keep the acquisition mode's verified resumability. Single-stream
         // fallback is intentionally non-resumable until range resume exists.
@@ -6329,7 +6384,7 @@ async fn commit_provisional(
             job.bandwidth_limit = bandwidth_limit;
             if job.state == "finalizing" && job_state == "ready" {
                 job.state = job_state;
-                job.eta = eta;
+                job.note = eta;
             }
             job.events.insert(0, job_event("Save could not be recorded; the download is still waiting", Some("error")));
         });
@@ -6495,7 +6550,7 @@ async fn commit_provisional(
                 if job.provisional == Some(false) && job.progress >= 100.0 {
                     job.destination_reservation = None;
                     complete_job(job);
-                    job.eta = None;
+                    job.note = None;
                     completed = true;
                 }
             });
@@ -6597,7 +6652,7 @@ fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
         }
         emit_job(&state, &id, |job| {
             job.state = "pending".into();
-            job.eta = Some("Waiting for renewed source".into());
+            job.note = Some("Waiting for renewed source".into());
             job.events.insert(
                 0,
                 job_event("Waiting for a renewed browser source", Some("warning"))
@@ -7177,29 +7232,18 @@ fn background_launch(args: &[String]) -> bool {
     })
 }
 
-fn tray_image() -> Image<'static> {
-    let mut pixels = vec![0u8; 32 * 32 * 4];
-    for y in 0..32u32 {
-        for x in 0..32u32 {
-            let dx = x as i32 - 16;
-            let dy = y as i32 - 16;
-            let distance = dx * dx + dy * dy;
-            let index = ((y * 32 + x) * 4) as usize;
-            if distance <= 225 {
-                pixels[index..index + 4].copy_from_slice(&[8, 120, 237, 255]);
-            }
-            if (x == 15 || x == 16) && (y >= 8 && y <= 20)
-                || (y >= 19
-                    && y <= 21
-                    && x >= 11
-                    && x <= 20
-                    && (x as i32 - 16).abs() <= (y as i32 - 19))
-            {
-                pixels[index..index + 4].copy_from_slice(&[255, 255, 255, 255]);
-            }
-        }
-    }
-    Image::new_owned(pixels, 32, 32)
+/// The tray icon drawn for the display's scale (16 px at 100 %), so Windows
+/// does not have to resample it.
+fn tray_image(app: &tauri::AppHandle) -> tauri::Result<Image<'static>> {
+    let scale = app.primary_monitor().ok().flatten().map_or(1.0, |monitor| monitor.scale_factor());
+    let bytes: &[u8] = if scale >= 1.75 {
+        include_bytes!("../icons/tray-32.png")
+    } else if scale >= 1.25 {
+        include_bytes!("../icons/tray-24.png")
+    } else {
+        include_bytes!("../icons/tray-16.png")
+    };
+    Image::from_bytes(bytes)
 }
 
 // Pure toggle decision shared by both tray check arms (SPEC §12): each arm
@@ -7238,20 +7282,23 @@ fn install_tray(
     intercept_downloads: bool,
     show_media_buttons: bool,
 ) -> tauri::Result<()> {
+    let status = MenuItemBuilder::with_id("status", "No active downloads").enabled(false).build(app)?;
     let open_manager =
         MenuItemBuilder::with_id("open-manager", "Open Download Manager").build(app)?;
-    let pause_all = MenuItemBuilder::with_id("pause-all", "Pause All").build(app)?;
-    let resume_all = MenuItemBuilder::with_id("resume-all", "Resume All").build(app)?;
+    let pause_all = MenuItemBuilder::with_id("pause-all", "Pause All").enabled(false).build(app)?;
+    let resume_all = MenuItemBuilder::with_id("resume-all", "Resume All").enabled(false).build(app)?;
     let browser_integration =
         CheckMenuItemBuilder::with_id("browser-integration", "Intercept browser downloads")
             .checked(intercept_downloads)
             .build(app)?;
-    let media_buttons = CheckMenuItemBuilder::with_id("media-buttons", "Media Buttons")
+    let media_buttons = CheckMenuItemBuilder::with_id("media-buttons", "Show media buttons")
         .checked(show_media_buttons)
         .build(app)?;
     let bandwidth = MenuItemBuilder::with_id("bandwidth", "Set Bandwidth Limit").build(app)?;
     let exit = MenuItemBuilder::with_id("exit-manager", "Exit Manager").build(app)?;
     let menu = MenuBuilder::new(app)
+        .item(&status)
+        .separator()
         .items(&[&open_manager, &pause_all, &resume_all])
         .separator()
         .items(&[&browser_integration, &media_buttons, &bandwidth])
@@ -7259,7 +7306,7 @@ fn install_tray(
         .item(&exit)
         .build()?;
     TrayIconBuilder::with_id("main-tray")
-        .icon(tray_image())
+        .icon(tray_image(app)?)
         .menu(&menu)
         .tooltip("Download Manager")
         .on_menu_event(|app, event| {
@@ -7291,9 +7338,7 @@ fn install_tray(
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
-                        let _ = window.eval(
-                            "window.location.href = window.location.pathname + '?settings=network'",
-                        );
+                        let _ = window.emit("open-settings", "network");
                     }
                 }
                 "exit-manager" => app.exit(0),
@@ -7306,6 +7351,10 @@ fn install_tray(
         if let Ok(mut checks) = state.tray_checks.lock() {
             *checks = Some((browser_integration.clone(), media_buttons.clone()));
         };
+        if let Ok(mut items) = state.tray_items.lock() {
+            *items = Some(TrayItems { status, pause_all, resume_all, shown: None });
+        }
+        refresh_tray(app, &state);
     }
     Ok(())
 }
@@ -7366,7 +7415,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && TRANSFER_STATES.contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials) });
+            app.manage(CoreState { tray_items: Mutex::new(None), snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());
@@ -7388,9 +7437,20 @@ fn main() {
             for (id, source) in recovered { let _ = spawn_transfer(app.handle(), app.state::<CoreState>().inner(), id, source); }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pairing_code, answer_pairing, forget_pairings, get_snapshot, open_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, main_window_action, start_window_drag])
-        .run(tauri::generate_context!())
+        .invoke_handler(tauri::generate_handler![pairing_code, answer_pairing, forget_pairings, get_snapshot, open_path, reveal_path, pause_job, resume_job, retry_job, cancel_job, remove_job, pause_all, resume_all, create_provisional, commit_provisional, update_settings, reattach_job, main_window_action, start_window_drag])
+        .run(app_context())
         .expect("error while running Download Manager");
+}
+
+/// On Windows, windows carry no icon of their own: the taskbar and Alt+Tab
+/// then take the executable's icon, which holds every size. Tauri's default
+/// window icon is the .ico's first (16 px) image, scaled up and blurred.
+fn app_context() -> tauri::Context<tauri::Wry> {
+    #[allow(unused_mut)]
+    let mut context = tauri::generate_context!();
+    #[cfg(windows)]
+    context.set_default_window_icon(None);
+    context
 }
 
 fn configure_portable_webview2() {

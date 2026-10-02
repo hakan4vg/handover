@@ -497,8 +497,13 @@ def main() -> int:
           await invoke('resume_job', { id: 'cap-own' });
           await invoke('resume_job', { id: 'cap-none' });
           const started = performance.now();
+          // What the app reports for the capped job once it has run a while.
+          const reported = [];
           while (performance.now() - started < 40000) {
-            const other = (await invoke('get_snapshot')).jobs.find((job) => job.id === 'cap-none');
+            const jobs = (await invoke('get_snapshot')).jobs;
+            const other = jobs.find((job) => job.id === 'cap-none');
+            const own = jobs.find((job) => job.id === 'cap-own');
+            if (own.state === 'downloading' && performance.now() - started > 3000) reported.push({ speed: own.speed, etaSeconds: own.etaSeconds ?? null, note: own.note ?? null, total: own.total ?? null });
             if (other.state !== 'downloading' && other.state !== 'connecting') break;
             await new Promise((r) => setTimeout(r, 100));
           }
@@ -508,9 +513,22 @@ def main() -> int:
           await new Promise((r) => setTimeout(r, 300));
           const after = { running: await state('cap-own'), completed: await state('range') };
           await invoke('pause_job', { id: 'cap-own' });
-          return after;
+          return { after, reported };
         })()""", timeout=60)
         devtools.invoke("update_settings", {"patch": {"bandwidthLimit": None}})
+        reported = (reattach or {}).get("reported") or []
+        reattach = (reattach or {}).get("after")
+        # Once bytes flow: the status note is gone, and over the later half of
+        # the run the speed is about the cap and the time left a number.
+        flowing = [item for item in reported if item["speed"] > 0]
+        steady = flowing[len(flowing) // 2:]
+        speeds = sorted(item["speed"] for item in steady)
+        median = speeds[len(speeds) // 2] / 1024 ** 2 if speeds else 0
+        run.check("engine/speed-reported", "a download capped at 1 MiB/s reports about that speed, a number of seconds left, and no leftover status note",
+                  len(steady) >= 5 and 0.75 <= median <= 1.25
+                  and all(item["note"] is None for item in flowing)
+                  and all(isinstance(item["etaSeconds"], int) and item["etaSeconds"] > 0 for item in steady if item["total"]),
+                  {"samples": len(reported), "flowing": len(flowing), "median_mib_s": round(median, 3), "speeds_kib": [item["speed"] // 1024 for item in reported], "last": reported[-2:]})
         sent = list(METER)
         rates: dict = {}
         if sent:

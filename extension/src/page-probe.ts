@@ -87,8 +87,9 @@ if (typeof MediaSource === 'function' && typeof SourceBuffer === 'function') {
     // A player in an open shadow root reaches the document as its host.
     const element = event.composedPath()[0] ?? event.target;
     if (!(element instanceof HTMLMediaElement)) return;
+    // null: this element's MediaSource was not created where the probe runs
+    // (another extension's player, or a page loaded before the extension).
     const source = sources.get(element.currentSrc || element.src)?.deref();
-    const tracks = source ? tracksOf.get(source) ?? [] : [];
-    element.dispatchEvent(new CustomEvent(ANSWER, { detail: JSON.stringify(tracks) }));
+    element.dispatchEvent(new CustomEvent(ANSWER, { detail: JSON.stringify(source ? tracksOf.get(source) ?? [] : null) }));
   }, true);
 }

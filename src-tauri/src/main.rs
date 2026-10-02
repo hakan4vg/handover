@@ -4992,9 +4992,12 @@ fn url_key(url: &str) -> Option<String> {
     Some(format!("{}://{}{}", parsed.scheme(), parsed.host_str()?.to_ascii_lowercase(), parsed.path()))
 }
 
-/// The playlists a played-media resolution may read, and how many.
-const PLAYED_MANIFESTS: usize = 8;
-const PLAYED_PLAYLIST_FETCHES: usize = 40;
+/// The page's playlists a played-media resolution reads (a thread of videos
+/// loads several each), how many at once, and how many more playlists a
+/// multivariant playlist may name that the page did not load itself.
+const PLAYED_MANIFESTS: usize = 64;
+const PLAYED_PARALLEL: usize = 8;
+const PLAYED_EXTRA_FETCHES: usize = 16;
 
 async fn fetch_manifest_text(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Option<(String, String)> {
     let response = acquisition_request(client, app, id, url).send().await.ok()?.error_for_status().ok()?;
@@ -5005,12 +5008,12 @@ async fn fetch_manifest_text(client: &reqwest::Client, app: &AppHandle, id: &str
 /// A capture from a blob/MSE player says what the player itself loaded
 /// (`selected_segments`: the files whose responses the extension matched to
 /// the player's own appends) and which playlists the page loaded (`source`,
-/// then `candidates`). The presentation is the playlist that lists the most of
-/// those files, whatever the URLs look like; within an HLS multivariant
-/// playlist, the variant and audio playlists that list them are what the
-/// player played. When no playlist lists them, one whole file the player read
-/// from (ranges of one URL) is itself the source; anything else would be a
-/// guess, and is refused.
+/// then `candidates`). Every one of those playlists is read: the presentation
+/// is the one whose contents list the most of those files, whatever the URLs
+/// look like. An HLS multivariant playlist counts what its variant and audio
+/// playlists list, and those are what the player played. When no playlist
+/// lists them, one whole file the player read from (ranges of one URL) is
+/// itself the source; anything else would be a guess, and is refused.
 async fn resolve_played_source(app: &AppHandle, id: &str, source: &str) -> Result<Option<String>, String> {
     let state = app.state::<CoreState>();
     let Some((played, candidates, companion)) = state.snapshot.lock().ok().and_then(|snapshot| {
@@ -5029,36 +5032,42 @@ async fn resolve_played_source(app: &AppHandle, id: &str, source: &str) -> Resul
         .collect();
     let listed = |urls: &[String]| urls.iter().filter(|url| url_key(url).is_some_and(|key| keys.contains(&key))).cloned().collect::<Vec<_>>();
     let client = http_client();
-    let mut fetches = 0usize;
+    let fetched: Vec<(String, Option<(String, String)>)> = futures_util::stream::iter(manifests)
+        .map(|manifest| {
+            let client = &client;
+            async move {
+                let body = fetch_manifest_text(client, app, id, &manifest).await;
+                (manifest, body)
+            }
+        })
+        .buffered(PLAYED_PARALLEL)
+        .collect()
+        .await;
+
+    // What each playlist lists of the played files. Media playlists are known
+    // by the URL they were asked under and the one that answered.
+    let mut media_hits: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut media_playlists: Vec<(String, usize, bool)> = Vec::new();
+    let mut multivariant: Vec<(String, String, String)> = Vec::new();
     // (files listed, manifest, the hints that name what was played in it)
     let mut best: Option<(usize, String, Vec<String>)> = None;
-    for manifest in &manifests {
-        if fetches >= PLAYED_PLAYLIST_FETCHES {
-            break;
+    let consider = |hits: usize, manifest: &str, hints: Vec<String>, best: &mut Option<(usize, String, Vec<String>)>| {
+        if hits > best.as_ref().map_or(0, |(count, _, _)| *count) {
+            *best = Some((hits, manifest.to_string(), hints));
         }
-        fetches += 1;
-        let Some((url, body)) = fetch_manifest_text(&client, app, id, manifest).await else { continue };
-        let (hits, hints) = if body.contains("#EXTM3U") {
-            let references = media::hls_references(&url, &body);
-            if body.contains("#EXT-X-STREAM-INF") {
-                let mut hits = 0;
-                let mut playlists = Vec::new();
-                for playlist in references {
-                    if fetches >= PLAYED_PLAYLIST_FETCHES {
-                        break;
-                    }
-                    fetches += 1;
-                    let Some((playlist_url, playlist_body)) = fetch_manifest_text(&client, app, id, &playlist).await else { continue };
-                    let found = listed(&media::hls_references(&playlist_url, &playlist_body)).len();
-                    if found > 0 {
-                        hits += found;
-                        playlists.push(playlist);
-                    }
-                }
-                (hits, playlists)
-            } else {
-                (listed(&references).len(), Vec::new())
+    };
+    let first_played = played.first().and_then(|url| url_key(url));
+    for (manifest, body) in fetched {
+        let Some((url, body)) = body else { continue };
+        if body.contains("#EXT-X-STREAM-INF") {
+            multivariant.push((manifest, url, body));
+        } else if body.contains("#EXTM3U") {
+            let found = listed(&media::hls_references(&url, &body));
+            for key in [url_key(&manifest), url_key(&url)].into_iter().flatten() {
+                media_hits.insert(key, found.len());
             }
+            let lists_first = found.iter().any(|file| url_key(file) == first_played);
+            media_playlists.push((manifest, found.len(), lists_first));
         } else {
             let files: Vec<String> = media::parse_dash_tracks_for_segments(&url, &body, &played)
                 .map(|tracks| {
@@ -5071,10 +5080,44 @@ async fn resolve_played_source(app: &AppHandle, id: &str, source: &str) -> Resul
             let found = listed(&files);
             // The representation is chosen by exact URL: hand over the URLs as
             // the MPD names them.
-            (found.len(), found)
-        };
-        if hits > best.as_ref().map_or(0, |(count, _, _)| *count) {
-            best = Some((hits, manifest.clone(), hints));
+            consider(found.len(), &manifest, found, &mut best);
+        }
+    }
+    // A multivariant playlist scores what its variant and audio playlists
+    // list. The page loaded the ones it played; any other is read here.
+    let mut extra = 0usize;
+    for (manifest, url, body) in &multivariant {
+        let mut hits = 0;
+        let mut playlists = Vec::new();
+        for playlist in media::hls_references(url, body) {
+            let key = url_key(&playlist);
+            let found = match key.as_ref().and_then(|key| media_hits.get(key)) {
+                Some(found) => *found,
+                None if extra < PLAYED_EXTRA_FETCHES => {
+                    extra += 1;
+                    let found = match fetch_manifest_text(&client, app, id, &playlist).await {
+                        Some((playlist_url, playlist_body)) => listed(&media::hls_references(&playlist_url, &playlist_body)).len(),
+                        None => 0,
+                    };
+                    if let Some(key) = key {
+                        media_hits.insert(key, found);
+                    }
+                    found
+                }
+                None => 0,
+            };
+            if found > 0 {
+                hits += found;
+                playlists.push(playlist);
+            }
+        }
+        consider(hits, manifest, playlists, &mut best);
+    }
+    // No multivariant playlist names them: a media playlist on its own, the
+    // one with the video's files first.
+    if best.is_none() {
+        if let Some((manifest, hits, _)) = media_playlists.iter().filter(|(_, hits, _)| *hits > 0).max_by_key(|(_, hits, lists_first)| (*lists_first, *hits)) {
+            consider(*hits, manifest, Vec::new(), &mut best);
         }
     }
     let chosen = if let Some((_, manifest, hints)) = best {
@@ -6553,7 +6596,8 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
                     let parsed = reqwest::Url::parse(value).ok()?;
                     matches!(parsed.scheme(), "http" | "https").then(|| value.to_string())
                 })
-                .take(8)
+                // Up to 16 played files per track, video and audio.
+                .take(32)
                 .collect()
         })
         .unwrap_or_default();
@@ -6569,7 +6613,7 @@ fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {
                 if !matches!(parsed.scheme(), "http" | "https") { continue }
                 let url = parsed.to_string();
                 if url != source && !urls.contains(&url) { urls.push(url); }
-                if urls.len() >= 6 { break; }
+                if urls.len() >= PLAYED_MANIFESTS { break; }
             }
             urls
         })

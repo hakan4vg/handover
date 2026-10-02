@@ -724,7 +724,7 @@ async function capture(): Promise<void> {
         name: captureName(el, source || currentSrc),
       },
     })) as { ok?: boolean; error?: string; reason?: string };
-    if (!response?.ok) flashError(response?.error, response?.reason === 'not-played' ? 'Play first' : undefined);
+    if (!response?.ok) flashError(response?.error, response?.reason === 'not-played' ? 'Play first' : response?.reason === 'not-visible' ? 'Not visible' : undefined);
   } catch {
     flashError();
   } finally {

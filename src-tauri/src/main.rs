@@ -169,7 +169,64 @@ struct NotificationItem { id: String, #[serde(rename = "type")] notification_typ
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool, paired_browsers: usize }
+struct AppSnapshot { jobs: Vec<DownloadJob>, settings: AppSettings, connected: bool, aggregate_speed: u64, notifications: Vec<NotificationItem>, bridge_available: bool, paired_browsers: usize, #[serde(default)] revision: u64 }
+
+/// What changed since the windows' last update (`revision` counts them). A
+/// window applies updates in order and re-reads the whole snapshot when it
+/// sees a gap. Unchanged jobs are not sent: with many downloads in the list,
+/// resending every job (and its log) four times a second was most of the cost.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotDelta {
+    revision: u64,
+    jobs: Vec<DownloadJob>,
+    removed: Vec<String>,
+    order: Option<Vec<String>>,
+    settings: Option<AppSettings>,
+    notifications: Option<Vec<NotificationItem>>,
+    connected: bool,
+    aggregate_speed: u64,
+    bridge_available: bool,
+    paired_browsers: usize,
+}
+
+/// A content fingerprint of a value as it would be serialized, without
+/// building the string.
+fn content_hash(value: &impl Serialize) -> u64 {
+    use std::hash::Hasher;
+    struct HashWriter(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
+    let _ = serde_json::to_writer(&mut writer, value);
+    writer.0.finish()
+}
+
+/// What the database holds, by content fingerprint, so a save writes (and
+/// DPAPI-protects) only the rows that changed.
+#[derive(Default)]
+struct Persisted {
+    jobs: std::collections::HashMap<String, u64>,
+    settings: Option<u64>,
+    credentials: Option<u64>,
+}
+
+/// What the windows last received, so an update carries only what changed.
+#[derive(Default)]
+struct Emitted {
+    revision: u64,
+    jobs: std::collections::HashMap<String, u64>,
+    order: Vec<String>,
+    settings: Option<u64>,
+    notifications: Option<u64>,
+}
 
 /// Tray menu items that follow the downloads, and what they last showed.
 struct TrayItems {
@@ -179,7 +236,7 @@ struct TrayItems {
     shown: Option<(String, bool, bool)>,
 }
 
-struct CoreState { tray_items: Mutex<Option<TrayItems>>, snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings>, credentials: Mutex<std::collections::HashMap<String, credentials::Credentials>> }
+struct CoreState { tray_items: Mutex<Option<TrayItems>>, snapshot: Mutex<AppSnapshot>, database: Mutex<Connection>, reattach_target: Mutex<Option<String>>, bandwidth: Mutex<BandwidthBucket>, job_bandwidth: Mutex<std::collections::HashMap<String, BandwidthBucket>>, transfer_controls: TransferRegistry, lifecycle: Mutex<()>, tray_checks: Mutex<Option<(CheckMenuItem<tauri::Wry>, CheckMenuItem<tauri::Wry>)>>, progress: Mutex<ProgressThrottle>, viability: Mutex<std::collections::HashMap<String, Viability>>, captures: Mutex<std::collections::VecDeque<(String, CaptureRecord)>>, adoptable_names: Mutex<std::collections::HashSet<String>>, publishing: Mutex<std::collections::HashSet<String>>, pairings: Mutex<pairing::Pairings>, credentials: Mutex<std::collections::HashMap<String, credentials::Credentials>>, persisted: Mutex<Persisted>, emitted: Mutex<Emitted> }
 
 /// Hot-loop progress bookkeeping (F09): transfer chunks mark their job dirty
 /// instead of rewriting the whole database. UI emits run at most 4 Hz shared
@@ -262,21 +319,20 @@ fn persist_dirty_jobs(state: &CoreState) -> Result<(), String> {
 }
 
 fn persist_job(state: &CoreState, id: &str) -> Result<(), String> {
-    let (created, payload) = {
+    let mut persisted = state.persisted.lock().map_err(|_| "Storage unavailable".to_string())?;
+    let (job, hash) = {
         let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
         let job = snapshot
             .jobs
             .iter()
             .find(|job| job.id == id)
             .ok_or_else(|| "Acquisition no longer exists".to_string())?;
-        let mut stored = job.clone();
-        protect_job_for_storage(&mut stored);
-        stored.error = stored.error.map(|error| redact_url_credentials(&error));
-        (
-            job.created.clone(),
-            serde_json::to_string(&stored).map_err(|error| format!("Could not serialize job {id}: {error}"))?,
-        )
+        (job.clone(), content_hash(job))
     };
+    if persisted.jobs.get(id) == Some(&hash) {
+        return Ok(());
+    }
+    let (created, payload) = stored_job_row(job)?;
     let database = state.database.lock().map_err(|_| "Database unavailable".to_string())?;
     database
         .execute(
@@ -284,7 +340,16 @@ fn persist_job(state: &CoreState, id: &str) -> Result<(), String> {
             params![id, created, payload],
         )
         .map_err(|error| format!("Could not persist job {id}: {error}"))?;
+    persisted.jobs.insert(id.to_string(), hash);
     Ok(())
+}
+
+/// A job as stored: replay context DPAPI-protected, credentials redacted.
+fn stored_job_row(mut job: DownloadJob) -> Result<(String, String), String> {
+    protect_job_for_storage(&mut job);
+    job.error = job.error.map(|error| redact_url_credentials(&error));
+    let payload = serde_json::to_string(&job).map_err(|error| format!("Could not serialize job {}: {error}", job.id))?;
+    Ok((job.created, payload))
 }
 
 // Transfer ownership is separate from persisted job state. Pause and cancel
@@ -763,44 +828,109 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
         aggregate_speed: 0,
         notifications,
         bridge_available: true, paired_browsers: 0,
+        revision: 0,
     }
 }
 
+/// Bring the database in line with the state, writing only what changed since
+/// the last save: changed and new jobs, removed jobs, settings and stored
+/// cookies when they changed. The state lock is held only to copy what
+/// changed; protecting and writing happen outside it, so transfers and the
+/// windows never wait on the disk. One save at a time keeps the record of
+/// what is on disk true.
 fn save_snapshot(state: &CoreState) -> Result<(), String> {
-    let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
-    let settings_payload = serde_json::to_string(&snapshot.settings).map_err(|error| format!("Could not serialize settings: {error}"))?;
-    let jobs = snapshot.jobs.iter().map(|job| {
-        let mut stored = job.clone();
-        protect_job_for_storage(&mut stored);
-        stored.error = stored.error.map(|error| redact_url_credentials(&error));
-        serde_json::to_string(&stored)
-            .map(|payload| (job.id.clone(), job.created.clone(), payload))
-            .map_err(|error| format!("Could not serialize job {}: {error}", job.id))
-    }).collect::<Result<Vec<_>, String>>()?;
+    let mut persisted = state.persisted.lock().map_err(|_| "Storage unavailable".to_string())?;
+    let (changed, removed, settings, credentials) = {
+        let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
+        let mut changed = Vec::new();
+        for job in &snapshot.jobs {
+            let hash = content_hash(job);
+            if persisted.jobs.get(&job.id) != Some(&hash) {
+                changed.push((job.clone(), hash));
+            }
+        }
+        let removed = persisted
+            .jobs
+            .keys()
+            .filter(|id| !snapshot.jobs.iter().any(|job| &job.id == *id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let settings_hash = content_hash(&snapshot.settings);
+        let settings = if persisted.settings == Some(settings_hash) {
+            None
+        } else {
+            Some((serde_json::to_string(&snapshot.settings).map_err(|error| format!("Could not serialize settings: {error}"))?, settings_hash))
+        };
+        // Cookies live exactly as long as an unfinished job that needs them: a
+        // completed, removed or discarded job's are erased here, in memory and
+        // on disk. A committed job's are stored (DPAPI) so it resumes after a
+        // restart; a provisional capture's stay in memory only.
+        let credentials = match state.credentials.lock() {
+            Ok(mut held) => {
+                held.retain(|id, _| snapshot.jobs.iter().any(|job| job.id == *id && job.state != "completed"));
+                let mut stored = held
+                    .iter()
+                    .filter(|(id, credentials)| !credentials.cookies.is_empty() && snapshot.jobs.iter().any(|job| job.id == **id && job.provisional != Some(true)))
+                    .map(|(id, credentials)| serde_json::to_string(&credentials.cookies).map(|payload| (id.clone(), payload)))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Could not serialize credentials: {error}"))?;
+                stored.sort();
+                let hash = content_hash(&stored);
+                (persisted.credentials != Some(hash)).then_some((stored, hash))
+            }
+            Err(_) => None,
+        };
+        (changed, removed, settings, credentials)
+    };
+    if changed.is_empty() && removed.is_empty() && settings.is_none() && credentials.is_none() {
+        return Ok(());
+    }
+    let rows = changed
+        .into_iter()
+        .map(|(job, hash)| {
+            let id = job.id.clone();
+            stored_job_row(job).map(|(created, payload)| (id, created, payload, hash))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let protected_credentials = credentials
+        .as_ref()
+        .map(|(stored, _)| stored.iter().map(|(id, payload)| (id.clone(), protect::protect_field(payload))).collect::<Vec<_>>());
     let mut database = state.database.lock().map_err(|_| "Database unavailable".to_string())?;
     let transaction = database.transaction().map_err(|error| format!("Could not begin snapshot transaction: {error}"))?;
-    transaction.execute("INSERT OR REPLACE INTO settings (id, payload) VALUES (1, ?1)", params![settings_payload]).map_err(|error| format!("Could not persist settings: {error}"))?;
-    transaction.execute("DELETE FROM jobs", []).map_err(|error| format!("Could not replace jobs: {error}"))?;
-    for (id, created, payload) in jobs {
-        transaction.execute("INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3)", params![id, created, payload]).map_err(|error| format!("Could not persist job {id}: {error}"))?;
+    if let Some((payload, _)) = &settings {
+        transaction.execute("INSERT OR REPLACE INTO settings (id, payload) VALUES (1, ?1)", params![payload]).map_err(|error| format!("Could not persist settings: {error}"))?;
     }
-    // Cookies live exactly as long as an unfinished job that needs them: a
-    // completed, removed or discarded job's are erased here, in memory and on
-    // disk. A committed job's are stored (DPAPI) so it resumes after a
-    // restart; a provisional capture's stay in memory only.
-    if let Ok(mut held) = state.credentials.lock() {
-        held.retain(|id, _| snapshot.jobs.iter().any(|job| job.id == *id && job.state != "completed"));
+    for (id, created, payload, _) in &rows {
+        transaction
+            .execute(
+                "INSERT INTO jobs (id, created_at, payload) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at, payload = excluded.payload",
+                params![id, created, payload],
+            )
+            .map_err(|error| format!("Could not persist job {id}: {error}"))?;
+    }
+    for id in &removed {
+        transaction.execute("DELETE FROM jobs WHERE id = ?1", params![id]).map_err(|error| format!("Could not remove job {id}: {error}"))?;
+    }
+    if let Some(protected) = &protected_credentials {
         transaction.execute("DELETE FROM credentials", []).map_err(|error| format!("Could not replace credentials: {error}"))?;
-        for (id, credentials) in held.iter_mut() {
-            let committed = snapshot.jobs.iter().any(|job| job.id == *id && job.provisional != Some(true));
-            if !committed || credentials.cookies.is_empty() {
-                continue;
-            }
-            let payload = serde_json::to_string(&credentials.cookies).map_err(|error| format!("Could not serialize credentials: {error}"))?;
-            transaction.execute("INSERT INTO credentials (id, payload) VALUES (?1, ?2)", params![id, protect::protect_field(&payload)]).map_err(|error| format!("Could not persist credentials: {error}"))?;
+        for (id, payload) in protected {
+            transaction.execute("INSERT INTO credentials (id, payload) VALUES (?1, ?2)", params![id, payload]).map_err(|error| format!("Could not persist credentials: {error}"))?;
         }
     }
-    transaction.commit().map_err(|error| format!("Could not commit snapshot: {error}"))
+    transaction.commit().map_err(|error| format!("Could not commit snapshot: {error}"))?;
+    for (id, _, _, hash) in rows {
+        persisted.jobs.insert(id, hash);
+    }
+    for id in removed {
+        persisted.jobs.remove(&id);
+    }
+    if let Some((_, hash)) = settings {
+        persisted.settings = Some(hash);
+    }
+    if let Some((_, hash)) = credentials {
+        persisted.credentials = Some(hash);
+    }
+    Ok(())
 }
 
 /// The cookies Chromium would send for this capture become the job's.
@@ -847,8 +977,53 @@ fn clear_destination_reservation(app: &AppHandle, state: &CoreState, id: &str) {
 }
 
 fn emit_snapshot_event(app: &AppHandle, state: &CoreState) -> Result<(), String> {
-    let snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?.clone();
-    app.emit("state-changed", snapshot).map_err(|error| error.to_string())?;
+    // Held through the emit, so updates leave in revision order.
+    let mut emitted = state.emitted.lock().map_err(|_| "State unavailable".to_string())?;
+    let delta = {
+        let mut snapshot = state.snapshot.lock().map_err(|_| "State unavailable".to_string())?;
+        emitted.revision += 1;
+        snapshot.revision = emitted.revision;
+        let mut jobs = Vec::new();
+        let mut seen = std::collections::HashMap::with_capacity(snapshot.jobs.len());
+        for job in &snapshot.jobs {
+            let hash = content_hash(job);
+            if emitted.jobs.get(&job.id) != Some(&hash) {
+                jobs.push(job.clone());
+            }
+            seen.insert(job.id.clone(), hash);
+        }
+        let removed = emitted.jobs.keys().filter(|id| !seen.contains_key(*id)).cloned().collect::<Vec<_>>();
+        let order = snapshot.jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>();
+        let order = (order != emitted.order).then(|| {
+            emitted.order = order.clone();
+            order
+        });
+        emitted.jobs = seen;
+        let settings_hash = content_hash(&snapshot.settings);
+        let settings = (emitted.settings != Some(settings_hash)).then(|| {
+            emitted.settings = Some(settings_hash);
+            snapshot.settings.clone()
+        });
+        let notifications_hash = content_hash(&snapshot.notifications);
+        let notifications = (emitted.notifications != Some(notifications_hash)).then(|| {
+            emitted.notifications = Some(notifications_hash);
+            snapshot.notifications.clone()
+        });
+        SnapshotDelta {
+            revision: emitted.revision,
+            jobs,
+            removed,
+            order,
+            settings,
+            notifications,
+            connected: snapshot.connected,
+            aggregate_speed: snapshot.aggregate_speed,
+            bridge_available: snapshot.bridge_available,
+            paired_browsers: snapshot.paired_browsers,
+        }
+    };
+    app.emit("state-delta", delta).map_err(|error| error.to_string())?;
+    drop(emitted);
     refresh_tray(app, state);
     Ok(())
 }
@@ -3752,7 +3927,8 @@ async fn acquire_manifest(
     }
     let total_segments = total_segments as u32;
     let concurrency = max_connections.clamp(1, total_segments) as usize;
-    let mut existing_segments: Vec<(usize, usize)> = Vec::new();
+    // A set: resume checks every fragment of the manifest against it.
+    let mut existing_segments: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     let mut existing_bytes = 0u64;
     for (track, length) in track_lengths.iter().enumerate() {
         if track_count > 1 {
@@ -3770,7 +3946,7 @@ async fn acquire_manifest(
                     return Ok(());
                 }
                 if metadata.is_file() && metadata.len() > 0 {
-                    existing_segments.push((track, index));
+                    existing_segments.insert((track, index));
                     existing_bytes = existing_bytes.saturating_add(metadata.len());
                 }
             }
@@ -5567,6 +5743,7 @@ fn get_snapshot(state: State<'_, CoreState>) -> AppSnapshot {
             aggregate_speed: 0,
             notifications: vec![],
             bridge_available: false, paired_browsers: 0,
+            revision: 0,
         })
 }
 
@@ -7575,6 +7752,15 @@ fn main() {
             apply_window_icon(&main_window);
             let database = Connection::open(root.join("download-manager.db")).map_err(|error| error.to_string())?;
             restrict_file(&root.join("download-manager.db"));
+            // Write-ahead logging: a commit is one sync of the log instead of the
+            // rollback journal's several, which a hard drive pays for in tens of
+            // milliseconds each. FULL keeps every commit durable.
+            if let Err(error) = database
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                .and_then(|_| database.pragma_update(None, "synchronous", "FULL"))
+            {
+                eprintln!("Write-ahead logging unavailable: {error}");
+            }
             database.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, payload TEXT); CREATE TABLE IF NOT EXISTS pairings (key_id TEXT PRIMARY KEY, secret TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, payload TEXT NOT NULL);").map_err(|error| error.to_string())?;
             let paired_keys = load_pairings(&database);
             let stored_credentials = load_credentials(&database);
@@ -7587,7 +7773,7 @@ fn main() {
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
             let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && TRANSFER_STATES.contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
-            app.manage(CoreState { tray_items: Mutex::new(None), snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials) });
+            app.manage(CoreState { tray_items: Mutex::new(None), snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials), persisted: Mutex::new(Persisted::default()), emitted: Mutex::new(Emitted::default()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;
             start_bridge(app.handle());

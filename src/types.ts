@@ -109,6 +109,22 @@ export interface AppSnapshot {
   notifications: NotificationItem[];
   bridgeAvailable?: boolean;
   pairedBrowsers?: number;
+  /** The core's update count this snapshot reflects. */
+  revision?: number;
+}
+
+/** One update from the core: only the jobs that changed since the last. */
+export interface SnapshotDelta {
+  revision: number;
+  jobs: DownloadJob[];
+  removed: string[];
+  order?: string[] | null;
+  settings?: AppSettings | null;
+  notifications?: NotificationItem[] | null;
+  connected: boolean;
+  aggregateSpeed: number;
+  bridgeAvailable: boolean;
+  pairedBrowsers: number;
 }
 
 export interface DownloadAdapter {

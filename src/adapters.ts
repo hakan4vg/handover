@@ -8,6 +8,7 @@ import type {
   DownloadAdapter,
   DownloadJob,
   JobEvent,
+  SnapshotDelta,
 } from './types';
 
 const SETTINGS_KEY = 'download-manager.settings';
@@ -326,6 +327,29 @@ class MockAdapter implements DownloadAdapter {
   }
 }
 
+/** A snapshot with one core update applied; unchanged jobs keep their objects. */
+export function applySnapshotDelta(snapshot: AppSnapshot, delta: SnapshotDelta): AppSnapshot {
+  const byId = new Map(snapshot.jobs.map((job) => [job.id, job] as const));
+  delta.jobs.forEach((job) => byId.set(job.id, job));
+  delta.removed.forEach((id) => byId.delete(id));
+  const order = delta.order ?? snapshot.jobs.map((job) => job.id);
+  const jobs = order.flatMap((id) => {
+    const job = byId.get(id);
+    return job ? [job] : [];
+  });
+  return {
+    ...snapshot,
+    revision: delta.revision,
+    jobs,
+    settings: delta.settings ?? snapshot.settings,
+    notifications: delta.notifications ?? snapshot.notifications,
+    connected: delta.connected,
+    aggregateSpeed: delta.aggregateSpeed,
+    bridgeAvailable: delta.bridgeAvailable,
+    pairedBrowsers: delta.pairedBrowsers,
+  };
+}
+
 class NativeAdapter implements DownloadAdapter {
   private ensureRuntime() {
     if (!(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
@@ -338,12 +362,59 @@ class NativeAdapter implements DownloadAdapter {
     return invoke<AppSnapshot>('get_snapshot');
   }
 
+  /** The core sends only what changed, numbered by revision. Updates are
+   *  applied in order on top of a full snapshot; one that arrives before it,
+   *  or after a gap, waits for a fresh full snapshot. */
   subscribe(listener: (snapshot: AppSnapshot) => void, onError?: (reason: unknown) => void) {
     let stopped = false;
     let unlisten: (() => void) | undefined;
-    listen<AppSnapshot>('state-changed', (event) => listener(event.payload)).then((dispose) => {
+    let current: AppSnapshot | null = null;
+    let waiting: SnapshotDelta[] = [];
+    let reading = false;
+    const reread = () => {
+      if (reading || stopped) return;
+      reading = true;
+      this.getSnapshot().then((snapshot) => {
+        reading = false;
+        if (stopped) return;
+        current = snapshot;
+        const queued = waiting.sort((left, right) => left.revision - right.revision);
+        waiting = [];
+        queued.forEach(advance);
+        if (current) listener(current);
+      }).catch((reason: unknown) => {
+        reading = false;
+        if (!stopped) onError?.(reason);
+      });
+    };
+    function advance(delta: SnapshotDelta) {
+      if (!current) {
+        waiting.push(delta);
+        return;
+      }
+      const at = current.revision ?? 0;
+      if (delta.revision <= at) return;
+      if (delta.revision !== at + 1) {
+        waiting.push(delta);
+        current = null;
+        reread();
+        return;
+      }
+      current = applySnapshotDelta(current, delta);
+    }
+    listen<SnapshotDelta>('state-delta', (event) => {
+      if (reading || !current) {
+        waiting.push(event.payload);
+        return;
+      }
+      advance(event.payload);
+      if (current) listener(current);
+    }).then((dispose) => {
       if (stopped) dispose();
-      else unlisten = dispose;
+      else {
+        unlisten = dispose;
+        reread();
+      }
     }).catch((reason: unknown) => {
       if (!stopped) onError?.(reason);
     });

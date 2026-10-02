@@ -863,6 +863,25 @@ def main() -> int:
         cleared = devtools.invoke("get_snapshot")["settings"].get("tempFolder")
         run.check("temp/explicit-folder", "a temp folder the user set holds the partial file even when Save picks another folder; clearing the setting goes back to next-to-the-file", Path(running.get("tempPath", "")).parent == explicit and done.get("state") == "completed" and final.is_file() and final.read_bytes() == METERED and cleared is None and not list(explicit.glob("*")), {"tempPath": running.get("tempPath"), "state": done.get("state"), "error": done.get("error"), "clearedSetting": cleared, "explicitLeft": [p.name for p in explicit.glob("*")]})
 
+        # ---- updates to the windows carry only what changed -------------------
+        captured = devtools.evaluate("""(async () => {
+          const internals = window.__TAURI_INTERNALS__;
+          const seen = [];
+          const handler = internals.transformCallback((event) => seen.push(event.payload));
+          await internals.invoke('plugin:event|listen', { event: 'state-delta', target: { kind: 'Any' }, handler });
+          const before = (await internals.invoke('get_snapshot')).settings.density;
+          await internals.invoke('update_settings', { patch: { density: before === 'compact' ? 'comfortable' : 'compact' } });
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          await internals.invoke('update_settings', { patch: { density: before } });
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const snapshot = await internals.invoke('get_snapshot');
+          return { jobsInList: snapshot.jobs.length, revision: snapshot.revision, updates: seen.map((delta) => ({ revision: delta.revision, jobs: delta.jobs.length, settings: delta.settings ? delta.settings.density : null })) };
+        })()""")
+        updates = captured.get("updates", [])
+        with_settings = [update for update in updates if update["settings"]]
+        revisions = [update["revision"] for update in updates]
+        run.check("ui/updates-carry-changes", "a settings change reaches the windows as an update with the new settings and none of the unchanged jobs, numbered in order", captured.get("jobsInList", 0) > 0 and len(with_settings) >= 2 and all(update["jobs"] == 0 for update in with_settings) and revisions == sorted(revisions) and captured.get("revision", 0) >= max(revisions or [0]), captured)
+
         # ---- cookies across a restart -------------------------------------
         reply = take("capture-acquisition", "/ck/slow.bin", "ck-slow.bin", [session])
         slow_id = reply.get("id", "")

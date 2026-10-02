@@ -86,6 +86,45 @@ The UI renders in the system WebView2 runtime, which keeps the frontend inspecta
 ordinary Chromium browser with fast HMR instead of requiring a native rebuild for every
 visual change.
 
+## Architecture
+
+One resident process does everything: the Tauri shell hosts the React windows and runs the
+Rust core, which owns the transfer engine, the database and the loopback bridge. There are no
+helper processes; media is assembled natively, without FFmpeg.
+
+```
+Chromium extension ──sealed messages──▶ loopback bridge (127.0.0.1:38217)
+                                              │
+React windows ◀── state-delta events ─── Rust core ──▶ transfer engine ──▶ name.<id>.part
+(manager, Add, Pair)  ──commands──▶          │                                  │
+                                         SQLite (WAL)                     final file + MotW
+```
+
+- **Bridge and pairing.** The bridge listens on loopback only, where any local program could
+  pose as either side, so the extension pairs once: the app shows a code, you allow it, and
+  the extension receives a 256-bit key. Every later message is AES-256-GCM sealed, carries a
+  timestamp and a fresh nonce (replays are refused), and each answer is bound to its request.
+  The app answers only the pinned extension ID.
+- **Cookies.** A download that needs your login carries the browser's cookies for its own
+  URLs (each range worker too) and nothing else. They are stored DPAPI-protected while the
+  job needs them and erased afterwards; source URLs, referrers and request bodies in the
+  database are DPAPI-protected as well.
+- **State.** The core keeps the authoritative state and saves only what changed (jobs,
+  settings, cookies) in one transaction, with the encryption and disk writes done outside the
+  state lock. SQLite runs in WAL mode with `synchronous=FULL`. Windows receive revisioned
+  `state-delta` updates instead of the whole state several times a second, which took update
+  traffic during a download from about 1 MiB/s to a few KiB/s.
+- **Ranged downloads.** A one-byte `Range: bytes=0-0` request decides whether a source can be
+  split (only an explicit `Accept-Ranges: none` is taken at its word), and that first response
+  also supplies the start of the file. Range workers stream to the part file as data arrives,
+  batching writes from a 64 MiB budget per download so a hard drive is not made to seek
+  between small interleaved writes. About once a second a flush claims every range written
+  before it; a range is recorded as done only after that, so resume always starts from data
+  that is really on disk, and a dropped connection continues from its last byte.
+- **Partial files** are created next to the destination without reserving the full size up
+  front: on exFAT that made Windows write zeros over the whole file first. Choosing another
+  folder at Save moves the part file there.
+
 ## Layout
 
 ```
@@ -147,10 +186,23 @@ npm run package:portable
 
 ## Running a release
 
-The executable is not code-signed yet, so Microsoft Defender or SmartScreen may
-flag it as a false positive; allow it, or add the folder as an exclusion. Load
-the `extension` folder as an unpacked extension (chrome://extensions, Developer
-mode), then click Pair in its popup and allow the code shown by the app.
+Load the `extension` folder as an unpacked extension (chrome://extensions, Developer mode),
+then click Pair in its popup and allow the code shown by the app.
+
+## Windows security warning
+
+Release builds are not code-signed yet. Microsoft Defender and SmartScreen judge new
+executables partly by signature and download reputation, and an unsigned app that intercepts
+browser downloads, listens on a local port and writes files elsewhere on disk looks a lot like
+the things they are meant to stop. So Defender may quarantine `Download Manager.exe` as a
+false positive (new unsigned Tauri apps hit this often), and SmartScreen may show "Windows
+protected your PC" on first launch.
+
+If that happens and you trust the build, either click More info › Run anyway, restore the file
+from Windows Security › Protection history, or add the release folder as an exclusion. Only do
+this for a build you downloaded from this repository's Releases page or built yourself from
+source. The binary is not altered to slip past antivirus heuristics; the intended fix is code
+signing, which is planned.
 
 ## License
 

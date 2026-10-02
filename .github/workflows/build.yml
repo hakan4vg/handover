@@ -191,7 +191,8 @@ jobs:
           - Windows 10/11 x64. Chrome is the reference browser; other Chromium browsers
             should work.
           - The executable is not code-signed yet, so Microsoft Defender may flag it as a
-            false positive (a known issue for new unsigned Tauri apps).
+            false positive (a known issue for new unsigned Tauri apps). The README's
+            "Windows security warning" section explains why and what to do.
           - Early development release. Not production-ready.
           '@
           $notes | Out-File -Encoding utf8 "$env:RUNNER_TEMP\notes.md"

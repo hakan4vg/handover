@@ -342,10 +342,13 @@ def zone_identifier(path: Path) -> str | None:
 class Run:
     def __init__(self) -> None:
         self.results: list[dict] = []
+        self.started = time.monotonic()
 
     def check(self, scenario: str, guards: str, ok: bool, evidence: dict) -> None:
-        self.results.append({"scenario": scenario, "guards": guards, "pass": bool(ok), "evidence": evidence})
-        print(f"{'PASS' if ok else 'FAIL'}  {scenario}  - {guards}")
+        # Seconds since the run started, so slow scenarios show in the artifact.
+        at = round(time.monotonic() - self.started, 1)
+        self.results.append({"scenario": scenario, "guards": guards, "pass": bool(ok), "at": at, "evidence": evidence})
+        print(f"{'PASS' if ok else 'FAIL'}  {at:6.1f}s  {scenario}  - {guards}")
 
 
 EXTENSION_ORIGIN = "chrome-extension://joniainjojgbpnjjclallmfbdgnebgbe"

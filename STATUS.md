@@ -7399,3 +7399,56 @@ commits, each one revertable on its own.
   representation URLs as the variant hints instead of falling back to the manifest's first entry, and
   then — as one self-contained change with its own live proof on a session-gated hoster — to replay
   the captured request's own scoped headers (cookies included) instead of a cookie-less fetch.
+
+## 2026-10-01 to 2026-10-03 — pairing, cookies, player capture, 0.2.0, engine performance
+
+The working backlog for this stretch is `audit/BACKLOG-2026-10-01.md` (local, not published);
+this entry is the summary.
+
+**Merged to main and released as 0.2.0 (657291a; tag not pushed yet):**
+- **Pairing and a sealed bridge.** The extension pairs once (a code shown by the app, allowed
+  there); every later message is sealed with the pairing key and the app answers only the pinned
+  extension ID. An Allow survives the extension worker restarting; an unsealed answer never costs
+  the key; allowing an expired request says so.
+- **Scoped cookies.** A download carries the browser's cookies for its own URLs (each range worker
+  too) and nothing else; they are kept DPAPI-protected while the job needs them and erased after.
+- **Media from the clicked player.** Capture uses what that player itself played; a track is
+  judged by its contents; finished media is a regular MP4 (indexed, no fragments), separate video
+  and audio joined.
+- **UI batch.** Fluent icons, compact popup, accent shades follow the chosen accent, the details
+  pane closes fully, the Alt+Tab icon is the app's.
+- **Partial files next to the download.** `name.<id>.part` beside the destination unless
+  Settings › Downloads › Temporary folder is set; Save to another folder moves it. No up-front
+  sizing: on exFAT that made Windows write zeros over the whole file first, minutes on a hard
+  drive with the UI stuck in Connecting.
+
+**On perf/snapshot-writes (awaiting the owner's test; e2e 102/102):**
+- **Speed while ranges land** (from a parallel session): ranged downloads count bytes as they
+  arrive, so the speed no longer reads zero between finished ranges.
+- **Save and send only what changed.** Saves write only changed jobs, settings and cookies, in one
+  transaction, encrypting and writing outside the state lock; windows get revisioned `state-delta`
+  updates instead of the whole state 4×/s; SQLite in WAL with synchronous=FULL. With 300 jobs: a
+  settings change 180 → 33 ms and 195 → 1.9 MiB written per 30 changes; update traffic during a
+  download 0.9–1.5 MiB/s → 6 KiB/s.
+- **Range workers stream to disk.** No whole range in memory (275 → 126 MiB extra for 1 GiB over 8
+  connections); writes in batches from a 64 MiB budget per download, since small interleaved writes
+  cost seeks on a hard drive; one flush a second claims every range written before it (a range is
+  still trusted only once flushed); a dropped connection resumes the range in place.
+- **One-byte range probe.** Any response of known length is probed with `bytes=0-0` whatever
+  `Accept-Ranges` says (only `none` is respected), and the first response supplies the start of
+  the file instead of a second 1 MiB request.
+
+**Measured, not changed:** exFAT zero-fills ahead of out-of-order writes, so parallel downloads
+write ~1.7× the file on exFAT (1 GiB to the owner's exFAT hard drive: 19.3 s vs 13.2 s for a plain
+sequential write); options are in the backlog. The "UI stalls while the disk is busy" reports were
+mostly the harness's own per-call `node` spawn; timed inside the page, the UI's longest wait during
+such a download was ~107 ms.
+
+**Harness:** checks now record when they ran (`at`, seconds from app start). New checks:
+ui/updates-carry-changes, engine/range-cut-resumes, engine/range-unadvertised,
+engine/first-response-reused, plus the pairing, temp-folder and no-preallocation checks.
+
+**Next:** making testing faster and less intrusive. A full harness run is ~96 s, but builds on the
+exFAT drive (incremental debug 104 s), full re-runs for every change and sessions sharing port 38217
+cost more. Ten proposals (build dir on NTFS, `--only` selection, parallel shards, test-instance
+ports, event waits, kept perf tools, windows out of the way) are in the backlog's Testing section.

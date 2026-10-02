@@ -5049,6 +5049,133 @@ async fn classify_candidate(
     CandidateVerdict::NotMedia
 }
 
+/// A URL's identity for matching what a player loaded against what a playlist
+/// lists: origin and path. Query strings carry per-request tokens.
+fn url_key(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    Some(format!("{}://{}{}", parsed.scheme(), parsed.host_str()?.to_ascii_lowercase(), parsed.path()))
+}
+
+/// The playlists a played-media resolution may read, and how many.
+const PLAYED_MANIFESTS: usize = 8;
+const PLAYED_PLAYLIST_FETCHES: usize = 40;
+
+async fn fetch_manifest_text(client: &reqwest::Client, app: &AppHandle, id: &str, url: &str) -> Option<(String, String)> {
+    let response = acquisition_request(client, app, id, url).send().await.ok()?.error_for_status().ok()?;
+    let effective = response.url().to_string();
+    Some((effective, manifest_text(response).await.ok()?))
+}
+
+/// A capture from a blob/MSE player says what the player itself loaded
+/// (`selected_segments`: the files whose responses the extension matched to
+/// the player's own appends) and which playlists the page loaded (`source`,
+/// then `candidates`). The presentation is the playlist that lists the most of
+/// those files, whatever the URLs look like; within an HLS multivariant
+/// playlist, the variant and audio playlists that list them are what the
+/// player played. When no playlist lists them, one whole file the player read
+/// from (ranges of one URL) is itself the source; anything else would be a
+/// guess, and is refused.
+async fn resolve_played_source(app: &AppHandle, id: &str, source: &str) -> Result<Option<String>, String> {
+    let state = app.state::<CoreState>();
+    let Some((played, candidates, companion)) = state.snapshot.lock().ok().and_then(|snapshot| {
+        snapshot.jobs.iter().find(|job| job.id == id).filter(|job| job.media && !job.selected_segments.is_empty()).map(|job| {
+            (job.selected_segments.clone(), job.candidates.clone(), job.companion_audio.clone())
+        })
+    }) else {
+        return Ok(None);
+    };
+    let keys: std::collections::HashSet<String> = played.iter().filter_map(|url| url_key(url)).collect();
+    let companion_key = companion.as_deref().and_then(url_key);
+    let manifests: Vec<String> = std::iter::once(source.to_string())
+        .chain(candidates)
+        .filter(|url| url_key(url).is_some_and(|key| !keys.contains(&key) && Some(&key) != companion_key.as_ref()))
+        .take(PLAYED_MANIFESTS)
+        .collect();
+    let listed = |urls: &[String]| urls.iter().filter(|url| url_key(url).is_some_and(|key| keys.contains(&key))).cloned().collect::<Vec<_>>();
+    // The job's own client: a playlist behind a login is read with the
+    // capture's cookies, as the download will be.
+    let client = job_client(app, id);
+    let mut fetches = 0usize;
+    // (files listed, manifest, the hints that name what was played in it)
+    let mut best: Option<(usize, String, Vec<String>)> = None;
+    for manifest in &manifests {
+        if fetches >= PLAYED_PLAYLIST_FETCHES {
+            break;
+        }
+        fetches += 1;
+        let Some((url, body)) = fetch_manifest_text(&client, app, id, manifest).await else { continue };
+        let (hits, hints) = if body.contains("#EXTM3U") {
+            let references = media::hls_references(&url, &body);
+            if body.contains("#EXT-X-STREAM-INF") {
+                let mut hits = 0;
+                let mut playlists = Vec::new();
+                for playlist in references {
+                    if fetches >= PLAYED_PLAYLIST_FETCHES {
+                        break;
+                    }
+                    fetches += 1;
+                    let Some((playlist_url, playlist_body)) = fetch_manifest_text(&client, app, id, &playlist).await else { continue };
+                    let found = listed(&media::hls_references(&playlist_url, &playlist_body)).len();
+                    if found > 0 {
+                        hits += found;
+                        playlists.push(playlist);
+                    }
+                }
+                (hits, playlists)
+            } else {
+                (listed(&references).len(), Vec::new())
+            }
+        } else {
+            let files: Vec<String> = media::parse_dash_tracks_for_segments(&url, &body, &played)
+                .map(|tracks| {
+                    tracks
+                        .into_iter()
+                        .flat_map(|track| track.segments.into_iter().map(|segment| segment.url).chain(track.segment_base.map(|base| base.url)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let found = listed(&files);
+            // The representation is chosen by exact URL: hand over the URLs as
+            // the MPD names them.
+            (found.len(), found)
+        };
+        if hits > best.as_ref().map_or(0, |(count, _, _)| *count) {
+            best = Some((hits, manifest.clone(), hints));
+        }
+    }
+    let chosen = if let Some((_, manifest, hints)) = best {
+        emit_job(&state, id, |job| {
+            job.source = manifest.clone();
+            job.domain = domain(&manifest);
+            job.candidates.clear();
+            job.companion_audio = None;
+            if !hints.is_empty() {
+                job.selected_segments = hints.clone();
+            }
+            job.events.insert(0, job_event("Found the playlist that lists what the player played", Some("success")));
+        });
+        manifest
+    } else {
+        let mut files: Vec<&String> = played.iter().filter(|url| url_key(url).is_some_and(|key| Some(&key) != companion_key.as_ref())).collect();
+        files.dedup_by_key(|url| url_key(url));
+        let whole: std::collections::HashSet<_> = files.iter().filter_map(|url| url_key(url)).collect();
+        if whole.len() != 1 {
+            return Err("The player's video is not listed in any playlist the page loaded; reload the page and play it again".into());
+        }
+        let file = files[0].clone();
+        emit_job(&state, id, |job| {
+            job.source = file.clone();
+            job.domain = domain(&file);
+            job.candidates.clear();
+            job.selected_segments.clear();
+            job.events.insert(0, job_event("Acquiring the file the player read from", Some("success")));
+        });
+        file
+    };
+    emit_snapshot(app, &state);
+    Ok(Some(chosen))
+}
+
 /// A capture can hand over alternates when the page could not prove which
 /// resource feeds the player (SPEC §6.2): blob/MSE players whose bytes arrive
 /// from a realm nothing can instrument. Deciding is the resident's job, because
@@ -5056,6 +5183,9 @@ async fn classify_candidate(
 /// becomes the job's source, the job's log records the swap, and the alternates
 /// are consumed either way so nothing lingers in the store.
 async fn resolve_job_source(app: &AppHandle, id: &str, source: String) -> Result<String, String> {
+    if let Some(played) = resolve_played_source(app, id, &source).await? {
+        return Ok(played);
+    }
     let candidates = app
         .state::<CoreState>()
         .snapshot
@@ -5201,7 +5331,7 @@ async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
                     state.inner(),
                     &id,
                     error,
-                    "Source was a byte-range fragment, not a file",
+                    "The capture's source could not be decided",
                 );
             }
             return;

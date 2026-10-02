@@ -7405,7 +7405,7 @@ commits, each one revertable on its own.
 The working backlog for this stretch is `audit/BACKLOG-2026-10-01.md` (local, not published);
 this entry is the summary.
 
-**Merged to main and released as 0.2.0 (657291a; tag not pushed yet):**
+**Merged to main for 0.2.0 (657291a):**
 - **Pairing and a sealed bridge.** The extension pairs once (a code shown by the app, allowed
   there); every later message is sealed with the pairing key and the app answers only the pinned
   extension ID. An Allow survives the extension worker restarting; an unsealed answer never costs
@@ -7422,7 +7422,7 @@ this entry is the summary.
   sizing: on exFAT that made Windows write zeros over the whole file first, minutes on a hard
   drive with the UI stuck in Connecting.
 
-**On perf/snapshot-writes (awaiting the owner's test; e2e 102/102):**
+**From perf/snapshot-writes, also in 0.2.0 (e2e 102/102 on 903f091):**
 - **Speed while ranges land** (from a parallel session): ranged downloads count bytes as they
   arrive, so the speed no longer reads zero between finished ranges.
 - **Save and send only what changed.** Saves write only changed jobs, settings and cookies, in one
@@ -7452,3 +7452,15 @@ engine/first-response-reused, plus the pairing, temp-folder and no-preallocation
 exFAT drive (incremental debug 104 s), full re-runs for every change and sessions sharing port 38217
 cost more. Ten proposals (build dir on NTFS, `--only` selection, parallel shards, test-instance
 ports, event waits, kept perf tools, windows out of the way) are in the backlog's Testing section.
+
+## 2026-10-03 — 0.2.0 released
+
+perf/snapshot-writes was merged into main and tagged v0.2.0, so the release carries the engine
+performance work above as well as pairing, scoped cookies, player capture and partial files next to
+the download. `native.py --only <areas>` and `DM_TEST_ROOT` landed with it. The extension manifest
+now says 0.2.0 too.
+
+Test instances keeping their windows transparent and unfocused (`DM_TEST_INSTANCE=1`, harness check
+`windows/out-of-the-way`) is on its own branch, `test/windows-out-of-the-way`, because it has not
+completed a harness run and needs a visual check on Windows. The trace recorder stays on
+`harness/capture-traces` as a debug branch and is not merged.

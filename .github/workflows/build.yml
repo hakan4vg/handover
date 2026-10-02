@@ -176,6 +176,11 @@ jobs:
             single-stream fallback
           - Pause, resume and restart recovery for multi-connection and segmented
             downloads; a single-stream fallback download starts over
+          - Faster multi-connection downloads: range support is probed with a single byte,
+            workers stream to disk as data arrives, a dropped connection continues from
+            the last byte received, and speed is reported live while ranges land
+          - Lighter on the disk and UI: the app saves and sends only what changed instead
+            of rewriting the whole state
           - One-time pairing between the extension and the app; a download that needs
             the browser's login carries its cookies for that download only
           - Partial files sit next to the download (or in a temporary folder set in

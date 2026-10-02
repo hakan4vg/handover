@@ -136,32 +136,6 @@ const captures = (w) => w.outbound.filter((m) => m.type === 'capture-acquisition
   handedOver.push({ scenario: 'lost-answer/downloads-api', name: created?.name, source: created?.source, captureId: created?.captureId });
 }
 
-// --- F23: an old request answering late is not the new source ---------------
-async function lateResponse(startedBeforeSwitchMs) {
-  const w = world(); await settle();
-  const sender = { tab: { id: 9 }, frameId: 0, documentId: 'doc-1' };
-  const blob = 'blob:http://127.0.0.1/new-video';
-  await w.message({ type: 'media-player-state', payload: { playerKey: 'player-1', currentSrc: blob, mediaIdentity: 'm-1', playing: true, visible: true, active: true, hovered: true } }, sender);
-  const switchedAt = Date.now();
-  const manifest = `${base}/hls/vod.m3u8`;
-  w.emit('beforeRequest', { tabId: 9, frameId: 0, documentId: 'doc-1', method: 'GET', type: 'xmlhttprequest', url: manifest, requestId: 'm', timeStamp: switchedAt - startedBeforeSwitchMs });
-  await settle(20);
-  w.emit('headers', { tabId: 9, frameId: 0, documentId: 'doc-1', type: 'xmlhttprequest', url: manifest, requestId: 'm', statusCode: 200, responseHeaders: [{ name: 'content-type', value: 'application/vnd.apple.mpegurl' }] });
-  w.emit('responseStarted', { tabId: 9, frameId: 0, documentId: 'doc-1', type: 'xmlhttprequest', url: manifest, requestId: 'm' });
-  const reply = await w.message({ type: 'media-capture', payload: { source: '', currentSrc: blob, mediaIdentity: 'm-1', pageUrl: `${base}/page`, playerKind: 'video', playerKey: 'player-1', name: 'video.mp4' } }, sender);
-  return { w, reply, sent: w.outbound.filter((m) => m.type === 'media-capture') };
-}
-{
-  const { reply, sent } = await lateResponse(60_000);
-  check('epoch/late-old-response', 'a manifest requested 60 s before the source switch is not handed over as the new video', reply.ok !== true && sent.length === 0, { reply, sent: sent.map((m) => m.payload.source) });
-}
-{
-  const { w, reply, sent } = await lateResponse(-500);
-  check('epoch/fresh-request', 'a manifest requested after the source switch is still captured (control)', reply.ok === true && sent[0]?.payload?.source?.endsWith('/hls/vod.m3u8'), { reply, sent: sent.map((m) => m.payload.source) });
-  handedOver.push(...sent.map((m) => ({ scenario: 'epoch/fresh-request', source: m.payload.source, captureId: m.payload.captureId, jobId: reply.id })));
-  void w;
-}
-
 // --- A1.4: the browser policy side changed last wins ---------------------------
 {
   // Interception was turned off in the popup while the resident was stopped.
@@ -180,91 +154,143 @@ async function lateResponse(startedBeforeSwitchMs) {
   handedOver.push(...captures(w).map((m) => ({ name: m.payload.name, scenario: 'policy/resident-change-newer', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
 }
 
-// --- no script runs in the page's own JavaScript world -----------------------
+// --- the page probe: what a player is fed, and nothing claimed in the page ---
 {
-  // A script in the page's world shares its globals and can break its scripts
-  // (an unwrapped one once broke Google's account menu); the extension needs
-  // none: the background sees media traffic from every realm.
   const { readFileSync } = await import('node:fs');
+  const probe = readFileSync(process.env.DM_PAGE_SCRIPT ?? path.join(root, 'extension/dist/page-probe.js'), 'utf8');
   const manifest = JSON.parse(readFileSync(path.join(root, 'extension/manifest.json'), 'utf8'));
-  const inPage = (manifest.content_scripts ?? []).filter((script) => script.world === 'MAIN');
-  check('page-script/none-in-page-world', "no content script runs in the page's own JavaScript world", inPage.length === 0, { mainWorldScripts: inPage.map((script) => script.js) });
-}
+  const inPage = (manifest.content_scripts ?? []).filter((script) => script.world === 'MAIN').flatMap((script) => script.js);
 
-// --- media attribution: the clicked player's stream, not the page's latest ---
-// A Vimeo page: the film's manifest, then a muted preview's manifest 260 ms
-// later. A worker fetches the film's variant playlists and segments while it
-// plays; the preview fetches nothing. Both are blob/MSE players.
-const vimeo = (asset, session, tail) => `${base}/vimeo/exp=1790900895~acl=%2F${asset}%2F~hmac=00ff/${asset}/psid=${session}/v2/${tail}`;
-const FILM = ['9c6d66af-d530-4333-9d02-07a74fb89b25', '2194ea3a7339e5a45b55a080d770698c'];
-const PREVIEW = ['d8acfedf-8469-460f-a029-4e4f432e8b81', '4cfc27005a28f11d72859ac2536d6eeb'];
-let mediaRequest = 0;
-function fetched(w, url, at, contentType) {
-  const requestId = `m${++mediaRequest}`;
-  const where = { tabId: 9, frameId: 0, documentId: 'doc-v', type: 'xmlhttprequest', url, requestId };
-  w.emit('beforeRequest', { ...where, method: 'GET', timeStamp: at });
-  w.emit('headers', { ...where, statusCode: 200, responseHeaders: [{ name: 'content-type', value: contentType }] });
-  w.emit('responseStarted', where);
-}
-const sender = { tab: { id: 9 }, frameId: 0, documentId: 'doc-v' };
-const playerState = (w, playerKey, currentSrc, playing) => w.message({ type: 'media-player-state', payload: { playerKey, currentSrc, mediaIdentity: playerKey, playing, visible: true, active: playing, hovered: playing } }, sender);
-const captureFor = (w, playerKey, currentSrc, pageEvidence) => w.message({ type: 'media-capture', payload: { source: '', currentSrc, mediaIdentity: playerKey, pageUrl: `${base}/vimeo-page`, playerKind: 'video', playerKey, name: 'film.mp4', ...(pageEvidence ? { pageEvidence } : {}) } }, sender);
-const filmBlob = 'blob:http://127.0.0.1/film', previewBlob = 'blob:http://127.0.0.1/preview';
-{
-  const w = world(); await settle();
-  await playerState(w, 'film', filmBlob, false);
-  await playerState(w, 'preview', previewBlob, false);
-  const start = Date.now();
-  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), start, 'application/vnd.apple.mpegurl');
-  fetched(w, vimeo(...PREVIEW, 'playlist/av/primary/playlist.m3u8'), start + 260, 'application/vnd.apple.mpegurl');
-  await playerState(w, 'film', filmBlob, true);
-  for (const [i, variant] of ['230c5f2f', 'c378f2e2'].entries()) {
-    fetched(w, vimeo(...FILM, `playlist/av/793d529c/avf/${variant}/media.m3u8`), start + 400 + i, 'application/vnd.apple.mpegurl');
-    for (let n = 0; n < 4; n += 1) fetched(w, vimeo(...FILM, `range/prot/cmFuZ2U9${n}${i}MC02OTU/avf/${variant}-a2f4-47e4-826f-c382d1e14f5b.mp4`) + `?range=${n}`, start + 500 + n * 10 + i, 'video/mp4');
+  // A minimal page: one element, a MediaSource player feeding it.
+  class Target {
+    constructor() { this.listeners = {}; }
+    addEventListener(type, listener) { (this.listeners[type] ??= []).push(listener); }
+    removeEventListener(type, listener) { this.listeners[type] = (this.listeners[type] ?? []).filter((item) => item !== listener); }
   }
-  // What the old in-page script answered for this player: every manifest on
-  // the page, the preview's first.
-  const reply = await captureFor(w, 'film', filmBlob, { currentSrc: filmBlob, sourceIdentity: 'source-1', playerKind: 'video', selectedSegments: [vimeo(...PREVIEW, 'playlist/av/primary/playlist.m3u8'), vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8')] });
-  const sent = w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
-  const sentAssets = sent.map((p) => [p.source, ...(p.candidates ?? [])].map((url) => (url.match(/[0-9a-f]{8}-[0-9a-f-]{27}/) ?? ['?'])[0].slice(0, 8)));
-  check('media/clicked-players-stream', "with a preview's manifest loaded last, the button on the playing film captures the film's stream, and no fallback names the preview", sent.length === 1 && sent[0].source.includes(FILM[0]) && sent[0].source.endsWith('playlist.m3u8') && !JSON.stringify(sent[0]).includes(PREVIEW[0]), { reply: { ok: reply.ok, error: reply.error }, sentAssets });
-  handedOver.push(...sent.map((p) => ({ scenario: 'media/clicked-players-stream', source: p.source, captureId: p.captureId, jobId: reply.id })));
-}
-{
-  const w = world(); await settle();
-  await playerState(w, 'film', filmBlob, false);
-  await playerState(w, 'preview', previewBlob, false);
-  const start = Date.now();
-  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), start, 'application/vnd.apple.mpegurl');
-  fetched(w, vimeo(...PREVIEW, 'playlist/av/primary/playlist.m3u8'), start + 260, 'application/vnd.apple.mpegurl');
-  const reply = await captureFor(w, 'film', filmBlob);
-  const sent = w.outbound.filter((m) => m.type === 'media-capture');
-  check('media/play-first', 'before anything plays, two presentations on the page are not guessed between: the button asks to play first', reply.ok === false && reply.reason === 'not-played' && sent.length === 0, { reply, sent: sent.length });
-}
-{
-  const w = world(); await settle();
-  await playerState(w, 'film', filmBlob, false);
-  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), Date.now(), 'application/vnd.apple.mpegurl');
-  const reply = await captureFor(w, 'film', filmBlob);
-  const sent = w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
-  check('media/single-presentation', 'a page with one presentation resolves even before playback', sent.length === 1 && sent[0].source.includes(FILM[0]), { reply: { ok: reply.ok, error: reply.error }, sent: sent.map((p) => p.source.slice(-40)) });
-  handedOver.push(...sent.map((p) => ({ scenario: 'media/single-presentation', source: p.source, captureId: p.captureId, jobId: reply.id })));
+  const document = new Target();
+  class HTMLMediaElement extends Target {
+    constructor() { super(); this.src = ''; this.currentSrc = ''; }
+    dispatchEvent(event) {
+      event.target = this;
+      event.composedPath = () => [this, document];
+      for (const listener of document.listeners[event.type] ?? []) listener(event);
+      for (const listener of this.listeners[event.type] ?? []) listener(event);
+      return true;
+    }
+  }
+  class CustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; } }
+  class MediaSource {}
+  class SourceBuffer { constructor() { this.received = []; } }
+  MediaSource.prototype.addSourceBuffer = function addSourceBuffer() { return new SourceBuffer(); };
+  SourceBuffer.prototype.appendBuffer = function appendBuffer(data) { this.received.push(data.byteLength); };
+  SourceBuffer.prototype.changeType = function changeType() {};
+  let blobs = 0;
+  const URLish = { createObjectURL: function createObjectURL() { blobs += 1; return `blob:https://page.example/${blobs}`; } };
+  const realm = vm.createContext({ document, HTMLMediaElement, CustomEvent, MediaSource, SourceBuffer, URL: URLish, ArrayBuffer, WeakRef, WeakMap, Map, Proxy, Reflect, JSON, Date, String });
+  vm.runInContext(probe, realm);
+
+  const player = new MediaSource();
+  const element = new HTMLMediaElement();
+  element.src = element.currentSrc = URLish.createObjectURL(player);
+  const video = player.addSourceBuffer('video/mp4; codecs="avc1.64001f"');
+  const audio = player.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+  video.appendBuffer(new Uint8Array(1234));
+  video.appendBuffer(new Uint8Array(56789));
+  audio.appendBuffer(new ArrayBuffer(4321));
+  const other = new HTMLMediaElement();
+  other.src = other.currentSrc = URLish.createObjectURL(new MediaSource());
+  const ask = (target) => {
+    let answer;
+    target.addEventListener('dm-player-evidence', (event) => { answer ??= event.detail; });
+    target.dispatchEvent(new CustomEvent('dm-player-evidence-request'));
+    return JSON.parse(answer ?? 'null');
+  };
+  const answered = ask(element);
+  const sizes = answered?.map((track) => [track.mime.split(';')[0], track.appends.map(([bytes]) => bytes)]);
+  check('probe/what-the-player-is-fed', "the page probe reports each of the clicked element's tracks and the sizes it was given, and only that element's", JSON.stringify(sizes) === JSON.stringify([['video/mp4', [1234, 56789]], ['audio/mp4', [4321]]]) && JSON.stringify(ask(other)) === '[]' && JSON.stringify(video.received) === '[1234,56789]', { sizes, otherElement: ask(other), stillAppended: video.received });
+  check('probe/wrappers-keep-names', 'the wrapped functions keep their names', SourceBuffer.prototype.appendBuffer.name === 'appendBuffer' && MediaSource.prototype.addSourceBuffer.name === 'addSourceBuffer' && URLish.createObjectURL.name === 'createObjectURL', { names: [SourceBuffer.prototype.appendBuffer.name, MediaSource.prototype.addSourceBuffer.name, URLish.createObjectURL.name] });
+
+  // A classic script in the page's world shares its top-level names with the
+  // page's scripts (an unwrapped one once broke Google's account menu).
+  const fresh = vm.createContext({});
+  try { vm.runInContext(probe, fresh); } catch { /* browser APIs are absent here */ }
+  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
+  const names = [...letters, ...[...letters].flatMap((first) => [...letters, ...'0123456789'].map((second) => first + second))];
+  const clashes = names.filter((name) => { try { vm.runInContext(`let ${name} = 0;`, fresh); return false; } catch (error) { return /already been declared/.test(String(error)); } });
+  check('probe/no-global-names', "the page's own scripts can declare any short top-level name next to the probe, which is the only script in the page's world", clashes.length === 0 && JSON.stringify(inPage) === '["page-probe.js"]', { clashes: clashes.slice(0, 20), mainWorldScripts: inPage });
 }
 
+// --- what the player played decides, not what the URLs look like ------------
+// Fixture presentations (native.py): /pe/a/ lists segments under /pe/seg/7f3a
+// (video) and /pe/seg/91c2 (audio); /pe/b/ lists /pe/seg/2d0e. Playlist and
+// segment URLs share nothing.
+const sizeOf = async (url) => (await (await fetch(url)).arrayBuffer()).byteLength;
+const PE_A = { video: ['init.mp4', '0.m4s', '1.m4s', '2.m4s'].map((file) => `${base}/pe/seg/7f3a/${file}`), audio: ['init.mp4', '0.m4s'].map((file) => `${base}/pe/seg/91c2/${file}`) };
+const sizes = new Map();
+for (const url of [...PE_A.video, ...PE_A.audio]) sizes.set(url, await sizeOf(url));
+let responseNumber = 0;
+/** The tab received `url`: its headers, as webRequest reports them. */
+function received(w, tabId, url, { at = Date.now(), bytes, contentType = 'video/mp4', status = 200, range } = {}) {
+  const headers = [{ name: 'content-type', value: contentType }];
+  if (bytes !== undefined) headers.push({ name: 'content-length', value: String(bytes) });
+  if (range) headers.push({ name: 'content-range', value: range });
+  w.emit('headers', { tabId, frameId: 0, documentId: `doc-${tabId}`, type: 'xmlhttprequest', url, requestId: `r${++responseNumber}`, statusCode: status, timeStamp: at, responseHeaders: headers });
+}
+const playlist = (w, tabId, url, at) => received(w, tabId, url, { at, contentType: 'application/vnd.apple.mpegurl' });
+/** The player was fed these files' bytes, in order, a moment after each arrived. */
+const appendsOf = (urls, at) => urls.map((url, index) => [sizes.get(url), at + 50 + index * 10]);
+const captureMedia = (w, tabId, player, name) => w.message({ type: 'media-capture', payload: { source: '', player, pageUrl: `${base}/pe-page`, playerKind: 'video', name } }, { tab: { id: tabId }, frameId: 0, documentId: `doc-${tabId}` });
+const mediaCaptures = (w) => w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
 {
-  // The player is noticed late (it sits in a shadow root, or is only noticed
-  // on hover): the page loaded its manifest seconds before the extension saw
-  // the player's source. Its segments keep coming while it plays.
+  // The film plays; a preview's playlist is the last one the page loaded.
   const w = world(); await settle();
-  const start = Date.now();
-  fetched(w, vimeo(...FILM, 'playlist/av/primary/prot/cXNyPTE/playlist.m3u8'), start - 8_000, 'application/vnd.apple.mpegurl');
-  fetched(w, vimeo(...FILM, 'playlist/av/793d529c/avf/230c5f2f/media.m3u8'), start - 7_500, 'application/vnd.apple.mpegurl');
-  await playerState(w, 'film', filmBlob, true);
-  for (let n = 0; n < 3; n += 1) fetched(w, vimeo(...FILM, `range/prot/cmFuZ2U9${n}MC02OTU/avf/230c5f2f-a2f4-47e4-826f-c382d1e14f5b.mp4`) + `?range=${n}`, Date.now() + n, 'video/mp4');
-  const reply = await captureFor(w, 'film', filmBlob);
-  const sent = w.outbound.filter((m) => m.type === 'media-capture').map((m) => m.payload);
-  check('media/noticed-late', "a player noticed seconds after its manifest loaded still captures that manifest, not the segments it is fetching", sent.length === 1 && sent[0].source.includes(FILM[0]) && sent[0].source.endsWith('playlist.m3u8'), { reply: { ok: reply.ok, error: reply.error, reason: reply.reason }, sent: sent.map((p) => p.source.slice(-60)) });
-  handedOver.push(...sent.map((p) => ({ scenario: 'media/noticed-late', source: p.source, captureId: p.captureId, jobId: reply.id })));
+  const at = Date.now() - 4_000;
+  for (const url of ['/pe/a/master.m3u8', '/pe/a/video.m3u8', '/pe/a/audio.m3u8']) playlist(w, 21, base + url, at);
+  [...PE_A.video, ...PE_A.audio].forEach((url, index) => received(w, 21, url, { at: at + 100 + index * 10, bytes: sizes.get(url) }));
+  for (const url of ['/pe/b/master.m3u8', '/pe/b/video.m3u8']) playlist(w, 21, base + url, at + 900);
+  const reply = await captureMedia(w, 21, [{ mime: 'video/mp4; codecs="avc1.64001e"', appends: appendsOf(PE_A.video, at + 100) }, { mime: 'audio/mp4; codecs="mp4a.40.2"', appends: appendsOf(PE_A.audio, at + 140) }], 'pe-film.mp4');
+  const sent = mediaCaptures(w);
+  const named = sent[0]?.selectedSegments ?? [];
+  check('player/played-files', "the files handed over are exactly the ones the player's appends came from, with every playlist the page loaded", reply.ok === true && JSON.stringify(named) === JSON.stringify([...PE_A.video, ...PE_A.audio]) && [sent[0]?.source, ...(sent[0]?.candidates ?? [])].includes(`${base}/pe/a/master.m3u8`), { reply: { ok: reply.ok, error: reply.error }, source: sent[0]?.source, candidates: sent[0]?.candidates, selected: named.map((url) => url.slice(base.length)) });
+  handedOver.push(...sent.map((p) => ({ scenario: 'player/played-files', name: p.name, source: p.source, captureId: p.captureId, jobId: reply.id, expect: { states: ['ready', 'completed'], source: '/pe/a/master.m3u8', notRequested: ['/pe/seg/2d0e/'], guards: "the app takes the playlist that lists what the player played (the film's), not the one loaded last (the preview's), and downloads it" } })));
+}
+{
+  // The same, with a player that converts what it downloads: its appends
+  // have other lengths, each made right after a download arrived.
+  const w = world(); await settle();
+  const at = Date.now() - 4_000;
+  playlist(w, 22, `${base}/pe/a/master.m3u8`, at);
+  PE_A.video.forEach((url, index) => received(w, 22, url, { at: at + index * 400, bytes: sizes.get(url) }));
+  const reply = await captureMedia(w, 22, [{ mime: 'video/mp4; codecs="avc1.64001e,mp4a.40.2"', appends: PE_A.video.map((url, index) => [sizes.get(url) + 188, at + index * 400 + 30]) }], 'pe-converted.mp4');
+  const named = mediaCaptures(w)[0]?.selectedSegments ?? [];
+  check('player/converted-stream', 'a player that converts its downloads (appended lengths differ) is matched by when each download arrived', JSON.stringify(named) === JSON.stringify(PE_A.video), { reply: { ok: reply.ok, error: reply.error }, selected: named.map((url) => url.slice(base.length)) });
+  handedOver.push(...mediaCaptures(w).map((p) => ({ scenario: 'player/converted-stream', name: p.name, source: p.source, captureId: p.captureId, jobId: reply.id })));
+}
+{
+  // A progressive player (dash.js on one file per track, YouTube-style
+  // ranges): no playlist, the same two files read in ranges.
+  const w = world(); await settle();
+  const at = Date.now() - 2_000;
+  received(w, 23, `${base}/progressive/video.mp4`, { at, status: 206, bytes: 10000, range: 'bytes 0-9999/32058' });
+  received(w, 23, `${base}/progressive/video.mp4`, { at: at + 200, status: 206, bytes: 22058, range: 'bytes 10000-32057/32058' });
+  received(w, 23, `${base}/progressive/audio.mp4`, { at: at + 100, status: 206, bytes: 55177, range: 'bytes 0-55176/55177', contentType: 'video/mp4' });
+  const reply = await captureMedia(w, 23, [{ mime: 'video/mp4; codecs="avc1.64001e"', appends: [[10000, at + 50], [22058, at + 250]] }, { mime: 'audio/mp4; codecs="mp4a.40.2"', appends: [[55177, at + 150]] }], 'pe-progressive.mp4');
+  const sent = mediaCaptures(w);
+  check('player/one-file-per-track', "a player reading one file per track hands over that file and its audio file, whatever the audio is labelled", reply.ok === true && sent[0]?.source === `${base}/progressive/video.mp4` && sent[0]?.companionAudio === `${base}/progressive/audio.mp4`, { reply: { ok: reply.ok, error: reply.error }, source: sent[0]?.source, companionAudio: sent[0]?.companionAudio });
+  handedOver.push(...sent.map((p) => ({ scenario: 'player/one-file-per-track', name: p.name, source: p.source, captureId: p.captureId, jobId: reply.id, expect: { states: ['ready', 'completed'], source: '/progressive/video.mp4', guards: 'the app downloads the file the player read from, with its audio' } })));
+}
+{
+  // Segments played, but the page's playlist was never seen: no guess.
+  const w = world(); await settle();
+  const at = Date.now() - 2_000;
+  PE_A.video.forEach((url, index) => received(w, 24, url, { at: at + index * 10, bytes: sizes.get(url) }));
+  const reply = await captureMedia(w, 24, [{ mime: 'video/mp4', appends: appendsOf(PE_A.video, at) }], 'pe-unlisted.mp4');
+  check('player/segments-without-playlist', 'segments whose playlist was never seen are not handed over as if one of them were the video', reply.ok === false && mediaCaptures(w).length === 0, { reply });
+}
+{
+  const w = world(); await settle();
+  const reply = await captureMedia(w, 25, [{ mime: 'video/mp4', appends: [] }], 'pe-not-played.mp4');
+  check('player/play-first', 'a player that has loaded nothing yet asks to be played first', reply.ok === false && reply.reason === 'not-played' && mediaCaptures(w).length === 0, { reply });
 }
 
 console.log(JSON.stringify({ scenarios, handedOver }));

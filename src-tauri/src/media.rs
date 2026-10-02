@@ -134,6 +134,25 @@ pub fn hls_variant(source: &str, body: &str) -> Option<String> {
     selected
 }
 
+/// Every URI an HLS playlist references, resolved: a multivariant playlist's
+/// variant and rendition playlists, a media playlist's segments and maps.
+pub fn hls_references(source: &str, body: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let uri = if line.starts_with("#EXT-X-MEDIA") || line.starts_with("#EXT-X-MAP") {
+            hls_attribute(line, "URI")
+        } else if line.starts_with('#') {
+            None
+        } else {
+            Some(line.to_string())
+        };
+        if let Some(uri) = uri.and_then(|value| resolve(source, &value)) {
+            references.push(uri);
+        }
+    }
+    references
+}
+
 pub fn hls_variant_tracks(
     source: &str,
     body: &str,

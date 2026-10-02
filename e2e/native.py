@@ -21,6 +21,7 @@ import collections
 import datetime as dt
 import importlib.util
 import json
+import re
 import shutil
 import socket
 import sqlite3
@@ -84,6 +85,31 @@ DASH_BOUNDARY = {
 }
 
 
+# Player-evidence presentations: HLS whose playlist URLs look nothing like
+# their segments' (as on X: /pl/ playlists, /vid/ segments), so only what a
+# playlist lists can tie it to what a player played. Segment ids map to the
+# fixture's video (v) and audio (a) tracks.
+PE_SEGMENTS = {"7f3a": "v", "91c2": "a", "2d0e": "v"}
+
+
+def pe_media_playlist(segment_id: str) -> bytes:
+    track = PE_SEGMENTS[segment_id]
+    count = fixture.DASH_V_SEGS if track == "v" else fixture.DASH_A_SEGS
+    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:4", "#EXT-X-PLAYLIST-TYPE:VOD", f'#EXT-X-MAP:URI="/pe/seg/{segment_id}/init.mp4"']
+    for index in range(count):
+        lines += ["#EXTINF:2.0,", f"/pe/seg/{segment_id}/{index}.m4s"]
+    return ("\n".join(lines + ["#EXT-X-ENDLIST"]) + "\n").encode()
+
+
+PE_PLAYLISTS = {
+    "/pe/a/master.m3u8": b'#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=300000,AUDIO="aud"\nvideo.m3u8\n',
+    "/pe/a/video.m3u8": pe_media_playlist("7f3a"),
+    "/pe/a/audio.m3u8": pe_media_playlist("91c2"),
+    "/pe/b/master.m3u8": b"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=300000\nvideo.m3u8\n",
+    "/pe/b/video.m3u8": pe_media_playlist("2d0e"),
+}
+
+
 class Handler(fixture.Handler):
     def _count(self, method: str) -> None:
         counts[(self.path.split("?")[0], method, self.headers.get("Range", ""))] += 1
@@ -140,6 +166,14 @@ class Handler(fixture.Handler):
         path = self.path.split("?")[0]
         if path.startswith("/metered/"):
             return self._metered(path[len("/metered/"):])
+        if path in PE_PLAYLISTS:
+            return self._raw(200, PE_PLAYLISTS[path], {"Content-Type": "application/vnd.apple.mpegurl"})
+        pe = re.match(r"^/pe/seg/([0-9a-f]{4})/(init\.mp4|\d+\.m4s)$", path)
+        if pe and pe.group(1) in PE_SEGMENTS:
+            track = PE_SEGMENTS[pe.group(1)]
+            data = fixture.media_file(f"{track}-init.mp4" if pe.group(2) == "init.mp4" else f"{track}-{pe.group(2)}")
+            if data is not None:
+                return self._raw(200, data, {"Content-Type": "video/mp4"})
         # The fixture's fragmented MP4 tracks served whole, as progressive files.
         if path == "/progressive/video.mp4":
             return self._raw(200, b"".join(fixture.media_file(f) for f in ("v-init.mp4", "v-0.m4s", "v-1.m4s", "v-2.m4s")), {"Content-Type": "video/mp4"})
@@ -580,6 +614,24 @@ def main() -> int:
         for item in report["scenarios"]:
             run.check(f"extension/{item['scenario']}", item["guards"], item["pass"], item["evidence"])
         time.sleep(1.5)
+        stored = jobs()
+        # A capture whose source the app decides: wait until its job has
+        # downloaded (or failed), then check what it settled on.
+        for item in report["handedOver"]:
+            expect = item.get("expect")
+            if not expect:
+                continue
+            job_id, settled = item.get("jobId"), {}
+            for _ in range(120):
+                # The app's own view: sources are stored encrypted.
+                snapshot = devtools.invoke("get_snapshot") or {}
+                settled = next((j for j in snapshot.get("jobs", []) if j.get("id") == job_id), {})
+                if settled.get("state") in ("ready", "completed", "failed"):
+                    break
+                time.sleep(0.25)
+            fetched = sorted({path for (path, _, _) in counts if any(path.startswith(prefix) for prefix in expect.get("notRequested", []))})
+            ok = settled.get("state") in expect["states"] and (settled.get("source") or "").endswith(expect.get("source", "")) and expect.get("error", "") in (settled.get("error") or "") and not fetched
+            run.check(f"extension/{item['scenario']} app", expect["guards"], ok, {"state": settled.get("state"), "source": settled.get("source"), "error": settled.get("error"), "events": [event.get("message") for event in settled.get("events", [])][:4], "requestedButShouldNotBe": fetched})
         stored = jobs()
         for item in report["handedOver"]:
             owners = [j["id"] for j in stored.values() if j.get("name") == item.get("name") and j.get("provisional")]

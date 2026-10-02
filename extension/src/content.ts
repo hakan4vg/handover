@@ -74,18 +74,14 @@ const mediaFilterCache = new Map<string, { allowed: boolean; expires: number }>(
 let current: HTMLVideoElement | HTMLAudioElement | null = null;
 let button: HTMLButtonElement | null = null;
 let frame: number | null = null;
-let nextPlayerKey = 1;
 let captureInFlight = false;
 let lastPointerX: number | null = null;
 let lastPointerY: number | null = null;
 let pointerRAF: number | null = null;
 let buttonStyle: HTMLStyleElement | null = null;
-const playerKeys = new WeakMap<HTMLMediaElement, string>();
 const mediaIdentities = new WeakMap<HTMLMediaElement, { source: string; identity: string }>();
 const mediaFilterKeys = new WeakMap<HTMLMediaElement, string>();
 const observedPlayers = new WeakSet<HTMLMediaElement>();
-const lastPlayerReports = new WeakMap<HTMLMediaElement, number>();
-const lastReportedState = new WeakMap<HTMLMediaElement, string>();
 
 let nextMediaIdentity = 1;
 
@@ -285,14 +281,6 @@ function anchorRect(el: HTMLMediaElement): DOMRect {
     ) return rect;
   }
   return own;
-}
-
-function keyFor(el: HTMLMediaElement): string {
-  const existing = playerKeys.get(el);
-  if (existing) return existing;
-  const key = `player-${nextPlayerKey++}`;
-  playerKeys.set(el, key);
-  return key;
 }
 
 function currentSrcFor(el: HTMLMediaElement): string {
@@ -535,42 +523,30 @@ function isPointerOver(el: HTMLMediaElement, x: number | null, y: number | null)
   return el.matches(':hover');
 }
 
-function reportPlayer(el: HTMLMediaElement, force = false): void {
-  if (!active()) return;
-  const now = Date.now();
-  const source = sourceFor(el);
-  const currentSrc = currentSrcFor(el);
-  const hovered = isPointerOver(el, lastPointerX, lastPointerY);
-  const playing = !el.paused && !el.ended;
-  const isVis = visible(el);
-  const stateKey = `${source}|${el === current}|${hovered}|${playing}|${isVis}`;
-  if (!force && lastReportedState.get(el) === stateKey && now - (lastPlayerReports.get(el) ?? 0) < 2000) return;
-  lastReportedState.set(el, stateKey);
-  lastPlayerReports.set(el, now);
-  void chrome.runtime.sendMessage({
-    type: 'media-player-state',
-    payload: {
-      playerKey: keyFor(el),
-      source: isHttp(source) ? source : '',
-      currentSrc,
-      mediaIdentity: mediaIdentityFor(el, currentSrc),
-      active: el === current,
-      hovered,
-      playing,
-      visible: isVis,
-    },
-  }).catch(() => undefined);
-}
-
 function observePlayer(el: HTMLMediaElement): void {
-  keyFor(el);
   if (observedPlayers.has(el)) return;
   observedPlayers.add(el);
-  const update = () => {
-    track();
-    reportPlayer(el, true);
+  for (const event of ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'mouseenter', 'mouseleave']) el.addEventListener(event, track, { passive: true });
+}
+
+/** What the element was fed, as page-probe.ts recorded it: asked and answered
+ *  synchronously through events on the element itself. */
+function playerEvidence(el: HTMLMediaElement): unknown {
+  let answer: unknown;
+  const listen = (event: Event) => {
+    answer ??= (event as CustomEvent).detail;
   };
-  for (const event of ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'emptied', 'mouseenter', 'mouseleave']) el.addEventListener(event, update, { passive: true });
+  el.addEventListener('dm-player-evidence', listen);
+  try {
+    el.dispatchEvent(new CustomEvent('dm-player-evidence-request', { bubbles: true, composed: true }));
+  } finally {
+    el.removeEventListener('dm-player-evidence', listen);
+  }
+  try {
+    return typeof answer === 'string' ? JSON.parse(answer) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isPointerOverButton(btn: HTMLButtonElement, x: number | null, y: number | null): boolean {
@@ -682,7 +658,6 @@ function track(): void {
   media.forEach((el) => observePlayer(el as HTMLVideoElement | HTMLAudioElement));
   const next = active() ? pick() : null;
   if (next !== current) {
-    const previous = current;
     current = next;
     if (frame !== null) {
       cancelAnimationFrame(frame);
@@ -690,9 +665,7 @@ function track(): void {
     }
     button?.remove();
     button = null;
-    if (previous) reportPlayer(previous, true);
   }
-  if (current) reportPlayer(current);
   if (current && frame === null) {
     if (!positionButton()) current = null;
     else frame = requestAnimationFrame(loop);
@@ -743,13 +716,11 @@ async function capture(): Promise<void> {
       type: 'media-capture',
       payload: {
         source: isHttp(source) ? source : '',
-        currentSrc,
-        mediaIdentity: mediaIdentityFor(el, currentSrc),
+        ...(isHttp(source) ? {} : { player: playerEvidence(el) }),
         pageUrl: window.location.href,
         userAgent: navigator.userAgent,
         media: true,
         playerKind,
-        playerKey: keyFor(el),
         name: captureName(el, source || currentSrc),
       },
     })) as { ok?: boolean; error?: string; reason?: string };

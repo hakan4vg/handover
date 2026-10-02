@@ -20,7 +20,7 @@ const PAIRING = JSON.parse(process.env.DM_PAIRING ?? 'null');
 const bundle = await build({ entryPoints: [process.env.DM_EXTENSION_ENTRY ?? path.join(root, 'extension/src/background.ts')], bundle: true, format: 'iife', platform: 'browser', write: false });
 const code = bundle.outputFiles[0].text;
 
-function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {}, paired = true, answer = null, browserCookies = [] } = {}) {
+function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl = undefined, stored = {}, session = {}, paired = true, answer = null, pairApp = null, browserCookies = [] } = {}) {
   if (paired && PAIRING && !stored['dm-pairing']) stored['dm-pairing'] = PAIRING;
   const listeners = {};
   const calls = [];
@@ -29,7 +29,10 @@ function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl 
   const on = (name) => ({ addListener: (fn) => { (listeners[name] ??= []).push(fn); } });
   const emit = (name, ...args) => (listeners[name] ?? []).map((fn) => fn(...args));
   const fetchThrough = async (url, options = {}) => {
-    if (answer && url.includes('/v1/') && !url.includes('/v1/pair')) return answer(url, options);
+    // `answer` stands in for the app; returning nothing lets the real one answer.
+    const stood = answer && url.includes('/v1/') && !url.includes('/v1/pair') ? await answer(url, options) : undefined;
+    if (stood) return stood;
+    if (pairApp && url.includes('/v1/pair')) return pairApp(url, options);
     const message = options.body && url.endsWith('/v1/message') ? await openRequest(options.body) : options.body ? JSON.parse(options.body) : undefined;
     if (message) outbound.push(message);
     if (excludedSites && message?.type === 'get-policy') {
@@ -55,7 +58,7 @@ function world({ loseCaptureAnswers = false, excludedSites = null, activeTabUrl 
       cancel: async (id) => { calls.push(['cancel', id]); },
       download: async (options) => { calls.push(['browser-download', options.url]); return 99; },
     },
-    storage: { local: { get: async (key) => (key in stored ? { [key]: stored[key] } : {}), set: async (items) => { Object.assign(stored, items); } }, session: { get: async () => ({}), set: async () => {} }, onChanged: on('storage') },
+    storage: { local: { get: async (key) => (key in stored ? { [key]: stored[key] } : {}), set: async (items) => { Object.assign(stored, items); }, remove: async (key) => { delete stored[key]; } }, session: { get: async (key) => (key in session ? { [key]: session[key] } : {}), set: async (items) => { Object.assign(session, items); }, remove: async (key) => { delete session[key]; } }, onChanged: on('storage') },
     // Chromium's cookie store: answers by host, as chrome.cookies.getAll({ url }) does.
     cookies: { getAll: async (details) => { cookieQueries.push(details); const host = new URL(details.url).hostname; return details.partitionKey ? [] : browserCookies.filter((c) => c.domain.replace(/^\./, '') === host); } },
     tabs: { sendMessage: async () => undefined, query: async () => (activeTabUrl ? [{ id: 1, url: activeTabUrl }] : []) },
@@ -241,6 +244,51 @@ async function lateResponse(startedBeforeSwitchMs) {
   await w.determine({ id: 32, url: `${base}/file/range.bin?unpaired`, finalUrl: `${base}/file/range.bin?unpaired`, filename: 'x-unpaired.bin', referrer: `${base}/page` });
   await settle(300);
   check('pairing/unpaired', 'an unpaired extension leaves the download untouched and sends nothing but a pairing request', w.calls.length === 0 && w.outbound.every((m) => m.request), { calls: w.calls, sent: w.outbound });
+}
+
+{
+  // Another program holds the port for a while (a second copy of the app, a
+  // test build) and answers "not paired". The answer is unsealed: it must not
+  // cost the extension its key, which works again once the real app is back.
+  let impostor = true;
+  const stored = {};
+  const w = world({ stored, answer: async () => (impostor ? new Response(JSON.stringify({ ok: false, paired: false }), { status: 401, headers: { 'Content-Type': 'application/json' } }) : undefined) }); await settle();
+  await w.determine({ id: 33, url: `${base}/file/range.bin?other-app`, finalUrl: `${base}/file/range.bin?other-app`, filename: 'x-other-app.bin', referrer: `${base}/page` });
+  const kept = stored['dm-pairing']?.keyId === PAIRING.keyId;
+  impostor = false;
+  await w.determine({ id: 34, url: `${base}/file/range.bin?app-back`, finalUrl: `${base}/file/range.bin?app-back`, filename: 'x-app-back.bin', referrer: `${base}/page` });
+  const sent = captures(w).filter((m) => m.payload.source.endsWith('?app-back'));
+  check('pairing/other-app-on-port', 'an unsealed "not paired" answer from whatever holds the port does not erase the key: once the real app is back, downloads reach it again', kept && sent.length === 1, { kept, calls: w.calls, sentAfter: sent.length });
+  handedOver.push(...sent.map((m) => ({ name: m.payload.name, scenario: 'pairing/other-app-on-port', source: m.payload.source, captureId: m.payload.captureId, expectJob: true })));
+}
+{
+  // The user takes a while to answer in the app. Chrome stops an idle worker
+  // after ~30 s, and the next one must still collect the answer.
+  // As the app does: the Allow answers the request its window showed; a new
+  // request is a new window with a new code, which nobody answers here.
+  let approved = false;
+  const requests = [];
+  const pairApp = async (url, options) => {
+    const { request } = JSON.parse(options.body);
+    if (url.endsWith('/v1/pair')) requests.push(request);
+    const reply = url.endsWith('/v1/pair') ? { ok: true, code: requests.length === 1 ? '123 456' : '654 321' }
+      : request !== requests.at(-1) ? { state: 'unknown' }
+      : approved && request === requests[0] ? { state: 'approved', ...PAIRING } : { state: 'waiting' };
+    return new Response(JSON.stringify(reply), { headers: { 'Content-Type': 'application/json' } });
+  };
+  const session = {};
+  let stopped = false;
+  const first = world({ paired: false, session, pairApp: (url, options) => (stopped ? new Promise(() => {}) : pairApp(url, options)) }); await settle();
+  await first.message({ type: 'pair' }, {});
+  await settle(1500);
+  stopped = true; // the worker is gone: no more requests, no cleanup
+  const stored = {};
+  const second = world({ paired: false, stored, session, pairApp }); await settle();
+  const waiting = await second.message({ type: 'get-pairing' }, {});
+  approved = true;
+  await settle(2500);
+  const after = await second.message({ type: 'get-pairing' }, {});
+  check('pairing/worker-restarted', "an Allow given after Chrome restarted the extension's worker still pairs it", waiting.pairing?.state === 'waiting' && after.pairing?.state === 'paired' && stored['dm-pairing']?.keyId === PAIRING.keyId, { waiting: waiting.pairing, after: after.pairing, pairingRequests: requests.length });
 }
 
 // --- the in-page script must not claim names in the page's global scope -----

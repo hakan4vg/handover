@@ -7464,3 +7464,12 @@ Test instances keeping their windows transparent and unfocused (`DM_TEST_INSTANC
 `windows/out-of-the-way`) is on its own branch, `test/windows-out-of-the-way`, because it has not
 completed a harness run and needs a visual check on Windows. The trace recorder stays on
 `harness/capture-traces` as a debug branch and is not merged.
+
+## 2026-10-03 (later) — faster, quieter testing
+
+- Builds on this machine go to `C:\temporary\cargo-target` (untracked `src-tauri/.cargo/config.toml`):
+  incremental debug 3 s instead of 104 s on the exFAT drive. `native.py --only <areas>` runs just the
+  affected areas (ui 7 s, engine 11 s; full sweep ~95 s); `DM_TEST_ROOT` places the runtime.
+- Test instances (`DM_TEST_INSTANCE=1`) keep their Add and Pair windows transparent, click-through and
+  never activated, so back-to-back runs stop stealing focus. Probed by hand; the harness check
+  `windows/out-of-the-way` that guards it has not completed a run yet (see the backlog's Testing section).

@@ -12,8 +12,9 @@ CDP = Path(__file__).with_name("cdp.mjs")
 
 
 def environment() -> dict[str, str]:
-    """Environment for the resident's process that opens the DevTools port."""
-    return {**os.environ, "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": f"--remote-debugging-port={PORT}"}
+    """Environment for the resident's process that opens the DevTools port.
+    DM_TEST_INSTANCE keeps its windows invisible and out of the user's focus."""
+    return {**os.environ, "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": f"--remote-debugging-port={PORT}", "DM_TEST_INSTANCE": "1"}
 
 
 MANAGER = r"^http://tauri\.localhost/$"

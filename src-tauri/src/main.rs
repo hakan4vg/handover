@@ -6432,6 +6432,7 @@ fn open_add_window(app: &AppHandle, id: &str) -> Result<(), String> {
     let url = format!("index.html?window=add&id={id}");
     let mut add_window = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title("Add Download")
+        .focused(!test_instance())
         .inner_size(440.0, 500.0)
         .resizable(false)
         .decorations(false)
@@ -6439,7 +6440,7 @@ fn open_add_window(app: &AppHandle, id: &str) -> Result<(), String> {
         .visible(false)
         .on_page_load(|window, payload| {
             if payload.event() == PageLoadEvent::Finished {
-                let _ = window.show().and_then(|_| window.set_focus());
+                present_window(&window);
             }
         })
         .center();
@@ -6451,6 +6452,7 @@ fn open_add_window(app: &AppHandle, id: &str) -> Result<(), String> {
         .build()
         .map_err(|error| format!("Could not open Add Download window: {error}"))?;
     apply_window_icon(&window);
+    keep_out_of_the_way(&window, false);
     let close_handle = app.clone();
     let close_id = id.to_string();
     // Destroyed covers every way the window goes away, including the UI's
@@ -7503,10 +7505,8 @@ async fn bridge_message(app: AppHandle, message: Value) -> (u16, Value) {
             let Some(window) = app.get_webview_window("main") else {
                 return (500, json!({ "ok": false, "error": "manager window unavailable" }));
             };
-            match window.show().and_then(|_| window.set_focus()) {
-                Ok(()) => (200, json!({ "ok": true })),
-                Err(error) => (500, json!({ "ok": false, "error": error.to_string() })),
-            }
+            present_window(&window);
+            (200, json!({ "ok": true }))
         }
         _ => bridge_capture(app, message).await,
     }
@@ -7535,6 +7535,7 @@ fn open_pair_window(app: &AppHandle, request: &str) -> Result<(), String> {
     }
     let mut builder = WebviewWindowBuilder::new(app, format!("pair-{request}"), WebviewUrl::App(format!("index.html?window=pair&id={request}").into()))
         .title("Pair browser")
+        .focused(!test_instance())
         .inner_size(380.0, 230.0)
         .resizable(false)
         .decorations(false)
@@ -7542,7 +7543,7 @@ fn open_pair_window(app: &AppHandle, request: &str) -> Result<(), String> {
         .visible(false)
         .on_page_load(|window, payload| {
             if payload.event() == PageLoadEvent::Finished {
-                let _ = window.show().and_then(|_| window.set_focus());
+                present_window(&window);
             }
         })
         .center();
@@ -7552,6 +7553,7 @@ fn open_pair_window(app: &AppHandle, request: &str) -> Result<(), String> {
     }
     let window = builder.build().map_err(|error| format!("Could not open the pairing window: {error}"))?;
     apply_window_icon(&window);
+    keep_out_of_the_way(&window, false);
     let handle = app.clone();
     let request = request.to_string();
     window.on_window_event(move |event| {
@@ -7742,8 +7744,7 @@ fn install_tray(
             match id {
                 "open-manager" => {
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        present_window(&window);
                     }
                 }
                 "pause-all" => pause_all_jobs(app, "Paused from the system tray"),
@@ -7764,8 +7765,7 @@ fn install_tray(
                 }
                 "bandwidth" => {
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        present_window(&window);
                         let _ = window.emit("open-settings", "network");
                     }
                 }
@@ -7801,13 +7801,11 @@ fn main() {
                     .unwrap_or(true);
                 if show_manager {
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        present_window(&window);
                     }
                 }
             } else if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+                present_window(&window);
             }
         }));
     #[cfg(not(windows))]
@@ -7895,6 +7893,72 @@ fn app_context() -> tauri::Context<tauri::Wry> {
 /// back to the executable's. Give the window the executable's icon at the
 /// sizes its display asks for: the .ico holds every size, so none is scaled.
 #[cfg(windows)]
+/// A test instance (`DM_TEST_INSTANCE` set, as the e2e harness does) runs
+/// every window as usual but keeps them out of the user's way, so back-to-back
+/// test runs never steal the focus of the person at the machine.
+fn test_instance() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("DM_TEST_INSTANCE").is_some_and(|value| !value.is_empty()))
+}
+
+/// In a test instance, make a just-built window invisible to the eye and
+/// inert: fully transparent, click-through, never activated, no taskbar
+/// button. It stays where it would open and keeps running its page, so UI
+/// Automation and DevTools still drive it. (Moving it off-screen instead let
+/// display-scaling adjustments stretch it across the screen.)
+fn keep_out_of_the_way(window: &tauri::WebviewWindow, show: bool) {
+    if !test_instance() {
+        return;
+    }
+    let _ = window.set_skip_taskbar(true);
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
+            fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+            fn SetLayeredWindowAttributes(hwnd: *mut c_void, key: u32, alpha: u8, flags: u32) -> i32;
+            fn ShowWindow(hwnd: *mut c_void, command: i32) -> i32;
+        }
+        const GWL_EXSTYLE: i32 = -20;
+        const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+        const WS_EX_TRANSPARENT: isize = 0x0000_0020;
+        const WS_EX_LAYERED: isize = 0x0008_0000;
+        const WS_EX_NOACTIVATE: isize = 0x0800_0000;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
+        const LWA_ALPHA: u32 = 0x2;
+        if let Ok(hwnd) = window.hwnd() {
+            let hwnd = hwnd.0 as *mut c_void;
+            unsafe {
+                let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (style & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE);
+                SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+                if show {
+                    // Shown without activating: the windowing layer's own
+                    // show() activates, and resets these styles.
+                    const SW_SHOWNA: i32 = 8;
+                    ShowWindow(hwnd, SW_SHOWNA);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    if show {
+        let _ = window.show();
+    }
+}
+
+/// Show a window and bring it forward, the way each surface opens for the
+/// user; a test instance shows it without bringing it forward.
+pub(crate) fn present_window(window: &tauri::WebviewWindow) {
+    if test_instance() {
+        keep_out_of_the_way(window, true);
+    } else {
+        let _ = window.show().and_then(|_| window.set_focus());
+    }
+}
+
 fn apply_window_icon(window: &tauri::WebviewWindow) {
     use std::ffi::c_void;
     use std::sync::{Mutex, OnceLock};

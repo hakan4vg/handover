@@ -155,8 +155,7 @@ fn handle_notification_action(app: &AppHandle, action: &str, job_id: &str, desti
         }
         "details" => {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+                crate::present_window(&window);
             }
             let _ = app.emit(
                 "notification-action",

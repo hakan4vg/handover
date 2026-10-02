@@ -133,7 +133,8 @@ target directory. A full run takes about a minute and a half; `--only` runs
 just some areas (`engine`, `bandwidth`, `bridge`, `pairing`, `cookies`, `save`,
 `extension`, `temp`, `ui`, `restart`; areas that need a paired browser bring
 `pairing` along), and `DM_TEST_ROOT` sets where its throwaway runtime folder
-goes. Two things on the machine can disturb it: a
+goes. The app under test runs with `DM_TEST_INSTANCE=1`: its windows open
+transparent and never take the focus, so runs don't get in the way. Two things on the machine can disturb it: a
 browser with the extension installed may reach the test app on the bridge port
 and start its own pairing, and the Save checks use UI Automation, which hangs
 while the Windows session is locked.

@@ -7452,3 +7452,12 @@ engine/first-response-reused, plus the pairing, temp-folder and no-preallocation
 exFAT drive (incremental debug 104 s), full re-runs for every change and sessions sharing port 38217
 cost more. Ten proposals (build dir on NTFS, `--only` selection, parallel shards, test-instance
 ports, event waits, kept perf tools, windows out of the way) are in the backlog's Testing section.
+
+## 2026-10-03 (later) — faster, quieter testing
+
+- Builds on this machine go to `C:\temporary\cargo-target` (untracked `src-tauri/.cargo/config.toml`):
+  incremental debug 3 s instead of 104 s on the exFAT drive. `native.py --only <areas>` runs just the
+  affected areas (ui 7 s, engine 11 s; full sweep ~95 s); `DM_TEST_ROOT` places the runtime.
+- Test instances (`DM_TEST_INSTANCE=1`) keep their Add and Pair windows transparent, click-through and
+  never activated, so back-to-back runs stop stealing focus. Probed by hand; the harness check
+  `windows/out-of-the-way` that guards it has not completed a run yet (see the backlog's Testing section).

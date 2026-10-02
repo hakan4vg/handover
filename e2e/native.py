@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import ctypes
 import datetime as dt
 import importlib.util
 import json
@@ -345,6 +346,71 @@ AREAS = ("engine", "bandwidth", "bridge", "pairing", "cookies", "save", "extensi
 NEEDS_PAIRING = ("bridge", "cookies", "save", "extension", "restart")
 
 
+class WindowWatch(threading.Thread):
+    """Samples, ten times a second, whether any window of the app under test
+    holds the focus or can be seen on screen. A test instance shows its
+    windows fully transparent and never activated, so a run never steals the
+    focus of the person at the machine (Windows only; elsewhere it records
+    nothing)."""
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.pid = 0
+        self.stopped = False
+        self.focused: collections.Counter = collections.Counter()
+        self.on_screen: collections.Counter = collections.Counter()
+        self.samples = 0
+
+    def run(self) -> None:
+        if sys.platform != "win32":
+            return
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        screen = [user32.GetSystemMetrics(index) for index in (76, 77, 78, 79)]  # virtual screen x, y, width, height
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def owner(hwnd) -> int:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return pid.value
+
+        def title(hwnd) -> str:
+            buffer = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buffer, 256)
+            return buffer.value or "(untitled)"
+
+        def invisible(hwnd) -> bool:
+            # A layered window at alpha 0 cannot be seen; a click-through
+            # layered window without alpha set is one of the windowing layer's
+            # own 15x15 helper windows.
+            style = user32.GetWindowLongW(hwnd, -20)
+            if not style & 0x80000:  # WS_EX_LAYERED
+                return False
+            alpha, flags = ctypes.c_ubyte(), wintypes.DWORD()
+            if user32.GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags)) and flags.value & 0x2:  # LWA_ALPHA
+                return alpha.value == 0
+            return bool(style & 0x20)  # WS_EX_TRANSPARENT
+
+        def visit(hwnd, _) -> bool:
+            if owner(hwnd) == self.pid and user32.IsWindowVisible(hwnd) and not invisible(hwnd):
+                rect = wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                x, y, width, height = screen
+                if rect.right > x and rect.left < x + width and rect.bottom > y and rect.top < y + height and rect.right > rect.left:
+                    self.on_screen[title(hwnd)] += 1
+            return True
+
+        callback = enum_proc(visit)
+        while not self.stopped:
+            if self.pid:
+                self.samples += 1
+                foreground = user32.GetForegroundWindow()
+                if foreground and owner(foreground) == self.pid:
+                    self.focused[title(foreground)] += 1
+                user32.EnumWindows(callback, 0)
+            time.sleep(0.1)
+
+
 class Run:
     def __init__(self) -> None:
         self.results: list[dict] = []
@@ -467,6 +533,9 @@ def main() -> int:
     log_path = runtime / "app.log"
     log = open(log_path, "w", encoding="utf-8")
     app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    watch = WindowWatch()
+    watch.pid = app.pid
+    watch.start()
     run = Run()
 
     def jobs() -> dict[str, dict]:
@@ -1009,6 +1078,7 @@ def main() -> int:
             log.close()
             log = open(log_path, "a", encoding="utf-8")
             app = subprocess.Popen([str(exe), "--startup"], cwd=runtime, stdout=log, stderr=log, env=devtools.environment(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            watch.pid = app.pid
             restarted = time.time()
             for _ in range(60):
                 try:
@@ -1031,7 +1101,12 @@ def main() -> int:
             devtools.invoke("forget_pairings")
             status, answer = sealed.post("/v1/message", sealed.seal(PAIRING, probe_message)[0])
             run.check("pairing/forget", "after Forget in Settings the browser's key is refused and it must pair again", status == 401 and answer.get("paired") is False, {"status": status, "answer": answer})
+        # Every window the run opened (Add, Pair) stayed out of the way.
+        run.area = "windows"
+        watch.stopped = True
+        run.check("windows/out-of-the-way", "a test instance's windows never take the focus and can never be seen, so test runs leave the person at the machine alone", sys.platform != "win32" or (watch.samples > 0 and not watch.focused and not watch.on_screen), {"samples": watch.samples, "focused": dict(watch.focused), "onScreen": dict(watch.on_screen)})
     finally:
+        watch.stopped = True
         app.terminate()
         try:
             app.wait(timeout=15)

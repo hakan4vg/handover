@@ -6911,8 +6911,10 @@ fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
         if let Ok(mut target) = state.reattach_target.lock() {
             *target = Some(id.clone());
         }
+        let armed = REATTACH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut previous = JobState::Pending;
         emit_job(&state, &id, |job| {
-            job.state = JobState::Pending;
+            previous = std::mem::replace(&mut job.state, JobState::Pending);
             job.note = Some("Waiting for renewed source".into());
             job.events.insert(
                 0,
@@ -6920,7 +6922,39 @@ fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
             );
         });
         emit_snapshot(&app, &state);
+        tauri::async_runtime::spawn(expire_reattach(app.clone(), id, previous, armed));
     }
+}
+
+/// How long an armed reattach waits for the renewed browser source. Long
+/// enough to sign in again and re-click the link; past that, a capture is
+/// more likely an unrelated download from the same URL than the renewal.
+const REATTACH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Bumped on every arm so a stale timer never disarms a newer reattach.
+static REATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+async fn expire_reattach(app: AppHandle, id: String, previous: JobState, armed: u64) {
+    sleep(REATTACH_TIMEOUT).await;
+    if REATTACH_GENERATION.load(Ordering::SeqCst) != armed {
+        return;
+    }
+    let state = app.state::<CoreState>();
+    let expired = state
+        .reattach_target
+        .lock()
+        .map(|mut target| target.as_deref() == Some(id.as_str()) && target.take().is_some())
+        .unwrap_or(false);
+    if !expired || transfer_is_active(state.inner(), &id) {
+        return;
+    }
+    emit_job(&state, &id, |job| {
+        if job.state == JobState::Pending && job.note.as_deref() == Some("Waiting for renewed source") {
+            job.state = previous;
+            job.note = None;
+            job.events.insert(0, job_event("No renewed source arrived; reattach cancelled", Some("warning")));
+        }
+    });
+    emit_snapshot(&app, &state);
 }
 
 fn provisional_input_from_message(message: &Value) -> Option<ProvisionalInput> {

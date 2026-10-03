@@ -832,6 +832,15 @@ function onPointerMove(event: PointerEvent | MouseEvent): void {
 
 document.addEventListener('click', rememberBrowserOwnedClick, true);
 document.addEventListener('click', interceptDownloadClick, true);
+// A click is when a page most often swaps a poster for a player under a
+// pointer that then stays still, so no pointermove would hit-test for it.
+document.addEventListener('click', (event) => {
+  if (!event.isTrusted || !active()) return;
+  window.setTimeout(() => {
+    if (shadowScanned) document.dispatchEvent(new Event('dm-shadow-flush'));
+    requestDiscovery();
+  }, DISCOVERY_INTERVAL_MS);
+}, { capture: true, passive: true });
 window.addEventListener('pointermove', onPointerMove, { passive: true });
 window.addEventListener('mouseleave', () => {
   lastPointerX = null;

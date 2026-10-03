@@ -45,6 +45,44 @@ const CANCELLABLE_STATES: DownloadState[] = [...TRANSFER_STATES, ...RESUMABLE_ST
 
 const stateIn = (state: DownloadState, states: DownloadState[]) => states.includes(state);
 
+const SPARK_SAMPLES = 60;
+const SPARK_WIDTH = 60;
+const SPARK_HEIGHT = 14;
+
+/** Last minute of aggregate speed, one sample a second. Owns its own tick so
+ *  the manager does not re-render for it, and stops ticking once the window
+ *  has drained back to idle. */
+const SpeedSparkline = memo(function SpeedSparkline({ speed }: { speed: number }) {
+  const latest = useRef(speed);
+  const samples = useRef<number[]>([]);
+  const [, setTick] = useState(0);
+  latest.current = speed;
+  const idle = speed <= 0 && !samples.current.some((value) => value > 0);
+  useEffect(() => {
+    if (idle) return;
+    const timer = window.setInterval(() => {
+      const next = samples.current.length >= SPARK_SAMPLES ? samples.current.slice(1) : samples.current.slice();
+      next.push(Math.max(0, latest.current));
+      samples.current = next;
+      setTick((tick) => tick + 1);
+      if (!next.some((value) => value > 0)) {
+        samples.current = [];
+        window.clearInterval(timer);
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [idle]);
+  const values = samples.current;
+  if (values.length < 2) return null;
+  const peak = Math.max(...values);
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const step = SPARK_WIDTH / (SPARK_SAMPLES - 1);
+  const offset = (SPARK_SAMPLES - values.length) * step;
+  const points = values.map((value, index) => `${(offset + index * step).toFixed(1)},${(SPARK_HEIGHT - 1 - (peak > 0 ? value / peak : 0) * (SPARK_HEIGHT - 2)).toFixed(1)}`).join(' ');
+  const label = `Last ${values.length}s: peak ${formatSpeed(peak)}, average ${formatSpeed(total / values.length)}, ${formatBytes(total)} transferred`;
+  return <svg className="speed-sparkline" width={SPARK_WIDTH} height={SPARK_HEIGHT} viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`} role="img" aria-label={label}><title>{label}</title><polyline points={points} /></svg>;
+});
+
 const modeText = (mode: TransferMode) => ({ 'whole-object': 'Byte ranges', segments: 'HLS/DASH segments', 'dual-track': 'Separate video and audio', 'single-stream': 'Single stream' })[mode];
 
 const settingsNav: Array<{ key: SettingsPage; label: string; icon: IconName }> = [
@@ -299,7 +337,7 @@ export function Manager({ adapter, snapshot }: { adapter: DownloadAdapter; snaps
               </section>
               {selected && inspectorOpen && <Inspector job={selected} adapter={adapter} onClose={() => setInspectorOpen(false)} />}
             </div>
-             <div className="manager-statusbar"><div className="aggregate-status"><span>{active.length} active</span><span>·</span><span>{formatSpeed(active.length > 0 ? snapshot.aggregateSpeed : 0)}</span></div></div>
+             <div className="manager-statusbar"><div className="aggregate-status"><span>{active.length} active</span><span>·</span><span>{formatSpeed(active.length > 0 ? snapshot.aggregateSpeed : 0)}</span><SpeedSparkline speed={active.length > 0 ? snapshot.aggregateSpeed : 0} /></div></div>
           </main>
         )}
       </div>

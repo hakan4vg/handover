@@ -7699,7 +7699,12 @@ fn main() {
             let main_config = app.config().app.windows.iter().find(|window| window.label == "main").ok_or_else(|| "Main window configuration is missing".to_string())?;
             let mut main_window = WebviewWindowBuilder::from_config(app.handle(), main_config).map_err(|error| error.to_string())?;
             if launch_in_background {
-                main_window = main_window.visible(false);
+                // Unfocused as well: a window built focused takes the
+                // foreground even while hidden.
+                main_window = main_window.visible(false).focused(false);
+            }
+            if test_instance() {
+                main_window = main_window.focused(false);
             }
             #[cfg(windows)]
             {

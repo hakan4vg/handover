@@ -326,6 +326,13 @@ class Handler(fixture.Handler):
 
 # What the Add window's closeSurface() does: destroy(), else close(). It runs
 # after the evaluation returns, since the window may take the connection away.
+# Presses a button of the page by its accessible name; false when there is none to press.
+PRESS_BUTTON = """(() => {
+  const button = [...document.querySelectorAll('button')].find((item) => (item.getAttribute('aria-label') ?? item.textContent.trim()) === %s && !item.disabled);
+  button?.click();
+  return Boolean(button);
+})()"""
+
 CLOSE_SURFACE = """(() => {
   const invoke = window.__TAURI_INTERNALS__.invoke, label = window.__TAURI_INTERNALS__.metadata.currentWindow.label;
   setTimeout(() => invoke('plugin:window|destroy', { label }).catch(() => invoke('plugin:window|close', { label })).catch(() => {}), 50);
@@ -360,6 +367,10 @@ class WindowWatch(threading.Thread):
         self.focused: collections.Counter = collections.Counter()
         self.on_screen: collections.Counter = collections.Counter()
         self.samples = 0
+        # When the focus changed hands: seconds since the watch began, and the
+        # window of the app that took it ("" when it left the app).
+        self.timeline: list[tuple[float, str]] = []
+        self.began = time.monotonic()
 
     def run(self) -> None:
         if sys.platform != "win32":
@@ -401,12 +412,17 @@ class WindowWatch(threading.Thread):
             return True
 
         callback = enum_proc(visit)
+        last = ""
         while not self.stopped:
             if self.pid:
                 self.samples += 1
                 foreground = user32.GetForegroundWindow()
-                if foreground and owner(foreground) == self.pid:
-                    self.focused[title(foreground)] += 1
+                holder = title(foreground) if foreground and owner(foreground) == self.pid else ""
+                if holder:
+                    self.focused[holder] += 1
+                if holder != last:
+                    self.timeline.append((round(time.monotonic() - self.began, 1), holder))
+                    last = holder
                 user32.EnumWindows(callback, 0)
             time.sleep(0.1)
 
@@ -439,6 +455,7 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="keep the isolated runtime folder")
     parser.add_argument("--exe", help="resident build to run (default: the debug build in Cargo's target directory)")
     parser.add_argument("--only", help=f"comma-separated areas to run: {', '.join(AREAS)}")
+    parser.add_argument("--uia", action="store_true", help="drive the Add window's Save through UI Automation instead of its page (the window takes the focus)")
     args = parser.parse_args()
     only = {area.strip() for area in (args.only or "").split(",") if area.strip()}
     unknown = only - set(AREAS)
@@ -873,10 +890,22 @@ def main() -> int:
                 rows = connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0]
             run.check("cookies/erased-when-done", "once those downloads complete, their cookies are gone from storage", rows == 0, {"credentialRows": rows})
 
-        # ---- Save durability: the real Add window, driven by UI Automation ----
+        # ---- Save durability: the real Add window ----
+        # Driven from inside its own page, so nothing reaches for the window
+        # from outside: a UI Automation client makes it take the focus. --uia
+        # drives it through the accessibility tree instead.
         uia_timeouts: list[tuple[str, ...]] = []
+        save_page = ""
+        through_uia = args.uia
 
         def uia(*args: str) -> tuple[int, str]:
+            if not through_uia:
+                try:
+                    if args[0] == "-List":
+                        return 0, devtools.evaluate("document.body.innerText", timeout=10, page=save_page)
+                    return (0, f"invoked {args[1]}") if devtools.evaluate(PRESS_BUTTON % json.dumps(args[1]), timeout=10, page=save_page) else (1, "")
+                except Exception:
+                    return 1, ""
             # UI Automation blocks on WebView2 windows while the Windows session
             # is locked. A hung call is a failed attempt, and after two the Save
             # scenarios fail fast instead of waiting it out.
@@ -892,6 +921,7 @@ def main() -> int:
         if wants("save"):
             run.area = "save"
             reply = capture("/file/range.bin", "cap-save")
+            save_page = f"window=add&id={reply.get('id')}$"
             ready = False
             for _ in range(60):
                 code, listing = uia("-List", "-Seconds", "2")
@@ -1104,7 +1134,7 @@ def main() -> int:
         # Every window the run opened (Add, Pair) stayed out of the way.
         run.area = "windows"
         watch.stopped = True
-        run.check("windows/out-of-the-way", "a test instance's windows never take the focus and can never be seen, so test runs leave the person at the machine alone", sys.platform != "win32" or (watch.samples > 0 and not watch.focused and not watch.on_screen), {"samples": watch.samples, "focused": dict(watch.focused), "onScreen": dict(watch.on_screen)})
+        run.check("windows/out-of-the-way", "a test instance's windows never take the focus and can never be seen, so test runs leave the person at the machine alone", sys.platform != "win32" or (watch.samples > 0 and not watch.focused and not watch.on_screen), {"samples": watch.samples, "focused": dict(watch.focused), "focusTimeline": watch.timeline, "onScreen": dict(watch.on_screen)})
     finally:
         watch.stopped = True
         app.terminate()

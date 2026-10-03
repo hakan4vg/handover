@@ -279,7 +279,8 @@ const captures = (w) => w.outbound.filter((m) => m.type === 'capture-acquisition
     removeEventListener(type, listener) { this.listeners[type] = (this.listeners[type] ?? []).filter((item) => item !== listener); }
   }
   const document = new Target();
-  class HTMLMediaElement extends Target {
+  class Element extends Target {}
+  class HTMLMediaElement extends Element {
     constructor() { super(); this.src = ''; this.currentSrc = ''; }
     dispatchEvent(event) {
       event.target = this;
@@ -297,7 +298,7 @@ const captures = (w) => w.outbound.filter((m) => m.type === 'capture-acquisition
   SourceBuffer.prototype.changeType = function changeType() {};
   let blobs = 0;
   const URLish = { createObjectURL: function createObjectURL() { blobs += 1; return `blob:https://page.example/${blobs}`; } };
-  const realm = vm.createContext({ document, HTMLMediaElement, CustomEvent, MediaSource, SourceBuffer, URL: URLish, ArrayBuffer, WeakRef, WeakMap, Map, Proxy, Reflect, JSON, Date, String });
+  const realm = vm.createContext({ document, Element, HTMLMediaElement, CustomEvent, MediaSource, SourceBuffer, URL: URLish, ArrayBuffer, WeakRef, WeakMap, Map, Proxy, Reflect, JSON, Date, String });
   vm.runInContext(probe, realm);
 
   const player = new MediaSource();

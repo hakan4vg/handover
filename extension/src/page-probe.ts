@@ -8,7 +8,9 @@
 //
 // It wraps four functions (URL.createObjectURL, MediaSource#addSourceBuffer,
 // SourceBuffer#appendBuffer and #changeType), each a constant-time note, and
-// answers only when the extension asks about one element. It declares nothing
+// answers only when the extension asks about one element. It also wraps
+// Element#attachShadow to tell the content script about each open shadow root,
+// which saves it walking the whole document to find players inside them. It declares nothing
 // in the page's scope (the build wraps it), and the wrappers keep the
 // originals' names and native-looking source text.
 
@@ -18,6 +20,10 @@ const ANSWER = 'dm-player-evidence';
 const APPENDS_KEPT = 96;
 /** blob: URLs remembered (a page revokes and recreates them). */
 const SOURCES_KEPT = 64;
+const SHADOW_ROOT = 'dm-shadow-root';
+const SHADOW_FLUSH = 'dm-shadow-flush';
+/** Shadow hosts created outside the document, waiting to be inserted. */
+const PENDING_HOSTS_KEPT = 1024;
 
 interface TrackRecord {
   mime: string;
@@ -91,5 +97,44 @@ if (typeof MediaSource === 'function' && typeof SourceBuffer === 'function') {
     // (another extension's player, or a page loaded before the extension).
     const source = sources.get(element.currentSrc || element.src)?.deref();
     element.dispatchEvent(new CustomEvent(ANSWER, { detail: JSON.stringify(source ? tracksOf.get(source) ?? [] : null) }));
+  }, true);
+}
+
+// Open shadow roots are announced on their host, which must be in the document
+// for the event to reach the content script. Most hosts are inserted in the
+// same task that created them, so the check runs in a microtask; a host still
+// out of the document waits until the content script asks again after a DOM
+// insertion. The event neither bubbles nor carries data.
+let pendingHosts: Array<WeakRef<Element>> = [];
+let announceQueued = false;
+
+function announceConnectedHosts(): void {
+  announceQueued = false;
+  const hosts = pendingHosts;
+  pendingHosts = [];
+  for (const ref of hosts) {
+    const host = ref.deref();
+    if (!host) continue;
+    if (host.isConnected) host.dispatchEvent(new Event(SHADOW_ROOT, { composed: true }));
+    else pendingHosts.push(ref);
+  }
+}
+
+if (typeof Element.prototype.attachShadow === 'function') {
+  wrap(Element.prototype, 'attachShadow', (original, self, args) => {
+    const root = Reflect.apply(original, self, args);
+    if (root instanceof ShadowRoot && root.mode === 'open' && self instanceof Element) {
+      pendingHosts.push(new WeakRef(self));
+      if (pendingHosts.length > PENDING_HOSTS_KEPT) pendingHosts.shift();
+      if (!announceQueued) {
+        announceQueued = true;
+        queueMicrotask(announceConnectedHosts);
+      }
+    }
+    return root;
+  });
+
+  document.addEventListener(SHADOW_FLUSH, () => {
+    if (pendingHosts.length) announceConnectedHosts();
   }, true);
 }

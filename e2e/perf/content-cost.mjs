@@ -128,6 +128,7 @@ const PAGES = {
   media: { what: 'article + 4 paused <video>, pointer away', html: page('Media', VIDEOS + ARTICLE) },
   'media-hover': { what: 'article + 4 paused <video>, pointer over one (button shown)', html: page('Media hover', VIDEOS + ARTICLE), hover: 'video' },
   'heavy-shadow': { what: `${NODES / 1000}k elements + one open-shadow-root player (1 s shadow scan)`, html: page('Heavy shadow', '<x-player></x-player><div id="bulk"></div>', SHADOW_PLAYER + bulkScript(NODES)) },
+  'heavy-late-shadow': { what: `${NODES / 1000}k elements + an open-shadow-root player added 1 s after load`, html: page('Heavy late shadow', '<div id="slot"></div><div id="bulk"></div>', SHADOW_PLAYER + bulkScript(NODES) + "setTimeout(() => document.getElementById('slot').append(document.createElement('x-player')), 1000);") },
   'heavy-mutating-shadow': { what: `heavy-mutating + one open-shadow-root player`, html: page('Heavy mutating shadow', '<x-player></x-player>' + LIVE + '<div id="bulk"></div>', SHADOW_PLAYER + bulkScript(NODES) + MUTATE) },
 };
 
@@ -208,7 +209,7 @@ async function measureTotals(context, base, name) {
 
 // ---------------------------------------------------------------- profile
 
-const KEY_FUNCTIONS = ['track', 'collectMedia', 'scanShadowMedia', 'updateMediaCache', 'mediaInNode', 'rebuildMediaCache', 'pick', 'positionButton', 'loop', 'requestMediaFilter', 'onPointerMove', 'refreshPolicy'];
+const KEY_FUNCTIONS = ['track', 'collectMedia', 'scanShadowMedia', 'observeShadowRoot', 'updateMediaCache', 'mediaInNode', 'rebuildMediaCache', 'pick', 'positionButton', 'loop', 'requestMediaFilter', 'onPointerMove', 'refreshPolicy'];
 
 async function profile(context, base, name, extensionId) {
   const { tab, cdp } = await openPage(context, base, name);

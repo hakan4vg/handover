@@ -10,7 +10,7 @@ mod protect;
 mod startup;
 
 use futures_util::{future::Abortable, FutureExt, StreamExt};
-use lifecycle::{state_allows_transfer, TransferRegistry};
+use lifecycle::TransferRegistry;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,7 +41,7 @@ struct DownloadJob {
     name: String,
     source: String,
     domain: String,
-    state: String,
+    state: JobState,
     progress: f64,
     downloaded: u64,
     total: Option<u64>,
@@ -68,7 +68,7 @@ struct DownloadJob {
     /// databases written before this field existed loadable.
     #[serde(default)]
     bandwidth_limit: Option<u64>,
-    mode: String,
+    mode: TransferMode,
     media: bool,
     #[serde(default)]
     media_tracks: Option<u32>,
@@ -118,6 +118,46 @@ struct DownloadJob {
     candidates: Vec<String>,
     events: Vec<JobEvent>,
 }
+
+/// Where a job is in its lifecycle. Serialized as the lowercase name, which is
+/// what the store and the UI's `DownloadState` have always carried.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum JobState {
+    Connecting,
+    Downloading,
+    Finalizing,
+    Paused,
+    Pending,
+    /// Bytes are acquired; a provisional job waits for the user to save it.
+    Ready,
+    Completed,
+    Failed,
+}
+
+impl JobState {
+    /// States a transfer runs in.
+    fn is_transfer(self) -> bool {
+        matches!(self, Self::Connecting | Self::Downloading | Self::Finalizing)
+    }
+
+    /// Finalizing is local assembly of bytes already on disk, so it is not
+    /// pausable: recovery then always finishes it from disk instead of asking a
+    /// source that may have expired.
+    fn is_pausable(self) -> bool {
+        matches!(self, Self::Connecting | Self::Downloading)
+    }
+
+    /// Stopped without failing: Resume starts these again.
+    fn is_paused_or_pending(self) -> bool {
+        matches!(self, Self::Paused | Self::Pending)
+    }
+}
+
+/// How a job's bytes are being acquired; the UI names it in the inspector.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TransferMode { WholeObject, Segments, DualTrack, SingleStream }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -760,8 +800,8 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
                         job.referrer = None;
                         job.post_body = None;
                         job.selected_segments.clear();
-                        if job.state != "completed" {
-                            job.state = "paused".into();
+                        if job.state != JobState::Completed {
+                            job.state = JobState::Paused;
                             job.events.insert(0, job_event("Saved source is unavailable on this machine — the folder may have moved. Use Reattach download.", Some("warning")));
                         }
                     }
@@ -777,7 +817,7 @@ fn snapshot_from_database(database: &Connection, settings: AppSettings) -> AppSn
                             }
                             DestinationReservationRecovery::Completed => {
                                 job.destination_reservation = None;
-                                if TRANSFER_STATES.contains(&job.state.as_str())
+                                if job.state.is_transfer()
                                 {
                                     complete_job(&mut job);
                                     let _ = std::fs::remove_file(&job.temp_path);
@@ -867,7 +907,7 @@ fn save_snapshot(state: &CoreState) -> Result<(), String> {
         // restart; a provisional capture's stay in memory only.
         let credentials = match state.credentials.lock() {
             Ok(mut held) => {
-                held.retain(|id, _| snapshot.jobs.iter().any(|job| job.id == *id && job.state != "completed"));
+                held.retain(|id, _| snapshot.jobs.iter().any(|job| job.id == *id && job.state != JobState::Completed));
                 let mut stored = held
                     .iter()
                     .filter(|(id, credentials)| !credentials.cookies.is_empty() && snapshot.jobs.iter().any(|job| job.id == **id && job.provisional != Some(true)))
@@ -1052,9 +1092,9 @@ fn tray_status_text(active: usize, aggregate_speed: u64) -> String {
 
 fn refresh_tray(app: &AppHandle, state: &CoreState) {
     let Some(next) = state.snapshot.lock().ok().map(|snapshot| {
-        let active = snapshot.jobs.iter().filter(|job| TRANSFER_STATES.contains(&job.state.as_str())).count();
-        let can_pause = snapshot.jobs.iter().any(|job| matches!(job.state.as_str(), "connecting" | "downloading"));
-        let can_resume = snapshot.jobs.iter().any(|job| matches!(job.state.as_str(), "paused" | "pending"));
+        let active = snapshot.jobs.iter().filter(|job| job.state.is_transfer()).count();
+        let can_pause = snapshot.jobs.iter().any(|job| job.state.is_pausable());
+        let can_resume = snapshot.jobs.iter().any(|job| job.state.is_paused_or_pending());
         (tray_status_text(active, snapshot.aggregate_speed), can_pause, can_resume)
     }) else { return };
     let Ok(mut items) = state.tray_items.lock() else { return };
@@ -1119,7 +1159,7 @@ fn complete_job(job: &mut DownloadJob) {
     job.speed = 0;
     job.connections = 0;
     job.note = None;
-    job.state = "completed".into();
+    job.state = JobState::Completed;
     job.progress = 100.0;
     job.completed = Some(now_label());
     // SPEC §16: replay context is only needed while the job can transfer
@@ -1139,7 +1179,7 @@ fn complete_job(job: &mut DownloadJob) {
 /// nothing is moving, so nothing can be paused, and the Add Download surface is
 /// where the user either saves it or cancels it.
 fn mark_ready_for_confirmation(job: &mut DownloadJob, event: &str) {
-    job.state = "ready".into();
+    job.state = JobState::Ready;
     job.progress = 100.0;
     job.speed = 0;
     job.connections = 0;
@@ -1639,13 +1679,6 @@ fn valid_range_identity(response: &reqwest::Response, expected: &ResourceIdentit
     expected.etag.as_ref().map_or(true, |value| etag.as_ref() == Some(value)) && expected.last_modified.as_ref().map_or(true, |value| last_modified.as_ref() == Some(value))
 }
 
-/// States a transfer runs in.
-const TRANSFER_STATES: [&str; 3] = ["connecting", "downloading", "finalizing"];
-/// Finalizing is local assembly of bytes already on disk, so it is not
-/// pausable: recovery then always finishes it from disk instead of asking a
-/// source that may have expired.
-const PAUSABLE_STATES: [&str; 2] = ["connecting", "downloading"];
-
 fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) {
     // The job log is a bounded human-readable history (newest first), never a
     // debug dump: every mutation path funnels through here (F15).
@@ -1654,7 +1687,7 @@ fn emit_job(state: &CoreState, id: &str, update: impl FnOnce(&mut DownloadJob)) 
             update(job);
             sample_speed(job, std::time::Instant::now());
             job.events.truncate(50);
-            snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == "downloading").map(|item| item.speed).sum();
+            snapshot.aggregate_speed = snapshot.jobs.iter().filter(|item| item.state == JobState::Downloading).map(|item| item.speed).sum();
         }
     }
 }
@@ -1792,7 +1825,7 @@ const SPEED_MIN_SPAN: Duration = Duration::from_millis(500);
 /// received (written, or held for a range being written) over a moving
 /// window, whatever the transfer mode.
 fn sample_speed(job: &mut DownloadJob, now: std::time::Instant) {
-    if job.state != "downloading" {
+    if job.state != JobState::Downloading {
         job.speed = 0;
         job.eta_seconds = None;
         job.speed_samples.clear();
@@ -2206,9 +2239,36 @@ fn body_looks_like_html(body: &[u8]) -> bool {
     text.starts_with("<!doctype html") || text.starts_with("<html") || text.starts_with("<head")
 }
 
+/// Settles a transfer that ended early, unless a newer transfer owns the job.
+/// After a pause, in-flight progress may have set a speed or connection count
+/// again, so those are cleared. A failure is reported with `event` unless the
+/// job already failed (a cancel). Any other stop leaves the state to whoever
+/// stopped the transfer.
+fn settle_transfer_error(app: &AppHandle, state: &CoreState, id: &str, generation: u64, error: TransferError, event: &str) {
+    if !transfer_is_current(app, id, generation) {
+        return;
+    }
+    match job_state(app, id) {
+        Some(JobState::Paused) => {
+            emit_job(state, id, |job| {
+                job.connections = 0;
+                job.speed = 0;
+                job.note = Some("Paused".into());
+            });
+            emit_snapshot(app, state);
+        }
+        Some(JobState::Failed) => {}
+        _ => {
+            if let TransferError::Failed(error) = error {
+                mark_acquisition_failed(app, state, id, error, event);
+            }
+        }
+    }
+}
+
 fn mark_acquisition_failed(app: &AppHandle, state: &CoreState, id: &str, error: String, event: &str) {
     emit_job(state, id, |job| {
-        job.state = "failed".into();
+        job.state = JobState::Failed;
         job.error = Some(redact_url_credentials(&error));
         job.connections = 0;
         job.speed = 0;
@@ -2454,14 +2514,14 @@ async fn mux_media_tracks(track_paths: &[String], output_path: &str) -> Result<S
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-fn job_state(app: &AppHandle, id: &str) -> Option<String> {
+fn job_state(app: &AppHandle, id: &str) -> Option<JobState> {
     let state = app.state::<CoreState>();
     state.snapshot.lock().ok().and_then(|snapshot| {
         snapshot
             .jobs
             .iter()
             .find(|job| job.id == id)
-            .map(|job| job.state.clone())
+            .map(|job| job.state)
     })
 }
 
@@ -2508,12 +2568,146 @@ fn decline_while_publishing(state: &CoreState, publishing: &std::collections::Ha
     true
 }
 
+/// Whether a finished transfer goes to its destination now (the job was
+/// accepted) and where; a provisional job waits for Save instead.
+fn committed_destination(state: &CoreState, id: &str) -> (bool, String) {
+    state
+        .snapshot
+        .lock()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| (job.provisional != Some(true), job.destination.clone()))
+        })
+        .unwrap_or((false, String::new()))
+}
+
+/// Why a transfer step ended without its result. A stop is not a failure:
+/// whoever stopped the job (pause, cancel, a newer transfer) already put it in
+/// the state the user should see.
+#[derive(Clone)]
+enum TransferError {
+    /// The job no longer wants this transfer.
+    Stopped,
+    /// The step failed; the reason is for the user.
+    Failed(String),
+}
+
+impl From<String> for TransferError {
+    fn from(error: String) -> Self {
+        TransferError::Failed(error)
+    }
+}
+
+impl From<&str> for TransferError {
+    fn from(error: &str) -> Self {
+        TransferError::Failed(error.into())
+    }
+}
+
+impl From<PublishError> for TransferError {
+    fn from(error: PublishError) -> Self {
+        match error {
+            PublishError::Stopped => TransferError::Stopped,
+            PublishError::Reserve(error) | PublishError::Move(error) => TransferError::Failed(error),
+        }
+    }
+}
+
+/// Why a finished transfer did not reach its destination.
+enum PublishError {
+    /// The job stopped wanting this transfer (pause, cancel, a newer
+    /// transfer) before the move was claimed.
+    Stopped,
+    /// No non-colliding destination could be reserved.
+    Reserve(String),
+    /// The file could not be moved into place.
+    Move(String),
+}
+
+/// The one path a finished transfer takes to its destination. A committed job
+/// gets a non-colliding name (unless the user replaces existing files), its
+/// file moved there under a publishing claim held until the completion is
+/// recorded (F08), then `after_move` cleans up the parts. A provisional job is
+/// marked ready for Save with `ready_event`. `finished` is the file and the
+/// destination it asks for, present when a committed job has a destination.
+#[allow(clippy::too_many_arguments)]
+async fn publish(
+    app: &AppHandle,
+    id: &str,
+    generation: u64,
+    committed: &(bool, String),
+    finished: Option<(&str, &str)>,
+    replace_existing: bool,
+    after_move: impl std::future::Future<Output = ()>,
+    ready_event: &str,
+) -> Result<(), PublishError> {
+    let state = app.state::<CoreState>();
+    // Held until the completion below is recorded (F08).
+    let mut claim = None;
+    if let Some((file, requested)) = finished {
+        if let Some(parent) = Path::new(requested).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if !transfer_can_continue(app, id, generation) {
+            return Err(PublishError::Stopped);
+        }
+        let (destination, reserved, reservation) = managed_destination(requested, replace_existing).map_err(PublishError::Reserve)?;
+        let current = &committed.1;
+        if destination != *current || reservation.is_some() {
+            let reservation_marker = reservation.clone();
+            emit_job(&state, id, |job| {
+                job.destination = destination.clone();
+                job.destination_reservation = reservation_marker;
+                if destination != *current {
+                    if let Some(file_name) = Path::new(&destination).file_name().and_then(|value| value.to_str()) {
+                        job.name = file_name.to_string();
+                    }
+                    job.events.insert(0, job_event("Destination renamed to avoid a collision", Some("warning")));
+                }
+            });
+            emit_snapshot(app, &state);
+        }
+        claim = begin_publishing(&state, id, || transfer_can_continue(app, id, generation));
+        if claim.is_none() {
+            if reserved {
+                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
+            }
+            clear_destination_reservation(app, &state, id);
+            return Err(PublishError::Stopped);
+        }
+        let moved = move_completed_file(file, &destination, replace_existing, reservation.as_deref()).await;
+        clear_destination_reservation(app, &state, id);
+        moved.map_err(PublishError::Move)?;
+        after_move.await;
+    }
+    if !committed.0 && !transfer_can_continue(app, id, generation) {
+        return Err(PublishError::Stopped);
+    }
+    emit_job(&state, id, |job| {
+        if committed.0 {
+            complete_job(job);
+        } else {
+            mark_ready_for_confirmation(job, ready_event);
+        }
+    });
+    emit_snapshot(app, &state);
+    if committed.0 {
+        add_notification(app, &state, id, "completed");
+    }
+    drop(claim);
+    Ok(())
+}
+
 fn transfer_can_continue(app: &AppHandle, id: &str, generation: u64) -> bool {
-    transfer_is_current(app, id, generation) && state_allows_transfer(job_state(app, id).as_deref())
+    transfer_is_current(app, id, generation) && job_state(app, id).is_some_and(JobState::is_transfer)
 }
 
 fn transfer_is_downloading(app: &AppHandle, id: &str, generation: u64) -> bool {
-    transfer_is_current(app, id, generation) && job_state(app, id).as_deref() == Some("downloading")
+    transfer_is_current(app, id, generation) && job_state(app, id) == Some(JobState::Downloading)
 }
 
 fn transfer_is_active(state: &CoreState, id: &str) -> bool {
@@ -2561,7 +2755,7 @@ fn spawn_transfer(app: &AppHandle, state: &CoreState, id: String, source: String
         let state = handle.state::<CoreState>();
         state.transfer_controls.release_if_current(&id, generation);
         if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(&id); };
-        if panicked && state_allows_transfer(job_state(&handle, &id).as_deref()) {
+        if panicked && job_state(&handle, &id).is_some_and(JobState::is_transfer) {
             mark_acquisition_failed(
                 &handle,
                 &state,
@@ -2601,7 +2795,7 @@ async fn throttle(app: &AppHandle, id: &str, bytes: usize, generation: u64) -> b
     // come from one look at the state.
     let limits = app.state::<CoreState>().snapshot.lock().ok().and_then(|snapshot| {
         let item = snapshot.jobs.iter().find(|item| item.id == id)?;
-        if !state_allows_transfer(Some(item.state.as_str())) {
+        if !item.state.is_transfer() {
             return None;
         }
         let global = snapshot.settings.bandwidth_limit.map(|value| {
@@ -2665,14 +2859,14 @@ async fn fragment_bytes(
     byte_range: Option<(u64, u64)>,
     retries: u32,
     generation: u64
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, TransferError> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     let expected_length = byte_range.map(|(_, length)| length);
     let mut pacing = None;
     for attempt in 0..attempts {
         if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
-            return Err("paused".to_string());
+            return Err(TransferError::Stopped);
         }
         let mut request = acquisition_request(client, app, id, source);
         if let Some((start, length)) = byte_range {
@@ -2705,7 +2899,7 @@ async fn fragment_bytes(
                     match chunk {
                         Ok(chunk) => {
                             if !throttle(app, id, chunk.len(), generation).await {
-                                return Err("paused".to_string());
+                                return Err(TransferError::Stopped);
                             }
                             bytes.extend_from_slice(&chunk);
                             if expected_length
@@ -2736,7 +2930,7 @@ async fn fragment_bytes(
                 }
             }
             Ok(response) if terminal_source_status(response.status()) => {
-                return Err(terminal_source_error(response.status()));
+                return Err(terminal_source_error(response.status()).into());
             }
             Ok(response) => {
                 pacing = retry_after(&response);
@@ -2745,7 +2939,7 @@ async fn fragment_bytes(
             Err(error) => last_error = error.to_string()
         }
     }
-    Err(last_error)
+    Err(last_error.into())
 }
 
 /// Stream one media fragment into `part_path`, decrypting on the way when
@@ -2763,14 +2957,14 @@ async fn fragment_to_file(
     part_path: &Path,
     retries: u32,
     generation: u64
-) -> Result<u64, String> {
+) -> Result<u64, TransferError> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("fragment request failed");
     let expected_length = byte_range.map(|(_, length)| length);
     let mut pacing = None;
     for attempt in 0..attempts {
         if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
-            return Err("paused".to_string());
+            return Err(TransferError::Stopped);
         }
         let mut request = acquisition_request(client, app, id, source);
         if let Some((start, length)) = byte_range {
@@ -2807,7 +3001,7 @@ async fn fragment_to_file(
                     match chunk {
                         Ok(chunk) => {
                             if !throttle(app, id, chunk.len(), generation).await {
-                                return Err("paused".to_string());
+                                return Err(TransferError::Stopped);
                             }
                             received += chunk.len() as u64;
                             if expected_length.is_some_and(|length| received > length) {
@@ -2846,7 +3040,7 @@ async fn fragment_to_file(
                 }
             }
             Ok(response) if terminal_source_status(response.status()) => {
-                return Err(terminal_source_error(response.status()));
+                return Err(terminal_source_error(response.status()).into());
             }
             Ok(response) => {
                 pacing = retry_after(&response);
@@ -2855,7 +3049,7 @@ async fn fragment_to_file(
             Err(error) => last_error = error.to_string()
         }
     }
-    Err(last_error)
+    Err(last_error.into())
 }
 
 /// Read a response body, refusing to hold more than `limit` bytes: at most
@@ -2911,8 +3105,8 @@ async fn acquire_media_segment(
     total_segments: u32,
     existing_count: u64,
     connection_cap: usize,
-) -> Result<(), String> {
-    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+) -> Result<(), TransferError> {
+    if !transfer_can_continue(app, id, generation) { return Err(TransferError::Stopped); }
     // RFC 8216 4.4.2.4: full-segment AES-128 arrives encrypted; the 16-byte
     // key is fetched first through the same acquisition context (Referer
     // flows via acquisition_request) so the segment is decrypted as it
@@ -2923,7 +3117,7 @@ async fn acquire_media_segment(
         None => None,
     };
     if let Some(parent) = segment_path.parent() { tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?; }
-    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    if !transfer_can_continue(app, id, generation) { return Err(TransferError::Stopped); }
     let written = match fragment_to_file(client, app, id, &fragment.url, fragment.range, key, segment_temp_path, retry_count, generation).await {
         Ok(written) => written,
         Err(error) => {
@@ -2931,14 +3125,14 @@ async fn acquire_media_segment(
             return Err(error);
         }
     };
-    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    if !transfer_can_continue(app, id, generation) { return Err(TransferError::Stopped); }
     tokio::fs::rename(segment_temp_path, segment_path).await.map_err(|error| error.to_string())?;
-    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    if !transfer_can_continue(app, id, generation) { return Err(TransferError::Stopped); }
     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
     let size = downloaded.fetch_add(written, Ordering::Relaxed) + written;
     let state = app.state::<CoreState>();
     let finished_missing = done.saturating_sub(existing_count);
-    if !transfer_can_continue(app, id, generation) { return Err("paused".to_string()); }
+    if !transfer_can_continue(app, id, generation) { return Err(TransferError::Stopped); }
     emit_job(&state, id, |job| {
         job.downloaded = size;
         job.progress = done as f64 / total_segments as f64 * 100.0;
@@ -3034,7 +3228,7 @@ async fn range_to_file(
     generation: u64,
     intake: &Intake,
     batch_size: usize
-) -> Result<(), String> {
+) -> Result<(), TransferError> {
     let attempts = retries.saturating_add(1).max(1);
     let mut last_error = String::from("range request failed");
     let mut pacing = None;
@@ -3043,13 +3237,13 @@ async fn range_to_file(
     // last `batch.len()` bytes, which are gathered for the next write.
     let mut position = start;
     let mut batch: Vec<u8> = Vec::with_capacity(batch_size.min((end - start + 1) as usize));
-    let give_up = |position: u64, error: String| {
+    let give_up = |position: u64, error: TransferError| {
         intake.discard(app, id, position - start);
         Err(error)
     };
     for attempt in 0..attempts {
         if attempt > 0 && !wait_before_retry(app, id, generation, attempt, pacing.take()).await {
-            return give_up(position, "paused".into());
+            return give_up(position, TransferError::Stopped);
         }
         let response = match acquisition_request(client, app, id, source)
             .header(reqwest::header::RANGE, format!("bytes={position}-{end}"))
@@ -3058,7 +3252,7 @@ async fn range_to_file(
         {
             Ok(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => response,
             Ok(response) if terminal_source_status(response.status()) => {
-                return give_up(position, terminal_source_error(response.status()));
+                return give_up(position, terminal_source_error(response.status()).into());
             }
             Ok(response) => {
                 pacing = retry_after(&response);
@@ -3077,10 +3271,10 @@ async fn range_to_file(
         if !valid_range_identity(&response, expected) {
             // A different resource will not turn back into the verified one:
             // retrying only spends requests.
-            return give_up(position, "The resource changed while it was being acquired".into());
+            return give_up(position, String::from("The resource changed while it was being acquired").into());
         }
         if let Err(error) = file.seek(SeekFrom::Start(position)).await {
-            return give_up(position, error.to_string());
+            return give_up(position, error.to_string().into());
         }
         let mut stream = response.bytes_stream();
         last_error = "The server returned an incomplete byte range".into();
@@ -3106,19 +3300,19 @@ async fn range_to_file(
             intake.add(app, id, bytes.len() as u64);
             if batch.len() >= batch_size {
                 if let Err(error) = file.write_all(&batch).await {
-                    return give_up(position, error.to_string());
+                    return give_up(position, error.to_string().into());
                 }
                 batch.clear();
             }
             if !throttle(app, id, bytes.len(), generation).await {
-                return give_up(position, "paused".into());
+                return give_up(position, TransferError::Stopped);
             }
         }
         // What arrived before the stream ended or broke is good: write it, so
         // a retry asks only for the rest.
         if !batch.is_empty() {
             if let Err(error) = file.write_all(&batch).await {
-                return give_up(position, error.to_string());
+                return give_up(position, error.to_string().into());
             }
             batch.clear();
         }
@@ -3126,11 +3320,11 @@ async fn range_to_file(
             // The file's writes complete (and report their errors) here.
             return match file.flush().await {
                 Ok(()) => Ok(()),
-                Err(error) => give_up(position, error.to_string()),
+                Err(error) => give_up(position, error.to_string().into()),
             };
         }
     }
-    give_up(position, last_error)
+    give_up(position, last_error.into())
 }
 
 /// A download over parallel byte ranges. `first_body` is the body of the
@@ -3307,13 +3501,13 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
         return Ok(());
     }
     emit_job(&state, &id, |job| {
-        job.state = "downloading".into();
+        job.state = JobState::Downloading;
         job.total = Some(total);
         job.downloaded = initial_downloaded;
         job.receiving = 0;
         job.progress = initial_downloaded as f64 / total as f64 * 100.0;
         job.resumable = true;
-        job.mode = "whole-object".into();
+        job.mode = TransferMode::WholeObject;
         job.resource_identity = Some(identity.clone());
         job.completed_ranges = completed_ranges.clone();
         job.connections = if ranges.is_empty() {
@@ -3349,7 +3543,7 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
         let completed_workers = completed_workers.clone();
         async move {
             if !transfer_is_downloading(&app, &id, generation) {
-                return Err("paused".to_string());
+                return Err(TransferError::Stopped);
             }
             range_to_file(
                 &client,
@@ -3374,6 +3568,7 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
                 job.connections = connections;
             })
             .await
+            .map_err(TransferError::from)
         }
     }))
     .buffer_unordered(worker_count);
@@ -3387,13 +3582,13 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
     // Whatever was written since the last flush is claimed now, even when a
     // worker failed or the job was paused: those ranges are whole.
     if let Err(error) = land(&app, &id, generation, &temp_path, total, &intake, &landing, None, true, |_| {}).await {
-        transfer_error.get_or_insert(error);
+        transfer_error.get_or_insert(error.into());
     }
     if let Some(initial_error) = transfer_error {
         if !transfer_is_current(&app, &id, generation) {
             return Ok(());
         }
-        if job_state(&app, &id).as_deref() == Some("paused") {
+        if job_state(&app, &id) == Some(JobState::Paused) {
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
@@ -3409,6 +3604,10 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
             emit_snapshot(&app, &state);
             return Ok(());
         }
+        // Stopped for any other reason: whoever stopped it set the state.
+        let TransferError::Failed(initial_error) = initial_error else {
+            return Ok(());
+        };
         // A dead URL cannot be revived by fewer connections or a new stream:
         // report it instead of grinding through the fallback stages (F05).
         if is_terminal_source_error(&initial_error) {
@@ -3445,7 +3644,7 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
         });
         emit_snapshot(&app, &state);
         let fallback_client = job_client(&app, &id);
-        let mut fallback_error = None;
+        let mut fallback_failed = false;
         // Give a rate-limiting server a short quiet period before switching to
         // one connection. The range probe and the failed workers have already
         // consumed the server's burst allowance.
@@ -3470,10 +3669,12 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
             )
             .await;
             if let Err(error) = fetched {
-                if is_terminal_source_error(&error) {
-                    return Err(error);
+                if let TransferError::Failed(error) = error {
+                    if is_terminal_source_error(&error) {
+                        return Err(error);
+                    }
                 }
-                fallback_error = Some(error);
+                fallback_failed = true;
                 break;
             }
             if !transfer_can_continue(&app, &id, generation) {
@@ -3484,15 +3685,15 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
                 job.connections = 1;
             })
             .await;
-            if let Err(error) = landed {
-                fallback_error = Some(error);
+            if landed.is_err() {
+                fallback_failed = true;
                 break;
             }
         }
-        if let Err(error) = land(&app, &id, generation, &temp_path, total, &intake, &landing, None, true, |_| {}).await {
-            fallback_error.get_or_insert(error);
+        if land(&app, &id, generation, &temp_path, total, &intake, &landing, None, true, |_| {}).await.is_err() {
+            fallback_failed = true;
         }
-        if let Some(_error) = fallback_error {
+        if fallback_failed {
             emit_job(&state, &id, |job| {
                 // Whatever a failed range held is dropped with it.
                 job.receiving = 0;
@@ -3550,10 +3751,10 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
             let mut prefix: Vec<u8> = Vec::new();
             let mut sniffed = false;
             let mut stream = response.bytes_stream();
-            let outcome: Result<(), String> = async {
+            let outcome: Result<(), TransferError> = async {
                 while let Some(chunk) = stream.next().await {
                     if !transfer_is_downloading(&app, &id, generation) {
-                        return Err(String::new());
+                        return Err(TransferError::Stopped);
                     }
                     let bytes = chunk.map_err(|error| rejected(error.to_string()))?;
                     if !sniffed {
@@ -3561,14 +3762,14 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
                         if prefix.len() >= BODY_SNIFF_LIMIT {
                             sniffed = true;
                             if response_is_page(fallback_mime.as_deref(), fallback_disposition.as_deref(), &job_name, &prefix) {
-                                return Err(rejected("the source returned a web page instead of the file".into()));
+                                return Err(rejected("the source returned a web page instead of the file".into()).into());
                             }
                         }
                     }
                     file.write_all(&bytes).await.map_err(|error| rejected(error.to_string()))?;
                     full_downloaded = full_downloaded.saturating_add(bytes.len() as u64);
                     if !throttle(&app, &id, bytes.len(), generation).await {
-                        return Err(String::new());
+                        return Err(TransferError::Stopped);
                     }
                     let progress = full_downloaded as f64 / total as f64 * 100.0;
                     emit_job(&state, &id, |job| {
@@ -3584,19 +3785,22 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
                     emit_progress(&app, &state, &id);
                 }
                 if !sniffed && response_is_page(fallback_mime.as_deref(), fallback_disposition.as_deref(), &job_name, &prefix) {
-                    return Err(rejected("the source returned a web page instead of the file".into()));
+                    return Err(rejected("the source returned a web page instead of the file".into()).into());
                 }
                 if full_downloaded != total {
-                    return Err(rejected(format!("it returned {full_downloaded} bytes, expected {total}")));
+                    return Err(rejected(format!("it returned {full_downloaded} bytes, expected {total}")).into());
                 }
-                file.sync_all().await.map_err(|error| rejected(error.to_string()))
+                file.sync_all().await.map_err(|error| rejected(error.to_string()).into())
             }
             .await;
             drop(file);
-            if let Err(reason) = outcome {
+            if let Err(error) = outcome {
                 let _ = tokio::fs::remove_file(&staging).await;
-                // An empty reason is a pause/cancel: the caller decides.
-                return if reason.is_empty() { Ok(()) } else { Err(reason) };
+                // A stop (pause, cancel) is left to the caller.
+                return match error {
+                    TransferError::Stopped => Ok(()),
+                    TransferError::Failed(reason) => Err(reason),
+                };
             }
             tokio::fs::rename(&staging, &temp_path)
                 .await
@@ -3608,7 +3812,7 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
                 job.speed = 0;
                 job.connections = 1;
                 job.resumable = false;
-                job.mode = "single-stream".into();
+                job.mode = TransferMode::SingleStream;
                 job.completed_ranges = Vec::new();
                 job.mime = fallback_mime.clone();
                 job.note = Some("Finalizing".into());
@@ -3619,8 +3823,8 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
     if !transfer_is_current(&app, &id, generation) {
         return Ok(());
     }
-    if job_state(&app, &id).as_deref() != Some("downloading") {
-        if job_state(&app, &id).as_deref() == Some("paused") {
+    if job_state(&app, &id) != Some(JobState::Downloading) {
+        if job_state(&app, &id) == Some(JobState::Paused) {
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
@@ -3635,93 +3839,15 @@ async fn acquire_ranges<B: AsRef<[u8]>>(
     if written != total {
         return Err(format!("The partial file holds {written} bytes, not {total}"));
     }
-    let committed = state
-        .snapshot
-        .lock()
-        .ok()
-        .and_then(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .find(|job| job.id == id)
-                .map(|job| (job.provisional != Some(true), job.destination.clone()))
-        })
-        .unwrap_or((false, String::new()));
+    let committed = committed_destination(&state, &id);
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
-    // Held until the completion below is recorded (F08).
-    let publishing;
-    if committed.0 && !committed.1.is_empty() {
-        if let Some(parent) = PathBuf::from(&committed.1).parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-            if !transfer_can_continue(&app, &id, generation) {
-                return Ok(());
-            }
-        }
-        if !transfer_can_continue(&app, &id, generation) {
-            return Ok(());
-        }
-        let (destination, reserved, reservation) =
-            managed_destination(&committed.1, replace_existing)?;
-        if destination != committed.1 || reservation.is_some() {
-            let reservation_marker = reservation.clone();
-            emit_job(&state, &id, |job| {
-                job.destination = destination.clone();
-                job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                {
-                    if destination != committed.1 {
-                        job.name = file_name.to_string();
-                    }
-                }
-                if destination != committed.1 {
-                    job.events.insert(
-                        0,
-                        job_event("Destination renamed to avoid a collision", Some("warning"))
-                    );
-                }
-            });
-            emit_snapshot(&app, &state);
-        }
-        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
-        if publishing.is_none() {
-            if reserved {
-                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
-            }
-            clear_destination_reservation(&app, &state, &id);
-            return Ok(());
-        }
-        if let Err(error) = move_completed_file(
-            &temp_path,
-            &destination,
-            replace_existing,
-            reservation.as_deref()
-        )
-        .await
-        {
-            clear_destination_reservation(&app, &state, &id);
-            return Err(error);
-        }
-        clear_destination_reservation(&app, &state, &id);
+    let finished = (committed.0 && !committed.1.is_empty()).then_some((temp_path.as_str(), committed.1.as_str()));
+    match publish(&app, &id, generation, &committed, finished, replace_existing, async {}, "Download ready; waiting for destination").await {
+        Ok(()) | Err(PublishError::Stopped) => Ok(()),
+        Err(PublishError::Reserve(error) | PublishError::Move(error)) => Err(error),
     }
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
-        return Ok(());
-    }
-    emit_job(&state, &id, |job| {
-        if committed.0 {
-            complete_job(job);
-        } else {
-            mark_ready_for_confirmation(job, "Download ready; waiting for destination");
-        }
-    });
-    emit_snapshot(&app, &state);
-    if committed.0 {
-        add_notification(&app, &state, &id, "completed");
-    }
-    Ok(())
 }
 
 fn manifest_segment_path(directory: &Path, track: usize, index: usize, track_count: usize) -> PathBuf {
@@ -3780,7 +3906,7 @@ async fn resource_length(client: &reqwest::Client, app: &AppHandle, id: &str, ur
 
 const DASH_HEADER_LIMIT: u64 = 16 * 1024 * 1024;
 
-async fn materialize_dash_segment_bases(client: &reqwest::Client, app: &AppHandle, id: &str, mut tracks: Vec<media::MediaTrack>, retries: u32, generation: u64) -> Result<Vec<media::MediaTrack>, String> {
+async fn materialize_dash_segment_bases(client: &reqwest::Client, app: &AppHandle, id: &str, mut tracks: Vec<media::MediaTrack>, retries: u32, generation: u64) -> Result<Vec<media::MediaTrack>, TransferError> {
     for track in &mut tracks {
         let Some(base) = track.segment_base.clone() else { continue; };
         let total_length = resource_length(client, app, id, &base.url).await?;
@@ -3810,7 +3936,7 @@ async fn acquire_manifest(
     expected_kind: Option<String>,
     selected_segments: Vec<String>,
     generation: u64
-) -> Result<(), String> {
+) -> Result<(), TransferError> {
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
@@ -4047,8 +4173,8 @@ async fn acquire_manifest(
         return Ok(());
     }
     emit_job(&state, &id, |job| {
-        job.state = "downloading".into();
-        job.mode = "segments".into();
+        job.state = JobState::Downloading;
+        job.mode = TransferMode::Segments;
         job.media = true;
         job.mime = Some(container_mime.to_string());
         job.media_tracks = Some(track_count as u32);
@@ -4132,7 +4258,7 @@ async fn acquire_manifest(
         if !transfer_is_current(&app, &id, generation) {
             return Ok(());
         }
-        if matches!(job_state(&app, &id).as_deref(), Some("paused")) {
+        if job_state(&app, &id) == Some(JobState::Paused) {
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
@@ -4145,10 +4271,14 @@ async fn acquire_manifest(
             emit_snapshot(&app, &state);
             return Ok(());
         }
+        // Stopped for any other reason: whoever stopped it set the state.
+        let TransferError::Failed(initial_error) = initial_error else {
+            return Ok(());
+        };
         // Dead segment URLs cannot be revived sequentially either (F05).
         if is_terminal_source_error(&initial_error) {
             emit_job(&state, &id, |job| {
-                job.state = "failed".into();
+                job.state = JobState::Failed;
                 job.error = Some(initial_error.clone());
                 job.connections = 0;
                 job.speed = 0;
@@ -4158,7 +4288,7 @@ async fn acquire_manifest(
                 );
             });
             emit_snapshot(&app, &state);
-            return Err(initial_error);
+            return Err(initial_error.into());
         }
         emit_job(&state, &id, |job| {
             job.connections = 1;
@@ -4209,9 +4339,12 @@ async fn acquire_manifest(
             }
         }
         if let Some(error) = sequential_error {
+            let TransferError::Failed(error) = error else {
+                return Ok(());
+            };
             let error = format!("{initial_error}; sequential fallback failed: {error}");
             emit_job(&state, &id, |job| {
-                job.state = "failed".into();
+                job.state = JobState::Failed;
                 job.error = Some(error.clone());
                 job.connections = 0;
                 job.speed = 0;
@@ -4221,7 +4354,7 @@ async fn acquire_manifest(
                 );
             });
             emit_snapshot(&app, &state);
-            return Err(error);
+            return Err(error.into());
         }
     }
     finish_segmented(app.clone(), id.clone(), generation, segment_dir, temp_path, track_lengths, replace_existing).await
@@ -4239,14 +4372,14 @@ async fn finish_segmented(
     temp_path: String,
     track_lengths: Vec<usize>,
     replace_existing: bool
-) -> Result<(), String> {
+) -> Result<(), TransferError> {
     let state = app.state::<CoreState>();
     let track_count = track_lengths.len();
     if !transfer_is_current(&app, &id, generation) {
         return Ok(());
     }
-    if job_state(&app, &id).as_deref() != Some("downloading") {
-        if job_state(&app, &id).as_deref() == Some("paused") {
+    if job_state(&app, &id) != Some(JobState::Downloading) {
+        if job_state(&app, &id) == Some(JobState::Paused) {
             emit_job(&state, &id, |job| {
                 job.connections = 0;
                 job.speed = 0;
@@ -4257,7 +4390,7 @@ async fn finish_segmented(
         return Ok(());
     }
     emit_job(&state, &id, |job| {
-        job.state = "finalizing".into();
+        job.state = JobState::Finalizing;
         job.total = Some(job.downloaded);
         job.connections = 0;
         job.events.insert(
@@ -4306,20 +4439,8 @@ async fn finish_segmented(
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
-    let committed = state
-        .snapshot
-        .lock()
-        .ok()
-        .and_then(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .find(|job| job.id == id)
-                .map(|job| (job.provisional != Some(true), job.destination.clone()))
-        })
-        .unwrap_or((false, String::new()));
-    // Held until the completion below is recorded (F08).
-    let publishing;
+    let committed = committed_destination(&state, &id);
+    let mut finished = None;
     if committed.0 && !committed.1.is_empty() {
         let final_path = if track_count > 1 {
             let mux_path = format!("{temp_path}.mux.{}", media_extension(&committed.1));
@@ -4340,84 +4461,18 @@ async fn finish_segmented(
         } else {
             committed.1.clone()
         };
-        if let Some(parent) = PathBuf::from(&requested_destination).parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-            if !transfer_can_continue(&app, &id, generation) {
-                return Ok(());
-            }
-        }
-        if !transfer_can_continue(&app, &id, generation) {
-            return Ok(());
-        }
-        let (destination, reserved, reservation) =
-            managed_destination(&requested_destination, replace_existing)?;
-        if destination != committed.1 || reservation.is_some() {
-            let reservation_marker = reservation.clone();
-            emit_job(&state, &id, |job| {
-                job.destination = destination.clone();
-                job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                {
-                    if destination != committed.1 {
-                        job.name = file_name.to_string();
-                    }
-                }
-                if destination != committed.1 {
-                    job.events.insert(
-                        0,
-                        job_event("Destination renamed to avoid a collision", Some("warning"))
-                    );
-                }
-            });
-            emit_snapshot(&app, &state);
-        }
-        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
-        if publishing.is_none() {
-            if reserved {
-                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
-            }
-            clear_destination_reservation(&app, &state, &id);
-            return Ok(());
-        }
-        if let Err(error) = move_completed_file(
-            &final_path,
-            &destination,
-            replace_existing,
-            reservation.as_deref()
-        )
-        .await
-        {
-            clear_destination_reservation(&app, &state, &id);
-            return Err(error);
-        }
-        clear_destination_reservation(&app, &state, &id);
+        finished = Some((final_path, requested_destination));
+    }
+    let after_move = async {
         let _ = tokio::fs::remove_dir_all(&segment_dir).await;
         cleanup_media_track_files(&temp_path);
+    };
+    let ready_event = if track_count > 1 { "Tracks assembled; waiting for destination" } else { "Fragments assembled; waiting for destination" };
+    let finished = finished.as_ref().map(|(file, requested)| (file.as_str(), requested.as_str()));
+    match publish(&app, &id, generation, &committed, finished, replace_existing, after_move, ready_event).await {
+        Ok(()) | Err(PublishError::Stopped) => Ok(()),
+        Err(PublishError::Reserve(error) | PublishError::Move(error)) => Err(error.into()),
     }
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
-        return Ok(());
-    }
-    emit_job(&state, &id, |job| {
-        if committed.0 {
-            complete_job(job);
-        } else {
-            mark_ready_for_confirmation(
-                job,
-                if track_count > 1 {
-                    "Tracks assembled; waiting for destination"
-                } else {
-                    "Fragments assembled; waiting for destination"
-                }
-            );
-        }
-    });
-    emit_snapshot(&app, &state);
-    if committed.0 {
-        add_notification(&app, &state, &id, "completed");
-    }
-    Ok(())
 }
 
 async fn download_track_to_file(
@@ -4429,10 +4484,10 @@ async fn download_track_to_file(
     combined_total: Option<u64>,
     response: reqwest::Response,
     expected_kind: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), TransferError> {
     let state = app.state::<CoreState>();
     if !response.status().is_success() {
-        return Err(format!("track source returned {}", response.status()));
+        return Err(format!("track source returned {}", response.status()).into());
     }
     let expected = partial_response_is_complete(&response)?;
     let track_mime = header_string(&response, reqwest::header::CONTENT_TYPE);
@@ -4451,7 +4506,7 @@ async fn download_track_to_file(
                     break;
                 }
             }
-            Some(Err(error)) => return Err(error.to_string()),
+            Some(Err(error)) => return Err(error.to_string().into()),
             None => break,
         }
     }
@@ -4479,7 +4534,7 @@ async fn download_track_to_file(
     let mut track_downloaded = 0u64;
     while let Some(chunk) = stream.next().await {
         if !transfer_can_continue(app, id, generation) {
-            return Err("paused".into());
+            return Err(TransferError::Stopped);
         }
         let bytes = chunk.map_err(|e| e.to_string())?;
         file.write_all(&bytes).await.map_err(|e| e.to_string())?;
@@ -4494,11 +4549,11 @@ async fn download_track_to_file(
         });
         emit_progress(app, &state, id);
         if !throttle(app, id, bytes.len(), generation).await {
-            return Err("paused".into());
+            return Err(TransferError::Stopped);
         }
     }
     if expected.is_some_and(|total| track_downloaded != total) {
-        return Err(format!("track stream ended after {track_downloaded} bytes; expected {expected:?}"));
+        return Err(format!("track stream ended after {track_downloaded} bytes; expected {expected:?}").into());
     }
     file.sync_all().await.map_err(|e| e.to_string())?;
     Ok(())
@@ -4510,7 +4565,7 @@ async fn acquire_dual_track(
     video_response: reqwest::Response,
     audio_source: String,
     generation: u64,
-) -> Result<(), String> {
+) -> Result<(), TransferError> {
     if !transfer_can_continue(&app, &id, generation) {
         return Ok(());
     }
@@ -4539,7 +4594,7 @@ async fn acquire_dual_track(
         .await
         .map_err(|error| redact_url_credentials(&error.to_string()))?;
     if !audio_response.status().is_success() {
-        return Err(format!("audio source returned {}", audio_response.status()));
+        return Err(format!("audio source returned {}", audio_response.status()).into());
     }
     let audio_total = partial_response_is_complete(&audio_response)?;
 
@@ -4549,8 +4604,8 @@ async fn acquire_dual_track(
     };
 
     emit_job(&state, &id, |job| {
-        job.state = "downloading".into();
-        job.mode = "dual-track".into();
+        job.state = JobState::Downloading;
+        job.mode = TransferMode::DualTrack;
         // Both track files restart on every attempt.
         job.resumable = false;
         job.media = true;
@@ -4601,7 +4656,7 @@ async fn acquire_dual_track(
     }
 
     emit_job(&state, &id, |job| {
-        job.state = "finalizing".into();
+        job.state = JobState::Finalizing;
         job.total = Some(job.downloaded);
         job.connections = 0;
         job.speed = 0;
@@ -4613,21 +4668,8 @@ async fn acquire_dual_track(
     });
     emit_snapshot(&app, &state);
 
-    let committed = state
-        .snapshot
-        .lock()
-        .ok()
-        .and_then(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .find(|job| job.id == id)
-                .map(|job| (job.provisional != Some(true), job.destination.clone()))
-        })
-        .unwrap_or((false, String::new()));
-
-    // Held until the completion below is recorded (F08).
-    let publishing;
+    let committed = committed_destination(&state, &id);
+    let mut finished = None;
     if committed.0 && !committed.1.is_empty() {
         let track_paths = vec![track0_path, track1_path];
         let mux_path = format!("{temp_path}.mux.{}", media_extension(&committed.1));
@@ -4636,75 +4678,14 @@ async fn acquire_dual_track(
             return Ok(());
         }
         let requested_destination = destination_with_output_extension(&committed.1, &muxed_path);
-        if let Some(parent) = PathBuf::from(&requested_destination).parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-            if !transfer_can_continue(&app, &id, generation) {
-                return Ok(());
-            }
-        }
-        let (destination, reserved, reservation) =
-            managed_destination(&requested_destination, replace_existing)?;
-        if destination != committed.1 || reservation.is_some() {
-            let reservation_marker = reservation.clone();
-            emit_job(&state, &id, |job| {
-                job.destination = destination.clone();
-                job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                {
-                    if destination != committed.1 {
-                        job.name = file_name.to_string();
-                    }
-                }
-                if destination != committed.1 {
-                    job.events.insert(
-                        0,
-                        job_event("Destination renamed to avoid a collision", Some("warning")),
-                    );
-                }
-            });
-            emit_snapshot(&app, &state);
-        }
-        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
-        if publishing.is_none() {
-            if reserved {
-                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
-            }
-            clear_destination_reservation(&app, &state, &id);
-            return Ok(());
-        }
-        if let Err(error) = move_completed_file(
-            &muxed_path,
-            &destination,
-            replace_existing,
-            reservation.as_deref(),
-        )
-        .await
-        {
-            clear_destination_reservation(&app, &state, &id);
-            return Err(error);
-        }
-        clear_destination_reservation(&app, &state, &id);
-        cleanup_media_track_files(&temp_path);
+        finished = Some((muxed_path, requested_destination));
     }
-
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
-        return Ok(());
+    let finished = finished.as_ref().map(|(file, requested)| (file.as_str(), requested.as_str()));
+    let after_move = async { cleanup_media_track_files(&temp_path) };
+    match publish(&app, &id, generation, &committed, finished, replace_existing, after_move, "Tracks downloaded; waiting for destination").await {
+        Ok(()) | Err(PublishError::Stopped) => Ok(()),
+        Err(PublishError::Reserve(error) | PublishError::Move(error)) => Err(error.into()),
     }
-
-    emit_job(&state, &id, |job| {
-        if committed.0 {
-            complete_job(job);
-        } else {
-            mark_ready_for_confirmation(job, "Tracks downloaded; waiting for destination");
-        }
-    });
-    emit_snapshot(&app, &state);
-    if committed.0 {
-        add_notification(&app, &state, &id, "completed");
-    }
-    Ok(())
 }
 
 async fn acquire_once(app: AppHandle, id: String, source: String, generation: u64) -> bool {
@@ -4839,21 +4820,10 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 generation,
             )
             .await,
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         };
         if let Err(error) = result {
-            if transfer_is_current(&app, &id, generation) {
-                if job_state(&app, &id).as_deref() == Some("paused") {
-                    emit_job(&state, &id, |job| {
-                        job.connections = 0;
-                        job.speed = 0;
-                        job.note = Some("Paused".into());
-                    });
-                    emit_snapshot(&app, &state);
-                } else if job_state(&app, &id).as_deref() != Some("failed") {
-                    mark_acquisition_failed(&app, &state, &id, error, "Manifest acquisition failed");
-                }
-            }
+            settle_transfer_error(&app, &state, &id, generation, error, "Manifest acquisition failed");
         }
         return false;
     }
@@ -4872,18 +4842,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         )
         .await
         {
-            if transfer_is_current(&app, &id, generation) {
-                if job_state(&app, &id).as_deref() == Some("paused") {
-                    emit_job(&state, &id, |job| {
-                        job.connections = 0;
-                        job.speed = 0;
-                        job.note = Some("Paused".into());
-                    });
-                    emit_snapshot(&app, &state);
-                } else if job_state(&app, &id).as_deref() != Some("failed") {
-                    mark_acquisition_failed(&app, &state, &id, error, "Dual-track media acquisition failed");
-                }
-            }
+            settle_transfer_error(&app, &state, &id, generation, error, "Dual-track media acquisition failed");
         }
         return false;
     }
@@ -4948,9 +4907,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         )
         .await;
         if let Err(error) = result {
-            if transfer_is_current(&app, &id, generation) {
-                mark_acquisition_failed(&app, &state, &id, error, "Manifest acquisition failed");
-            }
+            settle_transfer_error(&app, &state, &id, generation, error, "Manifest acquisition failed");
         }
         return false;
     }
@@ -5002,18 +4959,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             )
             .await
             {
-                if transfer_is_current(&app, &id, generation) {
-                    if job_state(&app, &id).as_deref() == Some("paused") {
-                        emit_job(&state, &id, |job| {
-                            job.connections = 0;
-                            job.speed = 0;
-                            job.note = Some("Paused".into());
-                        });
-                        emit_snapshot(&app, &state);
-                    } else if job_state(&app, &id).as_deref() != Some("failed") {
-                        mark_acquisition_failed(&app, &state, &id, error, "Range acquisition failed");
-                    }
-                }
+                settle_transfer_error(&app, &state, &id, generation, error.into(), "Range acquisition failed");
             }
             return false;
         }
@@ -5034,7 +4980,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                 return false;
             }
             emit_job(&state, &id, |job| {
-                job.state = "failed".into();
+                job.state = JobState::Failed;
                 job.error = Some(format!("Could not create the temporary folder: {error}"));
                 job.events.insert(
                     0,
@@ -5054,7 +5000,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
             return false;
         }
         emit_job(&state, &id, |job| {
-            job.state = "failed".into();
+            job.state = JobState::Failed;
             job.error = Some("Could not open the temporary file".into());
             job.events.insert(
                 0,
@@ -5069,11 +5015,11 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         return false;
     }
     emit_job(&state, &id, |job| {
-        job.state = "downloading".into();
+        job.state = JobState::Downloading;
         job.total = total;
         job.resumable = false;
         job.connections = 1;
-        job.mode = "single-stream".into();
+        job.mode = TransferMode::SingleStream;
         job.mime = response_mime.clone();
         job.events.insert(
             0,
@@ -5104,7 +5050,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                         return false;
                     }
                     emit_job(&state, &id, |job| {
-                        job.state = "failed".into();
+                        job.state = JobState::Failed;
                         job.error = Some(redact_url_credentials(&error.to_string()));
                         job.speed = 0;
                         job.connections = 0;
@@ -5139,7 +5085,7 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
                     return false;
                 }
                 emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
+                    job.state = JobState::Failed;
                     job.error = Some(redact_url_credentials(&error.to_string()));
                     job.speed = 0;
                     job.connections = 0;
@@ -5172,117 +5118,25 @@ async fn acquire_once(app: AppHandle, id: String, source: String, generation: u6
         .ok()
         .map(|snapshot| snapshot.settings.collision_behavior == "replace")
         .unwrap_or(false);
-    let committed = state
-        .snapshot
-        .lock()
-        .ok()
-        .and_then(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .find(|job| job.id == id)
-                .map(|job| (job.provisional != Some(true), job.destination.clone()))
-        })
-        .unwrap_or((false, String::new()));
-    // Held until the completion below is recorded (F08).
-    let publishing;
-    if committed.0 && !committed.1.is_empty() {
-        if let Some(parent) = PathBuf::from(&committed.1).parent() {
-            let _ = std::fs::create_dir_all(parent);
+    let committed = committed_destination(&state, &id);
+    let finished = (committed.0 && !committed.1.is_empty()).then_some((temp_path.as_str(), committed.1.as_str()));
+    let (error, event) = match publish(&app, &id, generation, &committed, finished, replace_existing, async {}, "Download ready; waiting for destination").await {
+        Ok(()) | Err(PublishError::Stopped) => return false,
+        Err(PublishError::Reserve(error)) => (error, "Could not reserve a unique destination"),
+        Err(PublishError::Move(error)) => {
             if !transfer_can_continue(&app, &id, generation) {
                 return false;
             }
+            (redact_url_credentials(&error), "Could not move the completed file")
         }
-        if !transfer_can_continue(&app, &id, generation) {
-            return false;
-        }
-        let (destination, reserved, reservation) =
-            match managed_destination(&committed.1, replace_existing) {
-                Ok(value) => value,
-                Err(error) => {
-                    emit_job(&state, &id, |job| {
-                        job.state = "failed".into();
-                        job.error = Some(error.clone());
-                        job.events.insert(
-                            0,
-                            job_event("Could not reserve a unique destination", Some("error"))
-                        );
-                    });
-                    emit_snapshot(&app, &state);
-                    add_notification(&app, &state, &id, "failed");
-                    return false;
-                }
-            };
-        if destination != committed.1 || reservation.is_some() {
-            let reservation_marker = reservation.clone();
-            emit_job(&state, &id, |job| {
-                job.destination = destination.clone();
-                job.destination_reservation = reservation_marker;
-                if let Some(file_name) = PathBuf::from(&destination)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                {
-                    if destination != committed.1 {
-                        job.name = file_name.to_string();
-                    }
-                }
-                if destination != committed.1 {
-                    job.events.insert(
-                        0,
-                        job_event("Destination renamed to avoid a collision", Some("warning"))
-                    );
-                }
-            });
-            emit_snapshot(&app, &state);
-        }
-        publishing = begin_publishing(&state, &id, || transfer_can_continue(&app, &id, generation));
-        if publishing.is_none() {
-            if reserved {
-                cleanup_reserved_destination(&destination, reservation.as_deref()).await;
-            }
-            clear_destination_reservation(&app, &state, &id);
-            return false;
-        }
-        if let Err(error) = move_completed_file(
-            &temp_path,
-            &destination,
-            replace_existing,
-            reservation.as_deref()
-        )
-        .await
-        {
-            clear_destination_reservation(&app, &state, &id);
-            if !transfer_can_continue(&app, &id, generation) {
-                return false;
-            }
-            emit_job(&state, &id, |job| {
-                job.state = "failed".into();
-                job.error = Some(redact_url_credentials(&error.to_string()));
-                job.events.insert(
-                    0,
-                    job_event("Could not move the completed file", Some("error"))
-                );
-            });
-            emit_snapshot(&app, &state);
-            add_notification(&app, &state, &id, "failed");
-            return false;
-        }
-        clear_destination_reservation(&app, &state, &id);
-    }
-    if !committed.0 && !transfer_can_continue(&app, &id, generation) {
-        return false;
-    }
+    };
     emit_job(&state, &id, |job| {
-        if committed.0 {
-            complete_job(job);
-        } else {
-            mark_ready_for_confirmation(job, "Download ready; waiting for destination");
-        }
+        job.state = JobState::Failed;
+        job.error = Some(error);
+        job.events.insert(0, job_event(event, Some("error")));
     });
     emit_snapshot(&app, &state);
-    if committed.0 {
-        add_notification(&app, &state, &id, "completed");
-    }
+    add_notification(&app, &state, &id, "failed");
     false
 }
 
@@ -5708,7 +5562,7 @@ async fn finish_from_disk(app: &AppHandle, id: &str, generation: u64) -> bool {
         let replace_existing = snapshot.settings.collision_behavior == "replace";
         snapshot.jobs.iter().find(|job| job.id == id).and_then(|job| {
             let segments = job.segments.as_ref()?;
-            (job.state == "finalizing" && job.provisional != Some(true) && segments.completed == segments.total)
+            (job.state == JobState::Finalizing && job.provisional != Some(true) && segments.completed == segments.total)
                 .then(|| (job.temp_path.clone(), segments.total, replace_existing))
         })
     });
@@ -5716,12 +5570,12 @@ async fn finish_from_disk(app: &AppHandle, id: &str, generation: u64) -> bool {
     let segment_dir = PathBuf::from(format!("{temp_path}.segments"));
     let Some(track_lengths) = complete_segment_layout(&segment_dir, total) else { return false; };
     emit_job(&state, id, |job| {
-        job.state = "downloading".into();
+        job.state = JobState::Downloading;
         job.events.insert(0, job_event("Resuming assembly from the fragments already downloaded", Some("warning")));
     });
     emit_snapshot(app, &state);
-    if let Err(error) = finish_segmented(app.clone(), id.to_string(), generation, segment_dir, temp_path, track_lengths, replace_existing).await {
-        if transfer_is_current(app, id, generation) && job_state(app, id).as_deref() != Some("failed") {
+    if let Err(TransferError::Failed(error)) = finish_segmented(app.clone(), id.to_string(), generation, segment_dir, temp_path, track_lengths, replace_existing).await {
+        if transfer_is_current(app, id, generation) && job_state(app, id) != Some(JobState::Failed) {
             mark_acquisition_failed(app, &state, id, error, "Media finalization failed");
         }
     }
@@ -5775,12 +5629,12 @@ async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
         if attempt > 0 {
             let state = app.state::<CoreState>();
             if !transfer_is_current(&app, &id, generation)
-                || job_state(&app, &id).as_deref() != Some("failed")
+                || job_state(&app, &id) != Some(JobState::Failed)
             {
                 return;
             }
             emit_job(&state, &id, |job| {
-                job.state = "connecting".into();
+                job.state = JobState::Connecting;
                 job.error = None;
                 job.connections = 0;
                 job.events.insert(
@@ -5802,7 +5656,7 @@ async fn acquire(app: AppHandle, id: String, source: String, generation: u64) {
         if !transfer_is_current(&app, &id, generation)
             || !automatic
             || !retryable
-            || job_state(&app, &id).as_deref() != Some("failed")
+            || job_state(&app, &id) != Some(JobState::Failed)
             || attempt == retries
         {
             return;
@@ -5932,10 +5786,10 @@ fn forget_reattach(state: &CoreState, ids: &[&str]) {
 }
 
 fn pause_in_place(job: &mut DownloadJob, event: &str) -> bool {
-    if !PAUSABLE_STATES.contains(&job.state.as_str()) {
+    if !job.state.is_pausable() {
         return false;
     }
-    job.state = "paused".into();
+    job.state = JobState::Paused;
     job.speed = 0;
     job.connections = 0;
     job.note = Some("Paused".into());
@@ -5992,10 +5846,10 @@ fn plan_resume_all(
 ) -> Vec<(String, String)> {
     let mut sources = Vec::new();
     for job in snapshot.jobs.iter_mut() {
-        if !["paused", "pending"].contains(&job.state.as_str()) || transfer_active(&job.id) {
+        if !job.state.is_paused_or_pending() || transfer_active(&job.id) {
             continue;
         }
-        job.state = "downloading".into();
+        job.state = JobState::Downloading;
         job.connections = 1;
         job.note = Some("Resuming".into());
         job.events.insert(0, job_event(event, Some("success")));
@@ -6014,7 +5868,7 @@ fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
         snapshot
             .jobs
             .iter()
-            .find(|job| job.id == id && ["paused", "pending"].contains(&job.state.as_str()))
+            .find(|job| job.id == id && job.state.is_paused_or_pending())
             .map(|job| job.source.clone())
     })
     else {
@@ -6022,8 +5876,8 @@ fn resume_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
     };
     forget_reattach(state.inner(), &[id.as_str()]);
     emit_job(&state, &id, |job| {
-        if ["paused", "pending"].contains(&job.state.as_str()) {
-            job.state = "downloading".into();
+        if job.state.is_paused_or_pending() {
+            job.state = JobState::Downloading;
             job.connections = 1;
             job.note = Some("Resuming".into());
             job.events.insert(0, job_event("Resumed", Some("success")));
@@ -6049,7 +5903,7 @@ fn retry_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
             .map(|job| job.source.clone())
     });
     emit_job(&state, &id, |job| {
-        job.state = "connecting".into();
+        job.state = JobState::Connecting;
         job.error = None;
         job.speed = 0;
         job.connections = 0;
@@ -6076,7 +5930,7 @@ fn cancel_job_internal(app: &AppHandle, state: &CoreState, id: &str) {
         if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id && job.provisional == Some(true)) { temp_path = Some(job.temp_path.clone()); }
         snapshot.jobs.retain(|job| !(job.id == id && job.provisional == Some(true)));
         snapshot.notifications.retain(|item| item.job_id != id);
-        if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { job.state = "failed".into(); job.error = Some("Cancelled by user".into()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Cancelled by user", Some("warning"))); }
+        if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.id == id) { job.state = JobState::Failed; job.error = Some("Cancelled by user".into()); job.speed = 0; job.connections = 0; job.events.insert(0, job_event("Cancelled by user", Some("warning"))); }
     }
     if let Some(path) = temp_path { discard_temp_artifacts(path); }
     if let Ok(mut buckets) = state.job_bandwidth.lock() { buckets.remove(id); }
@@ -6160,7 +6014,7 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
     if let Ok(mut snapshot) = state.snapshot.lock() {
         if let Some(job) = snapshot.jobs.iter().find(|job| job.id == id) {
             track_cleanup = Some(job.temp_path.clone());
-            if job.state != "completed" {
+            if job.state != JobState::Completed {
                 temporary = Some(job.temp_path.clone());
             }
             // Only a completed job owns the file at its destination: an
@@ -6168,7 +6022,7 @@ fn remove_job(app: AppHandle, state: State<'_, CoreState>, id: String, delete_fi
             // creates that file only happens at completion. Deleting it for a
             // failed or paused job would remove whatever the user already had
             // under that name.
-            if delete_file.unwrap_or(false) && job.state == "completed" {
+            if delete_file.unwrap_or(false) && job.state == JobState::Completed {
                 destination_to_delete = Some(job.destination.clone());
             }
         }
@@ -6273,7 +6127,7 @@ fn start_provisional(
                             .and_then(user_agent_value)
                             .map(str::to_string);
                         job.domain = domain(&input.source);
-                        job.state = "connecting".into();
+                        job.state = JobState::Connecting;
                         job.error = None;
                         job.speed = 0;
                         job.connections = 0;
@@ -6360,7 +6214,7 @@ fn start_provisional(
         name,
         source: input.source.clone(),
         domain: domain(&input.source),
-        state: "connecting".into(),
+        state: JobState::Connecting,
         progress: 0.0,
         downloaded: 0,
         total: None,
@@ -6372,7 +6226,7 @@ fn start_provisional(
         connections: 0,
         max_connections,
         bandwidth_limit,
-        mode: "single-stream".into(),
+        mode: TransferMode::SingleStream,
         media,
         media_tracks: None,
         destination,
@@ -6497,45 +6351,36 @@ enum CommitDecision {
 
 fn commit_is_ready(
     provisional: Option<bool>,
-    state: Option<&str>,
+    state: Option<JobState>,
     progress: f64,
     transfer_active: bool,
 ) -> bool {
     provisional == Some(true)
         && !transfer_active
-        && state == Some("ready")
+        && state == Some(JobState::Ready)
         && progress >= 100.0
 }
 
-/// States a provisional acquisition can be accepted from. Accepting a paused or
-/// waiting acquisition is legitimate — the user is turning it into a managed job
-/// — which is why only failure blocks the decision.
-const COMMITTABLE_STATES: [&str; 6] = [
-    "connecting",
-    "downloading",
-    "paused",
-    "pending",
-    "finalizing",
-    "ready",
-];
-
 fn commit_decision(
     provisional: Option<bool>,
-    state: Option<&str>,
+    state: Option<JobState>,
     progress: f64,
     transfer_active: bool,
 ) -> CommitDecision {
     let Some(state) = state else {
         return CommitDecision::Reject;
     };
-    if provisional != Some(true) || !COMMITTABLE_STATES.contains(&state) {
+    // Accepting a paused or waiting acquisition is legitimate — the user is
+    // turning it into a managed job — which is why only failure (or a job
+    // already done) blocks the decision.
+    if provisional != Some(true) || matches!(state, JobState::Completed | JobState::Failed) {
         return CommitDecision::Reject;
     }
     // A settled acquisition (finished, or assembling its containers) accepts as
     // soon as it stops moving bytes, because this command then owns putting the
     // file in place. A job still moving bytes accepts immediately and keeps
     // transferring straight into the destination.
-    let settled = state == "ready" || progress >= 100.0;
+    let settled = state == JobState::Ready || progress >= 100.0;
     if settled && transfer_active {
         return CommitDecision::WaitForIdle;
     }
@@ -6549,7 +6394,7 @@ fn commit_still_owned(state: &CoreState, id: &str) -> bool {
         .ok()
         .and_then(|snapshot| {
             snapshot.jobs.iter().find(|job| job.id == id).map(|job| {
-                job.provisional == Some(false) && job.state == "finalizing" && job.progress >= 100.0
+                job.provisional == Some(false) && job.state == JobState::Finalizing && job.progress >= 100.0
             })
         })
         .unwrap_or(false)
@@ -6569,7 +6414,7 @@ async fn follow_destination(app: AppHandle, id: String) {
         let moves = !temp_folder_set
             && Path::new(&target).parent() != Path::new(&job.temp_path).parent()
             && (job.resumable || job.downloaded == 0)
-            && (PAUSABLE_STATES.contains(&job.state.as_str()) || ["paused", "pending"].contains(&job.state.as_str()));
+            && (job.state.is_pausable() || job.state.is_paused_or_pending());
         moves.then(|| (job.temp_path.clone(), target))
     });
     let Some((old_path, new_path)) = plan else { return };
@@ -6613,11 +6458,11 @@ async fn follow_destination(app: AppHandle, id: String) {
     if paused_here {
         let _lifecycle = state.lifecycle.lock().ok();
         let source = state.snapshot.lock().ok().and_then(|snapshot| {
-            snapshot.jobs.iter().find(|job| job.id == id && job.state == "paused").map(|job| job.source.clone())
+            snapshot.jobs.iter().find(|job| job.id == id && job.state == JobState::Paused).map(|job| job.source.clone())
         });
         if let Some(source) = source.filter(|_| !transfer_is_active(state.inner(), &id)) {
             emit_job(&state, &id, |job| {
-                job.state = "downloading".into();
+                job.state = JobState::Downloading;
                 job.connections = 1;
                 job.note = Some("Resuming".into());
             });
@@ -6658,11 +6503,11 @@ async fn commit_provisional(
             .find(|job| job.id == id)
             .ok_or_else(|| "Acquisition no longer exists".to_string())?;
         let active = transfer_is_active(state.inner(), &id);
-        let ready = job.state == "ready" || job.progress >= 100.0;
+        let ready = job.state == JobState::Ready || job.progress >= 100.0;
         (
             commit_decision(
                 job.provisional,
-                Some(job.state.as_str()),
+                Some(job.state),
                 job.progress,
                 active
             ),
@@ -6701,7 +6546,7 @@ async fn commit_provisional(
             .ok_or_else(|| "Acquisition was cancelled before it could be committed".to_string())?;
         let decision = commit_decision(
             job.provisional,
-            Some(job.state.as_str()),
+            Some(job.state),
             job.progress,
             active
         );
@@ -6710,7 +6555,7 @@ async fn commit_provisional(
             && (decision != CommitDecision::Accept
                 || !commit_is_ready(
                     job.provisional,
-                    Some(job.state.as_str()),
+                    Some(job.state),
                     job.progress,
                     active
                 ))
@@ -6720,7 +6565,7 @@ async fn commit_provisional(
         if decision == CommitDecision::Reject {
             return Err("Acquisition is no longer available for commit".into());
         }
-        let before = (job.name.clone(), job.destination.clone(), job.max_connections, job.bandwidth_limit, job.state.clone(), job.note.clone());
+        let before = (job.name.clone(), job.destination.clone(), job.max_connections, job.bandwidth_limit, job.state, job.note.clone());
         let name = if input.name.trim().is_empty() {
             job.name.clone()
         } else {
@@ -6762,8 +6607,8 @@ async fn commit_provisional(
         // The job is a managed download now. A transfer that had already
         // finished its bytes re-enters finalization, because moving the file
         // into place is exactly the work that is left.
-        if job.state == "ready" {
-            job.state = "finalizing".into();
+        if job.state == JobState::Ready {
+            job.state = JobState::Finalizing;
             job.note = None;
         }
         // Keep the acquisition mode's verified resumability. Single-stream
@@ -6777,7 +6622,7 @@ async fn commit_provisional(
             job.temp_path.clone(),
             job.destination.clone(),
             collision == "replace",
-            job.mode == "segments" || job.mode == "dual-track",
+            job.mode == TransferMode::Segments || job.mode == TransferMode::DualTrack,
             job.media_tracks.unwrap_or(1),
             before
         )
@@ -6789,7 +6634,7 @@ async fn commit_provisional(
     if let Err(error) = persist_job(&state, &id) {
         let (name, destination, max_connections, bandwidth_limit, job_state, eta) = accepted.6.clone();
         emit_job(&state, &id, |job| {
-            if job.state == "completed" {
+            if job.state == JobState::Completed {
                 return;
             }
             job.provisional = Some(true);
@@ -6797,7 +6642,7 @@ async fn commit_provisional(
             job.destination = destination;
             job.max_connections = max_connections;
             job.bandwidth_limit = bandwidth_limit;
-            if job.state == "finalizing" && job_state == "ready" {
+            if job.state == JobState::Finalizing && job_state == JobState::Ready {
                 job.state = job_state;
                 job.note = eta;
             }
@@ -6829,7 +6674,7 @@ async fn commit_provisional(
                     return Err("Acquisition was paused or cancelled during finalization".into());
                 }
                 emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
+                    job.state = JobState::Failed;
                     job.error = Some(error.clone());
                     job.events.insert(
                         0,
@@ -6856,7 +6701,7 @@ async fn commit_provisional(
                     return Err("Acquisition was paused or cancelled during finalization".into());
                 }
                 emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
+                    job.state = JobState::Failed;
                     job.error = Some(error.clone());
                     job.events.insert(
                         0,
@@ -6902,7 +6747,7 @@ async fn commit_provisional(
             }
             Err(error) => {
                 emit_job(&state, &id, |job| {
-                    job.state = "failed".into();
+                    job.state = JobState::Failed;
                     job.error = Some(error.clone());
                     job.events.insert(
                         0,
@@ -6985,7 +6830,7 @@ async fn commit_provisional(
                 return Err("Acquisition was paused or cancelled during the file move".into());
             }
             emit_job(&state, &id, |job| {
-                job.state = "failed".into();
+                job.state = JobState::Failed;
                 job.error = Some(redact_url_credentials(&error.to_string()));
                 job.events.insert(
                     0,
@@ -7059,7 +6904,7 @@ fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
             snapshot
                 .jobs
                 .iter()
-                .any(|job| job.id == id && job.provisional != Some(true) && ["paused", "pending", "failed"].contains(&job.state.as_str()))
+                .any(|job| job.id == id && job.provisional != Some(true) && (job.state.is_paused_or_pending() || job.state == JobState::Failed))
         })
         .unwrap_or(false);
     if stopped && !transfer_is_active(state.inner(), &id) {
@@ -7067,7 +6912,7 @@ fn reattach_job(app: AppHandle, state: State<'_, CoreState>, id: String) {
             *target = Some(id.clone());
         }
         emit_job(&state, &id, |job| {
-            job.state = "pending".into();
+            job.state = JobState::Pending;
             job.note = Some("Waiting for renewed source".into());
             job.events.insert(
                 0,
@@ -7852,7 +7697,7 @@ fn main() {
             initial_snapshot.paired_browsers = paired_keys.len();
             let tray_intercept_downloads = initial_snapshot.settings.intercept_downloads;
             let tray_show_media_buttons = initial_snapshot.settings.show_media_buttons;
-            let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && TRANSFER_STATES.contains(&job.state.as_str())).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
+            let recovered = initial_snapshot.jobs.iter().filter(|job| job.provisional != Some(true) && job.state.is_transfer()).map(|job| (job.id.clone(), job.source.clone())).collect::<Vec<_>>();
             app.manage(CoreState { tray_items: Mutex::new(None), snapshot: Mutex::new(initial_snapshot), database: Mutex::new(database), reattach_target: Mutex::new(None), bandwidth: Mutex::new(BandwidthBucket { tokens: 0.0, updated: std::time::Instant::now() }), transfer_controls: TransferRegistry::default(), job_bandwidth: Mutex::new(std::collections::HashMap::new()), lifecycle: Mutex::new(()), tray_checks: Mutex::new(None), progress: Mutex::new(ProgressThrottle::default()), viability: Mutex::new(std::collections::HashMap::new()), captures: Mutex::new(std::collections::VecDeque::new()), adoptable_names: Mutex::new(std::collections::HashSet::new()), publishing: Mutex::new(std::collections::HashSet::new()), pairings: Mutex::new(pairing::Pairings::with_keys(paired_keys)), credentials: Mutex::new(stored_credentials), persisted: Mutex::new(Persisted::default()), emitted: Mutex::new(Emitted::default()) });
             save_snapshot(&app.state::<CoreState>()).map_err(|error| error.to_string())?;
             install_tray(app.handle(), tray_intercept_downloads, tray_show_media_buttons)?;

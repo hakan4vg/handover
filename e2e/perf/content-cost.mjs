@@ -209,7 +209,7 @@ async function measureTotals(context, base, name) {
 
 // ---------------------------------------------------------------- profile
 
-const KEY_FUNCTIONS = ['track', 'collectMedia', 'scanShadowMedia', 'observeShadowRoot', 'updateMediaCache', 'mediaInNode', 'rebuildMediaCache', 'pick', 'positionButton', 'loop', 'requestMediaFilter', 'onPointerMove', 'refreshPolicy'];
+const KEY_FUNCTIONS = ['track', 'collectMedia', 'scanShadowMedia', 'watchShadowRoot', 'onMediaEvent', 'discoverAt', 'pick', 'positionButton', 'loop', 'requestMediaFilter', 'onPointerMove', 'refreshPolicy'];
 
 async function profile(context, base, name, extensionId) {
   const { tab, cdp } = await openPage(context, base, name);

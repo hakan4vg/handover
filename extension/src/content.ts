@@ -384,109 +384,92 @@ function usable(el: HTMLMediaElement): boolean {
   return !el.hasAttribute('disabled') && !!source && mediaFilterAllowed(el, source);
 }
 
+// Media is found from what it does instead of by watching the DOM. A
+// whole-document MutationObserver cost a big page that keeps changing a
+// callback per mutation batch, plus a track() and its layout reads every
+// 100 ms, whether or not the page had any media. Instead the document is
+// walked once at start; after that every media element that loads a source
+// fires loadstart (and timeupdate while it plays), which capture listeners on
+// the document and on each open shadow root see. A media element nothing
+// announced (it loaded while out of the document, or was removed and put
+// back) is found when it plays or when the pointer rests on it.
+//
 // Media inside web-component players (Media Chrome / mux-video and similar)
-// lives in open shadow roots; document.querySelectorAll('video, audio') cannot
-// see it. Walking every element to find those roots costs a long task on a big
-// page, so the document is walked once, for the roots that already exist
-// (declarative shadow DOM, and roots created before this script ran); after
-// that page-probe.ts announces each open root as the page creates it. Every
-// known root is observed like the document, which keeps its media fresh.
-// Closed shadow roots stay invisible.
+// lives in open shadow roots, whose events do not reach the document. The
+// document is walked once for the roots that already exist (declarative
+// shadow DOM, and roots created before this script ran); after that
+// page-probe.ts announces each open root as the page creates it. Every known
+// root gets the same listeners as the document. Closed shadow roots stay
+// invisible.
+const DISCOVERY_EVENTS = ['loadstart', 'loadedmetadata', 'play', 'timeupdate'];
+/** How often a resting or moving pointer may hit-test for media nothing announced. */
+const DISCOVERY_INTERVAL_MS = 250;
+const knownMedia = new Set<MediaElement>();
+const listenedRoots = new WeakSet<Document | ShadowRoot>();
+let started = false;
 let shadowScanned = false;
-let lightMediaCache: MediaElement[] | null = null;
-let shadowMediaCache: MediaElement[] = [];
-let mediaCache: MediaElement[] | null = null;
-let mediaObserver: MutationObserver | null = null;
+let queuedTrack: number | null = null;
+let lastDiscovery = 0;
+let discoveryTimer: number | null = null;
 
-const mediaMutationOptions: MutationObserverInit = {
-  childList: true,
-  subtree: true,
-  attributes: true,
-  attributeFilter: ['src', 'disabled', 'type'],
-};
+function isMedia(node: unknown): node is MediaElement {
+  return node instanceof HTMLVideoElement || node instanceof HTMLAudioElement;
+}
 
-function mediaInNode(node: Node): MediaElement[] {
-  const found: MediaElement[] = [];
-  if (node instanceof HTMLVideoElement || node instanceof HTMLAudioElement) found.push(node);
-  if (node instanceof Element || node instanceof DocumentFragment || node instanceof Document) {
-    node.querySelectorAll('video, audio').forEach((media) => {
-      if (media instanceof HTMLVideoElement || media instanceof HTMLAudioElement) found.push(media);
-    });
-  }
+function scheduleTrack(): void {
+  if (!started || queuedTrack !== null) return;
+  queuedTrack = window.setTimeout(() => {
+    queuedTrack = null;
+    track();
+  }, 100);
+}
+
+/** True when the element was not known before. */
+function rememberMedia(media: MediaElement): boolean {
+  if (knownMedia.has(media)) return false;
+  knownMedia.add(media);
+  observePlayer(media);
+  return true;
+}
+
+function rememberMediaIn(root: ParentNode): boolean {
+  let found = false;
+  root.querySelectorAll('video, audio').forEach((media) => {
+    if (isMedia(media) && rememberMedia(media)) found = true;
+  });
   return found;
 }
 
-function appendMedia(cache: MediaElement[], values: MediaElement[]): void {
-  const known = new Set(cache);
-  values.forEach((media) => {
-    if (!known.has(media)) {
-      known.add(media);
-      cache.push(media);
-    }
-  });
+function onMediaEvent(event: Event): void {
+  const target = event.target;
+  if (!isMedia(target)) return;
+  // loadstart on a known element means its source changed.
+  if (rememberMedia(target) || event.type === 'loadstart') scheduleTrack();
 }
 
-function mediaRootIsConnected(media: MediaElement, root: Document | ShadowRoot): boolean {
-  return media.isConnected && media.getRootNode() === root;
+function listenForMedia(root: Document | ShadowRoot): void {
+  if (listenedRoots.has(root)) return;
+  listenedRoots.add(root);
+  for (const type of DISCOVERY_EVENTS) root.addEventListener(type, onMediaEvent, { capture: true, passive: true });
 }
 
-function rebuildMediaCache(): MediaElement[] {
-  const light = lightMediaCache ?? [];
-  shadowMediaCache = shadowMediaCache.filter((media) => {
-    const root = media.getRootNode();
-    return typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot && mediaRootIsConnected(media, root);
-  });
-  mediaCache = [...light, ...shadowMediaCache];
-  return mediaCache;
-}
-
-function updateMediaCache(records: MutationRecord[]): void {
-  if (lightMediaCache === null) return;
-  let lightChanged = false;
-  let shadowChanged = false;
-  for (const record of records) {
-    if (record.type !== 'childList') continue;
-    const root = record.target.getRootNode();
-    const isShadow = typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot;
-    const cache = isShadow ? shadowMediaCache : lightMediaCache;
-    record.addedNodes.forEach((node) => {
-      appendMedia(cache, mediaInNode(node));
-      // A shadow host moved or re-inserted: its root is still observed, but
-      // its media left the cache while the host was out of the document.
-      const shadow = node instanceof Element ? node.shadowRoot : null;
-      if (shadow) {
-        appendMedia(shadowMediaCache, mediaInNode(shadow));
-        shadowChanged = true;
-      }
-    });
-    if (isShadow) shadowChanged = true;
-    else lightChanged = true;
-  }
-  if (lightChanged) {
-    lightMediaCache = lightMediaCache.filter((media) => mediaRootIsConnected(media, document));
-  }
-  if (shadowChanged || lightChanged) rebuildMediaCache();
-}
-
-function observeShadowRoot(shadow: ShadowRoot): void {
-  mediaObserver?.observe(shadow, mediaMutationOptions);
-  appendMedia(shadowMediaCache, mediaInNode(shadow));
+function watchShadowRoot(shadow: ShadowRoot): boolean {
+  listenForMedia(shadow);
+  return rememberMediaIn(shadow);
 }
 
 function scanShadowMedia(): void {
   if (typeof ShadowRoot === 'undefined') return;
-  shadowMediaCache = [];
   const scan = (root: ParentNode): void => {
     root.querySelectorAll('*').forEach((el) => {
       const shadow = (el as HTMLElement).shadowRoot;
       if (!shadow) return;
-      observeShadowRoot(shadow);
+      watchShadowRoot(shadow);
       scan(shadow);
     });
   };
   scan(document);
   shadowScanned = true;
-  rebuildMediaCache();
 }
 
 // page-probe.ts dispatches this on the host of each open shadow root the page
@@ -496,20 +479,55 @@ document.addEventListener('dm-shadow-root', (event) => {
   const host = event.composedPath()[0];
   const shadow = host instanceof Element ? host.shadowRoot : null;
   if (!shadow || !shadowScanned || !active()) return;
-  observeShadowRoot(shadow);
-  rebuildMediaCache();
+  if (watchShadowRoot(shadow)) scheduleTrack();
 }, true);
 
+/** Hit-tests under the pointer, through open shadow roots, for media no event
+ *  announced (a player that loaded while detached, or under an overlay). Rate
+ *  limited, with a trailing run so a pointer that stops is still tested. */
+function requestDiscovery(): void {
+  if (discoveryTimer !== null) return;
+  const wait = Math.max(0, lastDiscovery + DISCOVERY_INTERVAL_MS - performance.now());
+  discoveryTimer = window.setTimeout(() => {
+    discoveryTimer = null;
+    lastDiscovery = performance.now();
+    if (lastPointerX !== null && lastPointerY !== null && active() && discoverAt(lastPointerX, lastPointerY)) track();
+  }, wait);
+}
+
+function discoverAt(x: number, y: number): boolean {
+  let found = false;
+  const visited = new Set<Document | ShadowRoot>();
+  const visit = (root: Document | ShadowRoot): void => {
+    visited.add(root);
+    for (const el of root.elementsFromPoint(x, y)) {
+      if (isMedia(el)) {
+        if (rememberMedia(el)) found = true;
+      } else if (el.shadowRoot && !visited.has(el.shadowRoot)) {
+        if (shadowScanned) listenForMedia(el.shadowRoot);
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+  return found;
+}
+
 function collectMedia(): MediaElement[] {
-  if (lightMediaCache === null) lightMediaCache = Array.from(document.querySelectorAll('video, audio')) as MediaElement[];
   if (!active()) {
     // Roots created meanwhile go unannounced; walk again when re-activated.
-    mediaCache = null;
     shadowScanned = false;
-    return lightMediaCache;
+  } else if (!shadowScanned && started) {
+    scanShadowMedia();
   }
-  if (!shadowScanned && mediaObserver) scanShadowMedia();
-  return mediaCache ?? rebuildMediaCache();
+  // Media out of the document is dropped (and not held alive); if it comes
+  // back, it is found again as it plays or under the pointer.
+  const media: MediaElement[] = [];
+  knownMedia.forEach((el) => {
+    if (el.isConnected) media.push(el);
+    else knownMedia.delete(el);
+  });
+  return media;
 }
 
 function isPointerOver(el: HTMLMediaElement, x: number | null, y: number | null): boolean {
@@ -706,12 +724,11 @@ function reposition(): void {
 
 function track(): void {
   // Discipline: every DOM reaction below must be idempotent (guarded appends,
-  // same-value style writes). track() runs on a timer AND on a whole-document
-  // MutationObserver; any non-idempotent write here (e.g. rewriting
-  // document.title every tick) re-triggers the observer into a
-  // self-perpetuating loop that starves the page's main thread. Proven live.
-  const media = collectMedia();
-  media.forEach((el) => observePlayer(el as HTMLVideoElement | HTMLAudioElement));
+  // same-value style writes). track() runs on a timer and on page events; a
+  // non-idempotent write here (e.g. rewriting document.title every tick)
+  // turns every tick into page work, and with any observer watching the page
+  // into a self-perpetuating loop that starves its main thread. Proven live.
+  collectMedia();
   const next = active() ? pick() : null;
   if (next !== current) {
     current = next;
@@ -804,6 +821,7 @@ function onPointerMove(event: PointerEvent | MouseEvent): void {
     pointerRAF = null;
     if (!active()) return;
     const next = pick();
+    if (!next) requestDiscovery();
     if (next !== current) {
       track();
     } else if (current && button?.isConnected) {
@@ -814,6 +832,15 @@ function onPointerMove(event: PointerEvent | MouseEvent): void {
 
 document.addEventListener('click', rememberBrowserOwnedClick, true);
 document.addEventListener('click', interceptDownloadClick, true);
+// A click is when a page most often swaps a poster for a player under a
+// pointer that then stays still, so no pointermove would hit-test for it.
+document.addEventListener('click', (event) => {
+  if (!event.isTrusted || !active()) return;
+  window.setTimeout(() => {
+    if (shadowScanned) document.dispatchEvent(new Event('dm-shadow-flush'));
+    requestDiscovery();
+  }, DISCOVERY_INTERVAL_MS);
+}, { capture: true, passive: true });
 window.addEventListener('pointermove', onPointerMove, { passive: true });
 window.addEventListener('mouseleave', () => {
   lastPointerX = null;
@@ -843,25 +870,16 @@ if (window.top === window) {
   window.addEventListener('focus', () => { void refreshPolicy(); });
 }
 
+listenForMedia(document);
+rememberMediaIn(document);
 void refreshPolicy().then(() => {
+  started = true;
   window.setInterval(() => {
-    if (!document.hidden) track();
-  }, 500);
-  let queuedTrack: number | null = null;
-  const scheduleTrack = () => {
-    if (queuedTrack !== null) return;
-    queuedTrack = window.setTimeout(() => {
-      queuedTrack = null;
-      track();
-    }, 100);
-  };
-  mediaObserver = new MutationObserver((records) => {
-    updateMediaCache(records);
+    if (document.hidden) return;
     // A shadow host created out of the document is announced only once it
     // is inserted; page-probe.ts checks its waiting hosts when asked.
-    if (active() && records.some((record) => record.addedNodes.length)) document.dispatchEvent(new Event('dm-shadow-flush'));
-    scheduleTrack();
-  });
-  mediaObserver.observe(document.documentElement, mediaMutationOptions);
+    if (shadowScanned && active()) document.dispatchEvent(new Event('dm-shadow-flush'));
+    track();
+  }, 500);
   track();
 });

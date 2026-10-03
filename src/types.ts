@@ -45,6 +45,8 @@ export interface DownloadJob {
   note?: string;
   /** Seconds left at the current speed. */
   etaSeconds?: number;
+  /** Play time of segmented media, in seconds. */
+  durationSeconds?: number;
   connections: number;
   maxConnections: number;
   /** Per-job bandwidth cap in bytes/sec. Absent/null = follow the global setting. */

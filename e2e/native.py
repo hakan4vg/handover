@@ -68,6 +68,11 @@ COOKIE_LOG: list[tuple[float, str, str, str]] = []
 # to come back in a second; a retry inside that second is counted as early.
 PACING_FIRST: dict[str, float] = {}
 PACING_EARLY: collections.Counter = collections.Counter()
+# A playlist whose fragments are stated byte ranges, so its size is known
+# before any is fetched; the last one is never served, so the job stops short
+# of the point where every job's total becomes what it downloaded.
+SIZED_HLS_RANGES = [(3008, 0), (3008, 3008), (1504, 0)]
+SIZED_HLS = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2"] + [line for i, (length, start) in enumerate(SIZED_HLS_RANGES) for line in ("#EXTINF:2.0,", f"#EXT-X-BYTERANGE:{length}@{start}", "/sized-hls/missing.ts" if i == 2 else "/file/range.bin")] + ["#EXT-X-ENDLIST", ""])
 PACED_HLS = "\n".join(["#EXTM3U", "#EXT-X-TARGETDURATION:2"] + [line for i in range(3) for line in ("#EXTINF:2.0,", f"/paced-hls/seg{i}.ts")] + ["#EXT-X-ENDLIST", ""])
 
 
@@ -301,6 +306,8 @@ class Handler(fixture.Handler):
                 return None
             size, seed, _ = fixture.FILES["range.bin"]
             return self._serve_file("range.bin", seed, size, True)
+        if path == "/sized-hls.m3u8":
+            return self._raw(200, SIZED_HLS.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
         if path == "/paced-hls.m3u8":
             return self._raw(200, PACED_HLS.encode(), {"Content-Type": "application/vnd.apple.mpegurl"})
         if path.startswith("/paced-hls/seg"):
@@ -515,6 +522,7 @@ def main() -> int:
         # Stopped while finalizing: every fragment is on disk, the source has expired.
         "recover-media": ("/gone.mpd", {"media": True, "playerKind": "video", "state": "finalizing", "progress": 100, "segments": {"completed": 6, "total": 6, "identity": "seeded"}}),
         "paced-hls": ("/paced-hls.m3u8", {"media": True, "playerKind": "video"}),
+        "sized-hls": ("/sized-hls.m3u8", {"media": True, "playerKind": "video"}),
         "mpd-dynamic": ("/dynamic-spaced.mpd", {"media": True, "playerKind": "video"}),
         "mpd-periods": ("/two-periods.mpd", {"media": True, "playerKind": "video"}),
         "mpd-drm": ("/drm.mpd", {"media": True, "playerKind": "video"}),
@@ -639,6 +647,11 @@ def main() -> int:
             run.check("engine/first-response-reused", "a ranged download takes the start of the file from its first response: the only other request from byte 0 is a one-byte probe", j["mode"] == "whole-object" and QUIET_REQUESTS.count("bytes=0-0") == 1 and not first_again, evidence("quiet-range", firstAgain=first_again, requests=QUIET_REQUESTS[:12]))
             j = job("paced-hls")
             run.check("engine/paced-hls", "media segments told Retry-After wait it out: the playlist completes with no retry inside the server's window", j["state"] == "completed" and bool(j["bytes"]) and PACING_EARLY["hls"] == 0, evidence("paced-hls", earlyRetries=PACING_EARLY["hls"]))
+
+            play_times = {name: state.get(name, {}).get("durationSeconds") for name in ("hls-vod", "paced-hls", "range")}
+            run.check("engine/media-play-time", "a playlist's play time is reported with the job, and a plain file has none", play_times == {"hls-vod": 2 * fixture.SEG_TS_COUNT, "paced-hls": 6, "range": None}, {"durationSeconds": play_times})
+            sized = state.get("sized-hls", {})
+            run.check("engine/media-size-known", "a playlist of stated byte ranges reports its total size before the fragments are fetched", sized.get("state") != "completed" and sized.get("total") == sum(length for length, _ in SIZED_HLS_RANGES), {"state": sized.get("state"), "total": sized.get("total"), "downloaded": sized.get("downloaded"), "error": sized.get("error")})
 
             j = job("hls-vod")
             run.check("engine/hls-vod", "an ordinary finite HLS playlist still assembles (control)", j["state"] == "completed" and bool(j["bytes"]), evidence("hls-vod"))

@@ -54,6 +54,10 @@ struct DownloadJob {
     /// Seconds left at the current speed (see `sample_speed`).
     #[serde(default)]
     eta_seconds: Option<u64>,
+    /// Play time of segmented media in seconds, as its playlist or manifest
+    /// states it.
+    #[serde(default)]
+    duration_seconds: Option<u64>,
     #[serde(skip)]
     speed_samples: std::collections::VecDeque<SpeedSample>,
     /// Bytes received for byte ranges not yet written: they count toward the
@@ -3980,6 +3984,7 @@ async fn acquire_manifest(
     }
     let is_hls =
         manifest_source.to_ascii_lowercase().contains(".m3u8") || manifest_body.contains("#EXTM3U");
+    let mut duration_seconds = None;
     let tracks = if let Some(sources) = hls_track_sources {
         let mut tracks = Vec::with_capacity(sources.len());
         let mut track_has_map = Vec::with_capacity(sources.len());
@@ -4014,6 +4019,7 @@ async fn acquire_manifest(
                 }
             }
             track_has_map.push(body.contains("#EXT-X-MAP"));
+            duration_seconds = duration_seconds.max(media::hls_duration(&body));
             tracks.push(media::MediaTrack {
                 kind,
                 segments: media::parse_hls(&source, &body)?,
@@ -4029,12 +4035,14 @@ async fn acquire_manifest(
         tracks
     } else if is_hls {
         hls_all_mpeg_ts = !manifest_body.contains("#EXT-X-MAP");
+        duration_seconds = media::hls_duration(&manifest_body);
         vec![media::MediaTrack {
             kind: expected_kind.unwrap_or_else(|| "video".into()),
             segments: media::parse_hls(&manifest_source, &manifest_body)?,
             segment_base: None
         }]
     } else {
+        duration_seconds = media::dash_duration(&manifest_body);
         media::parse_dash_tracks_for_segments(&manifest_source, &manifest_body, &selected_segments)?
     };
     let range_retry_count = app
@@ -4092,6 +4100,13 @@ async fn acquire_manifest(
         .collect::<Vec<_>>()
         .join(" + ");
     let total_segments = track_lengths.iter().sum::<usize>();
+    // The size is known ahead only when every fragment is a stated byte range
+    // written as it arrives (an encrypted one is written without its padding).
+    let total_bytes = tracks
+        .iter()
+        .flat_map(|track| &track.segments)
+        .map(|segment| segment.range.filter(|_| segment.key.is_none()).map(|(_, length)| length))
+        .sum::<Option<u64>>();
     if total_segments == 0 {
         return Err("The manifest did not contain any downloadable segments".into());
     }
@@ -4179,6 +4194,8 @@ async fn acquire_manifest(
         job.mime = Some(container_mime.to_string());
         job.media_tracks = Some(track_count as u32);
         job.resumable = true;
+        job.total = total_bytes;
+        job.duration_seconds = duration_seconds;
         job.downloaded = existing_bytes;
         job.progress = existing_segments.len() as f64 / total_segments as f64 * 100.0;
         job.speed = 0;
@@ -6221,6 +6238,7 @@ fn start_provisional(
         speed: 0,
         note: Some("Connecting…".into()),
         eta_seconds: None,
+        duration_seconds: None,
         speed_samples: std::collections::VecDeque::new(),
         receiving: 0,
         connections: 0,

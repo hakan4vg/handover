@@ -996,14 +996,13 @@ export function AddDownloadWindow({ settings, job, captured, onCreate, onCommit,
   // whether the job happens to be present yet, so the window can not flash into
   // the manual form — or keep showing a previous acquisition it no longer owns.
   const isCapture = captured ?? job !== undefined;
+  // What is known of the whole before it is fetched: its size, and for media
+  // its play time. Bytes fetched so far are the Downloaded figure, not a size.
   const sizeText = job
-    ? job.total
-      ? formatBytes(job.total)
-      : job.downloaded
-        ? formatBytes(job.downloaded)
-        : job.state === 'connecting'
-          ? 'Detecting size'
-          : 'Unknown'
+    ? [
+        job.durationSeconds ? `${formatDuration(job.durationSeconds)} long` : '',
+        job.total ? formatBytes(job.total) : job.state === 'connecting' ? 'Detecting size' : job.durationSeconds ? '' : 'Size unknown',
+      ].filter(Boolean).join(' · ')
     : '';
   const displayedState = job ? stateText(job.state) : '';
   const [source, setSource] = useState(job?.source ?? '');

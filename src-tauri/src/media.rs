@@ -260,6 +260,37 @@ fn selected_hls_url(candidate: &str, selected_segments: &[String]) -> bool {
     })
 }
 
+/// Play time of an HLS media playlist in seconds: the sum of its EXTINF values.
+pub fn hls_duration(body: &str) -> Option<u64> {
+    let mut seconds = 0.0;
+    let mut found = false;
+    for line in body.lines().map(str::trim) {
+        let Some(value) = line.strip_prefix("#EXTINF:") else {
+            continue;
+        };
+        seconds += value.split(',').next()?.trim().parse::<f64>().ok()?;
+        found = true;
+    }
+    found.then(|| seconds.round() as u64)
+}
+
+/// Play time an MPD declares for the whole presentation, in seconds.
+pub fn dash_duration(body: &str) -> Option<u64> {
+    let mut reader = Reader::from_str(body);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
+                if element.name().as_ref().eq_ignore_ascii_case(b"mpd") {
+                    return attribute(&element, b"mediaPresentationDuration")
+                        .and_then(|value| parse_duration(&value));
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
 pub fn parse_hls(source: &str, body: &str) -> Result<Vec<Segment>, String> {
     if !body
         .lines()

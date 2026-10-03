@@ -5,7 +5,8 @@
 // opens one local page per way a page can create such a player: before the
 // content script runs, after it, detached and inserted later, nested, filled
 // in later, removed and re-inserted, and in a closed root (no button
-// expected). For each it points at the video and checks whether the button
+// expected). A few plain-document cases cover players added late, inserted
+// after loading, under an overlay, or given a source late. For each it points at the video and checks whether the button
 // shows. Runs anywhere Chromium does; no Windows or resident needed.
 //
 //   npm i --no-save playwright-core
@@ -62,6 +63,12 @@ const CASES = {
   filled: ['empty open root at load, video added 1.5 s later', '<div id="host"></div>', "const shadow = host.attachShadow({ mode: 'open' });" + later(1500, `shadow.innerHTML = '${VIDEO}'`), true],
   reinserted: ['removed 0.5 s after load, re-inserted 1.5 s later', '<div id="slot"><x-player></x-player></div>', PLAYER() + "const player = slot.firstElementChild;" + later(500, 'player.remove()') + later(2000, 'slot.append(player)'), true],
   closed: ['closed shadow root (out of reach, no button)', '<x-player></x-player>', PLAYER('closed'), false],
+  // Plain <video> in the document, added in the ways that only events (not a
+  // DOM observer) have to catch.
+  'light-late': ['plain video inserted 1 s after load', '<div id="slot"></div>', later(1000, `slot.innerHTML = '${VIDEO}'`), true],
+  'light-detached': ['plain video given its source at load, inserted 1.5 s later', '<div id="slot"></div>', `const held = document.createElement('div'); held.innerHTML = '${VIDEO}';` + later(1500, 'slot.append(held)'), true],
+  'light-overlaid': ['as light-detached, under a transparent overlay that takes the pointer', '<div id="slot" style="position:relative"></div>', `const held = document.createElement('div'); held.innerHTML = '${VIDEO}<div style="position:absolute;inset:0"></div>';` + later(1500, 'slot.append(held)'), true],
+  'light-source-later': ['plain video with no source until 1.5 s after load', '<video id="late" preload="none" width="640" height="360"></video>', later(1500, "late.src = '/clip.mp4'"), true],
 };
 
 function page(title, body, script) {
@@ -125,7 +132,7 @@ async function main() {
   for (const name of Object.keys(CASES)) {
     const result = await runCase(context, base, name);
     results.push(result);
-    process.stderr.write(`${result.pass ? 'pass' : 'FAIL'}  ${name.padEnd(11)} button ${result.buttonShown ? 'shown' : 'absent'} (${result.what})\n`);
+    process.stderr.write(`${result.pass ? 'pass' : 'FAIL'}  ${name.padEnd(18)} button ${result.buttonShown ? 'shown' : 'absent'} (${result.what})\n`);
   }
   await context.close();
   server.close();

@@ -386,10 +386,13 @@ function usable(el: HTMLMediaElement): boolean {
 
 // Media inside web-component players (Media Chrome / mux-video and similar)
 // lives in open shadow roots; document.querySelectorAll('video, audio') cannot
-// see it. Keep light and shadow results incrementally fresh, and pierce open
-// shadow roots at most once per second to bound cost on heavy pages. Closed
-// shadow roots stay invisible.
-let lastShadowScan = 0;
+// see it. Walking every element to find those roots costs a long task on a big
+// page, so the document is walked once, for the roots that already exist
+// (declarative shadow DOM, and roots created before this script ran); after
+// that page-probe.ts announces each open root as the page creates it. Every
+// known root is observed like the document, which keeps its media fresh.
+// Closed shadow roots stay invisible.
+let shadowScanned = false;
 let lightMediaCache: MediaElement[] | null = null;
 let shadowMediaCache: MediaElement[] = [];
 let mediaCache: MediaElement[] | null = null;
@@ -446,7 +449,16 @@ function updateMediaCache(records: MutationRecord[]): void {
     const root = record.target.getRootNode();
     const isShadow = typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot;
     const cache = isShadow ? shadowMediaCache : lightMediaCache;
-    record.addedNodes.forEach((node) => appendMedia(cache, mediaInNode(node)));
+    record.addedNodes.forEach((node) => {
+      appendMedia(cache, mediaInNode(node));
+      // A shadow host moved or re-inserted: its root is still observed, but
+      // its media left the cache while the host was out of the document.
+      const shadow = node instanceof Element ? node.shadowRoot : null;
+      if (shadow) {
+        appendMedia(shadowMediaCache, mediaInNode(shadow));
+        shadowChanged = true;
+      }
+    });
     if (isShadow) shadowChanged = true;
     else lightChanged = true;
   }
@@ -456,41 +468,47 @@ function updateMediaCache(records: MutationRecord[]): void {
   if (shadowChanged || lightChanged) rebuildMediaCache();
 }
 
+function observeShadowRoot(shadow: ShadowRoot): void {
+  mediaObserver?.observe(shadow, mediaMutationOptions);
+  appendMedia(shadowMediaCache, mediaInNode(shadow));
+}
+
 function scanShadowMedia(): void {
   if (typeof ShadowRoot === 'undefined') return;
-  const found: MediaElement[] = [];
-  const known = new Set<MediaElement>();
+  shadowMediaCache = [];
   const scan = (root: ParentNode): void => {
     root.querySelectorAll('*').forEach((el) => {
       const shadow = (el as HTMLElement).shadowRoot;
       if (!shadow) return;
-      mediaObserver?.observe(shadow, mediaMutationOptions);
-      shadow.querySelectorAll('video, audio').forEach((media) => {
-        if ((media instanceof HTMLVideoElement || media instanceof HTMLAudioElement) && !known.has(media)) {
-          known.add(media);
-          found.push(media);
-        }
-      });
+      observeShadowRoot(shadow);
       scan(shadow);
     });
   };
   scan(document);
-  shadowMediaCache = found;
-  lastShadowScan = performance.now();
+  shadowScanned = true;
   rebuildMediaCache();
 }
 
-function collectMedia(scanShadow = true): MediaElement[] {
+// page-probe.ts dispatches this on the host of each open shadow root the page
+// creates, once the host is in the document. It does not bubble; capturing on
+// document still sees it, and composedPath() reaches into open roots.
+document.addEventListener('dm-shadow-root', (event) => {
+  const host = event.composedPath()[0];
+  const shadow = host instanceof Element ? host.shadowRoot : null;
+  if (!shadow || !shadowScanned || !active()) return;
+  observeShadowRoot(shadow);
+  rebuildMediaCache();
+}, true);
+
+function collectMedia(): MediaElement[] {
   if (lightMediaCache === null) lightMediaCache = Array.from(document.querySelectorAll('video, audio')) as MediaElement[];
   if (!active()) {
+    // Roots created meanwhile go unannounced; walk again when re-activated.
     mediaCache = null;
+    shadowScanned = false;
     return lightMediaCache;
   }
-  const now = performance.now();
-  // The full-document shadow scan is the expensive part of tracking: rescan
-  // every second while shadow-hosted media exists, every five otherwise.
-  const shadowInterval = shadowMediaCache.length ? 1000 : 5000;
-  if (scanShadow && (mediaCache === null || now - lastShadowScan >= shadowInterval)) scanShadowMedia();
+  if (!shadowScanned && mediaObserver) scanShadowMedia();
   return mediaCache ?? rebuildMediaCache();
 }
 
@@ -561,7 +579,7 @@ function pick(): HTMLVideoElement | HTMLAudioElement | null {
   if (current?.isConnected && button?.isConnected && (document.activeElement === button || isPointerOverButton(button, lastPointerX, lastPointerY))) {
     return current;
   }
-  const media = collectMedia(false);
+  const media = collectMedia();
   // 1. Hovered media (playing OR paused)
   for (const el of media) {
     const item = el as HTMLVideoElement | HTMLAudioElement;
@@ -619,8 +637,6 @@ function ensureButton(): HTMLButtonElement {
   return button;
 }
 
-let loopCount = 0;
-
 function positionButton(): boolean {
   if (!current || !active() || !current.isConnected || !visible(current) || !usable(current)) {
     button?.remove();
@@ -629,23 +645,63 @@ function positionButton(): boolean {
   }
   const el = ensureButton();
   const rect = anchorRect(current);
-  el.style.top = `${Math.max(6, rect.top + 6)}px`;
-  el.style.left = `${Math.max(32, Math.min(document.documentElement.clientWidth - 6, rect.right - 6))}px`;
+  const top = `${Math.max(6, rect.top + 6)}px`;
+  const left = `${Math.max(32, Math.min(document.documentElement.clientWidth - 6, rect.right - 6))}px`;
+  buttonMoved = el.style.top !== top || el.style.left !== left;
+  el.style.top = top;
+  el.style.left = left;
   el.style.transform = 'translateX(-100%)';
   return true;
 }
 
+// The button follows its media without a standing per-frame loop, which kept
+// an otherwise idle page rendering 60 frames a second for as long as the
+// button showed. Anything that can move the media (scroll, window or media
+// resize, a CSS transition or animation, fullscreen, the pointer, track()
+// finding it moved) starts a short burst of frames that repositions the
+// button until it has held still for FOLLOW_STILL_FRAMES frames, then stops.
+const FOLLOW_STILL_FRAMES = 10;
+let stillFrames = 0;
+let buttonMoved = false;
+let watchedMedia: MediaElement | null = null;
+const mediaResize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => follow()) : null;
+
+function follow(): void {
+  stillFrames = 0;
+  if (current && frame === null) frame = requestAnimationFrame(loop);
+}
+
 function loop(): void {
   frame = null;
-  loopCount++;
-  // rAF gives smooth following during scroll/resize, but it can be throttled
-  // in backgrounded pages — track() positions directly too, so the control
-  // never depends on rAF alone to exist.
   if (!positionButton()) {
     current = null;
+    watchCurrent();
     return;
   }
-  frame = requestAnimationFrame(loop);
+  stillFrames = buttonMoved ? 0 : stillFrames + 1;
+  if (stillFrames < FOLLOW_STILL_FRAMES) frame = requestAnimationFrame(loop);
+}
+
+/** Watch the current media's box (and its parent's, which an audio element
+ *  may borrow as its anchor) so a player that grows, shrinks or reflows
+ *  moves the button without polling. */
+function watchCurrent(): void {
+  if (watchedMedia === current || !mediaResize) return;
+  mediaResize.disconnect();
+  watchedMedia = current;
+  if (!current) return;
+  mediaResize.observe(current);
+  if (current.parentElement) mediaResize.observe(current.parentElement);
+}
+
+/** Position now, and keep following for a few frames if the media moved. */
+function reposition(): void {
+  if (!positionButton()) {
+    current = null;
+    watchCurrent();
+    return;
+  }
+  if (buttonMoved) follow();
 }
 
 function track(): void {
@@ -665,11 +721,11 @@ function track(): void {
     }
     button?.remove();
     button = null;
+    watchCurrent();
   }
-  if (current && frame === null) {
-    if (!positionButton()) current = null;
-    else frame = requestAnimationFrame(loop);
-  }
+  // Positioning here, not only in rAF, keeps the control independent of rAF,
+  // which backgrounded pages throttle.
+  if (current) reposition();
 }
 
 function mediaExtension(media: HTMLMediaElement, source: string): string {
@@ -751,7 +807,7 @@ function onPointerMove(event: PointerEvent | MouseEvent): void {
     if (next !== current) {
       track();
     } else if (current && button?.isConnected) {
-      positionButton();
+      reposition();
     }
   });
 }
@@ -766,6 +822,14 @@ window.addEventListener('mouseleave', () => {
 }, { passive: true });
 document.addEventListener('mouseenter', track, true);
 document.addEventListener('scroll', track, { capture: true, passive: true });
+window.addEventListener('resize', follow, { passive: true });
+document.addEventListener('fullscreenchange', follow);
+// Players that slide, dock or expand with CSS move without resizing; follow
+// for the length of the transition or animation (the burst outlasts it by a
+// few still frames once it ends).
+for (const type of ['transitionstart', 'transitionend', 'animationstart', 'animationend']) {
+  document.addEventListener(type, () => { if (current) follow(); }, { capture: true, passive: true });
+}
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && (changes['dm-policy'] || changes['dm-media-filters'])) void refreshPolicy();
 });
@@ -793,6 +857,9 @@ void refreshPolicy().then(() => {
   };
   mediaObserver = new MutationObserver((records) => {
     updateMediaCache(records);
+    // A shadow host created out of the document is announced only once it
+    // is inserted; page-probe.ts checks its waiting hosts when asked.
+    if (active() && records.some((record) => record.addedNodes.length)) document.dispatchEvent(new Event('dm-shadow-flush'));
     scheduleTrack();
   });
   mediaObserver.observe(document.documentElement, mediaMutationOptions);

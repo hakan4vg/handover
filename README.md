@@ -132,7 +132,7 @@ src/              React UI (manager window, Add Download window)
 src-tauri/        Rust core: transfer engine, media finalization, IPC, persistence
 extension/        Chromium extension (background worker, popup)
 e2e/              End-to-end harness against the real app (results in e2e/results/)
-fixtures/         Fixture server, probe scripts and media payloads
+fixtures/         Fixture server and media payloads used by the harness
 scripts/          Packaging
 ```
 

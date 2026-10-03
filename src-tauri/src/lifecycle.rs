@@ -5,13 +5,6 @@ use std::sync::{
     Mutex,
 };
 
-pub(crate) fn state_allows_transfer(state: Option<&str>) -> bool {
-    matches!(
-        state,
-        Some("connecting") | Some("downloading") | Some("finalizing")
-    )
-}
-
 struct TransferOwner {
     generation: u64,
     abort: AbortHandle,

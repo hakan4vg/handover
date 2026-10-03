@@ -619,8 +619,6 @@ function ensureButton(): HTMLButtonElement {
   return button;
 }
 
-let loopCount = 0;
-
 function positionButton(): boolean {
   if (!current || !active() || !current.isConnected || !visible(current) || !usable(current)) {
     button?.remove();
@@ -629,23 +627,63 @@ function positionButton(): boolean {
   }
   const el = ensureButton();
   const rect = anchorRect(current);
-  el.style.top = `${Math.max(6, rect.top + 6)}px`;
-  el.style.left = `${Math.max(32, Math.min(document.documentElement.clientWidth - 6, rect.right - 6))}px`;
+  const top = `${Math.max(6, rect.top + 6)}px`;
+  const left = `${Math.max(32, Math.min(document.documentElement.clientWidth - 6, rect.right - 6))}px`;
+  buttonMoved = el.style.top !== top || el.style.left !== left;
+  el.style.top = top;
+  el.style.left = left;
   el.style.transform = 'translateX(-100%)';
   return true;
 }
 
+// The button follows its media without a standing per-frame loop, which kept
+// an otherwise idle page rendering 60 frames a second for as long as the
+// button showed. Anything that can move the media (scroll, window or media
+// resize, a CSS transition or animation, fullscreen, the pointer, track()
+// finding it moved) starts a short burst of frames that repositions the
+// button until it has held still for FOLLOW_STILL_FRAMES frames, then stops.
+const FOLLOW_STILL_FRAMES = 10;
+let stillFrames = 0;
+let buttonMoved = false;
+let watchedMedia: MediaElement | null = null;
+const mediaResize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => follow()) : null;
+
+function follow(): void {
+  stillFrames = 0;
+  if (current && frame === null) frame = requestAnimationFrame(loop);
+}
+
 function loop(): void {
   frame = null;
-  loopCount++;
-  // rAF gives smooth following during scroll/resize, but it can be throttled
-  // in backgrounded pages — track() positions directly too, so the control
-  // never depends on rAF alone to exist.
   if (!positionButton()) {
     current = null;
+    watchCurrent();
     return;
   }
-  frame = requestAnimationFrame(loop);
+  stillFrames = buttonMoved ? 0 : stillFrames + 1;
+  if (stillFrames < FOLLOW_STILL_FRAMES) frame = requestAnimationFrame(loop);
+}
+
+/** Watch the current media's box (and its parent's, which an audio element
+ *  may borrow as its anchor) so a player that grows, shrinks or reflows
+ *  moves the button without polling. */
+function watchCurrent(): void {
+  if (watchedMedia === current || !mediaResize) return;
+  mediaResize.disconnect();
+  watchedMedia = current;
+  if (!current) return;
+  mediaResize.observe(current);
+  if (current.parentElement) mediaResize.observe(current.parentElement);
+}
+
+/** Position now, and keep following for a few frames if the media moved. */
+function reposition(): void {
+  if (!positionButton()) {
+    current = null;
+    watchCurrent();
+    return;
+  }
+  if (buttonMoved) follow();
 }
 
 function track(): void {
@@ -665,11 +703,11 @@ function track(): void {
     }
     button?.remove();
     button = null;
+    watchCurrent();
   }
-  if (current && frame === null) {
-    if (!positionButton()) current = null;
-    else frame = requestAnimationFrame(loop);
-  }
+  // Positioning here, not only in rAF, keeps the control independent of rAF,
+  // which backgrounded pages throttle.
+  if (current) reposition();
 }
 
 function mediaExtension(media: HTMLMediaElement, source: string): string {
@@ -751,7 +789,7 @@ function onPointerMove(event: PointerEvent | MouseEvent): void {
     if (next !== current) {
       track();
     } else if (current && button?.isConnected) {
-      positionButton();
+      reposition();
     }
   });
 }
@@ -766,6 +804,14 @@ window.addEventListener('mouseleave', () => {
 }, { passive: true });
 document.addEventListener('mouseenter', track, true);
 document.addEventListener('scroll', track, { capture: true, passive: true });
+window.addEventListener('resize', follow, { passive: true });
+document.addEventListener('fullscreenchange', follow);
+// Players that slide, dock or expand with CSS move without resizing; follow
+// for the length of the transition or animation (the burst outlasts it by a
+// few still frames once it ends).
+for (const type of ['transitionstart', 'transitionend', 'animationstart', 'animationend']) {
+  document.addEventListener(type, () => { if (current) follow(); }, { capture: true, passive: true });
+}
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && (changes['dm-policy'] || changes['dm-media-filters'])) void refreshPolicy();
 });
